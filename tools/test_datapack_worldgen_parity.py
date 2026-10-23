@@ -18,6 +18,7 @@ import argparse
 import os
 import random
 import sys
+from pathlib import Path
 
 try:
     from . import lab, test_chunk_generation_parity as chunks
@@ -25,7 +26,9 @@ except ImportError:
     import lab
     import test_chunk_generation_parity as chunks
 
-DATAPACKS = lab.ROOT / 'tools/fixtures/datapacks'
+# HORIZON_PARITY_DATAPACKS: another folder of packs (tools/fixtures/tall_datapacks: a 2096-high
+# Overworld).
+DATAPACKS = Path(os.environ.get('HORIZON_PARITY_DATAPACKS', lab.ROOT / 'tools/fixtures/datapacks'))
 SEEDS = [12345, 4242]
 
 
