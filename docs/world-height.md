@@ -197,6 +197,11 @@ Steps 1 to 5 are done, and step 6 in part.
   render distance 12 (692 for vanilla) and 1169 MiB at 16 (743). Generating a chunk's noise takes
   about twice as long as vanilla's.
 
+Tall generation is checked against vanilla: `HORIZON_PARITY_DATAPACKS=tools/fixtures/tall_datapacks
+python3 tools/test_datapack_worldgen_parity.py` generates the fixture's 2096-high Overworld with the
+vanilla oracle (which takes each level's range from its dimension type) and with Horizon, and finds
+no difference in terrain or decoration.
+
 What is left: the constants `MIN_Y`, `HEIGHT` and `SECTIONS` remain for tests, fixtures and
 examples. The Nether and the End live in the Overworld's window, so in a tall world their columns
 carry the empty sections above 256 (shared, so they cost a slot each). Looking down from far above
