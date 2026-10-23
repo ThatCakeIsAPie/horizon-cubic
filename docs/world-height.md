@@ -173,14 +173,35 @@ chunks in a tall Overworld, which the shared empty section makes cheap anyway.
 
 ### Where this stands
 
-Steps 1 to 3 are done, and step 5 is done for servers: the client's column is the union of the
-dimension types a server sends. `crates/horizon-client/tests/tall_column.rs` sets To The Max's
-131-section layout and streams, lights, meshes, edits, saves and reloads a column up to y 2031. Local
-worlds still open with vanilla's column, because their dimension types come from the generator's
-fixed table (`dimension_type_height` in `worldgen/generator.rs`). Step 4 (gameplay build range) and
-step 6 (cost) are still to do. `lowest_sky_source` (`light.rs`) checks every block from the column's
-top down for each relit column, so the relighter does about 5.5 times the work at 2096. It should
-skip uniform air sections, as `Chunk::highest` does.
+Steps 1 to 5 are done, and step 6 in part.
+
+- **Local worlds.** A data pack's `dimension_type/<id>.json` joins the worldgen overrides
+  (`overrides::DIMENSION_TYPES`). `WorldgenOverrides::level_height` gives each vanilla level's range
+  (the type its level stem names, a pack's over vanilla's, checked as the codec checks it), and the
+  generator reads a level's range from the same data instead of a fixed table, so a taller type no
+  longer clamps the noise. Opening a world (`world_loading::set_world_heights`, both single-player
+  paths) sets each level's range (`chunk::set_level_heights`) and the column covering them.
+- **Servers and the server thread.** A host sends a dimension type the world's packs changed with its
+  data, even to a client that knows the vanilla pack (`lan/data.rs`), and a client takes each level's
+  range from the server's types (`game/remote.rs`).
+- **Gameplay.** `Dim::min_y`, `max_y` and `logical_height`, and `LevelAccess`'s bounds, read the
+  level's range. Spawn and surface searches, build bounds, void and below-world checks, commands'
+  coordinate checks, mob goals, navigation and paths, falling blocks, wind charges, the portal's
+  logical height and entities' fluid scans read the level's range or the column.
+- **Cost.** Uniform sections (one block, one biome, one light value) are shared by every column
+  (`chunk::share_uniform`), and `lowest_sky_source` passes over a uniform section light goes
+  through. Measured with `tools/fixtures/datapacks/horizon_tall_test` (terrain from about y 475 to
+  1900) on a 7 GB laptop (`chunk_bench --world`, and the game offscreen): resident chunk storage is
+  110 KiB per chunk against vanilla's 38 (118 before sharing: air above the terrain mostly holds
+  several biomes, so few of its sections are uniform); the game's resident memory is 1073 MiB at
+  render distance 12 (692 for vanilla) and 1169 MiB at 16 (743). Generating a chunk's noise takes
+  about twice as long as vanilla's.
+
+What is left: the constants `MIN_Y`, `HEIGHT` and `SECTIONS` remain for tests, fixtures and
+examples. The Nether and the End live in the Overworld's window, so in a tall world their columns
+carry the empty sections above 256 (shared, so they cost a slot each). Looking down from far above
+the terrain shows fog: vanilla's render-distance fog uses `max(xz, |y|)`, so terrain more than the
+render distance below the camera is fogged in vanilla too.
 
 Each step runs the harnesses its files reach (`python3 tools/parity.py --changed-files`), which for
 client-library files is about a hundred, and a vanilla world in game. Once step 5 lands, a test world

@@ -284,6 +284,18 @@ impl Default for LevelSync {
     }
 }
 
+/// The level's dimension type as the open world has it: its data packs'
+/// build range (`chunk::level_height`), what the registry data sends.
+fn level_dimension(level: &str) -> horizon_protocol::registry::DimensionType {
+    let h = crate::chunk::level_height(level);
+    horizon_protocol::registry::DimensionType {
+        min_y: h.min_y,
+        height: h.height,
+        logical_height: h.logical_height,
+        ..horizon_protocol::registry::DimensionType::vanilla(level)
+    }
+}
+
 impl Hub {
     pub fn new(lan: Lan, sync: Arc<SyncData>, encoder: ChunkEncoder, config: HubConfig) -> Self {
         let chat_type = sync
@@ -294,7 +306,7 @@ impl Hub {
             .unwrap_or(0);
         let clock_ids = (0..sync.dynamic.len("minecraft:world_clock") as i32).collect();
         let mut encoder = encoder;
-        let d = horizon_protocol::registry::DimensionType::vanilla(&config.dimension);
+        let d = level_dimension(&config.dimension);
         encoder.set_dimension(d.min_y, d.height, d.has_skylight);
         Self {
             lan,
@@ -2435,7 +2447,7 @@ impl Hub {
             .sync
             .id("minecraft:dimension_type", dimension)
             .unwrap_or(0);
-        let d = horizon_protocol::registry::DimensionType::vanilla(dimension);
+        let d = level_dimension(dimension);
         self.encoder
             .set_dimension(d.min_y, d.height, d.has_skylight);
     }
