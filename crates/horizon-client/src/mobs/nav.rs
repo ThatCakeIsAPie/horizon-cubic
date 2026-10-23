@@ -196,14 +196,14 @@ impl Mob {
         let solid = |p: [i32; 3]| w.solid(p[0], p[1], p[2]);
         if air(p) {
             let mut q = [p[0], p[1] - 1, p[2]];
-            while q[1] >= crate::chunk::MIN_Y && air(q) {
+            while q[1] >= crate::chunk::layout().min_y() && air(q) {
                 q[1] -= 1;
             }
-            if q[1] >= crate::chunk::MIN_Y {
+            if q[1] >= crate::chunk::layout().min_y() {
                 return [q[0], q[1] + 1, q[2]];
             }
             q[1] = p[1] + 1;
-            while q[1] <= 319 && air(q) {
+            while q[1] < crate::chunk::layout().max_y() && air(q) {
                 q[1] += 1;
             }
             p = q;
@@ -212,7 +212,7 @@ impl Mob {
             return p;
         }
         let mut q = [p[0], p[1] + 1, p[2]];
-        while q[1] <= 319 && solid(q) {
+        while q[1] < crate::chunk::layout().max_y() && solid(q) {
             q[1] += 1;
         }
         q
@@ -225,7 +225,7 @@ impl Mob {
         max_len: f32,
     ) -> Option<Path> {
         if targets.is_empty()
-            || self.position.y < f64::from(crate::chunk::MIN_Y)
+            || self.position.y < f64::from(crate::chunk::layout().min_y())
             || !self.can_update_path()
         {
             return None;

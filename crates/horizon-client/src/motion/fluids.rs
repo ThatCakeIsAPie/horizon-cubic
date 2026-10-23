@@ -215,10 +215,9 @@ impl FluidInteractionWorld for MotionWorld<'_, '_, '_> {
     fn chunk_sections(&mut self, _: ()) -> Result<FluidSections<'_>> {
         // Resident sections keep no fluid count: scanning the box finds no
         // fluid where a section without fluid would have skipped it.
-        static SECTIONS: [bool; crate::chunk::SECTIONS] = [true; crate::chunk::SECTIONS];
         Ok(FluidSections {
-            minimum_section_y: crate::chunk::MIN_Y >> 4,
-            has_fluid: &SECTIONS,
+            minimum_section_y: crate::chunk::layout().min_y() >> 4,
+            has_fluid: crate::chunk::every_section(),
         })
     }
     fn bounding_box_min_y(&self) -> f64 {

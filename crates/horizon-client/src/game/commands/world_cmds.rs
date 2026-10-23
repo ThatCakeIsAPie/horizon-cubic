@@ -1075,12 +1075,12 @@ impl Game<'_> {
         let respect = matches!(ctx.get("respectTeams"), Some(Arg::Bool(true)));
         let max_y = match ctx.get("maxHeight") {
             Some(Arg::Int(h)) => *h,
-            _ => horizon_client::chunk::MIN_Y + horizon_client::chunk::HEIGHT,
+            _ => horizon_client::chunk::layout().max_y(),
         };
-        if max_y < horizon_client::chunk::MIN_Y {
+        if max_y < horizon_client::chunk::layout().min_y() {
             return Err(err(
                 "commands.spreadplayers.failed.invalid.height",
-                &[&max_y, &horizon_client::chunk::MIN_Y],
+                &[&max_y, &horizon_client::chunk::layout().min_y()],
             ));
         }
         let targets = self.entities(ctx, "targets", false)?;
@@ -1281,7 +1281,7 @@ impl Game<'_> {
         let mut air2 = air(y);
         y -= 1;
         let mut air1 = air(y);
-        while y > horizon_client::chunk::MIN_Y {
+        while y > horizon_client::chunk::layout().min_y() {
             y -= 1;
             let current = air(y);
             if !current && air1 && air2 {

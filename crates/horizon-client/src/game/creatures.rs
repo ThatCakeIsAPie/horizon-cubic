@@ -375,14 +375,18 @@ impl Game<'_> {
     }
     /// Highest motion-blocking (no leaves) block + 1 (Heightmap MOTION_BLOCKING_NO_LEAVES).
     pub(super) fn motion_top(&self, x: i32, z: i32) -> i32 {
-        let top = if self.dim == Dim::Nether { 127 } else { 319 };
-        for y in (horizon_client::chunk::MIN_Y..=top).rev() {
+        let top = if self.dim == Dim::Nether {
+            127
+        } else {
+            self.dim.max_y()
+        };
+        for y in (horizon_client::chunk::layout().min_y()..=top).rev() {
             let f = self.res.facts().get(self.world.block(x, y, z));
             if (f.full_collision || f.fluid != Fluid::None) && !f.name.ends_with("leaves") {
                 return y + 1;
             }
         }
-        horizon_client::chunk::MIN_Y
+        horizon_client::chunk::layout().min_y()
     }
     pub(super) fn mob_world_base<'s>(&'s self, others: &'s [Seen]) -> MobWorld<'s> {
         let (rain, thunder) = self.world.weather.levels(1.0);

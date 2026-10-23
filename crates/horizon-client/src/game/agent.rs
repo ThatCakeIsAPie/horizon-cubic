@@ -4,13 +4,7 @@
 //! take time run as a task advanced every frame and reply when they finish or
 //! time out, so `horizon-ctl break 10 64 3` returns what the block dropped.
 use super::{Game, Screen};
-use horizon_client::{
-    Result,
-    block_entity_anim::Ticker,
-    chunk::{MIN_Y, SECTIONS},
-    items::ItemStack,
-    widgets,
-};
+use horizon_client::{Result, block_entity_anim::Ticker, chunk::layout, items::ItemStack, widgets};
 use horizon_core::geometry::Vec3;
 use horizon_world::registry::BlockStateId;
 use serde_json::{Value, json};
@@ -1009,7 +1003,7 @@ impl Game<'_> {
                                 .world
                                 .chunks
                                 .get(&(x >> 4, z >> 4))
-                                .filter(|_| (MIN_Y..MIN_Y + SECTIONS as i32 * 16).contains(&y))
+                                .filter(|_| (layout().min_y()..layout().max_y()).contains(&y))
                                 .map(|c| c.light(x & 15, y, z & 15));
                             let digit = |v: u8| char::from_digit(u32::from(v), 16).unwrap_or('.');
                             sky.push(packed.map_or('.', |v| digit(v >> 4)));
@@ -1030,7 +1024,9 @@ impl Game<'_> {
                 let eye = self.eye_position().ok_or("no player")?;
                 let c = eye.map(|v| v.floor() as i32);
                 let mut found = Vec::new();
-                for y in (c[1] - radius).max(-64)..=(c[1] + radius).min(319) {
+                for y in
+                    (c[1] - radius).max(self.dim.min_y())..=(c[1] + radius).min(self.dim.max_y())
+                {
                     for z in c[2] - radius..=c[2] + radius {
                         for x in c[0] - radius..=c[0] + radius {
                             let state = self.world.block(x, y, z);

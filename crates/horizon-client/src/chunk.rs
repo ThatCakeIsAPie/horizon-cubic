@@ -128,6 +128,14 @@ pub fn set_layout(layout: ColumnLayout) {
     LAYOUT.store(layout.pack(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `true` for each section of the column: what callers that keep no
+/// per-section record (of fluids, say) pass as "every section may have it".
+pub fn every_section() -> &'static [bool] {
+    // The tallest column vanilla allows: 4064 blocks.
+    static ALL: [bool; 254] = [true; 254];
+    &ALL[..layout().sections()]
+}
+
 pub use horizon_world::worldgen::overrides::LevelHeight;
 
 /// The levels whose build range `level_height` keeps: the three a world has.

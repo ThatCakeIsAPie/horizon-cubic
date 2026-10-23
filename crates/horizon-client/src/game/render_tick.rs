@@ -6,7 +6,7 @@ use horizon_client::{
     animate_tick::{AnimateContext, animate_tick, campfire_particles, marker_particle_target},
     biome::Biomes,
     blocks::{BlockFacts, Fluid},
-    chunk::{HEIGHT, MIN_Y},
+    chunk::layout,
     particles::{ParticleLevel, ParticleOptions, ParticleType},
     world::World,
 };
@@ -18,15 +18,15 @@ use horizon_core::random::{LegacyRandom, RandomSource};
 
 /// The first motion-blocking block at or below `from` (Heightmap MOTION_BLOCKING), plus one.
 fn motion_blocking(world: &World, facts: &BlockFacts, x: i32, z: i32, from: i32) -> i32 {
-    let mut y = from.min(MIN_Y + HEIGHT - 1);
-    while y > MIN_Y {
+    let mut y = from.min(layout().max_y() - 1);
+    while y > layout().min_y() {
         let f = facts.get(world.block(x, y, z));
         if f.full_collision || f.fluid != Fluid::None || f.name.contains("leaves") {
             return y + 1;
         }
         y -= 1;
     }
-    MIN_Y
+    layout().min_y()
 }
 /// `Biome.getPrecipitationAt` is rain (not snow) at this position.
 fn rains_at(world: &World, biomes: &Biomes, x: i32, y: i32, z: i32) -> bool {
@@ -91,8 +91,8 @@ impl Game<'_> {
                 distant_terrain: self.lod.is_some(),
                 cloud_range_chunks: self.settings.cloud_range,
                 camera_y: camera.y,
-                // level.getMinY(): the Nether and the End start at y 0.
-                min_y: if self.dim == Dim::Overworld { MIN_Y } else { 0 },
+                // level.getMinY(): the level's dimension type's.
+                min_y: self.dim.min_y(),
                 flat: false,
                 forward: forward.map(|c| c as f32),
                 rain,
@@ -333,7 +333,7 @@ impl Game<'_> {
                     let x = block[0] + random.next_int_bound(diameter).unwrap_or(0) - radius;
                     let z = block[2] + random.next_int_bound(diameter).unwrap_or(0) - radius;
                     let top = motion_blocking(world, facts, x, z, block[1] + 64);
-                    if top <= MIN_Y
+                    if top <= layout().min_y()
                         || top > block[1] + 10
                         || top < block[1] - 10
                         || !rains_at(world, biomes, x, top, z)

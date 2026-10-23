@@ -240,7 +240,9 @@ impl Game<'_> {
                 if !self.world.loaded(x, z) {
                     continue;
                 }
-                for y in (from[1] - range).max(horizon_client::chunk::MIN_Y)..=from[1] + range {
+                for y in
+                    (from[1] - range).max(horizon_client::chunk::layout().min_y())..=from[1] + range
+                {
                     if &*self.res.facts().get(self.world.block(x, y, z)).name != "minecraft:bell" {
                         continue;
                     }

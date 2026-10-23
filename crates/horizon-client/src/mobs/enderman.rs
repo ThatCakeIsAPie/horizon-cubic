@@ -80,7 +80,9 @@ pub fn teleport_to(
         return false;
     }
     let mut by = y.floor() as i32;
-    while by > crate::chunk::MIN_Y && !w.facts.get(w.world.block(bx, by, bz)).full_collision {
+    while by > crate::chunk::layout().min_y()
+        && !w.facts.get(w.world.block(bx, by, bz)).full_collision
+    {
         by -= 1;
     }
     let ground = w.facts.get(w.world.block(bx, by, bz));

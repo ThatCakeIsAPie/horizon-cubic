@@ -96,7 +96,7 @@ impl MobWorld<'_> {
     /// WalkNodeEvaluator.getPathTypeStatic.
     pub fn path_type_static(&self, x: i32, y: i32, z: i32) -> PathType {
         let t = self.path_type_from_state(x, y, z);
-        if t == PathType::Open && y > MIN_Y {
+        if t == PathType::Open && y > min_y() {
             match self.path_type_from_state(x, y - 1, z) {
                 PathType::Open | PathType::Water | PathType::Lava | PathType::Walkable => {
                     PathType::Open
@@ -313,7 +313,10 @@ pub struct Finder<'a, 'w> {
     entity_depth: i32,
 }
 
-const MIN_Y: i32 = crate::chunk::MIN_Y;
+/// The column's lowest block: where a downward search gives up.
+fn min_y() -> i32 {
+    crate::chunk::layout().min_y()
+}
 
 impl<'a, 'w> Finder<'a, 'w> {
     pub fn new(w: &'a MobWorld<'w>, mob: &'a PathMob, eval: Evaluator) -> Self {
@@ -433,7 +436,7 @@ impl<'a, 'w> Finder<'a, 'w> {
     }
     fn fly_path_type(&self, x: i32, y: i32, z: i32) -> PathType {
         let mut t = self.type_from_state(x, y, z);
-        if t == PathType::Open && y > MIN_Y {
+        if t == PathType::Open && y > min_y() {
             let below = self.type_from_state(x, y - 1, z);
             t = match below {
                 PathType::Fire | PathType::Lava => PathType::Fire,
@@ -648,7 +651,7 @@ impl<'a, 'w> Finder<'a, 'w> {
                 start_y = (p.y + 0.5).floor() as i32;
             } else {
                 let mut y = (p.y + 1.0).floor() as i32;
-                while y > MIN_Y {
+                while y > min_y() {
                     start_y = y;
                     y -= 1;
                     let s = self.w.world.block(bx, y, bz);
@@ -838,7 +841,7 @@ impl<'a, 'w> Finder<'a, 'w> {
         mut best: Option<u32>,
     ) -> Option<u32> {
         y -= 1;
-        while y > MIN_Y {
+        while y > min_y() {
             let t = self.cached(x, y, z);
             if t != PathType::Water {
                 return best;
@@ -851,7 +854,7 @@ impl<'a, 'w> Finder<'a, 'w> {
     }
     fn first_ground_below(&mut self, x: i32, y: i32, z: i32) -> u32 {
         let mut cy = y - 1;
-        while cy >= MIN_Y {
+        while cy >= min_y() {
             if y - cy > self.mob.max_fall_distance {
                 return self.blocked_node(x, cy, z);
             }

@@ -945,7 +945,7 @@ fn chunk_pois(
         return;
     };
     let kind = |state: u32| poi_of_state(w, horizon_world::registry::BlockStateId(state));
-    let min = crate::chunk::MIN_Y;
+    let min = crate::chunk::layout().min_y();
     for s in (y0 - min) >> 4..=(y1 - min) >> 4 {
         let section = &chunk.sections[s as usize];
         for &(i, poi) in w.world.pois.get((qx, s, qz), section, kind).iter() {
@@ -974,8 +974,8 @@ fn pois_in_range(
     let r2 = i64::from(radius) * i64::from(radius);
     let (cx, cz) = (c[0] >> 4, c[2] >> 4);
     let chunks = radius.div_euclid(16) + 1;
-    let y0 = (c[1] - radius).max(crate::chunk::MIN_Y);
-    let y1 = (c[1] + radius).min(crate::chunk::MIN_Y + crate::chunk::HEIGHT - 1);
+    let y0 = (c[1] - radius).max(crate::chunk::layout().min_y());
+    let y1 = (c[1] + radius).min(crate::chunk::layout().max_y() - 1);
     for qz in cz - chunks..=cz + chunks {
         for qx in cx - chunks..=cx + chunks {
             chunk_pois(w, (qx, qz), y0, y1, |poi, p| {
@@ -3393,8 +3393,8 @@ fn homes_in_range(m: &Mob, w: &MobWorld, radius: i32) -> Vec<[i32; 3]> {
     let c = block_of(m.position);
     let r2 = i64::from(radius) * i64::from(radius);
     let mut out = Vec::new();
-    let y0 = (c[1] - radius).max(crate::chunk::MIN_Y);
-    let y1 = (c[1] + radius).min(crate::chunk::MIN_Y + crate::chunk::HEIGHT - 1);
+    let y0 = (c[1] - radius).max(crate::chunk::layout().min_y());
+    let y1 = (c[1] + radius).min(crate::chunk::layout().max_y() - 1);
     for qz in (c[2] - radius) >> 4..=(c[2] + radius) >> 4 {
         for qx in (c[0] - radius) >> 4..=(c[0] + radius) >> 4 {
             chunk_pois(w, (qx, qz), y0, y1, |poi, p| {

@@ -87,7 +87,9 @@ fn teleport(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) -> bool {
     for _ in 0..5 {
         let r = |m: &mut Mob| m.random.next_int_bound(17).unwrap_or(8) - 8;
         let t = [old[0] + r(m), old[1] + r(m), old[2] + r(m)];
-        if t[1] <= crate::chunk::MIN_Y || !w.facts.is_air(w.world.block(t[0], t[1], t[2])) {
+        if t[1] <= crate::chunk::layout().min_y()
+            || !w.facts.is_air(w.world.block(t[0], t[1], t[2]))
+        {
             continue;
         }
         let Some(face) = attachable(w, t) else {

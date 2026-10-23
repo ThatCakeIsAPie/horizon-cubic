@@ -667,8 +667,8 @@ impl Game<'_> {
     }
     /// The highest block of a heightmap type at a column (`Level.getHeight`).
     fn heightmap_at(&self, kind: &str, x: i32, z: i32) -> i32 {
-        let top = horizon_client::chunk::MIN_Y + horizon_client::chunk::HEIGHT;
-        for y in (horizon_client::chunk::MIN_Y..top).rev() {
+        let top = horizon_client::chunk::layout().max_y();
+        for y in (horizon_client::chunk::layout().min_y()..top).rev() {
             let state = self.world.block(x, y, z);
             if state == self.world.air {
                 continue;
@@ -691,7 +691,7 @@ impl Game<'_> {
                 return y + 1;
             }
         }
-        horizon_client::chunk::MIN_Y
+        horizon_client::chunk::layout().min_y()
     }
     /// A `store` modifier: a new callback in the source's chain.
     fn store_source(&mut self, c: &Context, s: Source) -> R<Source> {

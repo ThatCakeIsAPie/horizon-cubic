@@ -279,8 +279,8 @@ impl Game<'_> {
         if dimension != self.dim || !self.world.chunks.contains_key(&(p[0] >> 4, p[2] >> 4)) {
             return Err(err("argument.pos.unloaded", &[]));
         }
-        if p[1] < horizon_client::chunk::MIN_Y
-            || p[1] >= horizon_client::chunk::MIN_Y + horizon_client::chunk::HEIGHT
+        if p[1] < horizon_client::chunk::layout().min_y()
+            || p[1] >= horizon_client::chunk::layout().max_y()
         {
             return Err(err("argument.pos.outofworld", &[]));
         }
@@ -2615,7 +2615,7 @@ impl Game<'_> {
                     if !section.blocks.maybe_has(&mut wanted_state) {
                         continue;
                     }
-                    let base_y = horizon_client::chunk::MIN_Y + 16 * i as i32;
+                    let base_y = horizon_client::chunk::layout().min_y() + 16 * i as i32;
                     for j in 0..4096 {
                         let state = section.get(j);
                         let Some(kind) = cache.get(&state).copied().flatten() else {
@@ -2677,8 +2677,8 @@ impl Game<'_> {
                 radius: 6400,
                 horizontal: 32,
                 vertical: 64,
-                min_y: horizon_client::chunk::MIN_Y,
-                max_y: horizon_client::chunk::MIN_Y + horizon_client::chunk::HEIGHT - 1,
+                min_y: horizon_client::chunk::layout().min_y(),
+                max_y: horizon_client::chunk::layout().max_y() - 1,
             };
             let found = self
                 .end

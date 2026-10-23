@@ -174,7 +174,7 @@ use horizon_client::{
     audio::Audio,
     biome::Biomes,
     blocks::{BlockFacts, Fluid},
-    chunk::{HEIGHT, MIN_Y},
+    chunk::layout,
     clock::FixedStep,
     collisions,
     containers::{BlockEntity, Providers},
@@ -2977,7 +2977,7 @@ impl Game<'_> {
         // FallingBlockEntity.tick: off the ground, it gives up after 600
         // ticks (100 outside the world) and drops itself as an item.
         let y = next.y.floor() as i32;
-        let outside = y <= horizon_client::chunk::MIN_Y || y >= horizon_client::chunk::MIN_Y + 384;
+        let outside = y <= self.dim.min_y() || y > self.dim.max_y();
         if !on_ground && (f.age > 100 && outside || f.age > 600) {
             return Ok(if f.drop_item && entity_drops {
                 FallStep::Dropped(next)
@@ -3793,8 +3793,8 @@ impl Game<'_> {
             }
             return None;
         }
-        let mut y = MIN_Y + HEIGHT - 1;
-        while y > MIN_Y {
+        let mut y = layout().max_y() - 1;
+        while y > layout().min_y() {
             let s = self.world.block(x, y, z);
             if !self.res.facts().is_air(s) {
                 let f = self.res.facts().get(s);
@@ -4245,7 +4245,7 @@ impl Game<'_> {
         let Some(player) = self.player.as_mut() else {
             return Ok(());
         };
-        if player.position.y < f64::from(MIN_Y - 64) {
+        if player.position.y < f64::from(layout().min_y() - 64) {
             // Out of the world.
             let _ = player.set_health(0.0, false);
         }
@@ -8996,7 +8996,7 @@ impl Game<'_> {
     /// `LevelExtractor.allChanged`: every loaded section is rebuilt.
     fn all_sections_changed(&mut self) {
         for &(x, z) in self.world.chunks.keys() {
-            for sy in 0..horizon_client::chunk::HEIGHT / 16 {
+            for sy in 0..horizon_client::chunk::layout().height() / 16 {
                 self.world.dirty_sections.insert((x, sy, z));
             }
         }
@@ -10556,7 +10556,7 @@ impl Game<'_> {
                 }
             }
             for c in unloaded {
-                for sy in 0..(HEIGHT / 16) {
+                for sy in 0..(layout().height() / 16) {
                     renderer.remove((c.x, sy, c.z));
                 }
             }
