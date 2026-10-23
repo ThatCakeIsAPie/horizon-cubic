@@ -208,10 +208,21 @@ A world's enabled data packs (`<world>/datapacks`, in `datapacks.json`'s order) 
 conditions, carvers, configured and placed features, structures, structure sets, template pools, processor lists, biomes, level stems), a
 higher pack's file for an id replacing a lower one's, and its block, fluid and biome tag files to the tag bundles in pack order.
 `GeneratorData::load_with` reads the bundles with them; the client caches the result per set of pack entries
-(`vanillagen::shared_data_with`). What Horizon leaves out is logged: a pack's new biomes (the game has no id, colours or sounds for them;
-their tag entries and climate points go with them) and folders the generator does not read. A pack's dimension types set each level's
-height ([world-height.md](world-height.md)); noise settings taller than the level generate only inside it, as `clampToHeightAccessor`. Sapling growth and bone
-meal still place vanilla's features.
+(`vanillagen::shared_data_with`). What Horizon leaves out is logged: a biome file the game cannot read (its tag entries and climate
+points go with it) and folders the generator does not read. A pack's dimension types set each level's height
+([world-height.md](world-height.md)); noise settings taller than the level generate only inside it, as `clampToHeightAccessor`. Sapling
+growth and bone meal still place vanilla's features.
+
+**New biomes.** Opening a world builds its biome table (`Biomes::with_packs`) from the built-in biomes and its packs' biome files, and
+sets it on the shared `Resources` before the generator, streaming, saves and commands read it. A pack's file for a built-in biome
+replaces it in place; a new biome joins after the built-in ones, so the client's own ids for vanilla's biomes never move. The network
+registry is vanilla's: `RegistryDataLoader` sorts each registry's files by `Identifier` (path, then namespace), so a new
+`minecraft:molten_peaks` lands between `meadow` and `mushroom_fields` (`Biomes::registry_order`). A host sends that order, with data for
+every pack biome (no client knows a world's packs), remaps the biome tags' ids to it and writes chunk palettes in it; a remote client adds
+the server's biomes it lacks from the data sent. Saves store biome names. Colours, spawns, precipitation, ambient particles, music and
+ambient sounds come from the pack's file. `HORIZON_PARITY_DATAPACKS=tools/fixtures/biome_datapacks` runs the harness below with three new
+biomes (one in `minecraft:`, two in their own namespace) and a multi-noise level stem; the oracle uses a pack's level stem as world
+creation does.
 
 `tools/test_datapack_worldgen_parity.py` runs the whole-chunk harness with `HORIZON_DATAPACKS=tools/fixtures/datapacks` on both sides
 (the oracle selects every pack of the folder after vanilla through vanilla's own pack repository): its pack overrides a noise, a density
