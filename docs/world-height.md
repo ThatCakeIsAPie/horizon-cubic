@@ -190,7 +190,7 @@ Steps 1 to 5 are done, and step 6 in part.
   logical height and entities' fluid scans read the level's range or the column.
 - **Cost.** Uniform sections (one block, one biome, one light value) are shared by every column
   (`chunk::share_uniform`), and `lowest_sky_source` passes over a uniform section light goes
-  through. Measured with `tools/fixtures/datapacks/horizon_tall_test` (terrain from about y 475 to
+  through. Measured with `tools/fixtures/tall_datapacks/horizon_tall_test` (terrain from about y 475 to
   1900) on a 7 GB laptop (`chunk_bench --world`, and the game offscreen): resident chunk storage is
   110 KiB per chunk against vanilla's 38 (118 before sharing: air above the terrain mostly holds
   several biomes, so few of its sections are uniform); the game's resident memory is 1073 MiB at
