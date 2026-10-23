@@ -1,4 +1,5 @@
 use super::*;
+use crate::chunk::MIN_Y;
 use horizon_assets::model::Direction as ModelDirection;
 
 #[test]

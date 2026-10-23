@@ -4,7 +4,7 @@
 //! so stale work is dropped.
 use crate::fast_hash::{FxHashMap, FxHashSet};
 use crate::{
-    chunk::{Chunk, SECTIONS},
+    chunk::{Chunk, layout},
     light::{LightChanges, LightTables, apply_lighting, apply_relighting, light_chunk},
     mesher::{MeshTables, Mesher, Region, SectionMesh, borrow},
     world::World,
@@ -581,7 +581,7 @@ impl Streaming {
         self.meshing.clear();
         for &(x, z) in world.chunks.keys() {
             if self.lit.contains(&(x, z)) {
-                for sy in 0..SECTIONS as i32 {
+                for sy in 0..layout().sections() as i32 {
                     world.dirty_sections.insert((x, sy, z));
                 }
             }
@@ -599,7 +599,7 @@ impl Streaming {
         self.generated_total += 1;
         for dz in -1..=1 {
             for dx in -1..=1 {
-                for sy in 0..SECTIONS as i32 {
+                for sy in 0..layout().sections() as i32 {
                     world.dirty_sections.insert((key.0 + dx, sy, key.1 + dz));
                 }
             }
@@ -614,7 +614,7 @@ impl Streaming {
                 for dy in -1..=1 {
                     for dx in -1..=1 {
                         let s = sy as i32 + dy;
-                        if (0..SECTIONS as i32).contains(&s) {
+                        if (0..layout().sections() as i32).contains(&s) {
                             world.dirty_sections.insert((x + dx, s, z + dz));
                         }
                     }
@@ -713,7 +713,7 @@ impl Streaming {
         world.chunks.insert(key, Arc::new(chunk));
         if loaded {
             self.lit.insert(key);
-            for sy in 0..SECTIONS as i32 {
+            for sy in 0..layout().sections() as i32 {
                 world.dirty_sections.insert((key.0, sy, key.1));
             }
         }
@@ -854,7 +854,7 @@ impl Streaming {
                         if first {
                             for dz in -1..=1 {
                                 for dx in -1..=1 {
-                                    for sy in 0..SECTIONS as i32 {
+                                    for sy in 0..layout().sections() as i32 {
                                         world.dirty_sections.insert((x + dx, sy, z + dz));
                                     }
                                 }

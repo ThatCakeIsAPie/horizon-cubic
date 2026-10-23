@@ -80,8 +80,6 @@ pub mod translucency;
 pub(crate) mod upload;
 mod world_post;
 
-/// A column whose every section has its mesh (`Renderer::lod_detail_columns`).
-const COMPLETE_COLUMN: SectionMask = SectionMask::below(crate::chunk::SECTIONS);
 /// A section's instance: its camera-relative origin and, in `w`, the step of
 /// its fixed-point UVs (`terrain.wgsl`'s `terrain_uv`).
 /// The world pass again after occlusion culling's test: it loads both
@@ -488,6 +486,9 @@ pub struct Renderer {
     block_entity_revision: u64,
     /// VisGraph face connectivity per meshed section (cave culling).
     occlusion: occlusion::Occlusion,
+    /// The column `occlusion` and `detail_columns` were made for: a world of
+    /// another layout gets new ones (`clear_sections`).
+    layout: crate::chunk::ColumnLayout,
     /// Resolution scale and FXAA (Horizon settings).
     world_post: world_post::Post,
     /// The selected shader pack's stages (Horizon setting; none by default).
@@ -2412,7 +2413,11 @@ impl Renderer {
             phase2_runs: page_runs::PageRuns::default(),
             block_entities: HashMap::new(),
             block_entity_revision: next_block_entity_revision(),
-            occlusion: occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16),
+            occlusion: occlusion::Occlusion::new(
+                crate::chunk::layout().min_y(),
+                crate::chunk::layout().sections() as i32,
+            ),
+            layout: crate::chunk::layout(),
             world_post,
             pack: None,
             hud,
@@ -2790,11 +2795,21 @@ impl Renderer {
         self.sorted_indices.clear();
         self.translucency_cursor = 0;
         self.occlusion.clear();
+        let layout = crate::chunk::layout();
+        if layout != self.layout {
+            self.layout = layout;
+            self.occlusion = occlusion::Occlusion::new(layout.min_y(), layout.sections() as i32);
+        }
+    }
+    /// A column whose every section has its mesh (`lod_detail_columns`).
+    fn complete_column(&self) -> SectionMask {
+        SectionMask::below(self.layout.sections())
     }
     pub fn lod_detail_columns(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
+        let complete = self.complete_column();
         self.detail_columns
             .iter()
-            .filter_map(move |(&column, &mask)| (mask == COMPLETE_COLUMN).then_some(column))
+            .filter_map(move |(&column, &mask)| (mask == complete).then_some(column))
     }
     /// Changes whenever `lod_detail_columns` does.
     pub fn lod_detail_revision(&self) -> u64 {
@@ -2814,7 +2829,8 @@ impl Renderer {
         } else {
             next.remove(key.1 as usize);
         }
-        if (mask == COMPLETE_COLUMN) != (next == COMPLETE_COLUMN) {
+        let complete = self.complete_column();
+        if (mask == complete) != (next == complete) {
             self.detail_revision += 1;
         }
         if next.is_empty() {
@@ -3214,7 +3230,7 @@ impl Renderer {
             planes: frustum(view_proj),
         };
         let camera = frame.camera;
-        let camera_section = camera_section(camera);
+        let camera_section = camera_section(camera, self.layout.min_y());
         let culling = !frame.title && frame.cave_culling;
         if culling {
             crate::spans::time("occlusion", || {
@@ -3381,7 +3397,7 @@ impl Renderer {
                 let scheduled = (i + count - self.translucency_cursor) % count < budget;
                 let origin = [
                     v.key.0 * 16,
-                    crate::chunk::MIN_Y + v.key.1 * 16,
+                    self.layout.min_y() + v.key.1 * 16,
                     v.key.2 * 16,
                 ];
                 if (!s.sort.is_sorted() || nearby || scheduled)
@@ -4552,10 +4568,10 @@ enum Pack {
 }
 
 /// The section the camera is in.
-fn camera_section(camera: DVec3) -> SectionKey {
+fn camera_section(camera: DVec3, min_y: i32) -> SectionKey {
     (
         (camera.x.floor() as i32) >> 4,
-        (camera.y.floor() as i32 - crate::chunk::MIN_Y) >> 4,
+        (camera.y.floor() as i32 - min_y) >> 4,
         (camera.z.floor() as i32) >> 4,
     )
 }

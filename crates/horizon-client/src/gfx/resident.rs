@@ -147,7 +147,7 @@ pub struct Visible {
 fn origin(key: SectionKey, camera: DVec3) -> DVec3 {
     DVec3::new(
         f64::from(key.0 * 16),
-        f64::from(crate::chunk::MIN_Y + key.1 * 16),
+        f64::from(crate::chunk::layout().min_y() + key.1 * 16),
         f64::from(key.2 * 16),
     ) - camera
 }
