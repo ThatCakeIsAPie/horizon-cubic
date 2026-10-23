@@ -10,7 +10,7 @@ use super::{Dim, Game, Mining, Screen};
 use horizon_client::first_person::{Hand, SwingAnimation};
 use horizon_client::{
     Result,
-    chunk::{BIOME_STRATEGY, Chunk, Light, MIN_Y, SECTIONS, Section, block_strategy},
+    chunk::{BIOME_STRATEGY, Chunk, Light, Section, block_strategy, layout},
     containers::{BlockEntity, Furnace, FurnaceKind},
     entities::{Experience, ExperienceOrb, ItemEntity},
     hud::{HudBatch, rgba},
@@ -971,7 +971,7 @@ impl Game<'_> {
         self.apply_settings();
     }
 
-    /// LevelChunkSection data into the client's fixed -64..320 column.
+    /// LevelChunkSection data into the client's column (`chunk::layout`).
     fn remote_chunk(&self, p: &play::LevelChunkWithLight) -> std::result::Result<Chunk, String> {
         let r = self.remote.as_ref().ok_or("no connection")?;
         let sections = p
@@ -979,7 +979,8 @@ impl Game<'_> {
             .sections(r.dimension.sections(), 16, r.biome_bits)
             .map_err(|e| e.to_string())?;
         let mut chunk = Chunk::empty(p.x, p.z);
-        let offset = (r.dimension.min_y - MIN_Y).div_euclid(16);
+        let column = chunk.sections.len() as i32;
+        let offset = (r.dimension.min_y - chunk.min_y()).div_euclid(16);
         // Biome table index per quart cell of the dimension's own sections.
         let mut biome_cells: Vec<[u32; 64]> = Vec::with_capacity(sections.len());
         for (i, s) in sections.iter().enumerate() {
@@ -994,7 +995,7 @@ impl Game<'_> {
                 );
             }
             biome_cells.push(cells);
-            if !(0..SECTIONS as i32).contains(&target) {
+            if !(0..column).contains(&target) {
                 continue;
             }
             // A global section is as wide as the server's registry: 16 bits
@@ -1034,7 +1035,7 @@ impl Game<'_> {
         // (the column's top or bottom cell layer repeated).
         if !biome_cells.is_empty() {
             let last = biome_cells.len() - 1;
-            for si in 0..SECTIONS as i32 {
+            for si in 0..column {
                 let i = si - offset;
                 if (0..sections.len() as i32).contains(&i) {
                     continue;
@@ -1063,23 +1064,25 @@ impl Game<'_> {
         &self,
         light: &horizon_protocol::chunk::LightData,
     ) -> (Vec<LightLayers>, [u8; 256]) {
-        let mut layers: Vec<LightLayers> = vec![(None, None); SECTIONS];
+        let column = layout();
+        let mut layers: Vec<LightLayers> = vec![(None, None); column.sections()];
         let Some(r) = self.remote.as_ref() else {
             return (layers, [0; 256]);
         };
         let sky = r.dimension.has_skylight;
         let mut above = [if sky { 15 } else { 0 }; 256];
         // Light section b is the dimension's section b - 1.
-        let first = (r.dimension.min_y - MIN_Y).div_euclid(16) - 1;
+        let first = (r.dimension.min_y - column.min_y()).div_euclid(16) - 1;
+        let top = column.sections() as i32;
         for (b, layer) in light
             .layers(r.dimension.sections() + 2)
             .into_iter()
             .enumerate()
         {
             let si = first + b as i32;
-            if (0..SECTIONS as i32).contains(&si) {
+            if (0..top).contains(&si) {
                 layers[si as usize] = layer;
-            } else if si == SECTIONS as i32
+            } else if si == top
                 && sky
                 && let Some(l) = &layer.0
             {
@@ -1130,7 +1133,7 @@ impl Game<'_> {
                 .block_entities
                 .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
             if let Some(renderer) = self.renderer.as_mut() {
-                for sy in 0..SECTIONS as i32 {
+                for sy in 0..layout().sections() as i32 {
                     renderer.remove((x, sy, z));
                 }
             }
@@ -1681,7 +1684,7 @@ impl Game<'_> {
                     .block_entities
                     .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
                 if let Some(renderer) = self.renderer.as_mut() {
-                    for sy in 0..SECTIONS as i32 {
+                    for sy in 0..layout().sections() as i32 {
                         renderer.remove((x, sy, z));
                     }
                 }

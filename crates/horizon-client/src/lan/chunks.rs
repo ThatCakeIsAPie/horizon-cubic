@@ -2,7 +2,7 @@
 //! (sections with their paletted containers, block entities and the sky and
 //! block DataLayers) and the section block-change batches.
 use crate::{
-    chunk::{Chunk, Light, MIN_Y, SECTIONS, Section},
+    chunk::{Chunk, Light, Section, layout},
     containers::BlockEntity,
     fast_hash::FxHashMap,
     section_mask::SectionMask,
@@ -436,7 +436,7 @@ impl ChunkEncoder {
             tables: None,
             cache: Default::default(),
             heights: Default::default(),
-            sections: 0..SECTIONS,
+            sections: 0..layout().sections(),
             sky: true,
         }
     }
@@ -462,7 +462,7 @@ impl ChunkEncoder {
     /// The level's min_y and height (`DimensionType`), the heightmaps' range.
     fn level(&self) -> (i32, i32) {
         (
-            MIN_Y + 16 * self.sections.start as i32,
+            layout().section_y(self.sections.start),
             16 * self.sections.len() as i32,
         )
     }
@@ -521,11 +521,12 @@ impl ChunkEncoder {
     /// Encode for a level of `min_y` and `height` (multiples of 16 within
     /// the column), with or without sky light.
     pub fn set_dimension(&mut self, min_y: i32, height: i32, sky: bool) {
-        let lo = usize::try_from((min_y - MIN_Y) >> 4)
+        let column = layout();
+        let lo = usize::try_from((min_y - column.min_y()) >> 4)
             .unwrap_or(0)
-            .min(SECTIONS);
-        let n = usize::try_from(height >> 4).unwrap_or(SECTIONS);
-        self.sections = lo..(lo + n).min(SECTIONS);
+            .min(column.sections());
+        let n = usize::try_from(height >> 4).unwrap_or(column.sections());
+        self.sections = lo..(lo + n).min(column.sections());
         self.sky = sky;
         // The heightmaps depend on the level's height.
         self.heights.get_mut().unwrap().clear();
@@ -814,7 +815,7 @@ impl ChunkEncoder {
                     i32::from(index >> 8),
                     i32::from(index >> 4 & 15),
                 );
-                let wy = MIN_Y + (i as i32) * 16 + y;
+                let wy = chunk.min_y() + (i as i32) * 16 + y;
                 let pos = (chunk.x * 16 + x, wy, chunk.z * 16 + z);
                 entity_infos.push(BlockEntityInfo {
                     packed_xz: ((x << 4) | z) as i8,
@@ -1072,6 +1073,7 @@ fn write_light(lights: &[(usize, SectionLight)], sky: bool, w: &mut Writer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::{MIN_Y, SECTIONS};
 
     #[test]
     fn block_entity_blocks_are_recognised() {
