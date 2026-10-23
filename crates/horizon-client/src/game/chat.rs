@@ -392,6 +392,11 @@ impl Game<'_> {
             }
         }
         let reg = &mut self.ui.registries;
+        // The export lists vanilla's biomes: the open world has its data packs' too.
+        let biomes = reg.biomes.clone();
+        if let Some(r) = reg.by_registry.get_mut("minecraft:worldgen/biome") {
+            r.ids = biomes;
+        }
         reg.timelines = self.ui.timelines.keys().cloned().collect();
         reg.time_markers = self
             .ui
