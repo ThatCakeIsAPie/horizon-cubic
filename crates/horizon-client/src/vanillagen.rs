@@ -19,6 +19,7 @@ use horizon_world::{
         generator::{
             GeneratorData, GeneratorWorker, OverworldGenerator, ProtoChunk, SurfaceSample,
         },
+        overrides::WorldgenOverrides,
         terrain::PreLightChunkStage,
     },
 };
@@ -88,7 +89,21 @@ impl VanillaTerrain {
         dimension: &str,
         structures: bool,
     ) -> crate::Result<Self> {
-        let data: Arc<GeneratorData> = shared_data(dir, registry)?;
+        let none = WorldgenOverrides::default();
+        Self::for_world_with(dir, &none, registry, biomes, seed, dimension, structures)
+    }
+    /// `for_world` with the world's data packs over the bundle at `dir`
+    /// (`datapack::worldgen_overrides`).
+    pub fn for_world_with(
+        dir: &Path,
+        overrides: &WorldgenOverrides,
+        registry: &'static BlockRegistry,
+        biomes: &Biomes,
+        seed: i64,
+        dimension: &str,
+        structures: bool,
+    ) -> crate::Result<Self> {
+        let data: Arc<GeneratorData> = shared_data_with(dir, overrides, registry)?;
         let biome_map = data
             .biome_names()
             .iter()
@@ -96,6 +111,16 @@ impl VanillaTerrain {
             .collect();
         let generator =
             OverworldGenerator::for_world(data, seed, "minecraft:normal", dimension, structures)?;
+        if let Some((asked, kept)) = generator.noise_clamped() {
+            log::warn!(
+                "Horizon: {dimension}'s noise settings reach y {}..{}, past its build height; \
+                 only y {}..{} generates",
+                asked.min_y,
+                asked.min_y + asked.height,
+                kept.min_y,
+                kept.min_y + kept.height
+            );
+        }
         let unsupported = generator.unsupported_features();
         if !unsupported.is_empty() {
             log::warn!(
@@ -284,14 +309,36 @@ pub fn shared_data(
     dir: &Path,
     registry: &'static BlockRegistry,
 ) -> crate::Result<Arc<GeneratorData>> {
-    static CACHE: std::sync::Mutex<Vec<(std::path::PathBuf, Arc<GeneratorData>)>> =
-        std::sync::Mutex::new(Vec::new());
+    shared_data_with(dir, &WorldgenOverrides::default(), registry)
+}
+/// `shared_data` with data packs over the bundle: loaded once for each set
+/// of packs' entries, and the most recent few kept.
+pub fn shared_data_with(
+    dir: &Path,
+    overrides: &WorldgenOverrides,
+    registry: &'static BlockRegistry,
+) -> crate::Result<Arc<GeneratorData>> {
+    type Entry = (std::path::PathBuf, WorldgenOverrides, Arc<GeneratorData>);
+    static CACHE: std::sync::Mutex<Vec<Entry>> = std::sync::Mutex::new(Vec::new());
+    /// Bundles with packs kept besides the plain ones: a world's dimensions
+    /// share one, and returning to a world finds it.
+    const WITH_PACKS: usize = 2;
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, data)) = cache.iter().find(|(path, _)| path == dir) {
+    if let Some((_, _, data)) = cache
+        .iter()
+        .find(|(path, o, _)| path == dir && o == overrides)
+    {
         return Ok(data.clone());
     }
-    let data = GeneratorData::load(dir, registry)?;
-    cache.push((dir.to_owned(), data.clone()));
+    let data = GeneratorData::load_with(dir, registry, overrides)?;
+    for warning in data.warnings() {
+        log::warn!("Horizon: data pack worldgen: {warning}");
+    }
+    if !overrides.is_empty() && cache.iter().filter(|e| !e.1.is_empty()).count() >= WITH_PACKS {
+        let oldest = cache.iter().position(|e| !e.1.is_empty());
+        cache.remove(oldest.expect("counted"));
+    }
+    cache.push((dir.to_owned(), overrides.clone(), data.clone()));
     Ok(data)
 }
 impl ChunkGenerator for VanillaTerrain {

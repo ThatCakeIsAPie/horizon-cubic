@@ -15,7 +15,6 @@ use horizon_client::{
     text::{self, Text},
 };
 use horizon_world::nbt::Tag;
-use std::collections::BTreeSet;
 
 /// A `TimerQueue` event.
 #[derive(Clone, Debug, PartialEq)]
@@ -60,31 +59,7 @@ impl Game<'_> {
     }
     pub(super) fn reload_datapacks(&mut self, run_load: bool) {
         self.fns.packs = datapack::discover(&self.world_root);
-        let saved: Option<serde_json::Value> = std::fs::read(self.datapack_settings_path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok());
-        let list = |key: &str| -> Vec<String> {
-            saved
-                .as_ref()
-                .and_then(|v| v[key].as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let disabled: BTreeSet<String> = list("disabled").into_iter().collect();
-        let mut enabled: Vec<String> = list("enabled")
-            .into_iter()
-            .filter(|id| self.fns.packs.iter().any(|p| &p.id == id))
-            .collect();
-        for p in &self.fns.packs {
-            if !enabled.contains(&p.id) && !disabled.contains(&p.id) {
-                enabled.push(p.id.clone());
-            }
-        }
-        self.fns.enabled = enabled;
+        self.fns.enabled = datapack::enabled_ids(&self.world_root, &self.fns.packs);
         self.rebuild_store();
         self.fns.loaded = true;
         self.fns.load_pending = true;
