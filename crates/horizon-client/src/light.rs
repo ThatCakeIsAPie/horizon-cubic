@@ -467,8 +467,15 @@ fn pack_lighting(
 /// edits and immutable snapshots retained by other workers.
 pub fn apply_lighting(chunk: &mut Chunk, lights: Vec<Light>) {
     for (section, light) in chunk.sections.iter_mut().zip(lights) {
+        // A shared section already lit so stays as it is.
+        if let (Light::Uniform(a), Light::Uniform(b)) = (&section.light, &light)
+            && a == b
+        {
+            continue;
+        }
         Arc::make_mut(section).light = light;
     }
+    crate::chunk::share_uniform(&mut chunk.sections);
 }
 
 /// `apply_lighting` for a chunk lit before: writes only the sections whose
@@ -493,6 +500,7 @@ pub fn apply_relighting(chunk: &mut Chunk, lights: Vec<Light>, changed: &mut Lig
             Arc::make_mut(section).light = light;
         }
     }
+    crate::chunk::share_uniform(&mut chunk.sections);
 }
 
 /// `DataLayer.get`: the nibble at index `i` (`y << 8 | z << 4 | x`), low first.
@@ -534,6 +542,7 @@ pub fn light_from_layers<L: AsRef<[u8]>>(
         section.light = Light::Full(data);
         section.compact();
     }
+    crate::chunk::share_uniform(&mut chunk.sections);
     chunk.lit = true;
     chunk.light_loaded = true;
 }
@@ -578,12 +587,22 @@ pub trait LightWorld {
     /// Packed light (sky << 4 | block), None outside loaded chunks.
     fn light(&self, x: i32, y: i32, z: i32) -> Option<u8>;
     fn set_light(&mut self, x: i32, y: i32, z: i32, packed: u8);
+    /// The one state of the section holding `y`, when it has a single
+    /// one (a shortcut for column scans; `None` is always correct).
+    fn uniform_section(&self, _x: i32, _y: i32, _z: i32) -> Option<u32> {
+        None
+    }
 }
 impl<S: std::hash::BuildHasher> LightWorld for HashMap<(i32, i32), Arc<Chunk>, S> {
     fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         self.get(&(x >> 4, z >> 4))
             .filter(|c| c.lit && c.section_index(y).is_some())
             .map(|c| c.get(x & 15, y, z & 15))
+    }
+    fn uniform_section(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        let c = self.get(&(x >> 4, z >> 4)).filter(|c| c.lit)?;
+        let section = &c.sections[c.section_index(y)?];
+        (section.blocks.bits() == 0).then(|| section.get(0))
     }
     fn light(&self, x: i32, y: i32, z: i32) -> Option<u8> {
         self.get(&(x >> 4, z >> 4))
@@ -715,12 +734,31 @@ fn set_level(world: &mut impl LightWorld, sky: bool, p: Pos, value: u8) {
 /// `ChunkSkyLightSources`: the Y of the upper block of the highest occluded
 /// edge in the column (every block at or above it is a sky source).
 pub fn lowest_sky_source(world: &impl LightWorld, tables: &LightTables, x: i32, z: i32) -> i32 {
-    let (min_y, max_y) = (layout().min_y(), layout().max_y());
+    lowest_sky_source_in(world, tables, x, z, layout().min_y(), layout().max_y())
+}
+/// `lowest_sky_source` in a column spanning `min_y..max_y`.
+pub fn lowest_sky_source_in(
+    world: &impl LightWorld,
+    tables: &LightTables,
+    x: i32,
+    z: i32,
+    min_y: i32,
+    max_y: i32,
+) -> i32 {
     let mut y = max_y - 1;
     let Some(mut top) = world.state(x, y, z) else {
         return min_y;
     };
     while y > min_y {
+        // A section of one state that lets light through itself (the air of
+        // a tall column) holds no source edge: go to its bottom block.
+        if let Some(state) = world.uniform_section(x, y - 1, z)
+            && state == top
+            && !tables.edge_occluded(top as usize, top as usize)
+        {
+            y = ((y - 1 - min_y) & !15) + min_y;
+            continue;
+        }
         let Some(bottom) = world.state(x, y - 1, z) else {
             break;
         };
@@ -1197,6 +1235,18 @@ mod tests {
         assert_eq!(chunk.light(8, 1501, 8) & 15, 13);
         assert_eq!(chunk.light(8, 1601, 8) >> 4, 15);
         assert_eq!(chunk.light(8, 2031, 8), 0xF0);
+        // The empty sections above are one shared allocation.
+        let top = chunk.sections.len() - 1;
+        assert!(Arc::ptr_eq(&chunk.sections[top], &chunk.sections[top - 10]));
+        let other = Chunk::with_layout(1, 0, layout);
+        assert!(Arc::ptr_eq(&chunk.sections[top], &other.sections[top]));
+        // The sky's lowest source skips the air sections above the stone.
+        let mut world: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
+        chunk.lit = true;
+        world.insert((0, 0), Arc::new(chunk));
+        let (min_y, max_y) = (layout.min_y(), layout.max_y());
+        let source = |x, z| lowest_sky_source_in(&world, &tables(), x, z, min_y, max_y);
+        assert_eq!((source(3, 3), source(8, 8)), (1601, 1601));
     }
 
     #[test]
@@ -1211,6 +1261,10 @@ mod tests {
                     .iter()
                     .all(|v| matches!(v, Light::Uniform(n) if *n == if sky { 0xF0 } else { 0 }))
             );
+            apply_lighting(&mut chunk, lights.clone());
+            // Every section is the one shared air section of that light, and
+            // lighting it the same again keeps it.
+            assert!(Arc::ptr_eq(&chunk.sections[0], &chunk.sections[1]));
             let section = Arc::as_ptr(&chunk.sections[0]);
             apply_lighting(&mut chunk, lights);
             assert_eq!(section, Arc::as_ptr(&chunk.sections[0]));

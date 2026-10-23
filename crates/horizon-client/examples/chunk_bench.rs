@@ -161,9 +161,7 @@ fn main() -> Result<()> {
     let (mut bytes, mut sections, mut uniform) = (0usize, 0usize, 0usize);
     let top = chunks
         .iter()
-        .flat_map(|c| {
-            (0..256).filter_map(move |i| c.highest(0, |y| c.get(i & 15, y, i >> 4) != 0))
-        })
+        .flat_map(|c| (0..256).filter_map(move |i| c.highest(0, |y| c.get(i & 15, y, i >> 4) != 0)))
         .max()
         .unwrap_or(column.min_y());
     println!("highest block: y {top}");

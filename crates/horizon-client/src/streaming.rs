@@ -590,7 +590,8 @@ impl Streaming {
     /// A column received from a server, with the light it sent
     /// (`ClientPacketListener.handleLevelChunkWithLight`): nothing is
     /// relit, and it and its neighbours remesh (`enableChunkLight`).
-    pub fn insert_remote(&mut self, world: &mut World, chunk: Chunk) {
+    pub fn insert_remote(&mut self, world: &mut World, mut chunk: Chunk) {
+        crate::chunk::share_uniform(&mut chunk.sections);
         let key = (chunk.x, chunk.z);
         self.lighting.remove(&key);
         self.light_snapshots.remove(&key);

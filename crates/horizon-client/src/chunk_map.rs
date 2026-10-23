@@ -85,6 +85,9 @@ impl crate::light::LightWorld for ChunkMap {
     fn set_light(&mut self, x: i32, y: i32, z: i32, packed: u8) {
         self.columns.set_light(x, y, z, packed);
     }
+    fn uniform_section(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        self.columns.uniform_section(x, y, z)
+    }
 }
 
 #[cfg(test)]
