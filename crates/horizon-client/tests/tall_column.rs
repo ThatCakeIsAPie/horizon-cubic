@@ -9,7 +9,7 @@ use horizon_client::{
     chunk::{Chunk, ColumnLayout, set_layout},
     light::LightTables,
     mesher::{MeshTables, Mesher, Region, SectionMesh, borrow},
-    models,
+    models, save,
     streaming::{ChunkGenerator, Proto, Streaming, WorkerContext},
     world::World,
 };
@@ -150,4 +150,16 @@ fn a_tall_column_streams_lights_and_meshes_to_its_top() {
         checked += 1;
     }
     assert_eq!(checked, 16);
+    // The column saves with all 131 sections and loads back, light included.
+    let centre = world.chunks.get(&(0, 0)).unwrap();
+    let saved = save::encode(centre, assets.registry, &context.biomes);
+    let mut loaded = save::decode(&saved, assets.registry, &context.biomes).unwrap();
+    save::load_light(&saved.tag, &mut loaded, true);
+    assert_eq!(loaded.sections.len(), 131);
+    for y in [-64, 0, 1799, 1800, 1803, 2031] {
+        for (x, z) in [(0, 0), (8, 8), (7, 7)] {
+            assert_eq!(loaded.get(x, y, z), centre.get(x, y, z), "{x} {y} {z}");
+            assert_eq!(loaded.light(x, y, z), centre.light(x, y, z), "{x} {y} {z}");
+        }
+    }
 }

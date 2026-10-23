@@ -16,7 +16,7 @@
 use crate::{
     Result,
     biome::Biomes,
-    chunk::{BIOME_STRATEGY, Chunk, Light, MIN_Y, SECTIONS, Section, block_strategy},
+    chunk::{BIOME_STRATEGY, Chunk, Light, Section, block_strategy, layout},
     streaming::ChunkGenerator,
 };
 use horizon_core::{
@@ -695,16 +695,17 @@ pub fn decode_block_entity(tag: &Tag) -> Option<((i32, i32, i32), crate::contain
 
 /// A column's sections as `Heightmap.primeHeightmaps` reads them.
 struct HeightmapView<'a> {
+    min_y: i32,
     sections: &'a [Arc<Section>],
     tables: &'a SaveTables,
 }
 impl HeightmapChunk for HeightmapView<'_> {
     type State = crate::assets::StateFacts;
     fn min_y(&self) -> i32 {
-        MIN_Y
+        self.min_y
     }
     fn height(&self) -> i32 {
-        SECTIONS as i32 * 16
+        self.sections.len() as i32 * 16
     }
     fn highest_section_y(&self) -> i32 {
         let top = self
@@ -712,11 +713,11 @@ impl HeightmapChunk for HeightmapView<'_> {
             .iter()
             .rposition(|s| !s.is_uniform(self.tables.air))
             .unwrap_or(0);
-        MIN_Y + top as i32 * 16
+        self.min_y + top as i32 * 16
     }
     fn block_state(&self, x: i32, y: i32, z: i32) -> Self::State {
         // Chunk.get: no block outside the sections.
-        let state = usize::try_from((y - MIN_Y) >> 4)
+        let state = usize::try_from((y - self.min_y) >> 4)
             .ok()
             .and_then(|s| self.sections.get(s))
             .map_or(0, |s| s.get(crate::chunk::index(x, y, z)));
@@ -733,9 +734,10 @@ fn heightmaps(chunk: &Chunk, tables: &SaveTables) -> Tag {
     ];
     let mut maps: Vec<Heightmap> = kinds
         .iter()
-        .filter_map(|k| Heightmap::new(*k, MIN_Y, SECTIONS as i32 * 16).ok())
+        .filter_map(|k| Heightmap::new(*k, chunk.min_y(), chunk.max_y() - chunk.min_y()).ok())
         .collect();
     let view = HeightmapView {
+        min_y: chunk.min_y(),
         sections: &chunk.sections,
         tables,
     };
@@ -754,10 +756,15 @@ fn heightmaps(chunk: &Chunk, tables: &SaveTables) -> Tag {
 /// sendToClient: WORLD_SURFACE, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES),
 /// as (network id, packed longs) in Heightmap.Types order.
 pub fn client_heightmaps(chunk: &Chunk, tables: &SaveTables) -> Vec<(i32, Vec<i64>)> {
-    client_heightmaps_in(&chunk.sections, tables, MIN_Y, SECTIONS as i32 * 16)
+    client_heightmaps_in(
+        &chunk.sections,
+        tables,
+        chunk.min_y(),
+        chunk.max_y() - chunk.min_y(),
+    )
 }
-/// The client heightmaps of a column's sections, in a level from `min_y`,
-/// `height` blocks high.
+/// The client heightmaps of a column's sections (a whole column of the
+/// current layout), in a level from `min_y`, `height` blocks high.
 pub fn client_heightmaps_in(
     sections: &[Arc<Section>],
     tables: &SaveTables,
@@ -773,7 +780,11 @@ pub fn client_heightmaps_in(
         .iter()
         .filter_map(|(id, k)| Heightmap::new(*k, min_y, height).ok().map(|m| (*id, m)))
         .collect();
-    let view = HeightmapView { sections, tables };
+    let view = HeightmapView {
+        min_y: layout().min_y(),
+        sections,
+        tables,
+    };
     let mut refs: Vec<&mut Heightmap> = maps.iter_mut().map(|(_, m)| m).collect();
     if Heightmap::prime(&view, &mut refs).is_err() {
         return Vec::new();
@@ -820,7 +831,7 @@ pub fn encode_with(
         Light::Full(a) => a.iter().any(|v| v >> 4 != 15),
     });
     for (si, section) in chunk.sections.iter().enumerate() {
-        let y = (MIN_Y >> 4) + si as i32;
+        let y = (chunk.min_y() >> 4) + si as i32;
         // PalettedContainer.pack: distinct states in index order, indices at
         // the saved width.
         let packed = section.blocks.pack();
@@ -950,7 +961,7 @@ pub fn encode_with(
         ("DataVersion", Tag::Int(DATA_VERSION)),
         ("xPos", Tag::Int(chunk.x)),
         ("zPos", Tag::Int(chunk.z)),
-        ("yPos", Tag::Int(MIN_Y >> 4)),
+        ("yPos", Tag::Int(chunk.min_y() >> 4)),
         ("Status", string("minecraft:full")),
         ("LastUpdate", Tag::Long(extras.map_or(0, |e| e.last_update))),
         ("isLightOn", Tag::Byte(i8::from(chunk.lit))),
@@ -983,7 +994,7 @@ pub fn encode_with(
             s.insert("References".into(), Tag::Compound(refs));
         }
         map.entry("PostProcessing".into())
-            .or_insert_with(|| Tag::List(vec![Tag::List(Vec::new()); SECTIONS]));
+            .or_insert_with(|| Tag::List(vec![Tag::List(Vec::new()); chunk.sections.len()]));
     }
     if let Some(t) = tables {
         put(&mut root, "Heightmaps", heightmaps(chunk, t));
@@ -1069,10 +1080,9 @@ fn decode_column(
         let Some(y) = number(section.get("Y")) else {
             continue;
         };
-        let si = y as i32 - (MIN_Y >> 4);
-        if !(0..SECTIONS as i32).contains(&si) {
+        let Some(si) = chunk.section_index(y as i32 * 16) else {
             continue;
-        }
+        };
         if let Some(states) = section.get("block_states")
             && let Some(Tag::List(palette)) = states.get("palette")
         {
@@ -1103,7 +1113,7 @@ fn decode_column(
                     })
                 })
                 .collect();
-            let target = Arc::make_mut(&mut chunk.sections[si as usize]);
+            let target = Arc::make_mut(&mut chunk.sections[si]);
             let data = match states.get("data") {
                 Some(Tag::LongArray(data)) => {
                     Some(data.iter().map(|&w| w as u64).collect::<Vec<_>>())
@@ -1133,7 +1143,7 @@ fn decode_column(
                 _ => None,
             };
             let palette: Vec<u32> = ids.iter().map(|&id| u32::from(id)).collect();
-            let target = Arc::make_mut(&mut chunk.sections[si as usize]);
+            let target = Arc::make_mut(&mut chunk.sections[si]);
             if let Ok(container) =
                 PalettedContainer::from_packed(BIOME_STRATEGY, palette.clone(), data.as_deref())
             {
@@ -1211,9 +1221,9 @@ pub fn encode_proto(
         ChunkStatus::Terrain
     };
     // ProtoChunk.postProcessing: one list per section, packed section offsets.
-    let mut marks = vec![Vec::new(); SECTIONS];
+    let mut marks = vec![Vec::new(); proto.column.sections.len()];
     for &[x, y, z] in &proto.column.postprocess {
-        if let Some(list) = marks.get_mut(((y - MIN_Y) >> 4) as usize) {
+        if let Some(list) = proto.column.section_index(y).and_then(|s| marks.get_mut(s)) {
             list.push(Tag::Short(
                 ((x & 15) | (y & 15) << 4 | (z & 15) << 8) as i16,
             ));
@@ -1248,7 +1258,7 @@ pub fn decode_proto(
     }
     let mut column = decode_column(root, registry, biomes, tables)?;
     column.block_entities.clear();
-    let base = number(root.tag.get("yPos")).map_or(MIN_Y, |y| y as i32 * 16);
+    let base = number(root.tag.get("yPos")).map_or(column.min_y(), |y| y as i32 * 16);
     if let Some(Tag::List(sections)) = root.tag.get("PostProcessing") {
         for (si, marks) in sections.iter().enumerate() {
             let Tag::List(marks) = marks else {
@@ -1290,20 +1300,19 @@ pub fn load_light(tag: &Tag, chunk: &mut Chunk, sky_light: bool) {
     let Some(Tag::List(sections)) = tag.get("sections") else {
         return;
     };
-    let mut layers: Vec<(Option<&[u8]>, Option<&[u8]>)> = vec![(None, None); SECTIONS];
+    let mut layers: Vec<(Option<&[u8]>, Option<&[u8]>)> = vec![(None, None); chunk.sections.len()];
     for section in sections {
         let Some(y) = number(section.get("Y")) else {
             continue;
         };
-        let si = y as i32 - (MIN_Y >> 4);
-        if !(0..SECTIONS as i32).contains(&si) {
+        let Some(si) = chunk.section_index(y as i32 * 16) else {
             continue;
-        }
+        };
         let layer = |name: &str| match section.get(name) {
             Some(Tag::ByteArray(a)) if a.len() == 2048 => Some(&a[..]),
             _ => None,
         };
-        layers[si as usize] = (layer("SkyLight"), layer("BlockLight"));
+        layers[si] = (layer("SkyLight"), layer("BlockLight"));
     }
     // Uniform saved layers need no expanded allocation. Both nibbles of
     // each byte must match, not merely the bytes across the layer.
@@ -3097,21 +3106,22 @@ fn lod_palette_index(
     (value < palette.len()).then_some(value)
 }
 fn lod_light_layers(sections: &[(i32, &Tag)], sky_light: bool) -> Box<[u8]> {
-    let mut layers = [(None, None); SECTIONS];
+    let (min_section, count) = (layout().min_y() >> 4, layout().sections());
+    let mut layers = vec![(None, None); count];
     for &(y, section) in sections {
         let layer = |name: &str| match section.get(name) {
             Some(Tag::ByteArray(data)) if data.len() == 2048 => Some(&data[..]),
             _ => None,
         };
-        layers[(y - (MIN_Y >> 4)) as usize] = (
+        layers[(y - min_section) as usize] = (
             if sky_light { layer("SkyLight") } else { None },
             layer("BlockLight"),
         );
     }
-    let mut light = vec![0u8; SECTIONS * 4096].into_boxed_slice();
+    let mut light = vec![0u8; count * 4096].into_boxed_slice();
     let mut above = [if sky_light { 15u8 } else { 0 }; 256];
     let nibble = |data: &[u8], index: usize| (data[index / 2] >> ((index & 1) * 4)) & 15;
-    for si in (0..SECTIONS).rev() {
+    for si in (0..count).rev() {
         let (sky, block) = layers[si];
         let section = &mut light[si * 4096..(si + 1) * 4096];
         for (index, value) in section.iter_mut().enumerate() {
@@ -3135,7 +3145,7 @@ fn lod_face_light(light: &[u8], x: usize, y: usize, z: usize) -> u16 {
         (z > 0, index.wrapping_sub(16)),
         (z < 15, index + 16),
         (y > 0, index.wrapping_sub(256)),
-        (y + 1 < SECTIONS * 16, index + 256),
+        (y + 1 < light.len() / 256, index + 256),
     ] {
         if valid {
             sky = sky.max(light[index] >> 4);
@@ -3157,7 +3167,8 @@ fn decode_lod_surfaces(
         .iter()
         .filter_map(|section| {
             let y = number(section.get("Y"))? as i32;
-            (MIN_Y >> 4..(MIN_Y >> 4) + SECTIONS as i32)
+            let min = layout().min_y() >> 4;
+            (min..min + layout().sections() as i32)
                 .contains(&y)
                 .then_some((y, section))
         })
@@ -3249,7 +3260,8 @@ fn decode_lod_surfaces(
                                 });
                             }
                         }
-                        let light = lod_face_light(&light, x, (height - 1 - MIN_Y) as usize, z);
+                        let light =
+                            lod_face_light(&light, x, (height - 1 - layout().min_y()) as usize, z);
                         let min = (height - 1) as i16;
                         let max = height as i16;
                         if let Some(previous) = column.spans.last_mut()
@@ -3880,6 +3892,7 @@ mod tests {
         assert_eq!(back.components, banner.components);
     }
     use super::*;
+    use crate::chunk::{MIN_Y, SECTIONS};
 
     #[test]
     fn uuid_text_round_trips() {
