@@ -89,7 +89,10 @@ def blocks(world, chunks):
     for cx, cz in chunks:
         rx, rz = cx >> 5, cz >> 5
         if (rx, rz) not in regions:
-            path = world / "region" / f"r.{rx}.{rz}.mca"
+            # 26.x keeps each dimension under dimensions/<ns>/<name>/; older worlds used region/.
+            path = world / "dimensions" / "minecraft" / "overworld" / "region" / f"r.{rx}.{rz}.mca"
+            if not path.exists():
+                path = world / "region" / f"r.{rx}.{rz}.mca"
             regions[(rx, rz)] = anvil_dump.region_chunks(path) if path.exists() else {}
         chunk = regions[(rx, rz)].get((cx & 31, cz & 31))
         if chunk is None:
@@ -119,8 +122,14 @@ def blocks(world, chunks):
 
 
 def state_name(entry):
-    name = entry["Name"]
-    props = entry.get("Properties")
+    # 26.2 saves {Name, Properties}; 26.3 saves the bare id, or {id, properties}. In a list
+    # mixing both, NBT wraps each bare id in a compound with an empty key.
+    if isinstance(entry, str):
+        return entry
+    if "" in entry:
+        return entry[""]
+    name = entry.get("Name") or entry["id"]
+    props = entry.get("Properties") or entry.get("properties")
     if props:
         name += "[" + ",".join(f"{k}={v}" for k, v in sorted(props.items())) + "]"
     return name
@@ -175,7 +184,7 @@ def main():
         for (x, y), n in pairs.most_common(args.top):
             print(f"  {n:8}  {x} -> {y}")
         print("  by height:", ", ".join(f"y{h}..{h + 63}: {n}" for h, n in sorted(heights.items())))
-        if problems:
+        if problems or missing:
             sys.exit(1)
     finally:
         if args.keep:
