@@ -385,7 +385,9 @@ impl Chunk {
         Self::with_layout(x, z, layout())
     }
     pub fn with_layout(x: i32, z: i32, layout: ColumnLayout) -> Self {
-        let mut sections = vec![Arc::new(Section::default()); layout.sections()];
+        // One empty section for the whole column, then the shared one.
+        let empty = Arc::new(Section::default());
+        let mut sections: Vec<_> = (0..layout.sections()).map(|_| empty.clone()).collect();
         share_uniform(&mut sections);
         Self {
             x,
