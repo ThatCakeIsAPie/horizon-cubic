@@ -24,6 +24,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
@@ -56,10 +57,14 @@ def run_server(version, folder, seed, pack, chunks):
         problems = [l for l in server.lines if ERRORS.search(l)]
         if pack and not any(pack.name in l for l in server.lines):
             problems.append(f"{version}: the pack {pack.name} was not mentioned in the log (not loaded?)")
-        xs = sorted({x for x, _ in chunks})
-        zs = sorted({z for _, z in chunks})
-        server.console(f"forceload add {xs[0] * 16} {zs[0] * 16} {xs[-1] * 16 + 15} {zs[-1] * 16 + 15}")
+        # One forceload per chunk: a rectangle over several sites would pass
+        # the command's 256-chunk limit and load nothing.
+        for x, z in chunks:
+            server.console(f"forceload add {x * 16} {z * 16}")
+        deadline = time.time() + 3600
         for poll in range(100000):
+            if time.time() > deadline:
+                raise AssertionError(f"{version}: chunks still not loaded after an hour")
             start = len(server.lines)
             for x, z in chunks:
                 server.console(f"execute unless loaded {x * 16} 0 {z * 16} run say unloaded")
@@ -67,6 +72,9 @@ def run_server(version, folder, seed, pack, chunks):
             server.wait_for(rf"\[Server\] poll {poll}$", timeout=1800)
             if not any(l.endswith("[Server] unloaded") for l in server.lines[start:]):
                 break
+            # Polls are cheap, but each adds lines to the kept log.
+            del server.lines[start:]
+            time.sleep(5)
         server.console("save-all flush")
         server.wait_for(r"Saved the game", timeout=600)
     finally:
