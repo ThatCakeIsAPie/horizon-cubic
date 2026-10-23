@@ -330,7 +330,15 @@ impl Game<'_> {
         reg.effects.sort();
         reg.enchantments = list("data/minecraft/enchantment");
         reg.structures = list("data/minecraft/worldgen/structure");
-        reg.biomes = list("data/minecraft/worldgen/biome");
+        // The open world's biomes: its data packs' too.
+        reg.biomes = self
+            .res
+            .biomes()
+            .list
+            .iter()
+            .map(|b| b.name.clone())
+            .collect();
+        reg.biomes.sort();
         reg.clocks = list("data/minecraft/world_clock");
         reg.dimensions = vec![
             "minecraft:overworld".into(),
