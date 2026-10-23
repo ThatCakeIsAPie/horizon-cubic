@@ -2,7 +2,7 @@
 //! Far tiles never enter World, lighting, simulation or the section cave graph.
 use crate::{
     blocks::BlockFacts,
-    chunk::{Chunk, MIN_Y},
+    chunk::{Chunk, layout},
     fast_hash::{FxHashMap, FxHashSet},
     mesher::SectionMesh,
     streaming::{LodSource, WorkerContext},
@@ -76,7 +76,7 @@ impl Column {
         let mut sky = [0i32; 16];
         let mut block = [0i32; 16];
         let mut occupied = 0;
-        let mut bottom = MIN_Y as i16;
+        let mut bottom = layout().min_y() as i16;
         for (y, material, change) in events {
             if bottom < y {
                 if occupied * 2 >= (width * width) as i32
@@ -118,9 +118,10 @@ impl Column {
             spans: Vec::new(),
         };
         if let Some(s) = surface {
-            if s.height > MIN_Y {
+            let min_y = layout().min_y();
+            if s.height > min_y {
                 column.spans.push(Span {
-                    min: MIN_Y as i16,
+                    min: min_y as i16,
                     max: s.height as i16,
                     state: s.state,
                     biome: s.biome,
@@ -177,7 +178,7 @@ impl Column {
         };
         let mut column = Self::default();
         for (sy, section) in chunk.sections.iter().enumerate() {
-            let min = MIN_Y + sy as i32 * 16;
+            let min = chunk.min_y() + sy as i32 * 16;
             let uniform = section.blocks.bits() == 0
                 && section.biomes.bits() == 0
                 && matches!(section.light, crate::chunk::Light::Uniform(_));
@@ -220,7 +221,7 @@ impl Column {
             && let Some((height, state)) = water
         {
             column.surface = Some(Surface {
-                height: MIN_Y,
+                height: chunk.min_y(),
                 state: BlockStateId(
                     kinds.iter().position(|&kind| kind & AIR != 0).unwrap_or(0) as u32
                 ),
@@ -1025,8 +1026,7 @@ impl Lod {
         covered: Option<FxHashSet<(i32, i32)>>,
     ) -> Vec<(TileKey, SectionMesh)> {
         let elevation =
-            (((camera[1] - f64::from(MIN_Y + crate::chunk::HEIGHT)).clamp(0., 16384.)) as i32 / 32)
-                * 32;
+            (((camera[1] - f64::from(layout().max_y())).clamp(0., 16384.)) as i32 / 32) * 32;
         let camera = [camera[0].floor() as i32, camera[2].floor() as i32];
         // Fill the view ahead first; a nearest-only ring spends most work out
         // of sight while visible forests remain undecorated noise terrain.
@@ -1448,6 +1448,7 @@ impl Drop for Lod {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::MIN_Y;
     use crate::mesher::TerrainVertex;
     #[test]
     fn reduced_far_detail_only_merges_tiles_away_from_the_near_terrain() {

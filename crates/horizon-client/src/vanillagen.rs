@@ -2,7 +2,7 @@
 //! aquifers, surface rules, carvers and placed features) to chunk streaming.
 use crate::{
     biome::Biomes,
-    chunk::{BIOME_STRATEGY, Chunk, HEIGHT, MIN_Y, SECTIONS, Section},
+    chunk::{BIOME_STRATEGY, Chunk, Section},
     save::SavedProto,
     streaming::{ChunkGenerator, LodSampler, Proto},
 };
@@ -147,14 +147,15 @@ impl VanillaTerrain {
         let pos = chunk.position();
         let mut out = Chunk::empty(pos.x, pos.z);
         let (bx, bz) = (pos.x * 16, pos.z * 16);
+        let (min_y, sections) = (out.min_y(), out.sections.len() as i32);
         // Only the generated range (the Nether is 0..256) is copied.
         let (lo, hi) = (
-            chunk.terrain.min_y().max(MIN_Y),
-            (chunk.terrain.min_y() + chunk.terrain.height()).min(MIN_Y + HEIGHT),
+            chunk.terrain.min_y().max(min_y),
+            (chunk.terrain.min_y() + chunk.terrain.height()).min(out.max_y()),
         );
         let mut values = Box::new([0u32; 4096]);
-        for si in 0..SECTIONS as i32 {
-            let base = MIN_Y + si * 16;
+        for si in 0..sections {
+            let base = min_y + si * 16;
             if base + 16 <= lo || base >= hi {
                 continue;
             }
@@ -210,11 +211,11 @@ impl VanillaTerrain {
                 }
             }
         }
-        for si in 0..SECTIONS as i32 {
+        for si in 0..sections {
             let mut cells = [0u32; 64];
             for (j, cell) in cells.iter_mut().enumerate() {
                 let (qx, qz, qy) = (j as i32 & 3, (j as i32 >> 2) & 3, si * 4 + (j as i32 >> 4));
-                let y = (MIN_Y + qy * 4).clamp(lo, hi - 1);
+                let y = (min_y + qy * 4).clamp(lo, hi - 1);
                 let id = chunk.biome_id_at(bx + qx * 4, y, bz + qz * 4);
                 *cell = u32::from(self.biome_map.get(id.0 as usize).copied().unwrap_or(0));
             }
@@ -402,8 +403,8 @@ impl ChunkGenerator for VanillaTerrain {
         let column = &saved.column;
         let (bx, bz) = (column.x * 16, column.z * 16);
         let (lo, hi) = (
-            chunk.terrain.min_y().max(MIN_Y),
-            (chunk.terrain.min_y() + chunk.terrain.height()).min(MIN_Y + HEIGHT),
+            chunk.terrain.min_y().max(column.min_y()),
+            (chunk.terrain.min_y() + chunk.terrain.height()).min(column.max_y()),
         );
         for y in lo..hi {
             for z in 0..16 {

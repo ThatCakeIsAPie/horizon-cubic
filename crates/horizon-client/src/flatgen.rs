@@ -40,7 +40,7 @@ impl FlatTerrain {
         let mut surface = None;
         for (i, &id) in layers
             .iter()
-            .take(crate::chunk::HEIGHT as usize)
+            .take(crate::chunk::layout().height() as usize)
             .enumerate()
             .rev()
         {
@@ -52,7 +52,7 @@ impl FlatTerrain {
             ) {
                 continue;
             }
-            let height = crate::chunk::MIN_Y + i as i32 + 1;
+            let height = crate::chunk::layout().min_y() + i as i32 + 1;
             if matches!(name, "minecraft:water" | "minecraft:lava") {
                 water.get_or_insert((height, state));
             } else {
@@ -73,7 +73,8 @@ impl FlatTerrain {
     }
     /// FlatLevelSource.getSpawnHeight: the top of the layers.
     pub fn spawn_height(&self) -> i32 {
-        crate::chunk::MIN_Y + self.layers.len().min(crate::chunk::HEIGHT as usize) as i32
+        let column = crate::chunk::layout();
+        column.min_y() + self.layers.len().min(column.height() as usize) as i32
     }
 }
 /// DimensionType.Y_SIZE: the most layers FlatLevelGeneratorSettings takes.
@@ -197,13 +198,14 @@ impl ChunkGenerator for FlatTerrain {
                 u32::from(self.biome),
             );
         }
-        for (i, &block) in self.layers.iter().enumerate().take(384) {
+        let height = (chunk.max_y() - chunk.min_y()) as usize;
+        for (i, &block) in self.layers.iter().enumerate().take(height) {
             if block == 0 {
                 continue;
             }
             for z in 0..16 {
                 for x in 0..16 {
-                    chunk.set(x, -64 + i as i32, z, block);
+                    chunk.set(x, chunk.min_y() + i as i32, z, block);
                 }
             }
         }
