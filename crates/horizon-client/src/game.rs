@@ -7423,6 +7423,10 @@ impl Game<'_> {
             return Ok(());
         }
         self.join_world_rest()?;
+        // A local world's column: vanilla's dimension types until a world's
+        // data can give others (docs/world-height.md). A server joined before
+        // may have left another.
+        horizon_client::chunk::set_layout(horizon_client::chunk::ColumnLayout::VANILLA);
         let save_root = std::env::current_dir()?.join("saves").join(folder);
         if integrated::wanted(&self.options, &save_root) {
             return self.open_integrated(folder, name, seed, creative, create);

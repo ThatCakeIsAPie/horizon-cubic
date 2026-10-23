@@ -10,7 +10,9 @@ use super::{Dim, Game, Mining, Screen};
 use horizon_client::first_person::{Hand, SwingAnimation};
 use horizon_client::{
     Result,
-    chunk::{BIOME_STRATEGY, Chunk, Light, Section, block_strategy, layout},
+    chunk::{
+        BIOME_STRATEGY, Chunk, ColumnLayout, Light, Section, block_strategy, layout, set_layout,
+    },
     containers::{BlockEntity, Furnace, FurnaceKind},
     entities::{Experience, ExperienceOrb, ItemEntity},
     hud::{HudBatch, rgba},
@@ -890,6 +892,13 @@ impl Game<'_> {
         }
     }
     fn set_registries(&mut self, registries: Arc<Dynamic>) {
+        // The client's column covers every dimension type the server sent,
+        // before the first chunk arrives (vanilla's: -64..320).
+        let layout = ColumnLayout::of_registries(&registries).unwrap_or_else(|e| {
+            log::warn!("Horizon: dimension types out of range ({e}); using vanilla's height");
+            ColumnLayout::VANILLA
+        });
+        set_layout(layout);
         let biomes: Vec<u16> = registries
             .registries
             .get("minecraft:worldgen/biome")
@@ -911,7 +920,11 @@ impl Game<'_> {
             return;
         };
         let dimension = r.registries.dimension(spawn.dimension_type);
-        let same = r.dimension.name == dimension.name && keep_world;
+        // Columns of another layout (registries sent again) can't stay.
+        let fits = self.world.chunks.values().next().is_none_or(|c| {
+            (c.min_y(), c.sections.len()) == (layout().min_y(), layout().sections())
+        });
+        let same = r.dimension.name == dimension.name && keep_world && fits;
         r.dimension = dimension;
         r.game_mode = spawn.game_type;
         r.loaded_sent = false;

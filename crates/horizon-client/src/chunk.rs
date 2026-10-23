@@ -66,6 +66,14 @@ impl ColumnLayout {
         }
         Self::new(low, high - low)
     }
+    /// The layout covering every dimension type a server synchronized.
+    pub fn of_registries(registries: &horizon_protocol::registry::Dynamic) -> Result<Self, String> {
+        let types = registries.len("minecraft:dimension_type");
+        Self::covering((0..types).map(|i| {
+            let d = registries.dimension(i as i32);
+            (d.min_y, d.height)
+        }))
+    }
     pub fn min_y(self) -> i32 {
         self.min_y
     }
@@ -580,6 +588,43 @@ mod tests {
         assert_eq!(ColumnLayout::unpack(tall.pack()), tall);
         let low = ColumnLayout::new(-2032, 16).unwrap();
         assert_eq!(ColumnLayout::unpack(low.pack()), low);
+    }
+
+    #[test]
+    fn a_server_s_dimension_types_set_the_layout() {
+        use horizon_protocol::packets::configuration::{RegistryData, RegistryEntry};
+        use horizon_world::nbt::Tag;
+        let mut registries = horizon_protocol::registry::Dynamic::default();
+        let entry = |id: &str, data| RegistryEntry {
+            id: id.into(),
+            data,
+        };
+        registries.add(RegistryData {
+            registry: "minecraft:dimension_type".into(),
+            entries: vec![
+                entry("minecraft:overworld", None),
+                entry("minecraft:the_nether", None),
+            ],
+        });
+        assert_eq!(
+            ColumnLayout::of_registries(&registries),
+            Ok(ColumnLayout::VANILLA)
+        );
+        registries.add(RegistryData {
+            registry: "minecraft:dimension_type".into(),
+            entries: vec![
+                entry(
+                    "minecraft:overworld",
+                    Some(Tag::compound([
+                        ("min_y", Tag::Int(-64)),
+                        ("height", Tag::Int(2096)),
+                    ])),
+                ),
+                entry("minecraft:the_nether", None),
+            ],
+        });
+        let tall = ColumnLayout::of_registries(&registries).unwrap();
+        assert_eq!((tall.min_y(), tall.sections()), (-64, 131));
     }
 
     #[test]
