@@ -172,6 +172,28 @@ pub fn component_nbt(v: &Value) -> Tag {
     }
 }
 
+/// The biome registry key.
+const BIOME: &str = "minecraft:worldgen/biome";
+
+/// The open world's biomes, when its data packs add or change some: the
+/// biome registry this host sends is theirs (`set_world_biomes`).
+static WORLD_BIOMES: std::sync::RwLock<Option<std::sync::Arc<crate::biome::Biomes>>> =
+    std::sync::RwLock::new(None);
+
+/// The biomes of the world being opened (its data packs' with the built-in
+/// ones), before a client can join it.
+pub fn set_world_biomes(biomes: std::sync::Arc<crate::biome::Biomes>) {
+    let world = biomes.has_packs().then_some(biomes);
+    *WORLD_BIOMES.write().unwrap_or_else(|e| e.into_inner()) = world;
+}
+
+fn world_biomes() -> Option<std::sync::Arc<crate::biome::Biomes>> {
+    WORLD_BIOMES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 impl SyncData {
     /// No registries, tags or recipes: enough for tests of the login phase.
     #[cfg(test)]
@@ -278,6 +300,13 @@ impl SyncData {
         if let Some(ids) = self.builtin.get(registry) {
             return ids.id(name);
         }
+        if registry == BIOME {
+            return self
+                .biome_registry()
+                .iter()
+                .position(|n| n == name)
+                .map(|i| i as i32);
+        }
         self.dynamic
             .registries
             .get(registry)?
@@ -286,35 +315,117 @@ impl SyncData {
             .map(|i| i as i32)
     }
 
+    /// The biome registry's names in network order: the open world's, its
+    /// data packs' biomes among the built-in ones in `Identifier` order.
+    pub fn biome_registry(&self) -> Vec<String> {
+        match world_biomes() {
+            Some(world) => world
+                .registry_order()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            None => self.dynamic.registries[BIOME]
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect(),
+        }
+    }
+
+    /// The biome registry entries for the open world: the built-in pack's
+    /// (no data for a client that knows it) and its data packs' files,
+    /// which no client knows, so their data is always sent.
+    fn biome_entries(&self, known_pack: bool, world: &crate::biome::Biomes) -> Vec<RegistryEntry> {
+        let builtin = self
+            .registries
+            .iter()
+            .find(|(k, _)| k == BIOME)
+            .map(|(_, e)| e);
+        world
+            .registry_order()
+            .into_iter()
+            .map(|name| {
+                let data = match world.pack_file(name) {
+                    Some(file) => Some(json_to_nbt(file)),
+                    None if known_pack => None,
+                    None => builtin
+                        .and_then(|e| e.names.iter().position(|n| n == name).map(|i| &e.json[i]))
+                        .map(json_to_nbt),
+                };
+                RegistryEntry {
+                    id: name.to_owned(),
+                    data,
+                }
+            })
+            .collect()
+    }
+
+    /// ClientboundUpdateTagsPacket: the biome tags' ids follow the open
+    /// world's biome registry.
+    pub fn tags_packet(&self) -> UpdateTags {
+        let mut tags = self.tags.clone();
+        if world_biomes().is_none() {
+            return tags;
+        }
+        let vanilla = &self.dynamic.registries[BIOME];
+        let world: HashMap<String, i32> = self
+            .biome_registry()
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| (n, i as i32))
+            .collect();
+        for registry in tags.registries.iter_mut().filter(|r| r.registry == BIOME) {
+            for tag in &mut registry.tags {
+                tag.ids = tag
+                    .ids
+                    .iter()
+                    .filter_map(|&id| world.get(&vanilla.get(id as usize)?.0).copied())
+                    .collect();
+            }
+        }
+        tags
+    }
+
     /// ClientboundRegistryDataPacket per registry. With `known_pack` the
     /// client rebuilds the entries from its own data, so none is sent.
     /// The registries for a client, with the data of a dimension type the
     /// world's data packs changed (`levels`) even when it knows the vanilla
     /// pack.
     pub fn registry_packets(&self, known_pack: bool, levels: &LevelShapes) -> Vec<RegistryData> {
+        let world = world_biomes();
         self.registries
             .iter()
             .map(|(key, e)| RegistryData {
                 registry: key.clone(),
-                entries: e
-                    .names
-                    .iter()
-                    .zip(&e.json)
-                    .zip(&e.from_pack)
-                    .map(|((name, json), &from_pack)| {
-                        let changed = (key == "minecraft:dimension_type")
-                            .then(|| changed_dimension_type(name, json, levels))
-                            .flatten();
-                        RegistryEntry {
-                            id: name.clone(),
-                            data: match changed {
-                                Some(json) => Some(json_to_nbt(&json)),
-                                None if known_pack && !from_pack => None,
-                                None => Some(json_to_nbt(json)),
-                            },
-                        }
-                    })
-                    .collect(),
+                entries: match world.as_deref() {
+                    Some(world) if key == BIOME => self.biome_entries(known_pack, world),
+                    _ => Self::entries(key, e, known_pack, levels),
+                },
+            })
+            .collect()
+    }
+
+    fn entries(
+        key: &str,
+        e: &Entries,
+        known_pack: bool,
+        levels: &LevelShapes,
+    ) -> Vec<RegistryEntry> {
+        e.names
+            .iter()
+            .zip(&e.json)
+            .zip(&e.from_pack)
+            .map(|((name, json), &from_pack)| {
+                let changed = (key == "minecraft:dimension_type")
+                    .then(|| changed_dimension_type(name, json, levels))
+                    .flatten();
+                RegistryEntry {
+                    id: name.clone(),
+                    data: match changed {
+                        Some(json) => Some(json_to_nbt(&json)),
+                        None if known_pack && !from_pack => None,
+                        None => Some(json_to_nbt(json)),
+                    },
+                }
             })
             .collect()
     }

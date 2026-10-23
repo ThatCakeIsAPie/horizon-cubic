@@ -1011,7 +1011,7 @@ fn login_and_configure(
     for packet in sync.registry_packets(known_pack, &shared.config.levels) {
         send(c, cfg::Clientbound::RegistryData(packet))?;
     }
-    send(c, cfg::Clientbound::UpdateTags(sync.tags.clone()))?;
+    send(c, cfg::Clientbound::UpdateTags(sync.tags_packet()))?;
     // addOptionalTasks: the code of conduct task comes first.
     if let Some(text) =
         super::code_of_conduct::pick(&shared.config.code_of_conducts, &info.language)
