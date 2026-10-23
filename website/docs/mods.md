@@ -56,7 +56,8 @@ A world's data packs go in its `datapacks` folder, as folders or `.zip` files wi
 
 - **Functions** (`.mcfunction`, with macros and line continuation), **function tags** (such as `minecraft:load` and `minecraft:tick`), **predicates** and **item modifiers**.
 - The `/function`, `/datapack` and `/reload` commands, and the choice of which packs are on, kept with the world.
+- **World generation:** noises, density functions, noise settings, carvers, features, structures and changes to vanilla's biomes, read when the world loads. New biomes and taller worlds are not supported yet: the log lists what a pack had that Horizon left out. The pack must be made for Minecraft 26.3, as in vanilla.
 
-**Not applied from data packs yet:** custom recipes, loot tables, advancements and world generation. Horizon reads those from the vanilla data it prepared, and from content mods.
+**Not applied from data packs yet:** custom recipes, loot tables and advancements. Horizon reads those from the vanilla data it prepared, and from content mods.
 
 Vanilla's own data is always on, and it matches vanilla: every command runs as vanilla does, and recipes, loot and world generation are checked against the real game.
