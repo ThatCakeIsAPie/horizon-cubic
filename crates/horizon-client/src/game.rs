@@ -693,7 +693,7 @@ impl LevelAccess for GameLevel<'_> {
         self.world.block(pos.x, pos.y, pos.z)
     }
     fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
-        if !self.world.loaded(pos.x, pos.z) || pos.y < MIN_Y || pos.y >= MIN_Y + HEIGHT {
+        if !self.world.loaded(pos.x, pos.z) || pos.y < self.min_y() || pos.y >= self.max_y() {
             return None;
         }
         let previous = self.world.block(pos.x, pos.y, pos.z);
@@ -704,19 +704,11 @@ impl LevelAccess for GameLevel<'_> {
         self.world.loaded(pos.x, pos.z)
     }
     fn min_y(&self) -> i32 {
-        if self.dimension != LevelDimension::Overworld {
-            0
-        } else {
-            MIN_Y
-        }
+        Dim::of_level(self.dimension).min_y()
     }
     fn max_y(&self) -> i32 {
         // Exclusive, as LevelAccess::max_y documents.
-        if self.dimension != LevelDimension::Overworld {
-            256
-        } else {
-            MIN_Y + HEIGHT
-        }
+        Dim::of_level(self.dimension).max_y() + 1
     }
     fn random(&mut self) -> &mut horizon_core::random::LegacyRandom {
         &mut self.world.random
@@ -1599,27 +1591,29 @@ impl Dim {
             _ => Self::Overworld,
         }
     }
+    fn of_level(dimension: LevelDimension) -> Self {
+        match dimension {
+            LevelDimension::Overworld => Self::Overworld,
+            LevelDimension::Nether => Self::Nether,
+            LevelDimension::End => Self::End,
+        }
+    }
+    /// The open world's build range of this level: its dimension type's.
+    fn height(self) -> horizon_client::chunk::LevelHeight {
+        horizon_client::chunk::level_height(self.id())
+    }
     /// `Level.getMinY`: the dimension type's minimum y.
     fn min_y(self) -> i32 {
-        match self {
-            Self::Overworld => MIN_Y,
-            Self::Nether | Self::End => 0,
-        }
+        self.height().min_y
     }
     /// `DimensionType.logicalHeight`.
     fn logical_height(self) -> i32 {
-        match self {
-            Self::Overworld => HEIGHT,
-            Self::Nether => 128,
-            Self::End => 256,
-        }
+        self.height().logical_height
     }
     /// `Level.getMaxY`: the dimension type's minimum y plus height, less one.
     fn max_y(self) -> i32 {
-        match self {
-            Self::Overworld => MIN_Y + HEIGHT - 1,
-            Self::Nether | Self::End => 255,
-        }
+        let h = self.height();
+        h.min_y + h.height - 1
     }
 }
 fn facing_offset(facing: &str) -> [i32; 3] {
@@ -7423,11 +7417,11 @@ impl Game<'_> {
             return Ok(());
         }
         self.join_world_rest()?;
-        // A local world's column: vanilla's dimension types until a world's
-        // data can give others (docs/world-height.md). A server joined before
-        // may have left another.
-        horizon_client::chunk::set_layout(horizon_client::chunk::ColumnLayout::VANILLA);
         let save_root = std::env::current_dir()?.join("saves").join(folder);
+        // A local world's levels and column: its dimension types, data
+        // packs' included (docs/world-height.md). A server joined before may
+        // have left others.
+        world_loading::set_world_heights(&save_root, self.res.biomes());
         if integrated::wanted(&self.options, &save_root) {
             return self.open_integrated(folder, name, seed, creative, create);
         }

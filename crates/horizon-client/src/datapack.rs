@@ -176,11 +176,6 @@ pub fn worldgen_overrides(
             let read = || String::from_utf8(pack.read(&file)?).ok();
             match out.add_file(&pack.id, &file, read) {
                 PackFile::Read | PackFile::Other => {}
-                PackFile::DimensionType { id, min_y, height } => warnings.push(format!(
-                    "{}: dimension type {id} (min_y {min_y}, height {height}) is not used: \
-                     the dimension keeps its vanilla build height",
-                    pack.id
-                )),
                 PackFile::NotRead(kind) => {
                     *not_read.entry(format!("{}: {kind}", pack.id)).or_default() += 1
                 }
@@ -691,10 +686,11 @@ mod tests {
         );
         let tag_packs: Vec<&str> = o.tags("biome_tags").map(|(_, p, _)| p).collect();
         assert_eq!(tag_packs, ["file/b", "file/a"]);
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(warnings[0].contains("height 2096"));
-        assert!(warnings[1].contains("minecraft:new_peaks"));
-        assert!(warnings[2].contains("worldgen/world_preset"));
+        let tall = o.level_height("minecraft:overworld").map(|h| h.height);
+        assert_eq!(tall, Some(2096));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("minecraft:new_peaks"));
+        assert!(warnings[1].contains("worldgen/world_preset"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

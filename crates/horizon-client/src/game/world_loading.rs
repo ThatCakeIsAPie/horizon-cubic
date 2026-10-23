@@ -195,6 +195,54 @@ fn world_worldgen_overrides(
     overrides
 }
 
+/// Sets each level's build range and the client column from the world's
+/// dimension types (its data packs' over vanilla's), before its first chunk.
+pub(super) fn set_world_heights(
+    world_root: &std::path::Path,
+    biomes: &horizon_client::biome::Biomes,
+) -> horizon_client::chunk::ColumnLayout {
+    use horizon_client::chunk::{LEVELS, set_level_heights, vanilla_level_heights};
+    let packs = horizon_client::datapack::discover(world_root);
+    let enabled = horizon_client::datapack::enabled_ids(world_root, &packs);
+    let enabled: Vec<_> = enabled
+        .iter()
+        .filter_map(|id| packs.iter().find(|p| &p.id == id))
+        .collect();
+    let (overrides, _) =
+        horizon_client::datapack::worldgen_overrides(&enabled, |b| biomes.contains(b));
+    let heights = LEVELS.map(|level| {
+        overrides.level_height(level).unwrap_or_else(|| {
+            log::warn!(
+                "Horizon: the data packs give {level} a build range vanilla refuses; \
+                 it keeps vanilla's"
+            );
+            horizon_client::chunk::LevelHeight::vanilla(level).expect("a vanilla level")
+        })
+    });
+    match set_level_heights(heights) {
+        Ok(layout) => {
+            if heights != vanilla_level_heights() {
+                log::info!(
+                    "Horizon: the world's dimension types: {}; the column spans y {}..{}",
+                    LEVELS
+                        .iter()
+                        .zip(heights)
+                        .map(|(l, h)| format!("{l} {}..{}", h.min_y, h.min_y + h.height))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    layout.min_y(),
+                    layout.max_y()
+                );
+            }
+            layout
+        }
+        Err(e) => {
+            log::warn!("Horizon: the world's dimension types ({e}): using vanilla's");
+            set_level_heights(vanilla_level_heights()).expect("vanilla's heights")
+        }
+    }
+}
+
 pub(super) fn make_streaming(
     res: &Resources,
     pack: &PackResources,

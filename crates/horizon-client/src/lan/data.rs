@@ -122,6 +122,23 @@ pub fn component_nbt(v: &Value) -> Tag {
     }
 }
 
+/// The vanilla dimension type `name` (its JSON `json`) with the open world's
+/// build range for the level of that name, if the world's data packs
+/// changed it (`chunk::level_height`).
+fn dimension_type(name: &str, json: &Value) -> Option<Value> {
+    use crate::chunk::{LEVELS, LevelHeight, level_height};
+    let level = LEVELS.iter().find(|l| **l == name)?;
+    let h = level_height(level);
+    if Some(h) == LevelHeight::vanilla(level) {
+        return None;
+    }
+    let mut json = json.clone();
+    json["min_y"] = h.min_y.into();
+    json["height"] = h.height.into();
+    json["logical_height"] = h.logical_height.into();
+    Some(json)
+}
+
 impl SyncData {
     pub fn load(resources: &Path) -> Result<Self, String> {
         let builtin = Builtin::find(resources)
@@ -183,13 +200,20 @@ impl SyncData {
                     .names
                     .iter()
                     .zip(&e.json)
-                    .map(|(name, json)| RegistryEntry {
-                        id: name.clone(),
-                        data: if known_pack {
-                            None
-                        } else {
-                            Some(json_to_nbt(json))
-                        },
+                    .map(|(name, json)| {
+                        // A world's data packs change a level's dimension
+                        // type: not the known pack's entry, so it is sent.
+                        let changed = (key == "minecraft:dimension_type")
+                            .then(|| dimension_type(name, json))
+                            .flatten();
+                        RegistryEntry {
+                            id: name.clone(),
+                            data: match changed {
+                                Some(json) => Some(json_to_nbt(&json)),
+                                None if known_pack => None,
+                                None => Some(json_to_nbt(json)),
+                            },
+                        }
                     })
                     .collect(),
             })

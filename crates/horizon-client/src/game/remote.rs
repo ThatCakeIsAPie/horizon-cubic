@@ -893,11 +893,30 @@ impl Game<'_> {
     }
     fn set_registries(&mut self, registries: Arc<Dynamic>) {
         // The client's column covers every dimension type the server sent,
-        // before the first chunk arrives (vanilla's: -64..320).
+        // before the first chunk arrives (vanilla's: -64..320), and each
+        // level's build range is its dimension type's.
         let layout = ColumnLayout::of_registries(&registries).unwrap_or_else(|e| {
             log::warn!("Horizon: dimension types out of range ({e}); using vanilla's height");
             ColumnLayout::VANILLA
         });
+        let heights = horizon_client::chunk::LEVELS.map(|level| {
+            let id = (0..registries.len("minecraft:dimension_type") as i32)
+                .find(|&i| registries.name("minecraft:dimension_type", i) == Some(level));
+            let d = id.map_or_else(
+                || horizon_protocol::registry::DimensionType::vanilla(level),
+                |i| registries.dimension(i),
+            );
+            horizon_client::chunk::LevelHeight {
+                min_y: d.min_y,
+                height: d.height,
+                logical_height: d.logical_height,
+            }
+        });
+        if horizon_client::chunk::set_level_heights(heights).is_err() {
+            let _ = horizon_client::chunk::set_level_heights(
+                horizon_client::chunk::vanilla_level_heights(),
+            );
+        }
         set_layout(layout);
         let biomes: Vec<u16> = registries
             .registries

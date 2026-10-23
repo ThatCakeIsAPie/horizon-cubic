@@ -128,6 +128,66 @@ pub fn set_layout(layout: ColumnLayout) {
     LAYOUT.store(layout.pack(), std::sync::atomic::Ordering::Relaxed);
 }
 
+pub use horizon_world::worldgen::overrides::LevelHeight;
+
+/// The levels whose build range `level_height` keeps: the three a world has.
+pub const LEVELS: [&str; 3] = [
+    "minecraft:overworld",
+    "minecraft:the_nether",
+    "minecraft:the_end",
+];
+const fn pack_level(h: LevelHeight) -> u64 {
+    (h.min_y as u32 as u64) << 32
+        | (h.height as u64 & 0xffff) << 16
+        | h.logical_height as u64 & 0xffff
+}
+static LEVEL_HEIGHTS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(pack_level(LevelHeight {
+        min_y: -64,
+        height: 384,
+        logical_height: 384,
+    })),
+    std::sync::atomic::AtomicU64::new(pack_level(LevelHeight {
+        min_y: 0,
+        height: 256,
+        logical_height: 128,
+    })),
+    std::sync::atomic::AtomicU64::new(pack_level(LevelHeight {
+        min_y: 0,
+        height: 256,
+        logical_height: 256,
+    })),
+];
+
+/// The open world's build range of `level` (`LevelHeightAccessor`, from its
+/// dimension type): vanilla's until `set_level_heights`. Other names get
+/// the Overworld's.
+pub fn level_height(level: &str) -> LevelHeight {
+    let i = LEVELS.iter().position(|l| *l == level).unwrap_or(0);
+    let bits = LEVEL_HEIGHTS[i].load(std::sync::atomic::Ordering::Relaxed);
+    LevelHeight {
+        min_y: (bits >> 32) as u32 as i32,
+        height: (bits >> 16 & 0xffff) as i32,
+        logical_height: (bits & 0xffff) as i32,
+    }
+}
+
+/// Sets the open world's levels' build ranges (in `LEVELS` order) and the
+/// column covering them, before the world's first chunk.
+pub fn set_level_heights(heights: [LevelHeight; 3]) -> Result<ColumnLayout, String> {
+    let layout = ColumnLayout::covering(heights.iter().map(|h| (h.min_y, h.height)))?;
+    for (slot, h) in LEVEL_HEIGHTS.iter().zip(heights) {
+        slot.store(pack_level(h), std::sync::atomic::Ordering::Relaxed);
+    }
+    set_layout(layout);
+    Ok(layout)
+}
+
+/// The vanilla levels' build ranges.
+pub fn vanilla_level_heights() -> [LevelHeight; 3] {
+    LEVELS.map(|l| LevelHeight::vanilla(l).expect("a vanilla level"))
+}
+
 /// Biomes are 4x4x4 containers over the biome table (67 entries: a 7-bit
 /// global palette).
 pub const BIOME_STRATEGY: Strategy = Strategy::biomes(7);
