@@ -42,6 +42,7 @@ To play, use [the launcher](../launcher/README.md); the project site is [playhor
 ## Architecture: world data and simulation
 
 - [World data](world-data.md): chunk storage, palettes, region files.
+- [World height](world-height.md): the client's fixed column, what a taller dimension type costs, and the plan to take the height from the dimension type.
 - [Block-state codecs](block-state-codecs.md), [scheduled ticks](scheduled-ticks.md).
 - [Collision geometry](collision-geometry.md): shapes, collision, movement and fluids.
 - [Face visibility](face-visibility.md): which model faces the mesher emits.
