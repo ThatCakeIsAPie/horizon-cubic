@@ -188,7 +188,7 @@ impl WorldgenOverrides {
             PackFile::Other
         }
     }
-    /// After the last pack: leaves out the packs' new biomes (`known` says
+    /// After the last pack: leaves out the packs' biomes the game lacks (`known` says
     /// which the game has), and what names them names the rest without
     /// them: their biome tags' other biomes, and the climate points of the
     /// other biomes in a level stem's multi-noise list (the left-out
@@ -198,9 +198,7 @@ impl WorldgenOverrides {
         let left_out = self.retain("biomes", &known);
         let mut warnings: Vec<String> = left_out
             .iter()
-            .map(|id| {
-                format!("biome {id} is new: Horizon cannot add biomes yet, so it is left out")
-            })
+            .map(|id| format!("biome {id}: the game could not read its file, so it is left out"))
             .collect();
         if left_out.is_empty() {
             return warnings;

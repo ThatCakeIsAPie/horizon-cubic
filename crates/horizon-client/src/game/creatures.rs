@@ -205,7 +205,8 @@ impl Game<'_> {
         let Some(chunk) = self.world.chunks.get(&(x >> 4, z >> 4)) else {
             return BiomeFacts::default();
         };
-        let b = self.res.biomes().get(chunk.biome(x, y, z));
+        let biomes = self.res.biomes();
+        let b = biomes.get(chunk.biome(x, y, z));
         let tags = self.res.mob_data();
         let has = |t: &str| tags.biome_has(t, &b.name);
         let climate = if has("minecraft:spawns_warm_variant_farm_animals") {

@@ -161,16 +161,18 @@ impl Game<'_> {
                 let saved;
                 let chunk = match self.world.chunks.get(&(x, z)) {
                     Some(c) => &**c,
-                    None => match self
-                        .save
-                        .load(x, z, self.pack.assets.registry, self.res.biomes())
-                    {
-                        Some(c) => {
-                            saved = c;
-                            &saved
+                    None => {
+                        match self
+                            .save
+                            .load(x, z, self.pack.assets.registry, &self.res.biomes())
+                        {
+                            Some(c) => {
+                                saved = c;
+                                &saved
+                            }
+                            None => continue,
                         }
-                        None => continue,
-                    },
+                    }
                 };
                 for (s, section) in chunk.sections.iter().enumerate() {
                     if !section.blocks.maybe_has(|v| {

@@ -52,8 +52,8 @@ impl Game<'_> {
                 let (dimension, biome) = (self.dim.id(), self.biome_at(eye));
                 let tables = self.res.music();
                 (
-                    tables.background(dimension, biome),
-                    tables.volume(dimension, biome),
+                    tables.background(dimension, &biome),
+                    tables.volume(dimension, &biome),
                 )
             }
             None => (empty, 1.0),
@@ -75,7 +75,7 @@ impl Game<'_> {
         (situation.music(), situation.volume())
     }
     /// `BiomeManager.getNoiseBiomeAtPosition`: the quart cell holding a position.
-    fn biome_at(&self, p: [f64; 3]) -> &str {
+    fn biome_at(&self, p: [f64; 3]) -> String {
         let (x, y, z) = (
             p[0].floor() as i32,
             p[1].floor() as i32,
@@ -84,10 +84,8 @@ impl Game<'_> {
         self.world
             .chunks
             .get(&(x >> 4, z >> 4))
-            .map_or("minecraft:plains", |c| {
-                self.res.biomes().list[c.biome(x, y, z) as usize]
-                    .name
-                    .as_str()
+            .map_or("minecraft:plains".to_owned(), |c| {
+                self.res.biomes().get(c.biome(x, y, z)).name.clone()
             })
     }
     /// `isEyeInFluid(WATER)`: the eye inside the water of its block column.
@@ -115,7 +113,7 @@ impl Game<'_> {
         };
         let feet = [p.position.x, p.position.y, p.position.z];
         let eye_y = feet[1] + f64::from(p.dimensions.eye_height);
-        let sounds = self.res.ambient().get(self.dim.id(), self.biome_at(feet));
+        let sounds = self.res.ambient().get(self.dim.id(), &self.biome_at(feet));
         let underwater = self.eye_in_water(feet[0], eye_y, feet[2]);
         let world = &self.world;
         let light = |b: [i32; 3]| {

@@ -163,7 +163,7 @@ pub fn enabled_ids(world: &Path, packs: &[DataPack]) -> Vec<String> {
 /// The worldgen entries of `packs` (lowest priority first, the built-in pack
 /// left out: the prepared bundles are it) for the chunk generator, and what
 /// it leaves out, for the log. `biomes` says which biomes the game has: a
-/// pack's new biome is left out (the game has no colours, sounds or id for it).
+/// pack biome the game lacks (its file did not read) is left out.
 pub fn worldgen_overrides(
     packs: &[&DataPack],
     biomes: impl Fn(&str) -> bool,
