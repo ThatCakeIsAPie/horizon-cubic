@@ -511,12 +511,8 @@ impl Game<'_> {
             .iter()
             .map(|b| b.name.clone())
             .collect();
-        let registry: Vec<String> = sync
-            .dynamic
-            .registries
-            .get("minecraft:worldgen/biome")
-            .map(|v| v.iter().map(|(n, _)| n.clone()).collect())
-            .unwrap_or_default();
+        // The world's biome registry: its data packs' biomes among vanilla's.
+        let registry: Vec<String> = sync.biome_registry();
         let mut encoder = ChunkEncoder::new(
             self.res
                 .facts()

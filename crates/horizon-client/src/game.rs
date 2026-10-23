@@ -952,6 +952,7 @@ impl Resources {
     }
     /// The biomes of the world about to open, before its first chunk.
     fn set_biomes(&self, biomes: Arc<Biomes>) {
+        horizon_client::lan::data::set_world_biomes(biomes.clone());
         *self.core.biomes.write().unwrap_or_else(|e| e.into_inner()) = biomes;
     }
     fn environment(&self) -> &Environment {
