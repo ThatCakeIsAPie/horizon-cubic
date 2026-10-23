@@ -77,7 +77,7 @@ pub fn upgrade_pack(files: &BTreeMap<String, Vec<u8>>) -> (BTreeMap<String, Vec<
         };
         let upgraded = match file.registry.as_str() {
             "worldgen/noise" => Some(noise(v, &mut report)),
-            "worldgen/density_function" => Some(ctx.density(v, &mut report)),
+            "worldgen/density_function" => Some(ctx.named_function(&file.id(), v, &mut report)),
             "worldgen/noise_settings" => Some(ctx.settings(&file.id(), v, &mut report)),
             "worldgen/configured_carver" => Some(carver(v, &mut report)),
             "worldgen/configured_feature" => Some(ctx.feature(v, &mut report)),
@@ -86,6 +86,7 @@ pub fn upgrade_pack(files: &BTreeMap<String, Vec<u8>>) -> (BTreeMap<String, Vec<
             "worldgen/structure" => Some(structure(v)),
             "worldgen/world_preset" => Some(ctx.world_preset(v, &mut report)),
             "dimension" => Some(ctx.dimension(v, &mut report)),
+            "dimension_type" => Some(dimension_type(v)),
             "worldgen/template_pool" | "worldgen/processor_list" => {
                 let mut v = v.clone();
                 states(&mut v);
@@ -186,6 +187,24 @@ fn density_path(id: &str) -> String {
 fn kind(v: &Value) -> Option<&str> {
     let t = v.get("type")?.as_str()?;
     Some(t.strip_prefix("minecraft:").unwrap_or(t))
+}
+
+/// An id with its namespace (`minecraft:` when it has none).
+fn full_id(id: &str) -> String {
+    if id.contains(':') {
+        id.to_owned()
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+/// Whether an object of type `t` appears anywhere in `v`.
+fn contains_type(v: &Value, t: &str) -> bool {
+    match v {
+        Value::Object(o) => kind(v) == Some(t) || o.values().any(|x| contains_type(x, t)),
+        Value::Array(a) => a.iter().any(|x| contains_type(x, t)),
+        _ => false,
+    }
 }
 
 fn vanilla(name: &str) -> Value {
@@ -358,9 +377,14 @@ struct Context<'a> {
     /// The pack's own density functions by id, in 26.2's form.
     functions: BTreeMap<String, &'a Value>,
     /// The interpolation cell (`size_horizontal * 4`, `size_vertical * 4`)
-    /// of the pack's noise settings, which 26.3 writes on each
+    /// of the noise settings being upgraded, which 26.3 writes on each
     /// `interpolated`.
     cell: (i64, i64),
+    /// The cells of the pack's noise settings that reach each of its named
+    /// density functions through their routers.
+    cells: BTreeMap<String, BTreeSet<(i64, i64)>>,
+    /// The cell of every noise settings in the pack.
+    all_cells: BTreeSet<(i64, i64)>,
     /// Named density functions the upgrade adds, by id.
     generated: BTreeMap<String, Value>,
 }
@@ -368,7 +392,7 @@ struct Context<'a> {
 impl<'a> Context<'a> {
     fn new(files: &'a BTreeMap<String, Value>) -> Self {
         let mut functions = BTreeMap::new();
-        let mut cells = BTreeSet::new();
+        let mut settings = Vec::new();
         for (path, v) in files {
             let Some(f) = PackFile::parse(path) else {
                 continue;
@@ -377,20 +401,63 @@ impl<'a> Context<'a> {
                 "worldgen/density_function" => {
                     functions.insert(f.id(), v);
                 }
-                "worldgen/noise_settings" => {
-                    cells.insert(cell_of(&v["noise"]));
-                }
+                "worldgen/noise_settings" => settings.push(v),
                 _ => {}
             }
         }
-        // Vanilla's overworld cell when the pack defines no settings of its
-        // own; with several, the first (reported as lossy when they differ).
-        let cell = cells.iter().next().copied().unwrap_or((4, 8));
-        Self {
+        let mut ctx = Self {
             functions,
-            cell,
+            cell: (4, 8),
+            cells: BTreeMap::new(),
+            all_cells: BTreeSet::new(),
             generated: BTreeMap::new(),
+        };
+        for s in settings {
+            let cell = cell_of(s.get("noise").unwrap_or(&Value::Null));
+            ctx.all_cells.insert(cell);
+            let mut reached = BTreeSet::new();
+            ctx.reach(s.get("noise_router").unwrap_or(&Value::Null), &mut reached);
+            for id in reached {
+                ctx.cells.entry(id).or_default().insert(cell);
+            }
         }
+        ctx
+    }
+
+    /// Every pack density function `v` names, directly or through others.
+    fn reach(&self, v: &Value, out: &mut BTreeSet<String>) {
+        match v {
+            Value::String(id) => {
+                let id = full_id(id);
+                if let Some(f) = self.functions.get(&id)
+                    && out.insert(id)
+                {
+                    self.reach(f, out);
+                }
+            }
+            Value::Object(o) => o.values().for_each(|x| self.reach(x, out)),
+            Value::Array(a) => a.iter().for_each(|x| self.reach(x, out)),
+            _ => {}
+        }
+    }
+
+    /// A named density function file in 26.3's form, with the cell of the
+    /// noise settings that use it: vanilla's overworld cell when none of the
+    /// pack's do, the pack's own when it has one.
+    fn named_function(&mut self, id: &str, v: &Value, report: &mut Report) -> Value {
+        let cells = self.cells.get(id).cloned().unwrap_or_default();
+        self.cell = match (cells.len(), self.all_cells.len()) {
+            (1, _) => *cells.iter().next().unwrap_or(&(4, 8)),
+            (0, 1) => *self.all_cells.iter().next().unwrap_or(&(4, 8)),
+            (0, _) => (4, 8),
+            _ => {
+                if contains_type(v, "interpolated") {
+                    report.lossy("density: an interpolated function shared by noise settings with different cells");
+                }
+                *cells.iter().next().unwrap_or(&(4, 8))
+            }
+        };
+        self.density(v, report)
     }
 
     /// One density function (a number, an id, or an object) in 26.3's form.
@@ -619,22 +686,22 @@ impl<'a> Context<'a> {
             return v.clone();
         }
         let router = o.get("noise_router").cloned().unwrap_or_default();
-        let saved = self.cell;
-        self.cell = cell_of(&o["noise"]);
-        if self.cell != saved {
-            report.lossy(
-                "noise settings: several interpolation cells in one pack (named density functions use the first)",
-            );
-        }
+        self.cell = cell_of(o.get("noise").unwrap_or(&Value::Null));
         let conv = |this: &mut Self, report: &mut Report, name: &str| {
             this.density(&router.get(name).cloned().unwrap_or(json!(0.0)), report)
         };
-        let temperature = conv(self, report, "temperature");
-        let vegetation = conv(self, report, "vegetation");
-        let continents = conv(self, report, "continents");
-        let erosion = conv(self, report, "erosion");
-        let depth = conv(self, report, "depth");
-        let ridges = conv(self, report, "ridges");
+        // The climate functions are named: the spawn target and the aquifer
+        // exclusion refer to them by id.
+        let climate = |this: &mut Self, report: &mut Report, name: &str| {
+            let f = conv(this, report, name);
+            this.named(id, name, f)
+        };
+        let temperature = climate(self, report, "temperature");
+        let vegetation = climate(self, report, "vegetation");
+        let continents = climate(self, report, "continents");
+        let erosion = climate(self, report, "erosion");
+        let depth = climate(self, report, "depth");
+        let ridges = climate(self, report, "ridges");
         let final_density = conv(self, report, "final_density");
         let surface = conv(self, report, "preliminary_surface_level");
         let surface = self.named(id, "preliminary_surface_level", surface);
@@ -701,9 +768,9 @@ impl<'a> Context<'a> {
         };
         n.insert(
             "noise_router".into(),
-            json!({"temperature": temperature.clone(), "vegetation": vegetation.clone(),
-                "continents": continents.clone(), "erosion": erosion.clone(),
-                "depth": depth, "ridges": ridges.clone(),
+            json!({"temperature": temperature, "vegetation": vegetation,
+                "continents": continents, "erosion": erosion,
+                "depth": depth, "ridges": ridges,
                 "chunk_surface_level": {"type": "minecraft:interpolated", "cell_size_xz": 16,
                     "cell_size_y": 1, "input": surface},
                 "final_density": {"type": "minecraft:add", "left": final_density,
@@ -711,11 +778,11 @@ impl<'a> Context<'a> {
         );
         n.insert("material_rule".into(), rule);
         let climate = [
-            ("temperature", self.named(id, "temperature", temperature)),
-            ("humidity", self.named(id, "vegetation", vegetation)),
-            ("continentalness", self.named(id, "continents", continents)),
-            ("erosion", self.named(id, "erosion", erosion)),
-            ("weirdness", self.named(id, "ridges", ridges)),
+            ("temperature", n["noise_router"]["temperature"].clone()),
+            ("humidity", n["noise_router"]["vegetation"].clone()),
+            ("continentalness", n["noise_router"]["continents"].clone()),
+            ("erosion", n["noise_router"]["erosion"].clone()),
+            ("weirdness", n["noise_router"]["ridges"].clone()),
         ];
         let spawn: Vec<Value> = o
             .get("spawn_target")
@@ -747,7 +814,6 @@ impl<'a> Context<'a> {
                 n.insert(key.into(), x.clone());
             }
         }
-        self.cell = saved;
         Value::Object(n)
     }
 
@@ -755,8 +821,10 @@ impl<'a> Context<'a> {
     /// inline noise settings object in its generator is upgraded.
     fn dimension(&mut self, v: &Value, report: &mut Report) -> Value {
         let mut v = v.clone();
+        let noise = v.get("generator").and_then(kind) == Some("noise");
         if let Some(settings) = v.pointer("/generator/settings").cloned()
             && settings.is_object()
+            && noise
         {
             v["generator"]["settings"] = self.settings("minecraft:inline", &settings, report);
         }
@@ -838,6 +906,7 @@ impl<'a> Context<'a> {
     /// modifiers.
     fn placed(&mut self, v: &Value, report: &mut Report) -> Value {
         let mut v = v.clone();
+        states(&mut v);
         if let Some(f) = v.get("feature").cloned()
             && f.is_object()
         {
@@ -1097,6 +1166,19 @@ fn biome(v: &Value, report: &mut Report) -> Value {
             "minecraft:gameplay/creature_world_gen_spawn_probability".into(),
             p,
         );
+    }
+    v
+}
+
+/// A dimension type: the bed rule's `explodes` is 26.3's `destroy_on_use`.
+fn dimension_type(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(rule) = v
+        .pointer_mut("/attributes/minecraft:gameplay~1bed_rule")
+        .and_then(Value::as_object_mut)
+        && let Some(explodes) = rule.remove("explodes")
+    {
+        rule.insert("destroy_on_use".into(), explodes);
     }
     v
 }
