@@ -171,6 +171,17 @@ chunks in a tall Overworld, which the shared empty section makes cheap anyway.
 6. **Cost.** One shared empty section per column. Sky light that starts at the region's top occupied
    section. Measure resident and GPU memory and generation speed with a 2096-high world.
 
+### Where this stands
+
+Steps 1 to 3 are done, and step 5 is done for servers: the client's column is the union of the
+dimension types a server sends. `crates/horizon-client/tests/tall_column.rs` sets To The Max's
+131-section layout and streams, lights, meshes, edits, saves and reloads a column up to y 2031. Local
+worlds still open with vanilla's column, because their dimension types come from the generator's
+fixed table (`dimension_type_height` in `worldgen/generator.rs`). Step 4 (gameplay build range) and
+step 6 (cost) are still to do. `lowest_sky_source` (`light.rs`) checks every block from the column's
+top down for each relit column, so the relighter does about 5.5 times the work at 2096. It should
+skip uniform air sections, as `Chunk::highest` does.
+
 Each step runs the harnesses its files reach (`python3 tools/parity.py --changed-files`), which for
 client-library files is about a hundred, and a vanilla world in game. Once step 5 lands, a test world
 with a tall dimension type (an MIT-licensed fixture data pack, not To The Max itself) checks saves,
