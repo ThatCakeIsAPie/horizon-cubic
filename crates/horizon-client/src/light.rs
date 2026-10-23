@@ -17,7 +17,7 @@
 use crate::fast_hash::FxHashMap;
 use crate::{
     blocks::BlockFacts,
-    chunk::{Chunk, HEIGHT, Light, MIN_Y, SECTIONS, index},
+    chunk::{Chunk, Light, index, layout},
 };
 use horizon_core::geometry::{Direction, ShapeOp, VoxelShape};
 use horizon_world::registry::{BlockRegistry, BlockStateId};
@@ -273,7 +273,8 @@ pub fn light_chunk(
     tables: &LightTables,
     sky_light: bool,
 ) -> Vec<Light> {
-    region[1][1].expect("centre chunk");
+    let centre = region[1][1].expect("centre chunk");
+    let sections = centre.sections.len();
     // Highest occupied section in the region bounds the work.
     let mut top_section = 0;
     for chunk in region.iter().flatten().flatten() {
@@ -286,7 +287,7 @@ pub fn light_chunk(
     }
     // One extra section above the highest occupied one: block light rises
     // up to 14 blocks into it (sky light there is always 15).
-    let h = ((top_section + 1) * 16).min(HEIGHT as usize);
+    let h = ((top_section + 1) * 16).min(sections * 16);
     let at = |x: usize, y: usize, z: usize| (y * W + z) * W + x;
     // Packed cells (`type << 4 | dampening`), not state ids: the flood fill
     // then never touches the large `LightTables::cells` table.
@@ -422,14 +423,20 @@ pub fn light_chunk(
     };
     spread(&mut sky, &mut sky_queue);
     spread(&mut block, &mut queue);
-    pack_lighting(h, &sky, &block, sky_light)
+    pack_lighting(sections, h, &sky, &block, sky_light)
 }
 
 /// Extract just the centre column's light; never copy worker snapshot sections.
-fn pack_lighting(h: usize, sky: &[u8], block: &[u8], sky_light: bool) -> Vec<Light> {
+fn pack_lighting(
+    sections: usize,
+    h: usize,
+    sky: &[u8],
+    block: &[u8],
+    sky_light: bool,
+) -> Vec<Light> {
     let at = |x: usize, y: usize, z: usize| (y * W + z) * W + x;
     let open = if sky_light { 0xF0 } else { 0x00 };
-    (0..SECTIONS)
+    (0..sections)
         .map(|si| {
             if si * 16 >= h {
                 return Light::Uniform(open);
@@ -506,7 +513,8 @@ pub fn light_from_layers<L: AsRef<[u8]>>(
     mut above: [u8; 256],
     sky_light: bool,
 ) {
-    for (si, (sky, block)) in layers.iter().enumerate().take(SECTIONS).rev() {
+    let sections = chunk.sections.len();
+    for (si, (sky, block)) in layers.iter().enumerate().take(sections).rev() {
         let sky = sky.as_ref().filter(|_| sky_light);
         let section = Arc::make_mut(&mut chunk.sections[si]);
         if sky.is_none() && block.is_none() && above.iter().all(|&v| v == above[0]) {
@@ -539,7 +547,8 @@ pub fn update_light_layers<L: AsRef<[u8]>>(
     sky_light: bool,
 ) -> Vec<usize> {
     let mut changed = Vec::new();
-    for (si, (sky, block)) in layers.iter().enumerate().take(SECTIONS) {
+    let sections = chunk.sections.len();
+    for (si, (sky, block)) in layers.iter().enumerate().take(sections) {
         let sky = sky.as_ref().filter(|_| sky_light);
         if sky.is_none() && block.is_none() {
             continue;
@@ -572,26 +581,22 @@ pub trait LightWorld {
 }
 impl<S: std::hash::BuildHasher> LightWorld for HashMap<(i32, i32), Arc<Chunk>, S> {
     fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
-        if !(MIN_Y..MIN_Y + HEIGHT).contains(&y) {
-            return None;
-        }
         self.get(&(x >> 4, z >> 4))
-            .filter(|c| c.lit)
+            .filter(|c| c.lit && c.section_index(y).is_some())
             .map(|c| c.get(x & 15, y, z & 15))
     }
     fn light(&self, x: i32, y: i32, z: i32) -> Option<u8> {
-        if !(MIN_Y..MIN_Y + HEIGHT).contains(&y) {
-            return None;
-        }
         self.get(&(x >> 4, z >> 4))
-            .filter(|c| c.lit)
+            .filter(|c| c.lit && c.section_index(y).is_some())
             .map(|c| c.light(x & 15, y, z & 15))
     }
     fn set_light(&mut self, x: i32, y: i32, z: i32, packed: u8) {
         let Some(chunk) = self.get_mut(&(x >> 4, z >> 4)) else {
             return;
         };
-        let s = ((y - MIN_Y) >> 4) as usize;
+        let Some(s) = chunk.section_index(y) else {
+            return;
+        };
         let i = index(x, y, z);
         if chunk.sections[s].light(i) == packed {
             return;
@@ -620,7 +625,7 @@ impl LightChanges {
     /// A cell whose stored light changed.
     #[inline]
     pub fn push(&mut self, (x, y, z): Pos) {
-        let key = (x >> 4, (y - MIN_Y) >> 4, z >> 4);
+        let key = (x >> 4, (y - layout().min_y()) >> 4, z >> 4);
         *self.sections.entry(key).or_default() |= 1 << Self::class(x, y, z);
     }
     /// Cells of section `key` (x, section index, z) in the given classes.
@@ -645,9 +650,10 @@ impl LightChanges {
         self.sections.keys().copied()
     }
     /// Every section (x, section index, z) whose cells lie within one block
-    /// of a changed cell, section indexes outside `0..SECTIONS` left out (a
+    /// of a changed cell, section indexes outside the column left out (a
     /// section next to several changed ones comes once for each).
     pub fn dirty_sections(&self, mut out: impl FnMut(Pos)) {
+        let sections = layout().sections() as i32;
         // Per class, the bit set of neighbour offsets (dx, dy, dz in -1..=1,
         // bit (dx + 1) + 3 (dy + 1) + 9 (dz + 1)) its cells reach.
         const REACH: [u32; 27] = {
@@ -683,7 +689,7 @@ impl LightChanges {
                 let o = offsets.trailing_zeros() as i32;
                 offsets &= offsets - 1;
                 let s = sy + o / 3 % 3 - 1;
-                if (0..SECTIONS as i32).contains(&s) {
+                if (0..sections).contains(&s) {
                     out((x + o % 3 - 1, s, z + o / 9 - 1));
                 }
             }
@@ -709,11 +715,12 @@ fn set_level(world: &mut impl LightWorld, sky: bool, p: Pos, value: u8) {
 /// `ChunkSkyLightSources`: the Y of the upper block of the highest occluded
 /// edge in the column (every block at or above it is a sky source).
 pub fn lowest_sky_source(world: &impl LightWorld, tables: &LightTables, x: i32, z: i32) -> i32 {
-    let mut y = MIN_Y + HEIGHT - 1;
+    let (min_y, max_y) = (layout().min_y(), layout().max_y());
+    let mut y = max_y - 1;
     let Some(mut top) = world.state(x, y, z) else {
-        return MIN_Y;
+        return min_y;
     };
-    while y > MIN_Y {
+    while y > min_y {
         let Some(bottom) = world.state(x, y - 1, z) else {
             break;
         };
@@ -723,7 +730,7 @@ pub fn lowest_sky_source(world: &impl LightWorld, tables: &LightTables, x: i32, 
         top = bottom;
         y -= 1;
     }
-    MIN_Y
+    min_y
 }
 /// Vanilla's `checkBlock` + `runLightUpdates` for changed positions on
 /// resident, lit chunks: clear the light that may have come through or from
@@ -740,6 +747,7 @@ pub fn relight(
     changed: &mut LightChanges,
 ) {
     relight_layer(world, tables, false, positions.to_vec(), force, changed);
+    let (min_y, max_y) = (layout().min_y(), layout().max_y());
     if sky_light {
         let mut seeds = positions.to_vec();
         let mut columns: HashMap<(i32, i32), i32> = HashMap::new();
@@ -751,13 +759,13 @@ pub fn relight(
             columns.insert((x, z), source);
             // Cells whose source status changed: non-15 at or above the new
             // lowest source, and old 15s (sources) below it.
-            for y in source..MIN_Y + HEIGHT {
+            for y in source..max_y {
                 if level(world, true, (x, y, z)).is_some_and(|l| l != 15) {
                     seeds.push((x, y, z));
                 }
             }
             let mut y = source - 1;
-            while y >= MIN_Y && level(world, true, (x, y, z)) == Some(15) {
+            while y >= min_y && level(world, true, (x, y, z)) == Some(15) {
                 seeds.push((x, y, z));
                 y -= 1;
             }
@@ -858,6 +866,7 @@ fn relight_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::{HEIGHT, MIN_Y, SECTIONS};
 
     const AIR: u32 = 0;
     const STONE: u32 = 1;
@@ -1173,6 +1182,24 @@ mod tests {
     }
 
     #[test]
+    fn a_tall_column_is_lit_to_its_top() {
+        let layout = crate::chunk::ColumnLayout::new(-64, 2096).unwrap();
+        let mut chunk = Chunk::with_layout(0, 0, layout);
+        for i in 0..256 {
+            chunk.set(i & 15, 1600, i >> 4, STONE);
+        }
+        chunk.set(8, 1500, 8, TORCH);
+        let region = [[None; 3], [None, Some(&chunk), None], [None; 3]];
+        let lights = light_chunk(&region, &tables(), true);
+        assert_eq!(lights.len(), 131);
+        apply_lighting(&mut chunk, lights);
+        assert_eq!(chunk.light(8, 1500, 8) & 15, 14);
+        assert_eq!(chunk.light(8, 1501, 8) & 15, 13);
+        assert_eq!(chunk.light(8, 1601, 8) >> 4, 15);
+        assert_eq!(chunk.light(8, 2031, 8), 0xF0);
+    }
+
+    #[test]
     fn empty_chunk_missing_neighbours_and_no_sky() {
         let mut chunk = Chunk::empty(0, 0);
         for sky in [false, true] {
@@ -1257,7 +1284,7 @@ mod tests {
         let mut old = fixture.clone();
         let mut new = fixture.clone();
         baseline_apply(&mut old, baseline_pack(&fixture, h, &sky, &block));
-        apply_lighting(&mut new, pack_lighting(h, &sky, &block, true));
+        apply_lighting(&mut new, pack_lighting(SECTIONS, h, &sky, &block, true));
         for (a, b) in old.sections.iter().zip(&new.sections) {
             for i in 0..4096 {
                 assert_eq!(a.light(i), b.light(i));
@@ -1274,14 +1301,20 @@ mod tests {
                     let mut current = fixture.clone();
                     let held = shared.then(|| current.clone());
                     // Warm up and detach for the uniquely-owned scenario.
-                    apply_lighting(&mut current, pack_lighting(h, &sky, &block, true));
+                    apply_lighting(&mut current, pack_lighting(SECTIONS, h, &sky, &block, true));
                     let started = Instant::now();
                     for _ in 0..500 {
                         let retained = shared.then(|| current.clone());
                         if optimized {
                             apply_lighting(
                                 black_box(&mut current),
-                                pack_lighting(h, black_box(&sky), black_box(&block), true),
+                                pack_lighting(
+                                    SECTIONS,
+                                    h,
+                                    black_box(&sky),
+                                    black_box(&block),
+                                    true,
+                                ),
                             );
                         } else {
                             baseline_apply(
