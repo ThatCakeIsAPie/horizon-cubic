@@ -22,8 +22,9 @@ const KINDS: [(&str, &str); 15] = [
     ("dimension", DIMENSIONS),
     ("dimension_type", DIMENSION_TYPES),
     ("worldgen/biome", "biomes"),
-    ("worldgen/configured_carver", "carvers"),
-    ("worldgen/configured_feature", "features"),
+    // 26.3's names: 26.2 called them configured_carver and configured_feature.
+    ("worldgen/carver", "carvers"),
+    ("worldgen/feature", "features"),
     ("worldgen/density_function", "densities"),
     ("worldgen/material_condition", "conditions"),
     ("worldgen/material_rule", "rules"),
@@ -363,6 +364,18 @@ mod tests {
             PackFile::Read
         );
         assert_eq!(
+            add("data/minecraft/worldgen/carver/cave.json", "6"),
+            PackFile::Read
+        );
+        assert_eq!(
+            add("data/minecraft/worldgen/feature/water_delta.json", "7"),
+            PackFile::Read
+        );
+        assert_eq!(
+            add("data/minecraft/worldgen/configured_carver/cave.json", "{}"),
+            PackFile::NotRead("worldgen/configured_carver".into())
+        );
+        assert_eq!(
             add("data/minecraft/worldgen/world_preset/normal.json", "{}"),
             PackFile::NotRead("worldgen/world_preset".into())
         );
@@ -377,6 +390,8 @@ mod tests {
         assert_eq!(get("settings"), [("minecraft:overworld", "3")]);
         assert_eq!(get("structure_sets"), [("minecraft:mineshafts", "4")]);
         assert_eq!(get(DIMENSIONS), [("minecraft:overworld", "5")]);
+        assert_eq!(get("carvers"), [("minecraft:cave", "6")]);
+        assert_eq!(get("features"), [("minecraft:water_delta", "7")]);
         assert_eq!(get("structures"), []);
         assert_eq!(o.tags("biome_tags").count(), 1);
     }
