@@ -2,13 +2,16 @@
 //! reports the resident block/biome memory, the cost of lookups, meshing and
 //! lighting on it.
 //!
-//! chunk_bench <client resource dir> [--seed S] [--size N]
+//! chunk_bench <client resource dir> [--seed S] [--size N] [--world DIR]
+//!
+//! `--world` generates with that world folder's enabled data packs, at its
+//! dimension types' height.
 #![forbid(unsafe_code)]
 use horizon_client::{
     assets::Assets,
     biome::Biomes,
     blocks::BlockFacts,
-    chunk::{Chunk, MIN_Y, SECTIONS},
+    chunk::{Chunk, layout},
     light::{LightTables, apply_lighting, light_chunk},
     mesher::{MeshTables, Mesher},
     models,
@@ -41,7 +44,49 @@ fn main() -> Result<()> {
         models::load_visibility(&root, assets.registry)?,
     )?;
     let light = LightTables::load(&root, assets.registry, &facts)?;
-    let terrain = VanillaTerrain::new(&root.join("worldgen"), assets.registry, &biomes, seed)?;
+    let world = args
+        .iter()
+        .position(|a| a == "--world")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
+    let overrides = match &world {
+        Some(world) => {
+            let packs = horizon_client::datapack::discover(world);
+            let enabled = horizon_client::datapack::enabled_ids(world, &packs);
+            let enabled: Vec<_> = enabled
+                .iter()
+                .filter_map(|id| packs.iter().find(|p| &p.id == id))
+                .collect();
+            let (o, warnings) =
+                horizon_client::datapack::worldgen_overrides(&enabled, |b| biomes.contains(b));
+            for w in warnings {
+                eprintln!("data pack: {w}");
+            }
+            let heights = horizon_client::chunk::LEVELS.map(|l| {
+                o.level_height(l)
+                    .unwrap_or_else(|| horizon_client::chunk::LevelHeight::vanilla(l).unwrap())
+            });
+            horizon_client::chunk::set_level_heights(heights)?;
+            o
+        }
+        None => Default::default(),
+    };
+    let column = layout();
+    println!(
+        "column: y {}..{} ({} sections)",
+        column.min_y(),
+        column.max_y(),
+        column.sections()
+    );
+    let terrain = VanillaTerrain::for_world_with(
+        &root.join("worldgen"),
+        &overrides,
+        assets.registry,
+        &biomes,
+        seed,
+        "minecraft:overworld",
+        true,
+    )?;
     let mut worker = terrain.worker();
 
     // Protos for size+4 columns, decorated for the inner size+2, finished as size+2.
@@ -114,18 +159,35 @@ fn main() -> Result<()> {
 
     // Memory.
     let (mut bytes, mut sections, mut uniform) = (0usize, 0usize, 0usize);
+    let top = chunks
+        .iter()
+        .flat_map(|c| {
+            (0..256).filter_map(move |i| c.highest(0, |y| c.get(i & 15, y, i >> 4) != 0))
+        })
+        .max()
+        .unwrap_or(column.min_y());
+    println!("highest block: y {top}");
+    // Each distinct section once (shared ones are one allocation), with its
+    // Arc header and struct, and an 8-byte slot per section of every column.
+    let mut seen = std::collections::HashSet::new();
     for chunk in &chunks {
-        bytes += chunk.heap_bytes();
         for s in &chunk.sections {
             sections += 1;
             uniform += usize::from(s.is_uniform(s.get(0)));
+            bytes += std::mem::size_of::<usize>();
+            if seen.insert(Arc::as_ptr(s)) {
+                bytes += s.heap_bytes()
+                    + std::mem::size_of::<horizon_client::chunk::Section>()
+                    + 2 * std::mem::size_of::<usize>();
+            }
         }
     }
     println!(
-        "resident: {} chunks, {} sections ({} uniform), {:.1} KiB per chunk ({:.2} MiB total)",
+        "resident: {} chunks, {} sections ({} uniform, {} distinct), {:.1} KiB per chunk ({:.2} MiB total)",
         chunks.len(),
         sections,
         uniform,
+        seen.len(),
         bytes as f64 / 1024.0 / chunks.len() as f64,
         bytes as f64 / 1048576.0
     );
@@ -156,7 +218,7 @@ fn main() -> Result<()> {
                     std::array::from_fn(|dx| Some(at(x + dx as i32 - 1, z + dz as i32 - 1)))
                 });
                 let borrowed = horizon_client::mesher::borrow(&region);
-                for sy in 0..SECTIONS as i32 {
+                for sy in 0..column.sections() as i32 {
                     let mesh = mesher.mesh(&borrowed, sy);
                     quads += (mesh.solid.len() + mesh.translucent.len()) / 4;
                     jobs += 1;
@@ -185,7 +247,7 @@ fn main() -> Result<()> {
         let chunk = &chunks[((cz - 1) * inner + cx - 1) as usize];
         let (x, y, z) = (
             (state >> 16) as i32 & 15,
-            MIN_Y + ((state >> 24) % 384) as i32,
+            column.min_y() + ((state >> 24) % column.height() as u64) as i32,
             (state >> 40) as i32 & 15,
         );
         sum += u64::from(chunk.get(x, y, z));
@@ -199,7 +261,7 @@ fn main() -> Result<()> {
     let mut sum = 0u64;
     for _ in 0..4 {
         for chunk in &chunks {
-            for y in MIN_Y..MIN_Y + 384 {
+            for y in column.min_y()..column.max_y() {
                 for z in 0..16 {
                     for x in 0..16 {
                         sum += u64::from(chunk.get(x, y, z));
@@ -210,7 +272,14 @@ fn main() -> Result<()> {
     }
     println!(
         "scan get: {:.2} ns per lookup (checksum {sum})",
-        started.elapsed().as_secs_f64() * 1e9 / (4.0 * chunks.len() as f64 * 98304.0)
+        started.elapsed().as_secs_f64() * 1e9
+            / (4.0 * chunks.len() as f64 * 256.0 * f64::from(column.height()))
     );
+    // The process's peak resident memory, where the system reports it.
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status")
+        && let Some(peak) = status.lines().find(|l| l.starts_with("VmHWM:"))
+    {
+        println!("peak resident: {}", peak["VmHWM:".len()..].trim());
+    }
     Ok(())
 }
