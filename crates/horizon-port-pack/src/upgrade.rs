@@ -110,7 +110,12 @@ pub fn upgrade_pack(files: &BTreeMap<String, Vec<u8>>) -> (BTreeMap<String, Vec<
         }
     }
     for (id, v) in std::mem::take(&mut ctx.generated) {
-        let path = density_path(&id);
+        let path = registry_path("worldgen/density_function", &id);
+        report.added.push(path.clone());
+        written.insert(path, v);
+    }
+    for (id, v) in std::mem::take(&mut ctx.rules) {
+        let path = registry_path("worldgen/material_rule", &id);
         report.added.push(path.clone());
         written.insert(path, v);
     }
@@ -178,9 +183,9 @@ impl PackFile {
     }
 }
 
-fn density_path(id: &str) -> String {
+fn registry_path(registry: &str, id: &str) -> String {
     let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id));
-    format!("data/{ns}/worldgen/density_function/{path}.json")
+    format!("data/{ns}/{registry}/{path}.json")
 }
 
 /// A type name without its `minecraft:` prefix, as the codecs read both.
@@ -387,6 +392,8 @@ struct Context<'a> {
     all_cells: BTreeSet<(i64, i64)>,
     /// Named density functions the upgrade adds, by id.
     generated: BTreeMap<String, Value>,
+    /// Material rules the upgrade adds (one per noise settings), by id.
+    rules: BTreeMap<String, Value>,
 }
 
 impl<'a> Context<'a> {
@@ -411,6 +418,7 @@ impl<'a> Context<'a> {
             cells: BTreeMap::new(),
             all_cells: BTreeSet::new(),
             generated: BTreeMap::new(),
+            rules: BTreeMap::new(),
         };
         for s in settings {
             let cell = cell_of(s.get("noise").unwrap_or(&Value::Null));
@@ -776,7 +784,12 @@ impl<'a> Context<'a> {
                 "final_density": {"type": "minecraft:add", "left": final_density,
                     "right": {"type": "minecraft:beardifier"}}}),
         );
-        n.insert("material_rule".into(), rule);
+        // Named, as vanilla names its own (and as Horizon reads them), under
+        // the settings' id so other vanilla settings keep their rule.
+        let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id));
+        let rule_id = format!("{ns}:{path}/upgraded/material_rule");
+        self.rules.insert(rule_id.clone(), rule);
+        n.insert("material_rule".into(), Value::String(rule_id));
         let climate = [
             ("temperature", n["noise_router"]["temperature"].clone()),
             ("humidity", n["noise_router"]["vegetation"].clone()),
@@ -1438,7 +1451,15 @@ mod tests {
             "disable_mob_generation": false, "legacy_random_source": false,
             "spawn_target": [{"temperature": [-1, 1], "humidity": [-1, 1], "continentalness": [-0.11, 1],
                 "erosion": [-1, 1], "weirdness": [-1, -0.16], "depth": 0, "offset": 0}]});
-        let (s, _) = up("data/x/worldgen/noise_settings/s.json", settings);
+        let files = BTreeMap::from([(
+            "data/x/worldgen/noise_settings/s.json".to_owned(),
+            serde_json::to_vec(&settings).unwrap(),
+        )]);
+        let (out, _) = upgrade_pack(&files);
+        let read = |p: &str| -> Value { serde_json::from_slice(&out[p]).unwrap() };
+        let s = read("data/x/worldgen/noise_settings/s.json");
+        assert_eq!(s["material_rule"], json!("x:s/upgraded/material_rule"));
+        let rule = read("data/x/worldgen/material_rule/s/upgraded/material_rule.json");
         let aquifers = &s["aquifers"];
         assert_eq!(aquifers["barrier"], json!(1.0));
         assert_eq!(
@@ -1446,7 +1467,7 @@ mod tests {
             json!("x:s/upgraded/preliminary_surface_level")
         );
         assert_eq!(aquifers["exclusion"]["left"]["right"], json!("x:e"));
-        let rules = s["material_rule"]["sequence"].as_array().unwrap();
+        let rules = rule["sequence"].as_array().unwrap();
         assert_eq!(rules.len(), 3);
         assert_eq!(rules[0]["type"], json!("minecraft:ore_vein"));
         assert_eq!(
