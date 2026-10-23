@@ -81,6 +81,19 @@ impl AmbientTables {
             .cloned()
             .unwrap_or_default()
     }
+    /// `get` in a biome a data pack gave (`pack`, its file) or the
+    /// built-in biome `biome`.
+    pub fn at(&self, dimension: &str, biome: &str, pack: Option<&Value>) -> AmbientSounds {
+        let Some(json) = pack else {
+            return self.get(dimension, biome);
+        };
+        let v = &json["attributes"]["minecraft:audio/ambient_sounds"];
+        if v.is_null() {
+            self.dimensions.get(dimension).cloned().unwrap_or_default()
+        } else {
+            AmbientSounds::parse(v)
+        }
+    }
 }
 /// What the handlers read about the player and level each tick.
 pub struct AmbientContext<'a> {

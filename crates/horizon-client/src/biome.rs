@@ -46,6 +46,9 @@ pub struct BiomeInfo {
     /// The biome's own fog colour attribute; otherwise the dimension's applies.
     pub fog: Option<u32>,
     pub water_fog: u32,
+    /// The `visual/ambient_particles` attribute: particle type names and
+    /// their chances per animated block.
+    pub ambient_particles: Vec<(String, f32)>,
 }
 /// The game's biomes, by id. The built-in (vanilla) biomes come first, in
 /// file order, and keep their ids whatever a world's data packs do; a pack's
@@ -148,6 +151,21 @@ impl BiomeInfo {
             sky: color(&attributes["minecraft:visual/sky_color"]),
             fog: color(&attributes["minecraft:visual/fog_color"]),
             water_fog: color(&attributes["minecraft:visual/water_fog_color"]).unwrap_or(0x050533),
+            ambient_particles: {
+                let list = &attributes["minecraft:visual/ambient_particles"];
+                let entries = list["argument"].as_array().or_else(|| list.as_array());
+                entries
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| {
+                        let ty = e["particle"]["type"].as_str()?;
+                        Some((
+                            ty.to_owned(),
+                            e["probability"].as_f64().unwrap_or(0.0) as f32,
+                        ))
+                    })
+                    .collect()
+            },
             name,
         }
     }
@@ -388,7 +406,12 @@ mod pack_tests {
     fn packs_replace_in_place_and_add_after_the_builtin_biomes() {
         let base = builtin(&["minecraft:meadow", "minecraft:plains", "minecraft:river"]);
         let red = json!({"temperature": 2.0, "effects": {"water_color": "#ff0000"}});
-        let hot = json!({"effects": {"grass_color": 0x123456}});
+        let hot = json!({
+            "effects": {"grass_color": 0x123456},
+            "attributes": {"minecraft:visual/ambient_particles": [
+                {"particle": {"type": "minecraft:ash"}, "probability": 0.25}
+            ]}
+        });
         let files = [
             ("pack:zeta", &hot),
             ("minecraft:molten_peaks", &hot),
@@ -404,6 +427,10 @@ mod pack_tests {
         assert_eq!(world.id("minecraft:molten_peaks"), 3);
         assert_eq!(world.id("pack:zeta"), 4);
         assert_eq!(world.get(3).grass, 0x123456);
+        assert_eq!(
+            world.get(3).ambient_particles,
+            [("minecraft:ash".to_owned(), 0.25)]
+        );
         assert!(world.pack_file("minecraft:river").is_some());
         assert!(world.pack_file("minecraft:plains").is_none());
         // The network registry sorts every name by path, then namespace.

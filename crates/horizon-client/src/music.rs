@@ -195,6 +195,28 @@ impl MusicTables {
             .or_else(|| self.dimensions.get(dimension).and_then(|l| l.volume))
             .unwrap_or(1.0)
     }
+    /// `background` and `volume` in a biome a data pack gave (`pack`, its
+    /// file) or the built-in biome `biome`.
+    pub fn at(&self, dimension: &str, biome: &str, pack: Option<&Value>) -> (BackgroundMusic, f32) {
+        let Some(json) = pack else {
+            return (
+                self.background(dimension, biome),
+                self.volume(dimension, biome),
+            );
+        };
+        let layer = Layer::parse(json);
+        let dimension = self.dimensions.get(dimension);
+        (
+            layer
+                .music
+                .or_else(|| dimension.and_then(|l| l.music.clone()))
+                .unwrap_or_default(),
+            layer
+                .volume
+                .or_else(|| dimension.and_then(|l| l.volume))
+                .unwrap_or(1.0),
+        )
+    }
 }
 /// `MusicManager.MusicFrequency` (the `musicFrequency` option).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

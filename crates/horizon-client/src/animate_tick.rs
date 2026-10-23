@@ -395,7 +395,23 @@ fn do_animate_tick(
             .chunks
             .get(&(x >> 4, z >> 4))
             .map_or(0, |c| c.biome(x, y, z));
-        for &(ty, probability) in tables.ambient.get(biome as usize).into_iter().flatten() {
+        // A data pack's biome: its own particles (the tables have the
+        // built-in biomes' files).
+        let info = ctx.biomes.get(biome);
+        let pack: Option<Vec<(T, f32)>> = ctx.biomes.pack_file(&info.name).map(|_| {
+            info.ambient_particles
+                .iter()
+                .filter_map(|(name, p)| Some((T::from_name(name)?, *p)))
+                .collect()
+        });
+        let list = match &pack {
+            Some(pack) => &pack[..],
+            None => tables
+                .ambient
+                .get(biome as usize)
+                .map_or(&[][..], |l| &l[..]),
+        };
+        for &(ty, probability) in list {
             // AmbientParticle.canSpawn: random.nextFloat() <= probability.
             let random = engine.random();
             if random.next_float() <= probability {
