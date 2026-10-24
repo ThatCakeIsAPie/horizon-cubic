@@ -15,6 +15,9 @@ off `main` at `3051dda`.
 > all (4 are done). Local commits only: don't push or merge to `main` without
 > asking me. Follow AGENTS.md.
 
+(Done on the Linux laptop, 2026-10-24: the loop has its 10 kept commits; see
+"Autoresearch loop". Nothing pushed.)
+
 ## What's on this branch
 
 1. **Baked LODs** (`crates/horizon-client/src/lod/bake.rs`, hooked into
@@ -77,8 +80,10 @@ off `main` at `3051dda`.
 ## Autoresearch loop (chunk generation)
 
 Goal: more finished chunks/s in `world_chunkgen_bench`, generation output
-bit-identical. Stop at **10 kept commits; 4 so far** (the two bench-checksum
-commits are setup and don't count).
+bit-identical. **Done: 10 kept commits** (the two bench-checksum commits are
+setup and don't count): 4 on the Windows PC, then 6 on the Linux laptop from
+three agents working in parallel, one area each (branches `ttm/cg-surface`,
+`ttm/cg-noise`, `ttm/cg-structures`), cherry-picked together here.
 
 **Setup.** TTM world copy (never the real save: the bench writes
 `horizon_rings.json` into it), seed 0, `--size 16 --threads 6`. The bench's
@@ -102,7 +107,29 @@ build's bench binary so it can be rerun.
 | discarded | Same "build free ones first" for neighbour biome chunks | 50.6 -> 50.8 |
 | discarded | Ore vein / uncached conditions out of line (smaller `apply` frames) | 59.0 -> 59.5 |
 
-Overall so far: **43.9 -> ~60 finished chunks/s (+37%)**.
+Windows PC (i7 4c/8t): **43.9 -> ~60 finished chunks/s (+37%)**.
+
+Linux laptop (Ryzen 5 7640U 6c/12t; numbers are higher here, so compare
+within a row only; each row interleaved with its branch's previous build):
+
+| Commit | Change | Interleaved finished chunks/s |
+|---|---|---|
+| `c32d434a` | Ore veins: skip heights where their eagerly sampled density can't be > 0 (TTM's rule starts with two veins) | 108.7 -> 115.7 |
+| `fc5a81ea` | Surface: the compiled rule runs as a flat program (jumps past failed conditions), not a recursive tree | 124.3 -> 134.4 |
+| `47715c83` | `DensityVolume` accessors `#[inline]` (the fast build has no LTO; `steps` was 3.6% of CPU) | 109.0 -> 114.3 |
+| `5e0a3185` | Noise fill reuses the terrain-density cells the biome stage sampled (TTM's ridges are a spline of that density); 1024-chunk cache, only for pointwise samplers | 121.6 -> 129.3 |
+| `3bf7bcf8` | Structure column checks sample the column's climate in one batched volume, as vanilla's `couldStructureExistInColumn` does (was ~525 single samples a column) | 116.4 -> 138.2 |
+| `47bc505f` | Decoration setup: biome list by bitset, one tick tracker per region, one-section placeholder chunks | 136.6 -> 139.4 (6 pairs) |
+| discarded | Perlin `add_volume`: reuse a Y sample identical to the previous one | 123.8 -> 124.3 |
+| discarded | Splines as flat arrays with a last-interval hint (spline self 6.1% -> 5.1%) | 124.4 -> 125.1 |
+
+**Combined (all 10), laptop, 5 interleaved rounds:** `9d03d424` 115.7
+(115.0-118.5) -> **158.9 (158.5-162.6), +37%**; each branch alone: surface
+133.5, noise 129.9, structures 138.5 (the gains overlap, so they don't add).
+All four checksums identical in all 25 runs. Per chunk on one thread, surface
+18.8 -> 13.9 ms. Laptop bench tooling (outside the repo): `~/Work/ttm-bench`
+(`build.sh`, `ab.sh`, `profile.sh` + `tools/top.py` for samply, `BRIEF.md`,
+`log-*.md` with every attempt).
 
 **Profile at `a129fb20`** (a sampling profiler suspending the workers, Windows
 without admin; on Linux use `perf`/`samply`): surface 41% of samples
@@ -115,13 +142,25 @@ waiting on another thread's build of the same start chunk, line 323 of
 `generator_structures.rs`), biome-chunk waits 3-4%, Perlin `get3` 9% self (4%
 from per-column 2D noise conditions, 2.4% climate samples for structures).
 
-**Ideas not tried yet:** flatten the compiled surface rule tree into a loop
-(no recursion per node); a per-column last-cell biome cache in
-`SurfaceQueries::biome_id` (uniform cells hit 80%; zoom ~150 ns otherwise);
-help while waiting on a busy start chunk (build start chunks the next chunks
-will need); spline evaluation cost (`CubicSpline::sample`, closure per
-coordinate, binary search); ore-vein eager density volumes cover air above the
-terrain (4.6 ms a chunk for 440k samples; only ~118k are read).
+**Ideas not tried yet** (from the laptop agents' reports):
+- Surface: a per-column cache of the current quart cell in
+  `SurfaceQueries::biome_id` (up to ~3.8% of CPU); sample the shared ore
+  richness volume only up to the heights its gates allow (~1.4%); fold
+  `Compiled::test` into one match without revision stamps for block-level
+  nodes. The per-column outcome memo ranks below these (biome changes with y in
+  mixed cells; gradients and the sulfur 3D noise would have to be keyed).
+- Noise: single-point climate samples (structure and carver biome checks,
+  ~10% of CPU) could read the same cached cells; the fill loop's per-block
+  `dyn` aquifer call (`compute_substance` ~4%); biome-name lookups and the 9
+  neighbour `BiomeChunk` clones are small (<= 1.5%). Perlin `get3` (11% self)
+  is tight; only fewer calls help.
+- Structures: what's left is three slow start chunks; the abandoned camp's
+  58 ms is 52 ms of first-use template loading (Horizon loads a whole pool's
+  templates at once, vanilla each on first try). "Help while waiting" gains
+  little: other start chunks take ~0.01 ms.
+- Decoration (thin now): dripstone clusters 21% of it (block reads through four
+  layers), ore `any_height_at_least` ~4%, placement biome lookups ~6%; each is
+  0.5-1% overall, so group them to clear the 2% bar.
 
 **Pitfalls met:** `Debug` of `ProtoChunkTicks` includes a `HashSet` (random
 order): hash `pack(0)` instead. In Rust 2024, `while let Some(x) =
@@ -149,8 +188,8 @@ Numbers are per machine: take a new baseline there before comparing.
 1. ~~Cache stronghold ring positions with the world~~: done (5 above). Not yet
    seen in the game itself: the log should say "stronghold positions kept in"
    on the first load and "read from" on the next.
-2. **Chunk generation speed**: in progress, see "Autoresearch loop" (surface
-   rules went from ~80 to ~40 ms a chunk on 6 threads).
+2. **Chunk generation speed**: loop done, 10 kept commits, see "Autoresearch
+   loop" (+37% on the Windows PC, then +37% more on the laptop).
 3. **Confirm the mouse fix** in real play on Windows (alt-tab, notifications).
 4. **Clean timing of baked LODs**: launch the same world twice with nothing else
    running and log `lod.sampled_target_tiles` / `target_tiles` from
