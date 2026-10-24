@@ -171,6 +171,16 @@ impl<R: RandomSource> CompiledRule<R> {
                 densities,
                 random,
             } => {
+                // Most blocks lie outside a vein's heights: the density read
+                // would give `<= 0`, and nothing happens before it. The
+                // heights are the buffer's as sampled now (`retarget` moves it).
+                if context
+                    .surface
+                    .density_heights(densities[0])
+                    .is_some_and(|heights| heights.never_positive(context.position))
+                {
+                    return Ok(None);
+                }
                 // Densities use the context; randomness uses application coordinates.
                 let density = context.surface.density(densities[0], context.position)?;
                 if density <= 0.0 {
