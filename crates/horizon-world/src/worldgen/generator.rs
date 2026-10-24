@@ -1505,6 +1505,46 @@ enum Biomes<'a, 'b> {
         &'a mut super::biome_source::BiomeSourceResolver<'b>,
         &'a mut SamplerContext,
     ),
+    /// A resolver whose answers are kept per quart: far sampling paints eight
+    /// depths of every column, and neighbouring columns share quarts, so most
+    /// queries repeat one (each is a full climate sample and parameter search).
+    Memo(
+        &'a mut super::biome_source::BiomeSourceResolver<'b>,
+        &'a mut SamplerContext,
+        &'a mut BiomeMemo,
+    ),
+}
+/// Resolved biomes by quart (`Biomes::Memo`).
+struct BiomeMemo {
+    biomes: HashMap<[i32; 3], BiomeId>,
+    /// One biome per column, the first one asked (its surface's): far cells
+    /// wider than a quart don't show a biome change a few blocks down.
+    columns: bool,
+}
+/// The biome at `quart`, resolved once per quart (`Biomes::Memo`).
+fn memo_biome(
+    data: &GeneratorData,
+    resolver: &mut super::biome_source::BiomeSourceResolver<'_>,
+    context: &mut SamplerContext,
+    memo: &mut BiomeMemo,
+    quart: [i32; 3],
+) -> Result<BiomeId, MaterialRuleError> {
+    let key = if memo.columns {
+        [quart[0], 0, quart[2]]
+    } else {
+        quart
+    };
+    if let Some(&id) = memo.biomes.get(&key) {
+        return Ok(id);
+    }
+    let name = resolver
+        .sample(context, quart)
+        .map_err(|_| MaterialRuleError::BiomeQueryFailed)?;
+    let id = data
+        .biome_id(name)
+        .ok_or(MaterialRuleError::MissingBiome)?;
+    memo.biomes.insert(key, id);
+    Ok(id)
 }
 // Lazy equality proofs for the eight quart corners of a block-biome cell.
 // Adjacent blocks share these candidates even though their zoom distances differ.
@@ -1624,6 +1664,13 @@ impl<R: RandomSource> MaterialSurfaceQueries for SurfaceQueries<'_, '_, R> {
                     .map_err(|_| MaterialRuleError::BiomeQueryFailed)?;
                 data.biome_id(name).ok_or(MaterialRuleError::MissingBiome)?
             }
+            Biomes::Memo(resolver, context, memo) => memo_biome(
+                data,
+                resolver,
+                context,
+                memo,
+                self.pipeline.zoom.quart_at_block(p),
+            )?,
         };
         Ok(Some(data.biome_names[id.0 as usize].clone()))
     }
@@ -2011,8 +2058,16 @@ where
         let oz = z.div_euclid(4) * 4;
         let nx = ((x - ox + (side as i32 - 1) * width + step_xz - 1) / step_xz) + 1;
         let nz = ((z - oz + (side as i32 - 1) * width + step_xz - 1) / step_xz) + 1;
-        let ny = (height + 7) / 8 + 1;
-        let volume = DensityVolume::new([nx, ny, nz], [ox, min, oz], [step_xz, 8, step_xz])
+        // Cells many blocks wide keep their interpolated shape on a coarser
+        // vertical lattice, for a fraction of the density work (tall worlds
+        // have hundreds of 8-block layers).
+        let step_y = match width {
+            ..32 => 8,
+            32..128 => 16,
+            _ => 32,
+        };
+        let ny = (height + step_y - 1) / step_y + 1;
+        let volume = DensityVolume::new([nx, ny, nz], [ox, min, oz], [step_xz, step_y, step_xz])
             .map_err(stage("far density"))?;
         let mut densities = vec![0.; volume.size()];
         self.router
@@ -2051,6 +2106,10 @@ where
             self.router.get(RouterField::Erosion).as_ref(),
         );
         let mut biome_context = SamplerContext::cached();
+        let mut biome_memo = BiomeMemo {
+            biomes: HashMap::new(),
+            columns: width >= 4,
+        };
         for dz in 0..side {
             for dx in 0..side {
                 let (wx, wz) = (x + dx as i32 * width, z + dz as i32 * width);
@@ -2063,8 +2122,8 @@ where
                     *density = value(wx, iy, wz);
                 }
                 for y in (min..min + height).rev() {
-                    let iy = (y - min) as usize / 8;
-                    let alpha = ((y - min) % 8) as f32 / 8.;
+                    let iy = ((y - min) / step_y) as usize;
+                    let alpha = ((y - min) % step_y) as f32 / step_y as f32;
                     let density = profile[iy] + (profile[iy + 1] - profile[iy]) * alpha;
                     let state = aquifer
                         .compute_substance([wx, y, wz], f64::from(density))
@@ -2096,15 +2155,14 @@ where
                     }
                 }
                 let biome = if let Some((height, _)) = top {
-                    let name = resolver
-                        .sample(
-                            &mut biome_context,
-                            self.zoom.quart_at_block(BlockPos::new(wx, height - 1, wz)),
-                        )
-                        .map_err(stage("far biome"))?;
-                    self.data
-                        .biome_id(name)
-                        .ok_or_else(|| resource("far biome"))?
+                    memo_biome(
+                        &self.data,
+                        &mut resolver,
+                        &mut biome_context,
+                        &mut biome_memo,
+                        self.zoom.quart_at_block(BlockPos::new(wx, height - 1, wz)),
+                    )
+                    .map_err(stage("far biome"))?
                 } else {
                     BiomeId(0)
                 };
@@ -2122,7 +2180,7 @@ where
         let queries = SurfaceQueries {
             pipeline: self,
             temperatures: &mut worker.temperatures,
-            biome: Biomes::Resolver(&mut resolver, &mut biome_context),
+            biome: Biomes::Memo(&mut resolver, &mut biome_context, &mut biome_memo),
             uniform_biomes: None,
             possible: None,
         };

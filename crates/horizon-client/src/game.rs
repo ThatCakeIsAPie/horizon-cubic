@@ -4607,6 +4607,31 @@ impl Game<'_> {
         }
         window.set_cursor_visible(!self.captured);
     }
+    /// Windows has no locked pointer: `capture` confines the hidden cursor to
+    /// the window, but the system drops that clip (focus changes, overlays,
+    /// other programs' `ClipCursor`), and turning then walks the hidden cursor
+    /// out of the window, where the next click lands. Like GLFW's disabled
+    /// cursor (`_glfwCenterCursorInContentArea` on every move), put it back in
+    /// the centre and clip it again. Looking reads raw motion, which a warp
+    /// doesn't produce.
+    #[cfg(windows)]
+    fn keep_captured_cursor(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
+        if !self.captured || !self.focused || self.agent_pointer {
+            return;
+        }
+        let Some(window) = &self.window else { return };
+        let size = window.inner_size();
+        let centre = winit::dpi::PhysicalPosition::new(
+            f64::from(size.width) / 2.0,
+            f64::from(size.height) / 2.0,
+        );
+        // A warp comes back as a move to the centre.
+        if (position.x - centre.x).abs() < 2.0 && (position.y - centre.y).abs() < 2.0 {
+            return;
+        }
+        let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+        let _ = window.set_cursor_position(centre);
+    }
     /// LevelLoadingScreen.onClose -> Gui.setScreen(null) -> grabMouse.
     fn capture_loaded_world(&mut self) {
         // Loading may finish after focus was lost or another screen opened.
@@ -10821,6 +10846,8 @@ impl ApplicationHandler for Game<'_> {
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
+                    #[cfg(windows)]
+                    self.keep_captured_cursor(position);
                     if let Some(r) = &self.renderer {
                         let b = HudBatch::new([r.config.width, r.config.height]);
                         self.cursor = (position.x as f32 / b.scale, position.y as f32 / b.scale);

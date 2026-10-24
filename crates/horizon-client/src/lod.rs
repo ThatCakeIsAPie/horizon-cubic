@@ -7,6 +7,7 @@ use crate::{
     mesher::SectionMesh,
     streaming::{LodSource, WorkerContext},
 };
+pub(crate) mod bake;
 mod mesh;
 use horizon_world::registry::BlockStateId;
 use std::{
@@ -24,7 +25,7 @@ const MAX_SAVED: usize = 1024;
 /// How many resident chunks may wait for the worker's summary at once
 /// (`Lod::observing`).
 pub const OBSERVE_AHEAD: usize = 8;
-const SAMPLE_JOBS: usize = 4;
+const SAMPLE_JOBS: usize = 6;
 /// While the near terrain loads on a machine with four threads or fewer, far
 /// terrain starts one sample job at most this often and no detail: it would
 /// otherwise take the cores the near chunks and the frame need.
@@ -517,7 +518,8 @@ struct Shared {
     wake: Condvar,
     stop: AtomicBool,
 }
-/// One background worker and at most two outstanding sample jobs. Only the
+/// One background worker, sampling threads and at most `SAMPLE_JOBS`
+/// outstanding sample jobs. Only the
 /// current view's quadtree and a bounded set of visited summaries are retained.
 pub struct Lod {
     shared: Arc<Shared>,
@@ -576,9 +578,12 @@ impl Lod {
             .name("Far terrain".into())
             .spawn(move || {
                 let mut sampler = source.sampler();
+                // Half the hardware threads less one: far terrain waits for
+                // the near terrain on small machines (`held`), and ticks and
+                // frames run ahead of these helpers (`horizon_threads`).
                 let count = thread::available_parallelism()
-                    .map_or(1, |n| n.get() / 4)
-                    .clamp(1, 3);
+                    .map_or(1, |n| (n.get() / 2).saturating_sub(1))
+                    .clamp(1, 6);
                 let mut sampling = Vec::new();
                 for _ in 0..count {
                     let Some(mut sample) = sampler.fork() else {
@@ -590,6 +595,7 @@ impl Lod {
                         thread::Builder::new()
                             .name("Far sampling".into())
                             .spawn(move || {
+                                horizon_threads::behind_server();
                                 loop {
                                     let key = {
                                         let mut jobs = shared.jobs.lock().unwrap();

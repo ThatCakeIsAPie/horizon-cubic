@@ -2986,6 +2986,8 @@ struct SavedLodSampler<G: ChunkGenerator> {
     inner: Box<dyn crate::streaming::LodSampler>,
     cache: std::collections::VecDeque<((i32, i32), Option<LodSurfaces>)>,
     details: Vec<crate::streaming::LodDetail>,
+    /// The generator's far output from earlier sessions (`lod::bake`).
+    bake: Option<Arc<crate::lod::bake::LodBake>>,
 }
 impl<G: ChunkGenerator> SavedLodSampler<G> {
     fn saved_columns(&mut self, key: (i32, i32)) -> Option<LodSurfaces> {
@@ -3014,12 +3016,15 @@ impl<G: ChunkGenerator> crate::streaming::LodSampler for SavedLodSampler<G> {
             inner: self.inner.fork()?,
             cache: Default::default(),
             details: Vec::new(),
+            bake: self.bake.clone(),
         }))
     }
     fn request_detail(&mut self, chunks: &[(i32, i32)], center: [i32; 2]) {
         let mut missing = Vec::new();
         for &key in chunks {
             if let Some(columns) = self.saved_columns(key) {
+                self.details.push((key, columns));
+            } else if let Some(columns) = self.bake.as_ref().and_then(|b| b.detail(key.0, key.1)) {
                 self.details.push((key, columns));
             } else {
                 missing.push(key);
@@ -3032,12 +3037,28 @@ impl<G: ChunkGenerator> crate::streaming::LodSampler for SavedLodSampler<G> {
         for (key, generated) in self.inner.drain_details() {
             // A generation batch also returns neighbouring, unrequested chunks.
             // Their saved builds must take precedence too.
-            details.push((key, self.saved_columns(key).unwrap_or(generated)));
+            let columns = match self.saved_columns(key) {
+                Some(saved) => saved,
+                None => {
+                    if let Some(bake) = &self.bake {
+                        bake.put_detail(key.0, key.1, &generated);
+                    }
+                    generated
+                }
+            };
+            details.push((key, columns));
         }
         details
     }
     fn grid(&mut self, x: i32, z: i32, stride: i32, side: usize) -> Vec<crate::lod::Column> {
-        let mut columns = self.inner.grid(x, z, stride, side);
+        let baked = self.bake.as_ref().and_then(|b| b.grid(x, z, stride, side));
+        let mut columns = baked.unwrap_or_else(|| {
+            let columns = self.inner.grid(x, z, stride, side);
+            if let Some(bake) = &self.bake {
+                bake.put_grid(x, z, stride, side, &columns);
+            }
+            columns
+        });
         if stride <= 16 {
             for (index, column) in columns.iter_mut().enumerate() {
                 let (wx, wz) = (
@@ -3332,11 +3353,18 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
     }
     fn lod_sampler(self: Arc<Self>) -> Box<dyn crate::streaming::LodSampler> {
         let inner = ChunkGenerator::lod_sampler(self.inner.clone());
+        let bake = crate::lod::bake::LodBake::open(
+            &self.save.root,
+            self.registry.registry.len(),
+            self.biomes.list.len(),
+        )
+        .map(Arc::new);
         Box::new(SavedLodSampler {
             generator: self,
             inner,
             cache: Default::default(),
             details: Vec::new(),
+            bake,
         })
     }
     fn load(&self, x: i32, z: i32) -> Option<Chunk> {
@@ -3565,6 +3593,7 @@ mod tests {
             inner: Box::new(SavedOnly(Vec::new())),
             cache: Default::default(),
             details: Vec::new(),
+            bake: None,
         };
         use crate::streaming::LodSampler;
         sampler.request_detail(&[(-2, 3)], [-32, 48]);
