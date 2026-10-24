@@ -570,6 +570,17 @@ impl VanillaTerrain {
     fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.created.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
+    /// Keeps the ring positions in the folder `dimension` across sessions
+    /// (`ring_cache`); `worldgen` is the bundle this generator was built from.
+    pub fn keep_rings(&self, dimension: &Path, worldgen: &Path) {
+        crate::ring_cache::keep(
+            &self.generator,
+            dimension,
+            worldgen,
+            self.seed,
+            &self.dimension,
+        );
+    }
 }
 /// A bundle directory, the data packs over it, and what loading them gave.
 type SharedEntry = (std::path::PathBuf, WorldgenOverrides, Arc<GeneratorData>);

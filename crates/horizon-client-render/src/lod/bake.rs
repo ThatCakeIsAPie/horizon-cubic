@@ -253,7 +253,18 @@ impl LodBake {
 
 /// What baked columns depend on besides the world's seed (fixed per world).
 fn fingerprint(dimension: &Path, shape: LevelShape, block_states: usize, biomes: usize) -> String {
-    let exe = std::env::current_exe()
+    let exe = exe_stamp();
+    let packs = world_packs_digest(dimension);
+    format!(
+        "{FORMAT}\nversion {}\nexe {exe}\nlevel {} {}\nblock_states {block_states}\nbiomes {biomes}\ndatapacks {packs}\n",
+        env!("CARGO_PKG_VERSION"),
+        shape.min_y,
+        shape.height,
+    )
+}
+/// The running game build: its size and change time.
+pub fn exe_stamp() -> String {
+    std::env::current_exe()
         .and_then(fs::metadata)
         .map(|m| {
             let modified = m
@@ -263,22 +274,19 @@ fn fingerprint(dimension: &Path, shape: LevelShape, block_states: usize, biomes:
                 .map_or(0, |d| d.as_nanos());
             format!("{} {modified}", m.len())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+/// `files_digest` of the data packs of the world `dimension` is a folder of.
+pub fn world_packs_digest(dimension: &Path) -> String {
     // `dimensions/<namespace>/<path>` inside the world folder.
-    let packs = dimension
+    dimension
         .ancestors()
         .nth(3)
-        .map(|world| packs_digest(&world.join("datapacks")))
-        .unwrap_or_default();
-    format!(
-        "{FORMAT}\nversion {}\nexe {exe}\nlevel {} {}\nblock_states {block_states}\nbiomes {biomes}\ndatapacks {packs}\n",
-        env!("CARGO_PKG_VERSION"),
-        shape.min_y,
-        shape.height,
-    )
+        .map(|world| files_digest(&world.join("datapacks")))
+        .unwrap_or_default()
 }
-/// Every file under the data packs folder: its path, size and change time.
-fn packs_digest(root: &Path) -> String {
+/// Every file under `root`: its path, size and change time.
+pub fn files_digest(root: &Path) -> String {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
