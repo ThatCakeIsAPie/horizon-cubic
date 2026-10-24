@@ -301,16 +301,35 @@ impl StructureState {
         context: &mut impl super::structure::start::StartContext,
         chunk: ChunkPos,
     ) -> Starts {
+        self.build_starts(context, chunk, true)
+            .expect("waited for the other builder")
+    }
+    /// `starts_at`, or with `wait` false `None` while another thread builds
+    /// that chunk's starts.
+    fn build_starts(
+        &self,
+        context: &mut impl super::structure::start::StartContext,
+        chunk: ChunkPos,
+        wait: bool,
+    ) -> Option<Starts> {
         if let Some(found) = self.starts.get((chunk.x, chunk.z)) {
-            return found;
+            return Some(found);
         }
         // Ring searches enlist other workers and wait for them: never hold a
         // chunk-work lock while helping, even when this chunk has no starts.
         let rings = self.rings(context);
         let work = self.start_work.at((chunk.x, chunk.z));
-        let _work = work.lock().unwrap();
+        let _work = if wait {
+            work.lock().unwrap()
+        } else {
+            match work.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+                Err(std::sync::TryLockError::Poisoned(e)) => panic!("{e}"),
+            }
+        };
         if let Some(found) = self.starts.get((chunk.x, chunk.z)) {
-            return found;
+            return Some(found);
         }
         let starts: Starts = Arc::new(
             create_starts(
@@ -326,7 +345,7 @@ impl StructureState {
             .map(Arc::new)
             .collect(),
         );
-        self.starts.insert_first((chunk.x, chunk.z), starts)
+        Some(self.starts.insert_first((chunk.x, chunk.z), starts))
     }
     /// ChunkGenerator.findNearestMapStructure: the nearest start of one of
     /// `names` from block `from` (rings: every ring chunk; random spreads:
@@ -429,18 +448,23 @@ impl StructureState {
         chunk: ChunkPos,
     ) -> Vec<Arc<StructureStart>> {
         let (bx, bz) = (chunk.x * 16, chunk.z * 16);
+        // Neighbouring chunks need the same start chunks at once: build the
+        // ones no other thread is building first, then wait for the rest.
+        // Waiting for each in turn left threads idle behind one another.
+        let around: Vec<ChunkPos> = (chunk.x - 8..=chunk.x + 8)
+            .flat_map(|sx| (chunk.z - 8..=chunk.z + 8).map(move |sz| ChunkPos::new(sx, sz)))
+            .collect();
+        let found: Vec<Option<Starts>> = around
+            .iter()
+            .map(|&at| self.build_starts(context, at, false))
+            .collect();
         let mut out = Vec::new();
-        for sx in chunk.x - 8..=chunk.x + 8 {
-            for sz in chunk.z - 8..=chunk.z + 8 {
-                for start in self.starts_at(context, ChunkPos::new(sx, sz)).iter() {
-                    let b = start.bounding_box;
-                    if b.max[0] >= bx
-                        && b.min[0] <= bx + 15
-                        && b.max[2] >= bz
-                        && b.min[2] <= bz + 15
-                    {
-                        out.push(start.clone());
-                    }
+        for (&at, found) in around.iter().zip(found) {
+            let starts = found.unwrap_or_else(|| self.starts_at(context, at));
+            for start in starts.iter() {
+                let b = start.bounding_box;
+                if b.max[0] >= bx && b.min[0] <= bx + 15 && b.max[2] >= bz && b.min[2] <= bz + 15 {
+                    out.push(start.clone());
                 }
             }
         }
