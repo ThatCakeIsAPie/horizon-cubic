@@ -94,6 +94,19 @@ pub struct SamplerContext {
     caches: Option<Vec<cache::CacheCell>>,
     fields: WorldFields,
     sparse: bool,
+    /// Lattice samples kept by interpolated samplers' aligned volumes.
+    capture: Option<Vec<LatticeSamples>>,
+    /// Known lattice samples interpolated samplers may read instead of
+    /// sampling their (pointwise) input again.
+    lattice: Vec<LatticeSamples>,
+}
+/// An interpolated sampler's input values over a volume on its cell lattice.
+#[derive(Clone, Debug)]
+pub struct LatticeSamples {
+    /// The interpolated sampler's identity.
+    sampler: (u64, usize),
+    volume: DensityVolume,
+    values: Arc<[f32]>,
 }
 impl SamplerContext {
     fn with_buffer<T>(
@@ -113,6 +126,24 @@ impl SamplerContext {
     pub fn reset(&mut self) {
         self.caches = self.caches.as_ref().map(|_| Vec::new());
         self.fields = WorldFields::default();
+        self.capture = None;
+        self.lattice = Vec::new();
+    }
+    /// Keep the input samples of interpolated samplers sampled on their own
+    /// cell lattice from now until [`Self::take_lattice_capture`].
+    pub fn capture_lattice(&mut self) {
+        self.capture = Some(Vec::new());
+    }
+    pub fn take_lattice_capture(&mut self) -> Vec<LatticeSamples> {
+        self.capture.take().unwrap_or_default()
+    }
+    /// Lattice samples (captured with the same samplers) that interpolated
+    /// samplers with a pointwise input reuse instead of sampling it again.
+    pub fn set_lattice(&mut self, lattice: Vec<LatticeSamples>) {
+        self.lattice = lattice;
+    }
+    pub fn clear_lattice(&mut self) {
+        self.lattice = Vec::new();
     }
     /// Release retained storage between worlds or after unusually large work.
     pub fn clear_scratch(&mut self) {
@@ -141,6 +172,31 @@ pub trait DensitySampler: std::fmt::Debug + Send + Sync {
             Ok(())
         })
     }
+
+    /// `Some(inputs)` when each value `sample_volume` writes depends only on
+    /// its own block position and on the same values of `inputs`: never on
+    /// the volume's origin, extent or other samples, nor on world fields.
+    /// Values of a pointwise graph (see [`is_pointwise`]) can then be taken
+    /// from another volume over the same lattice. `None` (the default) is the
+    /// conservative answer.
+    fn pointwise_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+        None
+    }
+}
+/// Whether every sampler reachable from `root` is pointwise.
+pub fn is_pointwise(root: &Arc<dyn DensitySampler>) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(sampler) = stack.pop() {
+        if !seen.insert(Arc::as_ptr(sampler) as *const () as usize) {
+            continue;
+        }
+        match sampler.pointwise_inputs() {
+            Some(inputs) => stack.extend(inputs),
+            None => return false,
+        }
+    }
+    true
 }
 fn check_buffer(buffer: &[f32], volume: DensityVolume) -> Result<(), SampleError> {
     if buffer.len() < volume.size() {
@@ -179,6 +235,9 @@ fn visit(
 #[derive(Clone, Copy, Debug)]
 pub struct ConstantSampler(pub f32);
 impl DensitySampler for ConstantSampler {
+    fn pointwise_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+        Some(Vec::new())
+    }
     fn sample_value(&self, _: &mut SamplerContext, _: [i32; 3]) -> Result<f32, SampleError> {
         Ok(self.0)
     }
@@ -259,6 +318,9 @@ impl GradientSampler {
     }
 }
 impl DensitySampler for GradientSampler {
+    fn pointwise_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+        Some(Vec::new())
+    }
     fn sample_value(&self, _: &mut SamplerContext, position: [i32; 3]) -> Result<f32, SampleError> {
         self.compute(position[self.axis as usize])
     }
@@ -303,6 +365,9 @@ pub struct NoiseSampler {
     pub y_scale: f64,
 }
 impl DensitySampler for NoiseSampler {
+    fn pointwise_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+        Some(Vec::new())
+    }
     fn sample_value(
         &self,
         _: &mut SamplerContext,
@@ -338,6 +403,18 @@ pub struct ShiftedNoiseSampler {
     pub shift_z: Arc<dyn DensitySampler>,
 }
 impl DensitySampler for ShiftedNoiseSampler {
+    fn pointwise_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+        Some(
+            [
+                Some(&self.shift_x),
+                self.shift_y.as_ref(),
+                Some(&self.shift_z),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        )
+    }
     fn sample_value(
         &self,
         context: &mut SamplerContext,

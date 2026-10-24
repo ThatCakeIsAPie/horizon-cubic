@@ -74,6 +74,9 @@ impl CachingDensitySampler {
     }
 }
 impl DensitySampler for CachingDensitySampler {
+    fn pointwise_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+        Some(vec![&self.input])
+    }
     fn sample_value(
         &self,
         context: &mut SamplerContext,
