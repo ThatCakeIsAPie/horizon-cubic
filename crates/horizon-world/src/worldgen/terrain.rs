@@ -33,6 +33,7 @@ pub trait TerrainAquifer {
     fn should_schedule_fluid_update(&self) -> bool;
 }
 impl<P: FluidPicker> TerrainAquifer for DisabledAquifer<P> {
+    #[inline]
     fn compute_substance(
         &mut self,
         _: &mut SamplerContext,
@@ -41,6 +42,7 @@ impl<P: FluidPicker> TerrainAquifer for DisabledAquifer<P> {
     ) -> Result<Option<BlockStateId>, AquiferError> {
         Ok(DisabledAquifer::compute_substance(self, position, density))
     }
+    #[inline]
     fn should_schedule_fluid_update(&self) -> bool {
         false
     }
@@ -48,6 +50,7 @@ impl<P: FluidPicker> TerrainAquifer for DisabledAquifer<P> {
 impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> TerrainAquifer
     for NoiseBasedAquifer<P, F, B>
 {
+    #[inline]
     fn compute_substance(
         &mut self,
         context: &mut SamplerContext,
@@ -56,6 +59,7 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> TerrainAquifer
     ) -> Result<Option<BlockStateId>, AquiferError> {
         NoiseBasedAquifer::compute_substance(self, context, position, density)
     }
+    #[inline]
     fn should_schedule_fluid_update(&self) -> bool {
         NoiseBasedAquifer::should_schedule_fluid_update(self)
     }
@@ -508,9 +512,11 @@ pub fn fill_noise<B: TerrainBlockStates>(
                     .first_available(x as i32, z as i32)
                     .map(|first| first.wrapping_sub(2))
             });
-            for y in (0..sy).rev() {
+            // Layout is Z, X, Y with Y innermost: this column is one run.
+            let column = volume.index([x, 0, z]).expect("valid density coordinates");
+            let column = &density[column..column + sy];
+            for (y, &value) in column.iter().enumerate().rev() {
                 let world_y = by.wrapping_add(y as i32);
-                let value = density[volume.index([x, y, z]).expect("valid density coordinates")];
                 let state = aquifer
                     .compute_substance(context, [world_x, world_y, world_z], f64::from(value))?
                     .unwrap_or(default_block);

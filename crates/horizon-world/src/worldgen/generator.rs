@@ -1192,8 +1192,8 @@ where
         )
         .map_err(stage("noise"))?;
         worker.timings.noise += lap(&mut clock);
-        let mut aquifer: Box<dyn TerrainAquifer> = match &self.aquifer {
-            Some(samplers) => Box::new(
+        let mut aquifer = match &self.aquifer {
+            Some(samplers) => ChunkAquifer::Noise(
                 NoiseBasedAquifer::new(
                     AquiferSamplers::new(samplers.clone()),
                     self.picker,
@@ -1206,7 +1206,7 @@ where
                 )
                 .map_err(stage("aquifer"))?,
             ),
-            None => Box::new(DisabledAquifer::new(
+            None => ChunkAquifer::Disabled(DisabledAquifer::new(
                 self.picker,
                 data.registry.default_state("minecraft:air").unwrap(),
             )),
@@ -1223,14 +1223,27 @@ where
                 .collect()
         };
         context.set_lattice(lattice);
-        let filled = fill_noise(
-            &mut chunk,
-            volume,
-            self.router.get(RouterField::FinalDensity).as_ref(),
-            context,
-            aquifer.as_mut(),
-            self.settings.default_block,
-        );
+        let final_density = self.router.get(RouterField::FinalDensity).as_ref();
+        let default_block = self.settings.default_block;
+        // Concrete aquifer types, so the per-block calls inline.
+        let filled = match &mut aquifer {
+            ChunkAquifer::Noise(aquifer) => fill_noise(
+                &mut chunk,
+                volume,
+                final_density,
+                context,
+                aquifer,
+                default_block,
+            ),
+            ChunkAquifer::Disabled(aquifer) => fill_noise(
+                &mut chunk,
+                volume,
+                final_density,
+                context,
+                aquifer,
+                default_block,
+            ),
+        };
         context.clear_lattice();
         filled.map_err(stage("noise"))?;
         let generation = self.generation();
@@ -1294,7 +1307,7 @@ where
                     preliminary_surface: self.preliminary.clone(),
                     density_context: context,
                 },
-                aquifer.as_mut(),
+                aquifer.as_dyn(),
                 &data.carving_blocks,
                 |_| true,
             )
@@ -2780,6 +2793,21 @@ impl GeneratorWorker {
     /// (for structure placement parity checks).
     pub fn set_structures_only(&mut self, only: bool) {
         self.state.structures_only = only;
+    }
+}
+
+/// A chunk's aquifer as its concrete type: the noise fill is monomorphized
+/// per variant; carving takes it as a trait object.
+enum ChunkAquifer<N, D> {
+    Noise(N),
+    Disabled(D),
+}
+impl<N: TerrainAquifer, D: TerrainAquifer> ChunkAquifer<N, D> {
+    fn as_dyn(&mut self) -> &mut dyn TerrainAquifer {
+        match self {
+            Self::Noise(aquifer) => aquifer,
+            Self::Disabled(aquifer) => aquifer,
+        }
     }
 }
 

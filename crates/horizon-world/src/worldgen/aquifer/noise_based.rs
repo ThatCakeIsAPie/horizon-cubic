@@ -41,6 +41,7 @@ pub struct RegistryAquiferBlockStates<'a> {
     registry: &'a BlockRegistry,
     air: BlockStateId,
     lava: BlockStateId,
+    water: Option<BlockStateId>,
 }
 impl<'a> RegistryAquiferBlockStates<'a> {
     pub fn new(registry: &'a BlockRegistry) -> Result<Self, AquiferError> {
@@ -52,10 +53,25 @@ impl<'a> RegistryAquiferBlockStates<'a> {
             lava: registry
                 .default_state("minecraft:lava")
                 .ok_or(AquiferError::MissingBlock)?,
+            water: registry.default_state("minecraft:water"),
         })
     }
     fn name(&self, state: BlockStateId) -> Option<&str> {
         self.registry.state(state).map(|s| s.name.as_str())
+    }
+    /// The fluid picker's states (air, lava, water defaults) without a name
+    /// lookup: (air, lava, water), or None for any other state.
+    #[inline]
+    fn known(&self, state: BlockStateId) -> Option<(bool, bool, bool)> {
+        if state == self.air {
+            Some((true, false, false))
+        } else if state == self.lava {
+            Some((false, true, false))
+        } else if Some(state) == self.water {
+            Some((false, false, true))
+        } else {
+            None
+        }
     }
 }
 impl AquiferBlockStates for RegistryAquiferBlockStates<'_> {
@@ -65,16 +81,28 @@ impl AquiferBlockStates for RegistryAquiferBlockStates<'_> {
     fn lava(&self) -> BlockStateId {
         self.lava
     }
+    #[inline]
     fn is_air(&self, state: BlockStateId) -> bool {
+        if let Some((air, _, _)) = self.known(state) {
+            return air;
+        }
         matches!(
             self.name(state),
             Some("minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")
         )
     }
+    #[inline]
     fn is_lava(&self, state: BlockStateId) -> bool {
+        if let Some((_, lava, _)) = self.known(state) {
+            return lava;
+        }
         self.name(state) == Some("minecraft:lava")
     }
+    #[inline]
     fn is_water(&self, state: BlockStateId) -> bool {
+        if let Some((_, _, water)) = self.known(state) {
+            return water;
+        }
         self.name(state) == Some("minecraft:water")
     }
 }
@@ -457,6 +485,9 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
         };
         Ok(2. * (barrier + q))
     }
+    /// Solid and above-surface blocks (most of a chunk) return here; the rest
+    /// goes to the out-of-line cell search.
+    #[inline]
     pub fn compute_substance(
         &mut self,
         context: &mut SamplerContext,
@@ -472,6 +503,16 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
             self.schedule = false;
             return Ok(Some(global.at(y, self.blocks.air())));
         }
+        self.compute_substance_below(context, [x, y, z], density, global)
+    }
+    #[inline(never)]
+    fn compute_substance_below(
+        &mut self,
+        context: &mut SamplerContext,
+        [x, y, z]: [i32; 3],
+        density: f64,
+        global: FluidStatus,
+    ) -> Result<Option<BlockStateId>, AquiferError> {
         if self.blocks.is_lava(global.at(y, self.blocks.air())) {
             self.schedule = false;
             return Ok(Some(self.blocks.lava()));
