@@ -8,6 +8,7 @@ use crate::{
     streaming::{LodSource, WorkerContext},
 };
 pub mod cache;
+pub mod bake;
 mod mesh;
 use horizon_world::registry::BlockStateId;
 use std::{
@@ -25,15 +26,18 @@ const MAX_SAVED: usize = 1024;
 /// How many resident chunks may wait for the worker's summary at once
 /// (`Lod::observing`).
 pub const OBSERVE_AHEAD: usize = 8;
-const SAMPLE_JOBS: usize = 4;
+const SAMPLE_JOBS: usize = 6;
 /// Threads that sample far tiles beside the mesher. Machines with 12 or more
 /// threads use up to 6 (measured: a cold 1024-chunk LoD loads about a quarter
-/// sooner than with 3); the rest keep a quarter of their threads, at most 3.
+/// sooner than with 3); smaller ones half their threads less one (a 4-core,
+/// 8-thread machine: 3), since far terrain waits for the near terrain there
+/// (`held`) and ticks and frames run ahead of these helpers
+/// (`horizon_threads`).
 fn sampling_threads(cores: usize) -> usize {
     if cores >= 12 {
         (cores / 2).min(6)
     } else {
-        (cores / 4).clamp(1, 3)
+        (cores / 2).saturating_sub(1).max(1)
     }
 }
 /// While the near terrain loads on a machine with four threads or fewer, far
@@ -639,7 +643,8 @@ struct Shared {
     /// Reduced far detail: samplers approximate wide cells.
     approximate: AtomicBool,
 }
-/// One background worker and at most two outstanding sample jobs. Only the
+/// One background worker, sampling threads and at most `SAMPLE_JOBS`
+/// outstanding sample jobs. Only the
 /// current view's quadtree and a bounded set of visited summaries are retained.
 pub struct Lod {
     shared: Arc<Shared>,
@@ -2519,8 +2524,8 @@ mod tests {
     }
 
     #[test]
-    fn extra_sampling_threads_only_on_large_machines() {
-        assert_eq!([1, 2, 4, 8, 11].map(sampling_threads), [1, 1, 1, 2, 2]);
+    fn sampling_threads_by_machine_size() {
+        assert_eq!([1, 2, 4, 6, 8, 11].map(sampling_threads), [1, 1, 1, 2, 3, 4]);
         assert_eq!([12, 16, 64].map(sampling_threads), [6, 6, 6]);
     }
 }
