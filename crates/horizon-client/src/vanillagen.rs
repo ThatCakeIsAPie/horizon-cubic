@@ -302,6 +302,17 @@ impl VanillaTerrain {
     pub fn ring_positions(&self, set: &str) -> Option<Vec<ChunkPos>> {
         self.generator.ring_positions(set)
     }
+    /// Keeps the ring positions in the folder `dimension` across sessions
+    /// (`ring_cache`); `worldgen` is the bundle this generator was built from.
+    pub fn keep_rings(&self, dimension: &Path, worldgen: &Path) {
+        crate::ring_cache::keep(
+            &self.generator,
+            dimension,
+            worldgen,
+            self.seed,
+            &self.dimension,
+        );
+    }
 }
 /// The worldgen bundle at `dir`, loaded once and shared by every generator
 /// and by live feature placement (sapling growth, bone meal).

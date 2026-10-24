@@ -71,6 +71,11 @@ impl RingSearch {
             None => ChunkPos::new(self.x, self.z),
         }
     }
+    /// Whether `find` can return `pos`: the searched square reaches 7 chunks
+    /// from the ring chunk.
+    pub fn may_find(&self, pos: ChunkPos) -> bool {
+        (pos.x - self.x).abs() <= 7 && (pos.z - self.z).abs() <= 7
+    }
 }
 
 /// The ring chunks and search randoms of generateRingPositions, in order:

@@ -326,6 +326,7 @@ pub(super) fn make_streaming(
                     format!("{e}\nThe world's data packs change its world generation: one of them may not be made for this version")
                 }
             })?);
+        inner.keep_rings(&save.root, &options.resources.join("worldgen"));
         locator = Some(inner.clone());
         Streaming::new(
             Arc::new(Persistent {

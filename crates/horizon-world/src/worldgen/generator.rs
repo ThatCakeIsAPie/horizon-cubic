@@ -1540,9 +1540,7 @@ fn memo_biome(
     let name = resolver
         .sample(context, quart)
         .map_err(|_| MaterialRuleError::BiomeQueryFailed)?;
-    let id = data
-        .biome_id(name)
-        .ok_or(MaterialRuleError::MissingBiome)?;
+    let id = data.biome_id(name).ok_or(MaterialRuleError::MissingBiome)?;
     memo.biomes.insert(key, id);
     Ok(id)
 }
@@ -1765,6 +1763,9 @@ trait SeededPipeline: Send + Sync {
     fn unsupported_features(&self) -> Vec<(String, String)>;
     fn forget_structure_starts(&self);
     fn ring_positions(&self, set: &str) -> Option<Vec<ChunkPos>>;
+    fn rings(&self) -> Option<super::structure::start::Rings>;
+    fn preset_rings(&self, rings: super::structure::start::Rings) -> bool;
+    fn on_rings(&self, listener: super::generator_structures::RingListener);
     fn spawn_position(&self) -> Result<[i32; 2], GeneratorError>;
     fn locate(
         &self,
@@ -1866,6 +1867,19 @@ where
     }
     fn ring_positions(&self, set: &str) -> Option<Vec<ChunkPos>> {
         self.structures.as_ref()?.cached_rings(set)
+    }
+    fn rings(&self) -> Option<super::structure::start::Rings> {
+        self.structures.as_ref()?.known_rings().cloned()
+    }
+    fn preset_rings(&self, rings: super::structure::start::Rings) -> bool {
+        self.structures
+            .as_ref()
+            .is_some_and(|s| s.preset_rings(rings, self.seed))
+    }
+    fn on_rings(&self, listener: super::generator_structures::RingListener) {
+        if let Some(structures) = &self.structures {
+            structures.on_rings(listener);
+        }
     }
     fn spawn_position(&self) -> Result<[i32; 2], GeneratorError> {
         if let Some(position) = self.spawn_position.get() {
@@ -2538,6 +2552,26 @@ impl OverworldGenerator {
     /// `minecraft:strongholds`), available once structure starts were looked up.
     pub fn ring_positions(&self, set: &str) -> Option<Vec<ChunkPos>> {
         self.pipeline.ring_positions(set)
+    }
+    /// Every concentric ring set's chunks by set name, once known.
+    pub fn rings(&self) -> Option<super::structure::start::Rings> {
+        self.pipeline.rings()
+    }
+    /// Uses ring positions kept from an earlier session of the same world
+    /// instead of searching for them. Vanilla searches on every start; the
+    /// caller vouches that seed, data and code are those of the session that
+    /// found them. Refused (false) when the rings are already known or do not
+    /// fit this generator's ring sets.
+    pub fn preset_rings(&self, rings: super::structure::start::Rings) -> bool {
+        self.pipeline.preset_rings(rings)
+    }
+    /// Calls `listener` once the ring positions are known: when the first
+    /// structure lookup finds them, or now. Never without structures.
+    pub fn on_rings(
+        &self,
+        listener: impl FnOnce(&super::structure::start::Rings) + Send + 'static,
+    ) {
+        self.pipeline.on_rings(Box::new(listener));
     }
     /// NoiseBasedChunkGenerator.getOrigin: the chunk a new world's spawn
     /// search starts from (NoiseSpawnFinder over the `spawn_target` points).

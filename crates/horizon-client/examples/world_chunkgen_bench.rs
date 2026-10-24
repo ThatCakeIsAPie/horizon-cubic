@@ -2,8 +2,12 @@
 //! generation (chunkgen_bench generates vanilla's): proto chunks per second
 //! and their stages, then decoration of the inner 3x3 regions.
 //!
-//! world_chunkgen_bench <client resource dir> <world folder> [--size N] [--threads T] [--center CX CZ]
-use horizon_client::{datapack, save::Level};
+//! world_chunkgen_bench <client resource dir> <world folder> [--size N] [--threads T] [--center CX CZ] [--no-ring-cache]
+//!
+//! The stronghold positions are kept in the world's overworld folder, as the
+//! game does (`ring_cache`): the second run reads them. `--no-ring-cache`
+//! searches for them without reading or writing that file.
+use horizon_client::{datapack, ring_cache, save::Level};
 use horizon_core::position::ChunkPos;
 use horizon_world::worldgen::generator::{
     GeneratorData, GeneratorWorker, OverworldGenerator, ProtoChunk, StageTimings,
@@ -25,9 +29,11 @@ fn main() -> Result<(), Error> {
     let resources = PathBuf::from(args.next().ok_or(usage)?);
     let world = PathBuf::from(args.next().ok_or(usage)?);
     let (mut size, mut threads, mut center) = (12i32, 6usize, (0, 0));
+    let mut ring_cache = true;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
+            "--no-ring-cache" => ring_cache = false,
             "--size" => size = value()?.parse()?,
             "--threads" => threads = value()?.parse()?,
             "--center" => center = (value()?.parse()?, value()?.parse()?),
@@ -49,6 +55,15 @@ fn main() -> Result<(), Error> {
     let data = GeneratorData::load_with(&resources.join("worldgen"), registry, &overrides)?;
     let generator =
         OverworldGenerator::for_world(data, seed, "minecraft:normal", "minecraft:overworld", true)?;
+    if ring_cache {
+        ring_cache::keep(
+            &generator,
+            &horizon_client::save::dimension_dir(&world, "minecraft:overworld"),
+            &resources.join("worldgen"),
+            seed,
+            "minecraft:overworld",
+        );
+    }
     println!(
         "seed {seed}, {} enabled packs, generator ready in {:.1}s; {size}x{size} chunks around {center:?}, {threads} threads",
         enabled.len(),
@@ -56,14 +71,35 @@ fn main() -> Result<(), Error> {
     );
 
     // A world's first structure lookup places the strongholds (concentric
-    // rings with biome searches), once per session: time it on its own.
+    // rings with biome searches), once per session unless kept from the last
+    // one: time it on its own.
+    let kept = generator.rings().is_some();
     let start = Instant::now();
     generator
         .worker()
         .generate_proto(ChunkPos::new(center.0 + 1000, center.1 + 1000))?;
     println!(
-        "first chunk, with the stronghold ring search (once per world load): {:.1}s",
+        "first chunk, {} (once per world load): {:.1}s",
+        if kept {
+            "with the kept stronghold positions"
+        } else {
+            "with the stronghold ring search"
+        },
         start.elapsed().as_secs_f64()
+    );
+    let rings = generator.rings().unwrap_or_default();
+    let mut hash = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&format!("{rings:?}"), &mut hash);
+    println!(
+        "ring positions: {}, checksum {:016x}{}",
+        rings.values().map(Vec::len).sum::<usize>(),
+        std::hash::Hasher::finish(&hash),
+        rings
+            .values()
+            .flatten()
+            .next()
+            .map(|c| format!(", first at chunk {} {}", c.x, c.z))
+            .unwrap_or_default()
     );
     let (x0, z0) = (center.0 - size / 2, center.1 - size / 2);
     let count = (size * size) as usize;

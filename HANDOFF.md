@@ -46,11 +46,39 @@ off `main` at `3051dda`.
    - `world_chunkgen_bench <resources> <world> [--size N] [--threads T] [--center CX CZ]`:
      full chunk generation with the world's data packs: the one-time stronghold
      search, per-stage times, a structure-start checksum, decoration.
+     It keeps the stronghold positions in the world folder as the game does
+     (see 5), so the second run reads them; `--no-ring-cache` searches. It
+     also prints a checksum of all ring positions (the structure checksum
+     only covers the area around `--center`).
+5. **Stronghold positions kept with the world** (`crates/horizon-client/src/ring_cache.rs`,
+   hooked in `world_loading::make_streaming` via `VanillaTerrain::keep_rings`).
+   `<dimension>/horizon_rings.json` holds every concentric-ring set's chunks
+   under a fingerprint (format, version, exe size+mtime, seed, dimension, a
+   digest of the resources' `worldgen/` files and of the world's data packs);
+   a mismatch searches again and rewrites the file (written whole, then
+   renamed). horizon-world side: `OverworldGenerator::{rings, preset_rings,
+   on_rings}`; `preset_rings` refuses positions that don't give each ring set
+   its count, or that its biome search could not return
+   (`RingSearch::may_find`: within 7 chunks of the ring chunk).
+   Measured with `world_chunkgen_bench` (TTM, seed 0, 6 threads):
+   - first chunk: 26.6 s at the branch's previous commit, 24.2 s with
+     `--no-ring-cache`, 23.7 s on the first cached run (searches and writes),
+     **0.6 s** on the second (reads);
+   - ring positions identical searched and read (128, checksum
+     `42c7fef9c3919780`); structure-start checksum identical to the previous
+     commit at (0, 0) (`66c9d0cf7819f968`), at stronghold ring chunk -15 -103
+     (`0daeb25dec9b3371`) and at ring chunk 223 -203, size 4 (3 starts,
+     `67ae2d4769bb55e9`).
+   - Note: TTM's `stronghold.json` only allows `minecraft:underground` and
+     `minecraft:underground_deep`, so many ring chunks get no stronghold start
+     (the same before and after; not checked against vanilla).
 
 ## Profile of the To The Max world (seed 0, 6 threads, i7 4c/8t)
 
 - One-time **stronghold ring search: ~25 CPU-seconds per world load**. Chunk
-  generation waits on it (`StructureSet::rings` in `generator_structures.rs`).
+  generation waits on it (`StructureState::rings` in `generator_structures.rs`).
+  Now only on a world's first load, or after the game, its resources or the
+  data packs change (5 above).
 - Steady state ~46 finished chunks/s. Per chunk on one thread: surface rules
   71 ms (~60%), noise 23 ms, decoration 13 ms, biomes 10 ms, structures 9 ms,
   carvers <1 ms.
@@ -59,10 +87,9 @@ off `main` at `3051dda`.
 
 ## To-do
 
-1. **Cache stronghold ring positions with the world** (like the LOD bake, same
-   kind of fingerprint), so loading skips the ~25 CPU-second search. Must give
-   identical positions (vanilla recomputes them each start; caching is a pure
-   speedup).
+1. ~~Cache stronghold ring positions with the world~~: done (5 above). Not yet
+   seen in the game itself: the log should say "stronghold positions kept in"
+   on the first load and "read from" on the next.
 2. **Surface rules: 71 ms/chunk.** Profile `MaterialConditions::try_apply` on
    TTM's rule tree in full chunk generation and find what repeats (noise,
    biome, stone-depth queries). Keep output identical.

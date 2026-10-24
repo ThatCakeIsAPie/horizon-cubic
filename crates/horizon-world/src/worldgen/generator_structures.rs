@@ -37,7 +37,10 @@ pub(super) struct StructureState {
     rings: Arc<OnceLock<Rings>>,
     /// Their biome searches while they are computed.
     ring_work: OnceLock<RingWork>,
+    /// Told the ring positions once they are computed (see `on_rings`).
+    ring_listener: Mutex<Option<RingListener>>,
 }
+pub(super) type RingListener = Box<dyn FnOnce(&Rings) + Send>;
 
 /// generateRingPositions' biome searches, shared out. Vanilla runs each as
 /// its own task on its worker pool; here every thread that needs the rings
@@ -219,12 +222,46 @@ impl StructureState {
             start_work: ChunkWork::new(),
             rings,
             ring_work: OnceLock::new(),
+            ring_listener: Mutex::new(None),
         }))
     }
     /// Concentric ring positions of a structure set, once the first start
     /// lookup has computed them.
     pub(super) fn cached_rings(&self, set: &str) -> Option<Vec<ChunkPos>> {
         self.rings.get().and_then(|rings| rings.get(set).cloned())
+    }
+    /// Every concentric ring set's positions, once known.
+    pub(super) fn known_rings(&self) -> Option<&Rings> {
+        self.rings.get()
+    }
+    /// Takes ring positions kept from an earlier session, unless the rings
+    /// are already known. Refused unless they give every ring set of this
+    /// generator its count of positions, each one a chunk its biome search
+    /// can return.
+    pub(super) fn preset_rings(&self, rings: Rings, seed: i64) -> bool {
+        let searches = self.registry.ring_searches(&self.possible_sets, seed);
+        let fits = rings.len() == searches.len()
+            && searches.iter().all(|(set, searches)| {
+                rings
+                    .get(&self.registry.sets[*set].name)
+                    .is_some_and(|found| {
+                        found.len() == searches.len()
+                            && found.iter().zip(searches).all(|(&pos, s)| s.may_find(pos))
+                    })
+            });
+        fits && self.rings.set(rings).is_ok()
+    }
+    /// Calls `listener` with the ring positions when the first lookup has
+    /// computed them, or now if they are known.
+    pub(super) fn on_rings(&self, listener: RingListener) {
+        let mut waiting = self.ring_listener.lock().unwrap();
+        match self.rings.get() {
+            Some(rings) => {
+                drop(waiting);
+                listener(rings);
+            }
+            None => *waiting = Some(listener),
+        }
     }
     /// The concentric ring positions, computing them with the threads that
     /// need them first (see `RingWork`).
@@ -242,8 +279,14 @@ impl StructureState {
         work.help(|set| registry.ring_biomes(set), &mut |quarts| {
             context.noise_biomes(quarts)
         });
-        self.rings
-            .get_or_init(|| work.rings(|set| registry.sets[set].name.clone()))
+        let rings = self
+            .rings
+            .get_or_init(|| work.rings(|set| registry.sets[set].name.clone()));
+        let listener = self.ring_listener.lock().unwrap().take();
+        if let Some(listener) = listener {
+            listener(rings);
+        }
+        rings
     }
     /// Drop the cached starts, so that later chunks build fresh pieces (the
     /// pieces keep per-start placement state such as a shipwreck's height).
@@ -506,6 +549,42 @@ mod tests {
                 rings["set2"],
                 serial(seed.wrapping_add(1), 20, 5, 40, &preferred)
             );
+        }
+    }
+    /// Kept positions are checked with `may_find`: every search result
+    /// passes it, up to the searched square's corners, and a chunk past them
+    /// does not.
+    #[test]
+    fn search_results_are_chunks_their_search_may_find() {
+        let preferred: BTreeSet<BiomeId> = [BiomeId(1)].into();
+        let corners = |quarts: &[[i32; 3]]| -> Vec<BiomeId> {
+            let (first, last) = (quarts[0], quarts[quarts.len() - 1]);
+            quarts
+                .iter()
+                .map(|q| BiomeId(u32::from(q[0] == first[0] || q[0] == last[0])))
+                .collect()
+        };
+        let scattered = |quarts: &[[i32; 3]]| -> Vec<BiomeId> {
+            quarts
+                .iter()
+                .map(|q| BiomeId(u32::from((q[0] ^ q[2].wrapping_mul(7)).rem_euclid(9) == 0)))
+                .collect()
+        };
+        let nowhere = |quarts: &[[i32; 3]]| vec![BiomeId(0); quarts.len()];
+        for seed in [0, 1234, -77] {
+            for search in ring_searches(seed, 32, 3, 128) {
+                for biomes in [
+                    &corners as &dyn Fn(&[[i32; 3]]) -> Vec<BiomeId>,
+                    &scattered,
+                    &nowhere,
+                ] {
+                    let found = search.find(&preferred, &mut |q| biomes(q));
+                    assert!(search.may_find(found), "{found:?}");
+                }
+                let ring = search.find(&preferred, &mut |q| nowhere(q));
+                assert!(!search.may_find(ChunkPos::new(ring.x + 8, ring.z)));
+                assert!(!search.may_find(ChunkPos::new(ring.x, ring.z - 8)));
+            }
         }
     }
 }
