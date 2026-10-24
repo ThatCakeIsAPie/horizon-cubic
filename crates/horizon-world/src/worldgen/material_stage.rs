@@ -321,8 +321,18 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
                     above = above.wrapping_add(1);
                     worker.update_y(above, y.wrapping_sub(bottom).wrapping_add(1), water, y);
                     if y >= write_min_y && y <= write_max_y {
-                        if let Some(state) = worker.try_apply(rule, BlockPos::new(x, y, z))? {
-                            column.set_block(y, state)?;
+                        if let Some(new) = worker.try_apply(rule, BlockPos::new(x, y, z))? {
+                            // Most rules give deep blocks the stone already
+                            // there. Rewriting it changes no block and, with
+                            // the stage's heightmaps kept, no height: only the
+                            // fluid mark of the write remains.
+                            if new == state && column.chunk.has_stage_heightmaps() {
+                                if column.chunk.block_properties(new).has_fluid() {
+                                    column.chunk.mark_postprocessing(x, y, z);
+                                }
+                            } else {
+                                column.set_block(y, new)?;
+                            }
                         }
                     }
                 }

@@ -343,6 +343,14 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     pub fn heightmap(&self, kind: HeightmapType) -> Option<&Heightmap> {
         self.heightmaps[kind as usize].as_ref()
     }
+    /// Whether every heightmap `set_block_worldgen` maintains at this stage
+    /// exists (none would be primed by the next write).
+    pub fn has_stage_heightmaps(&self) -> bool {
+        self.stage
+            .heightmaps()
+            .iter()
+            .all(|&kind| self.heightmaps[kind as usize].is_some())
+    }
     pub fn block_ticks(&self) -> &ProtoChunkTicks {
         &self.block_ticks
     }
