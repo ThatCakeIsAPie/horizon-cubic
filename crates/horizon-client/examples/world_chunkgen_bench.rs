@@ -127,12 +127,17 @@ fn main() -> Result<(), Error> {
         handles.into_iter().try_for_each(|h| h.join().unwrap())
     })?;
     let proto_wall = start.elapsed();
+    let mut hash = std::hash::DefaultHasher::new();
+    for slot in &slots {
+        chunk_hash(slot.lock().unwrap().as_ref().ok_or("chunk")?, &mut hash);
+    }
+    let terrain_hash = std::hash::Hasher::finish(&hash);
     let timings = timings.into_inner().unwrap();
     let per_chunk = |f: fn(&StageTimings) -> Duration| {
         timings.iter().map(f).sum::<Duration>().as_secs_f64() * 1000. / count as f64
     };
     println!(
-        "terrain: {count} chunks in {:.1}s = {:.1} chunks/s",
+        "terrain: {count} chunks in {:.1}s = {:.1} chunks/s, output {terrain_hash:016x}",
         proto_wall.as_secs_f64(),
         count as f64 / proto_wall.as_secs_f64()
     );
@@ -215,11 +220,16 @@ fn main() -> Result<(), Error> {
         }
     }
     let decorate_wall = start.elapsed();
+    let mut hash = std::hash::DefaultHasher::new();
+    for chunk in &chunks {
+        chunk_hash(chunk.as_ref().ok_or("chunk")?, &mut hash);
+    }
     println!(
-        "decoration: {decorated} chunks in {:.1}s = {:.1} chunks/s, {:.1} ms per chunk (one thread)",
+        "decoration: {decorated} chunks in {:.1}s = {:.1} chunks/s, {:.1} ms per chunk (one thread), output {:016x}",
         decorate_wall.as_secs_f64(),
         decorated as f64 / decorate_wall.as_secs_f64(),
-        busy.into_inner().unwrap().as_secs_f64() * 1000. / decorated as f64
+        busy.into_inner().unwrap().as_secs_f64() * 1000. / decorated as f64,
+        std::hash::Hasher::finish(&hash)
     );
     let total =
         proto_wall.as_secs_f64() * decorated as f64 / count as f64 + decorate_wall.as_secs_f64();
@@ -228,4 +238,31 @@ fn main() -> Result<(), Error> {
         decorated as f64 / total
     );
     Ok(())
+}
+
+/// Every block, quart biome and surface height of `chunk`, with its block
+/// entities, entities and structure references: an exact speedup keeps it.
+fn chunk_hash(chunk: &ProtoChunk, hash: &mut impl std::hash::Hasher) {
+    let pos = chunk.position();
+    hash.write_i32(pos.x);
+    hash.write_i32(pos.z);
+    let (min_y, height) = (chunk.terrain.min_y(), chunk.terrain.height());
+    for z in 0..16 {
+        for x in 0..16 {
+            hash.write_i32(chunk.surface_height(x, z));
+            for y in min_y..min_y + height {
+                hash.write_u32(chunk.block(x, y, z).0);
+            }
+        }
+    }
+    for z in 0..4 {
+        for x in 0..4 {
+            for y in (min_y..min_y + height).step_by(4) {
+                hash.write_u32(chunk.biome_id_at(x * 4, y, z * 4).0);
+            }
+        }
+    }
+    hash.write(format!("{:?}", chunk.block_entities).as_bytes());
+    hash.write(format!("{:?}", chunk.entities).as_bytes());
+    hash.write(format!("{:?}", chunk.structures()).as_bytes());
 }
