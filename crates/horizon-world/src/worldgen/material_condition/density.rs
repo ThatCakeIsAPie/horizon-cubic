@@ -1,5 +1,5 @@
 //! Preliminary surface density sampling scoped to one material context.
-use super::{MaterialRuleError, MaterialSurfaceQueries};
+use super::{DensityHeights, MaterialRuleError, MaterialSurfaceQueries};
 use crate::{registry::BlockStateId, worldgen::DecodeError};
 use horizon_core::{
     density::{DensitySampler, SamplerContext},
@@ -15,8 +15,9 @@ pub struct MaterialDensitySources<S: MaterialSurfaceQueries> {
     surface: S,
     expected: DensityVolume,
     densities: Vec<BoundDensity>,
-    /// Eagerly sampled volumes, shared by bindings of the same density root.
-    buffers: Vec<Vec<f32>>,
+    /// Eagerly sampled volumes, shared by bindings of the same density root,
+    /// with the heights where each is above zero or NaN.
+    buffers: Vec<(Vec<f32>, [i32; 2])>,
     retained_samples: usize,
     plane: DensityVolume,
     sampler: Arc<dyn DensitySampler>,
@@ -88,7 +89,8 @@ impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySource
                 let mut buffer = vec![0.0; self.expected.size()];
                 sampler.sample_volume(&mut self.context, &mut buffer, self.expected)?;
                 self.retained_samples += buffer.len();
-                self.buffers.push(buffer);
+                let heights = positive_heights(self.expected, &buffer);
+                self.buffers.push((buffer, heights));
                 Some(self.buffers.len() - 1)
             }
         };
@@ -104,10 +106,23 @@ impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySource
         let position = [position.x, position.y, position.z];
         if let Some(buffer) = source.buffer {
             if let Some(index) = block_index(self.expected, position) {
-                return Ok(self.buffers[buffer][index]);
+                return Ok(self.buffers[buffer].0[index]);
             }
         }
         Ok(source.sampler.sample_value(&mut self.context, position)?)
+    }
+    fn density_heights(&self, index: usize) -> Option<DensityHeights> {
+        let buffer = self.densities.get(index)?.buffer?;
+        if self.expected.steps() != [1; 3] {
+            return None;
+        }
+        let min = self.expected.minimum();
+        let sizes = self.expected.sizes();
+        Some(DensityHeights {
+            min,
+            max: std::array::from_fn(|i| min[i].wrapping_add(sizes[i] as i32 - 1)),
+            y: self.buffers[buffer].1,
+        })
     }
     fn preliminary_surface(&mut self, position: BlockPos) -> Result<f32, MaterialRuleError> {
         let position = [position.x, 0, position.z];
@@ -163,6 +178,27 @@ impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySource
     fn band(&mut self, position: BlockPos) -> Result<BlockStateId, MaterialRuleError> {
         self.surface.band(position)
     }
+}
+
+/// The lowest and highest block heights of a unit-step volume holding a
+/// sample above zero or NaN (`[i32::MAX, i32::MIN]` when none does).
+fn positive_heights(volume: DensityVolume, samples: &[f32]) -> [i32; 2] {
+    let sy = volume.sizes()[1];
+    let mut range = [usize::MAX, 0];
+    for column in samples.chunks_exact(sy) {
+        if let Some(low) = column.iter().position(|v| *v > 0.0 || v.is_nan()) {
+            let high = column.iter().rposition(|v| *v > 0.0 || v.is_nan()).unwrap();
+            range = [range[0].min(low), range[1].max(high)];
+        }
+    }
+    if range[0] == usize::MAX {
+        return [i32::MAX, i32::MIN];
+    }
+    let y = volume.minimum()[1];
+    [
+        y.wrapping_add(range[0] as i32),
+        y.wrapping_add(range[1] as i32),
+    ]
 }
 
 /// `DensityVolume::index_of_block` without its per-axis divisions for the
@@ -252,6 +288,39 @@ mod tests {
             }
         }
         assert_eq!(shared.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn positive_heights_cover_every_sample_above_zero_or_nan() {
+        let volume = DensityVolume::new([2, 4, 1], [0, -64, 0], [1; 3]).unwrap();
+        // Y-innermost: column x=0 then x=1, from y -64 to -61.
+        let heights = |samples: [f32; 8]| positive_heights(volume, &samples);
+        assert_eq!(
+            heights([0.0, -1.0, 0.0, -0.5, -1.0, 0.0, -0.0, -2.0]),
+            [i32::MAX, i32::MIN]
+        );
+        assert_eq!(
+            heights([0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0]),
+            [-63, -62]
+        );
+        assert_eq!(
+            heights([f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+            [-64, -61]
+        );
+        let mut sources = sources();
+        let density = sources
+            .bind_density(Arc::new(Counted::default()), true)
+            .unwrap();
+        let lazy = sources
+            .bind_density(Arc::new(Counted::default()), false)
+            .unwrap();
+        // Every sample of `Counted` over this volume is above zero.
+        let known = sources.density_heights(density).unwrap();
+        assert_eq!(
+            (known.min, known.max, known.y),
+            ([32, -64, -16], [47, -41, -1], [-64, -41])
+        );
+        assert_eq!(sources.density_heights(lazy), None);
     }
 
     #[test]

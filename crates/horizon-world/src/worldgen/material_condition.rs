@@ -43,6 +43,11 @@ pub trait MaterialSurfaceQueries {
     fn density(&mut self, _index: usize, _position: BlockPos) -> Result<f32, MaterialRuleError> {
         Err(MaterialRuleError::MissingDensityProvider)
     }
+    /// What an eager sample already tells about `density(index, _)`: where it
+    /// can be above zero (or NaN). `None` when nothing is known.
+    fn density_heights(&self, _index: usize) -> Option<DensityHeights> {
+        None
+    }
     fn preliminary_surface(&mut self, _position: BlockPos) -> Result<f32, MaterialRuleError> {
         Err(MaterialRuleError::MissingDensityProvider)
     }
@@ -98,6 +103,9 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
     fn density(&mut self, index: usize, position: BlockPos) -> Result<f32, MaterialRuleError> {
         (**self).density(index, position)
     }
+    fn density_heights(&self, index: usize) -> Option<DensityHeights> {
+        (**self).density_heights(index)
+    }
     fn preliminary_surface(&mut self, position: BlockPos) -> Result<f32, MaterialRuleError> {
         (**self).preliminary_surface(position)
     }
@@ -140,6 +148,24 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
     }
     fn band(&mut self, position: BlockPos) -> Result<BlockStateId, MaterialRuleError> {
         (**self).band(position)
+    }
+}
+/// Inside the inclusive block box `min..=max`, a density is `<= 0` at every
+/// height outside `y[0]..=y[1]` (an empty range when `y[0] > y[1]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DensityHeights {
+    pub min: [i32; 3],
+    pub max: [i32; 3],
+    pub y: [i32; 2],
+}
+impl DensityHeights {
+    /// Whether the density at `p` is known to be `<= 0`.
+    #[inline]
+    pub fn never_positive(&self, p: BlockPos) -> bool {
+        (p.y < self.y[0] || p.y > self.y[1])
+            && (self.min[0]..=self.max[0]).contains(&p.x)
+            && (self.min[1]..=self.max[1]).contains(&p.y)
+            && (self.min[2]..=self.max[2]).contains(&p.z)
     }
 }
 impl<P: PositionalRandom> MaterialSurfaceQueries for MaterialSurface<P> {

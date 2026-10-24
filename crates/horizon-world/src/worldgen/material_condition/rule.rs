@@ -1,5 +1,8 @@
 //! Compiled material rule composition, sharing the condition worker's context.
-use super::{Compiled, Context, MaterialCondition, MaterialConditions, MaterialSurfaceQueries};
+use super::{
+    Compiled, Context, DensityHeights, MaterialCondition, MaterialConditions,
+    MaterialSurfaceQueries,
+};
 use crate::{registry::BlockStateId, worldgen::DecodeError};
 use horizon_core::{
     density::DensitySampler,
@@ -76,6 +79,8 @@ pub(super) enum CompiledRule<R: RandomSource> {
         blocks: [BlockStateId; 3],
         raw_ore_chance: f32,
         densities: [usize; 3],
+        /// Where the eagerly sampled vein density is known to be `<= 0`.
+        heights: Option<DensityHeights>,
         random: R::Positional,
     },
     Sequence(Vec<Self>),
@@ -119,6 +124,7 @@ impl<R: RandomSource> CompiledRule<R> {
                     blocks: [ore, raw_ore, filler],
                     raw_ore_chance,
                     densities: [density, richness, gap],
+                    heights: context.surface.density_heights(density),
                     random,
                 }
             }
@@ -166,8 +172,14 @@ impl<R: RandomSource> CompiledRule<R> {
                 blocks,
                 raw_ore_chance,
                 densities,
+                heights,
                 random,
             } => {
+                // Most blocks lie outside a vein's heights: the density read
+                // would give `<= 0`, and nothing happens before it.
+                if heights.is_some_and(|heights| heights.never_positive(context.position)) {
+                    return Ok(None);
+                }
                 // Densities use the context; randomness uses application coordinates.
                 let density = context.surface.density(densities[0], context.position)?;
                 if density <= 0.0 {
