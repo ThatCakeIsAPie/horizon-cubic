@@ -21,6 +21,9 @@ pub struct PackedStorage {
     bits: u8,
     len: usize,
     per_word: usize,
+    /// `floor(2^64 / per_word) + 1`: `index / per_word` is the high half of
+    /// `index * divide_mul` (exact for any index below 2^57; per_word <= 64).
+    divide_mul: u64,
     mask: u64,
     words: Vec<u64>,
 }
@@ -45,6 +48,7 @@ impl PackedStorage {
             bits,
             len,
             per_word,
+            divide_mul: (u64::MAX / per_word as u64).wrapping_add(1),
             mask: (1_u64 << bits) - 1,
             words,
         })
@@ -70,6 +74,16 @@ impl PackedStorage {
         &self.words
     }
 
+    /// The word holding `index` and the bit offset within it.
+    #[inline]
+    fn word_and_shift(&self, index: usize) -> (usize, usize) {
+        let word = ((index as u128 * u128::from(self.divide_mul)) >> 64) as usize;
+        (
+            word,
+            (index - word * self.per_word) * usize::from(self.bits),
+        )
+    }
+
     fn location(&self, index: usize) -> Result<(usize, usize), StorageError> {
         if index >= self.len {
             return Err(StorageError::OutOfBounds {
@@ -91,20 +105,20 @@ impl PackedStorage {
     /// Reads `index` without a bounds check. Callers use this once they hold a
     /// slice length or a section index they have already validated.
     /// `index` must be less than `len`.
+    #[inline]
     pub fn read(&self, index: usize) -> u32 {
         debug_assert!(index < self.len);
-        let word = index / self.per_word;
-        let shift = (index % self.per_word) * usize::from(self.bits);
+        let (word, shift) = self.word_and_shift(index);
         ((self.words[word] >> shift) & self.mask) as u32
     }
 
     /// Writes `value` at `index` without revalidating either. `index` must be
     /// less than `len` and `value` must fit `bits`, which holds for a section
     /// palette index from the same container. Returns the previous value.
+    #[inline]
     pub fn write(&mut self, index: usize, value: u32) -> u32 {
         debug_assert!(index < self.len && u64::from(value) <= self.mask);
-        let word = index / self.per_word;
-        let shift = (index % self.per_word) * usize::from(self.bits);
+        let (word, shift) = self.word_and_shift(index);
         let old = ((self.words[word] >> shift) & self.mask) as u32;
         self.words[word] = (self.words[word] & !(self.mask << shift)) | (u64::from(value) << shift);
         old
@@ -151,6 +165,22 @@ impl PackedStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiplied_word_index_matches_division() {
+        for bits in 1..=32 {
+            let storage = PackedStorage::new(bits, 1).unwrap();
+            let per_word = 64 / usize::from(bits);
+            let large = [1 << 20, (1 << 40) + 12_345, (1 << 57) - 1];
+            for index in (0..70_000).chain(large) {
+                assert_eq!(
+                    storage.word_and_shift(index),
+                    (index / per_word, index % per_word * usize::from(bits)),
+                    "bits {bits} index {index}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn padded_words_never_split_entries() {
