@@ -7,12 +7,13 @@ off `main` at `3051dda`.
 ## Prompt for the next agent
 
 > Pick up the Horizon To The Max work on branch `ttm/bake-lod` of
-> ThatCakeIsAPie/horizon-ttm. Read `HANDOFF.md` at the repo root first: it says
-> what's done, how it was measured, and the to-do list. Start with to-do item 1
-> (cache the stronghold ring positions with the world), measure it with
-> `world_chunkgen_bench` before and after, and keep generation output identical
-> (the bench prints a structure-start checksum). Follow AGENTS.md. Don't push or
-> merge to `main` without asking me.
+> ThatCakeIsAPie/horizon-ttm. Read `HANDOFF.md` at the repo root first. Continue
+> the autoresearch loop on chunk generation described under "Autoresearch loop":
+> one change at a time, measured with `world_chunkgen_bench` interleaved against
+> the previous build, kept only if finished chunks/s improves beyond noise with
+> every output checksum unchanged. Stop when the loop has 10 kept commits in
+> all (4 are done). Local commits only: don't push or merge to `main` without
+> asking me. Follow AGENTS.md.
 
 ## What's on this branch
 
@@ -73,6 +74,64 @@ off `main` at `3051dda`.
      `minecraft:underground_deep`, so many ring chunks get no stronghold start
      (the same before and after; not checked against vanilla).
 
+## Autoresearch loop (chunk generation)
+
+Goal: more finished chunks/s in `world_chunkgen_bench`, generation output
+bit-identical. Stop at **10 kept commits; 4 so far** (the two bench-checksum
+commits are setup and don't count).
+
+**Setup.** TTM world copy (never the real save: the bench writes
+`horizon_rings.json` into it), seed 0, `--size 16 --threads 6`. The bench's
+output checksums: terrain (every block, quart biome, heightmap, post-processing
+mark, block and fluid tick, block entity, entity, structure reference), the
+same after decoration, structure starts, and ring positions. All must match
+the previous build's and be the same run to run.
+
+**Measuring.** Background load swings the numbers by 20% or more (the first
+baseline, 35.0, was taken under load; interleaved it is 43.9). So each
+candidate runs interleaved with the previous build's binary, 3+ pairs, and is
+kept when its median is >= 2% better with ranges not overlapping. Keep each
+build's bench binary so it can be rerun.
+
+| Commit | Change | Interleaved finished chunks/s |
+|---|---|---|
+| `fe8a9dcb` | Surface biome conditions compare biome ids (bitsets), no `Arc<str>` clone per block | 43.9 -> 50.4 (its message says 35.0 -> 48.9; that baseline was under load) |
+| `c2b6961f` | `references`: build start chunks no other thread holds, then wait for the rest | 49.3 -> 50.8 |
+| `593f6d5a` | Per-worker memo of structure checks' single noise-biome samples | 51.9 -> 57.0 |
+| `a129fb20` | Surface: skip rewriting the block already there (stage heightmaps kept) | 57.0 -> 60.3 |
+| discarded | Same "build free ones first" for neighbour biome chunks | 50.6 -> 50.8 |
+| discarded | Ore vein / uncached conditions out of line (smaller `apply` frames) | 59.0 -> 59.5 |
+
+Overall so far: **43.9 -> ~60 finished chunks/s (+37%)**.
+
+**Profile at `a129fb20`** (a sampling profiler suspending the workers, Windows
+without admin; on Linux use `perf`/`samply`): surface 41% of samples
+(`CompiledRule::apply` 28.5% inclusive, mostly call overhead per node per solid
+block: ~118k solid blocks a chunk since TTM reaches y 2032), noise fill 23%
+(`CubicSpline::sample` 12% inclusive, half in climate `sample_volume` for the
+biome stage, half in `fill_noise`; TTM's splines take y-dependent inputs, so
+they run per cell corner), decoration 12%, structure starts 10% (half of it
+waiting on another thread's build of the same start chunk, line 323 of
+`generator_structures.rs`), biome-chunk waits 3-4%, Perlin `get3` 9% self (4%
+from per-column 2D noise conditions, 2.4% climate samples for structures).
+
+**Ideas not tried yet:** flatten the compiled surface rule tree into a loop
+(no recursion per node); a per-column last-cell biome cache in
+`SurfaceQueries::biome_id` (uniform cells hit 80%; zoom ~150 ns otherwise);
+help while waiting on a busy start chunk (build start chunks the next chunks
+will need); spline evaluation cost (`CubicSpline::sample`, closure per
+coordinate, binary search); ore-vein eager density volumes cover air above the
+terrain (4.6 ms a chunk for 440k samples; only ~118k are read).
+
+**Pitfalls met:** `Debug` of `ProtoChunkTicks` includes a `HashSet` (random
+order): hash `pack(0)` instead. In Rust 2024, `while let Some(x) =
+m.lock().unwrap().pop()` holds the lock for the whole body.
+
+**On another machine:** the bench needs Horizon's prepared resources
+(`.local/horizon-client/26.3`, from the launcher or `horizon-prepare`) and a
+copy of the To The Max world with its data pack; neither is in the repo.
+Numbers are per machine: take a new baseline there before comparing.
+
 ## Profile of the To The Max world (seed 0, 6 threads, i7 4c/8t)
 
 - One-time **stronghold ring search: ~25 CPU-seconds per world load**. Chunk
@@ -90,9 +149,8 @@ off `main` at `3051dda`.
 1. ~~Cache stronghold ring positions with the world~~: done (5 above). Not yet
    seen in the game itself: the log should say "stronghold positions kept in"
    on the first load and "read from" on the next.
-2. **Surface rules: 71 ms/chunk.** Profile `MaterialConditions::try_apply` on
-   TTM's rule tree in full chunk generation and find what repeats (noise,
-   biome, stone-depth queries). Keep output identical.
+2. **Chunk generation speed**: in progress, see "Autoresearch loop" (surface
+   rules went from ~80 to ~40 ms a chunk on 6 threads).
 3. **Confirm the mouse fix** in real play on Windows (alt-tab, notifications).
 4. **Clean timing of baked LODs**: launch the same world twice with nothing else
    running and log `lod.sampled_target_tiles` / `target_tiles` from
