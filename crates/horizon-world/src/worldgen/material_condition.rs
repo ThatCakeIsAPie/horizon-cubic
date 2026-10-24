@@ -23,7 +23,7 @@ use horizon_core::{
 pub use library::MaterialRuleLibrary;
 pub use noise::MaterialNoiseSources;
 use rule::CompiledRule;
-pub use rule::{MaterialRule, MaterialRuleError};
+pub use rule::{DensityGate, MaterialRule, MaterialRuleError};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -39,6 +39,18 @@ pub trait MaterialSurfaceQueries {
         _eager: bool,
     ) -> Result<usize, DecodeError> {
         Err(DecodeError::Field("missing material density provider"))
+    }
+    /// `bind_density(sampler, true)` for a density read only where `gate`'s
+    /// input is in range (or, with `gated`, that `gate` describes): the eager
+    /// sample may stop above the highest such height. With `gated`,
+    /// `density_heights` also covers the heights above it.
+    fn bind_gated_density(
+        &mut self,
+        sampler: Arc<dyn horizon_core::density::DensitySampler>,
+        _gate: &DensityGate,
+        _gated: bool,
+    ) -> Result<usize, DecodeError> {
+        self.bind_density(sampler, true)
     }
     fn density(&mut self, _index: usize, _position: BlockPos) -> Result<f32, MaterialRuleError> {
         Err(MaterialRuleError::MissingDensityProvider)
@@ -99,6 +111,14 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
         eager: bool,
     ) -> Result<usize, DecodeError> {
         (**self).bind_density(sampler, eager)
+    }
+    fn bind_gated_density(
+        &mut self,
+        sampler: Arc<dyn horizon_core::density::DensitySampler>,
+        gate: &DensityGate,
+        gated: bool,
+    ) -> Result<usize, DecodeError> {
+        (**self).bind_gated_density(sampler, gate, gated)
     }
     fn density(&mut self, index: usize, position: BlockPos) -> Result<f32, MaterialRuleError> {
         (**self).density(index, position)

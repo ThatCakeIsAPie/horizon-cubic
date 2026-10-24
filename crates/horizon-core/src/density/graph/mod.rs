@@ -577,6 +577,13 @@ impl DensityGraph {
     pub fn function(&self, name: &str) -> Option<FunctionId> {
         self.function_names.get(name).copied()
     }
+    /// The definition of `id`, unless it is a bound sampler.
+    pub fn node(&self, id: FunctionId) -> Option<&GraphNode> {
+        match &self.entries.get(id.0)?.definition {
+            Definition::Node(node) => Some(node),
+            Definition::Bound { .. } => None,
+        }
+    }
     fn noise_entry(&self, id: NoiseId) -> Result<&seeded::NoiseEntry, CompileError> {
         self.noises.get(id.0).ok_or(CompileError::UnknownNoise)
     }

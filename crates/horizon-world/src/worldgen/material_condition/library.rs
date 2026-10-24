@@ -1,5 +1,7 @@
 //! Immutable material-rule definitions with a world-seeded density compiler.
-use super::{MaterialCondition, MaterialConditionRegistry, MaterialRule, codec::identifier};
+use super::{
+    DensityGate, MaterialCondition, MaterialConditionRegistry, MaterialRule, codec::identifier,
+};
 use crate::{
     registry::{BlockStateId, BlockStateJsonCodec},
     worldgen::{
@@ -12,7 +14,7 @@ use crate::{
 };
 use horizon_core::density::{
     DensitySampler,
-    graph::{DensityCompiler, FunctionId},
+    graph::{DensityCompiler, FunctionId, GraphNode},
 };
 use serde_json::value::RawValue;
 use std::{
@@ -150,10 +152,55 @@ impl MaterialRuleLibrary {
                 density: self.compiler.get_sampler(self.roots[roots[0]])?,
                 richness: self.compiler.get_sampler(self.roots[roots[1]])?,
                 filler_gap: self.compiler.get_sampler(self.roots[roots[2]])?,
+                gate: self.height_gate(self.roots[roots[0]])?,
             },
         });
         self.compiled.insert(key, value.clone());
         Ok(value)
+    }
+}
+impl MaterialRuleLibrary {
+    /// A density of the form `range_choice(input, min, max, inside, c)` with
+    /// an `input` that varies only with Y and a constant `c <= 0`: outside
+    /// the heights where `input` is in range, the density is never above zero.
+    fn height_gate(&mut self, mut id: FunctionId) -> Result<Option<DensityGate>, DecodeError> {
+        let graph = self.compiler.graph();
+        let resolve = |mut id: FunctionId| {
+            for _ in 0..256 {
+                match graph.node(id) {
+                    Some(GraphNode::Reference { input, .. }) => id = *input,
+                    _ => return Some(id),
+                }
+            }
+            None
+        };
+        let Some(root) = resolve(id) else {
+            return Ok(None);
+        };
+        id = root;
+        let Some(&GraphNode::Choice {
+            input,
+            min,
+            max,
+            outside,
+            ..
+        }) = graph.node(id)
+        else {
+            return Ok(None);
+        };
+        let constant = resolve(outside).and_then(|outside| match graph.node(outside) {
+            Some(GraphNode::Constant(value)) => Some(*value),
+            _ => None,
+        });
+        // `!(c > 0.0)` would admit NaN, which counts as possibly positive.
+        if !constant.is_some_and(|c| c <= 0.0) || graph.domain_axes(input)? & !2 != 0 {
+            return Ok(None);
+        }
+        Ok(Some(DensityGate {
+            input: self.compiler.get_sampler(input)?,
+            min_inclusive: min,
+            max_exclusive: max,
+        }))
     }
 }
 struct Loader<'a, 'b> {

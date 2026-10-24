@@ -24,6 +24,8 @@ pub enum MaterialRule {
         density: Arc<dyn DensitySampler>,
         richness: Arc<dyn DensitySampler>,
         filler_gap: Arc<dyn DensitySampler>,
+        /// What the density's definition tells about where it can be above zero.
+        gate: Option<DensityGate>,
     },
     Sequence(Vec<MaterialRule>),
     Condition {
@@ -32,6 +34,15 @@ pub enum MaterialRule {
     },
     /// Vanilla calls this rule "bandlands"; it queries terracotta bands.
     Bandlands,
+}
+/// A density that is a constant `<= 0` wherever `input`, a function of Y
+/// alone, lies outside `min_inclusive..max_exclusive` (vanilla's ore veins
+/// are a `range_choice` on Y).
+#[derive(Clone, Debug)]
+pub struct DensityGate {
+    pub input: Arc<dyn DensitySampler>,
+    pub min_inclusive: f32,
+    pub max_exclusive: f32,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterialRuleError {
@@ -115,9 +126,19 @@ impl<R: RandomSource> Node<R> {
                 density,
                 richness,
                 filler_gap,
+                gate,
             } => {
-                let density = context.surface.bind_density(density, true)?;
-                let richness = context.surface.bind_density(richness, true)?;
+                let (density, richness) = match &gate {
+                    // The richness is only read where the density is above zero.
+                    Some(gate) => (
+                        context.surface.bind_gated_density(density, gate, true)?,
+                        context.surface.bind_gated_density(richness, gate, false)?,
+                    ),
+                    None => (
+                        context.surface.bind_density(density, true)?,
+                        context.surface.bind_density(richness, true)?,
+                    ),
+                };
                 let gap = context.surface.bind_density(filler_gap, false)?;
                 let random = root.from_hash_of("minecraft:ore").fork_positional();
                 Self::OreVein {
