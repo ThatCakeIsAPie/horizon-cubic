@@ -322,6 +322,7 @@ fn rule(
                 inputs: inputs.clone(),
                 channel: Some(2),
             }),
+            gate: None,
         },
         "if" => MaterialRule::Condition {
             if_true: condition(&v[1], registry),

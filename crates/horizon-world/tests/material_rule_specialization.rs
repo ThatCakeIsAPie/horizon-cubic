@@ -89,6 +89,7 @@ fn ore() -> MaterialRule {
         density: Arc::new(ConstantSampler(1.)),
         richness: Arc::new(ConstantSampler(1.)),
         filler_gap: Arc::new(ConstantSampler(-1.)),
+        gate: None,
     }
 }
 #[test]
