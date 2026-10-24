@@ -262,6 +262,18 @@ fn chunk_hash(chunk: &ProtoChunk, hash: &mut impl std::hash::Hasher) {
             }
         }
     }
+    for kind in horizon_world::heightmap::HeightmapType::ALL {
+        if let Some(map) = chunk.terrain.heightmap(kind) {
+            for z in 0..16 {
+                for x in 0..16 {
+                    hash.write_i32(map.first_available(x, z).unwrap_or(i32::MIN));
+                }
+            }
+        }
+    }
+    hash.write(format!("{:?}", chunk.terrain.postprocessing()).as_bytes());
+    hash.write(format!("{:?}", chunk.terrain.block_ticks().pack(0)).as_bytes());
+    hash.write(format!("{:?}", chunk.terrain.fluid_ticks().pack(0)).as_bytes());
     hash.write(format!("{:?}", chunk.block_entities).as_bytes());
     hash.write(format!("{:?}", chunk.entities).as_bytes());
     hash.write(format!("{:?}", chunk.structures()).as_bytes());
