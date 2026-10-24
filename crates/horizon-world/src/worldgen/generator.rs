@@ -1648,9 +1648,14 @@ enum Biomes<'a, 'b> {
 /// Resolved biomes by quart (`Biomes::Memo`).
 struct BiomeMemo {
     biomes: HashMap<[i32; 3], BiomeId>,
-    /// One biome per column, the first one asked (its surface's): far cells
-    /// wider than a quart don't show a biome change a few blocks down.
-    columns: bool,
+    /// Quarts per side of the columns sharing one biome, the first one asked
+    /// (its surface's); 0 for one per quart. Far cells wider than a quart
+    /// don't show a biome change a few blocks down, and climate changes over
+    /// hundreds of blocks: a far tile shares one per 4x4 of its columns, in
+    /// cells up to 64 blocks wide.
+    /// (Painting asks through the biome zoom, which strays into neighbouring
+    /// quarts: per quart, those strays were most of the climate samples.)
+    cell: i32,
 }
 /// The biome at `quart`, resolved once per quart (`Biomes::Memo`).
 fn memo_biome(
@@ -1660,8 +1665,12 @@ fn memo_biome(
     memo: &mut BiomeMemo,
     quart: [i32; 3],
 ) -> Result<BiomeId, MaterialRuleError> {
-    let key = if memo.columns {
-        [quart[0], 0, quart[2]]
+    let key = if memo.cell > 0 {
+        [
+            quart[0].div_euclid(memo.cell),
+            0,
+            quart[2].div_euclid(memo.cell),
+        ]
     } else {
         quart
     };
@@ -2304,7 +2313,9 @@ where
         let mut biome_context = SamplerContext::cached();
         let mut biome_memo = BiomeMemo {
             biomes: HashMap::new(),
-            columns: width >= 4,
+            // Columns `width` blocks apart are width / 4 quarts apart; cells
+            // stop at 64 blocks (wider ones moved a third of level 6's biomes).
+            cell: if width >= 4 { width.min(16) } else { 0 },
         };
         for dz in 0..side {
             for dx in 0..side {
