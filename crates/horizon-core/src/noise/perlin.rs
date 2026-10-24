@@ -30,6 +30,39 @@ impl PerlinNoise {
         self.sample(cell, point, point[1])
     }
 
+    /// `get3` down one X/Z column: the X/Z cells, offsets and permutations
+    /// are found once, and corner gradients are reused while Y stays in its
+    /// cell. Each value is computed with `get3`'s arithmetic.
+    pub fn get3_column(&self, x: f64, z: f64, ys: &[f64], out: &mut [f32]) {
+        let (cell, relative) = self.coordinates([x, 0.0, z]);
+        let p = self.table.permute(cell[0]);
+        let q = self.table.permute(cell[0].wrapping_add(1));
+        let mut previous_y = None;
+        let mut gradients = [[0.0; 3]; 8];
+        for (out, y) in out.iter_mut().zip(ys) {
+            let shifted = wrap(*y) + self.table.offsets[1];
+            let cell_y = floor_i32(shifted);
+            let point = [
+                relative[0] as f32,
+                (shifted - f64::from(cell_y)) as f32,
+                relative[2] as f32,
+            ];
+            if previous_y != Some(cell_y) {
+                gradients = self.gradients_at(p, q, cell_y, cell[2]);
+                previous_y = Some(cell_y);
+            }
+            let values = Self::corner_values(gradients, point);
+            *out = lerp3(
+                [
+                    smoothstep(point[0]),
+                    smoothstep(point[1]),
+                    smoothstep(point[2]),
+                ],
+                values,
+            );
+        }
+    }
+
     fn coordinates(&self, point: [f64; 3]) -> ([i32; 3], [f64; 3]) {
         let shifted: [f64; 3] = std::array::from_fn(|i| wrap(point[i]) + self.table.offsets[i]);
         let cell = shifted.map(floor_i32);

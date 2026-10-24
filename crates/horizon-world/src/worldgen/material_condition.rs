@@ -246,7 +246,13 @@ struct CachedNoise {
     is_3d: bool,
     revision: i64,
     value: f64,
+    /// 3D noises: values down the current column from `column_top`, sampled
+    /// together (the surface walks each column down in y).
+    column: [f32; NOISE_COLUMN],
+    column_top: i32,
+    column_revision: i64,
 }
+const NOISE_COLUMN: usize = 16;
 impl<S: MaterialSurfaceQueries> Context<S> {
     fn minimum_surface_level(&mut self) -> Result<i32, MaterialRuleError> {
         if self.minimum_revision != self.column_revision {
@@ -292,12 +298,37 @@ impl<S: MaterialSurfaceQueries> Context<S> {
             }
             .wrapping_sub(1),
             value: 0.0,
+            column: [0.0; NOISE_COLUMN],
+            column_top: 0,
+            column_revision: self.column_revision.wrapping_sub(1),
         });
         self.noise_indices.insert(key, index);
         Ok(index)
     }
     fn noise(&mut self, index: usize) -> f64 {
         let noise = &mut self.noises[index];
+        if noise.is_3d {
+            // A pure function of the position: values sampled ahead for the
+            // blocks below are the ones `get3` would give there.
+            let y = self.position.y;
+            let below = i64::from(noise.column_top) - i64::from(y);
+            if noise.column_revision != self.column_revision
+                || !(0..NOISE_COLUMN as i64).contains(&below)
+            {
+                let ys: [f64; NOISE_COLUMN] =
+                    std::array::from_fn(|i| f64::from(y.wrapping_sub(i as i32)));
+                noise.sampler.get3_column(
+                    f64::from(self.position.x),
+                    f64::from(self.position.z),
+                    &ys,
+                    &mut noise.column,
+                );
+                noise.column_top = y;
+                noise.column_revision = self.column_revision;
+                return f64::from(noise.column[0]);
+            }
+            return f64::from(noise.column[below as usize]);
+        }
         let revision = if noise.is_3d {
             self.block_revision
         } else {
@@ -454,38 +485,53 @@ impl<R: RandomSource> Compiled<R> {
             result: None,
         })
     }
+    /// Test with vanilla's per-revision result cache (standalone conditions).
     fn test<S: MaterialSurfaceQueries>(
         &mut self,
         context: &mut Context<S>,
     ) -> Result<bool, MaterialRuleError> {
-        if let Kind::Constant(value) = self.kind {
-            return Ok(value);
+        self.eval::<true, S>(context)
+    }
+    /// Test inside a compiled rule program, which reaches each node at most
+    /// once per block: a block-level result is never asked for twice, and
+    /// column-level ones (hole, steep) are pure in the column's state, so the
+    /// revision cache would change nothing.
+    #[inline]
+    fn test_once<S: MaterialSurfaceQueries>(
+        &mut self,
+        context: &mut Context<S>,
+    ) -> Result<bool, MaterialRuleError> {
+        self.eval::<false, S>(context)
+    }
+    #[inline]
+    fn eval<const CACHE: bool, S: MaterialSurfaceQueries>(
+        &mut self,
+        context: &mut Context<S>,
+    ) -> Result<bool, MaterialRuleError> {
+        let column = match &mut self.kind {
+            Kind::Constant(value) => return Ok(*value),
+            Kind::Noise { sampler, min, max } => {
+                let value = context.noise(*sampler);
+                return Ok(value >= *min && value <= *max);
+            }
+            Kind::Not(child) => return child.eval::<CACHE, S>(context).map(|value| !value),
+            Kind::Simple(MaterialCondition::AbovePreliminarySurface) => {
+                return Ok(context.position.y >= context.minimum_surface_level()?);
+            }
+            Kind::Simple(MaterialCondition::Temperature) => {
+                let biome = context.biome()?.ok_or(MaterialRuleError::MissingBiome)?;
+                return context.surface.cold_enough_to_snow(
+                    &biome,
+                    context.position,
+                    context.generation.sea_level,
+                );
+            }
+            Kind::Simple(MaterialCondition::Hole | MaterialCondition::Steep) => true,
+            _ => false,
+        };
+        if !CACHE {
+            return self.compute(context);
         }
-        if matches!(
-            self.kind,
-            Kind::Simple(MaterialCondition::AbovePreliminarySurface)
-        ) {
-            return Ok(context.position.y >= context.minimum_surface_level()?);
-        }
-        if matches!(self.kind, Kind::Simple(MaterialCondition::Temperature)) {
-            let biome = context.biome()?.ok_or(MaterialRuleError::MissingBiome)?;
-            return context.surface.cold_enough_to_snow(
-                &biome,
-                context.position,
-                context.generation.sea_level,
-            );
-        }
-        if let Kind::Noise { sampler, min, max } = &self.kind {
-            let value = context.noise(*sampler);
-            return Ok(value >= *min && value <= *max);
-        }
-        if let Kind::Not(child) = &mut self.kind {
-            return child.test(context).map(|value| !value);
-        }
-        let column = matches!(
-            self.kind,
-            Kind::Simple(MaterialCondition::Hole | MaterialCondition::Steep)
-        );
         let revision = if column {
             context.column_revision
         } else {
@@ -497,6 +543,15 @@ impl<R: RandomSource> Compiled<R> {
                 .ok_or(MaterialRuleError::CachedConditionUnavailable);
         }
         self.revision = revision;
+        let result = self.compute(context)?;
+        self.result = Some(result);
+        Ok(result)
+    }
+    #[inline]
+    fn compute<S: MaterialSurfaceQueries>(
+        &self,
+        context: &mut Context<S>,
+    ) -> Result<bool, MaterialRuleError> {
         let result = match &self.kind {
             Kind::Biome(names) => names.contains(
                 context
@@ -581,7 +636,6 @@ impl<R: RandomSource> Compiled<R> {
             }
             _ => unreachable!("all recursive and gradient definitions are compiled"),
         };
-        self.result = Some(result);
         Ok(result)
     }
 }

@@ -253,7 +253,7 @@ impl<R: RandomSource> CompiledRule<R> {
                 Op::Block(block) => return Ok(Some(*block)),
                 Op::Bandlands => return context.surface.band(position).map(Some),
                 Op::Condition { condition, skip } => {
-                    at = if self.conditions[*condition].test(context)? {
+                    at = if self.conditions[*condition].test_once(context)? {
                         at + 1
                     } else {
                         *skip
