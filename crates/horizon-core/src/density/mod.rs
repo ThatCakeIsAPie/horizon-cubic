@@ -99,6 +99,8 @@ pub struct SamplerContext {
     /// Known lattice samples interpolated samplers may read instead of
     /// sampling their (pointwise) input again.
     lattice: Vec<LatticeSamples>,
+    /// Planes of y-fixed slices already sampled (`with_planes`).
+    planes: Option<std::collections::HashMap<slice::PlaneKey, Vec<f32>>>,
 }
 /// An interpolated sampler's input values over a volume on its cell lattice.
 #[derive(Clone, Debug)]
@@ -126,6 +128,9 @@ impl SamplerContext {
     pub fn reset(&mut self) {
         self.caches = self.caches.as_ref().map(|_| Vec::new());
         self.fields = WorldFields::default();
+        if let Some(planes) = &mut self.planes {
+            planes.clear();
+        }
         self.capture = None;
         self.lattice = Vec::new();
     }
