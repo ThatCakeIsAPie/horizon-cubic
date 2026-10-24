@@ -49,33 +49,41 @@ impl DensityVolume {
             size,
         })
     }
+    #[inline]
     pub fn sizes(self) -> [usize; 3] {
         self.sizes
     }
+    #[inline]
     pub fn minimum(self) -> [i32; 3] {
         self.minimum
     }
+    #[inline]
     pub fn steps(self) -> [i32; 3] {
         self.steps
     }
+    #[inline]
     pub fn size(self) -> usize {
         self.size
     }
+    #[inline]
     pub fn maximum(self) -> [i32; 3] {
         std::array::from_fn(|axis| self.coordinate(axis, self.sizes[axis]).wrapping_sub(1))
     }
+    #[inline]
     pub fn index(self, position: [usize; 3]) -> Option<usize> {
         if (0..3).any(|i| position[i] >= self.sizes[i]) {
             return None;
         }
         Some(position[1] + (position[0] + position[2] * self.sizes[0]) * self.sizes[1])
     }
+    #[inline]
     pub fn block(self, axis: Axis, index: usize) -> Option<i32> {
         let axis = axis as usize;
         (index < self.sizes[axis]).then(|| self.coordinate(axis, index))
     }
     /// Find an exact lattice sample, retaining Java's wrapped subtraction and
     /// extent multiplication. Coordinates between samples are cache misses.
+    #[inline]
     pub fn index_of_block(self, position: [i32; 3]) -> Option<usize> {
         let relative: [i32; 3] = std::array::from_fn(|i| position[i].wrapping_sub(self.minimum[i]));
         for (axis, value) in relative.iter().enumerate() {
@@ -88,6 +96,7 @@ impl DensityVolume {
             (relative[i] / self.steps[i]) as usize
         }))
     }
+    #[inline]
     pub(super) fn coordinate(self, axis: usize, index: usize) -> i32 {
         self.minimum[axis].wrapping_add((index as i32).wrapping_mul(self.steps[axis]))
     }
