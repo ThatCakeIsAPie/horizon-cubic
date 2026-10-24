@@ -302,4 +302,29 @@ mod tests {
         assert_eq!(nested.range().unwrap(), [0.0; 2]);
         assert!(nested.get3(1.0, 2.0, 3.0).is_nan());
     }
+
+    #[test]
+    fn get3_column_matches_get3() {
+        let mut random = LegacyRandom::new(42);
+        let stack = NormalNoise::create_parity(-5, &[1.0, 0.0, 1.0])
+            .unwrap()
+            .create(&mut random)
+            .unwrap();
+        let perlin = PerlinNoise::new(&mut random);
+        let noises: [&dyn Noise; 2] = [&stack, &perlin];
+        for noise in noises {
+            for (x, z) in [(0.0, 0.0), (-17.0, 33.0), (1.0e9, -3.0e7), (123.5, -0.25)] {
+                let ys: Vec<f64> = (0..40).map(|i| f64::from(100 - 7 * i)).collect();
+                let mut out = vec![0.0; ys.len()];
+                noise.get3_column(x, z, &ys, &mut out);
+                for (y, value) in ys.iter().zip(&out) {
+                    assert_eq!(
+                        value.to_bits(),
+                        noise.get3(x, *y, z).to_bits(),
+                        "{x} {y} {z}"
+                    );
+                }
+            }
+        }
+    }
 }
