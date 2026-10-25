@@ -142,7 +142,8 @@ waiting on another thread's build of the same start chunk, line 323 of
 `generator_structures.rs`), biome-chunk waits 3-4%, Perlin `get3` 9% self (4%
 from per-column 2D noise conditions, 2.4% climate samples for structures).
 
-**Ideas not tried yet** (from the laptop agents' reports):
+**Ideas not tried yet** (from the laptop agents' round-1 reports; several were
+done in round 2, below):
 - Surface: a per-column cache of the current quart cell in
   `SurfaceQueries::biome_id` (up to ~3.8% of CPU); sample the shared ore
   richness volume only up to the heights its gates allow (~1.4%); fold
@@ -171,6 +172,76 @@ m.lock().unwrap().pop()` holds the lock for the whole body.
 copy of the To The Max world with its data pack; neither is in the repo.
 Numbers are per machine: take a new baseline there before comparing.
 
+### Round 2 (Linux laptop, 2026-10-24/25)
+
+Same loop and areas, branches `ttm/cg2-{surface,noise,structures}`, stop at 5
+kept or 15 discarded each; combined as `ttm/cg2-combined`.
+
+**Measuring, tightened.** Bench builds use `codegen-units=1`, non-incremental:
+with the fast profile's 16 units, unrelated edits moved inlining and swung
+results ~6%. One unit still flipped the aquifer's fast path in or out of
+`fill_noise` with the size of `Pipeline::generate` (noise 6.6 vs 8.3 ms), so the
+round's base `43025047` pins `NoiseBasedAquifer::compute_substance` with
+`#[inline(always)]`. Smaller flips remain (`PerlinNoise::sample`,
+`BlockSection::get`, `BiomeZoom::quart_at_block`): stages can trade off from
+codegen alone, so candidates are scored on overall chunks/s. A 6-pair run that
+wins every pair, with a >= 2% median and the targeted stage better in every
+pair, also keeps when drift makes the unpaired ranges overlap. Each worktree
+builds in its own target dir: cargo fingerprints workspace crates by relative
+path and mtime, so a shared dir can link another worktree's `horizon-world`.
+The builds are byte-deterministic, so kept commits were checked by rebuilding
+them and comparing bytes.
+
+| Commit | Change | Interleaved finished chunks/s |
+|---|---|---|
+| `43025047` | Noise fill calls the aquifer through its concrete type; its fast path `#[inline(always)]` | ~3% (base of the round) |
+| `2c35e9d3` | Column searches for the top solid block memoized across chunks and threads (only for position-only densities) | 173.3 -> 179.9 |
+| `be717823` | Noise fill visits and writes one section at a time; all-default sections set at once | 176.15 -> 179.75 |
+| `94a58f2f` | Biome stage builds the neighbour biome chunks no other thread holds, then waits for the rest (~0.5 s of lock waits in a 1.1 s terrain phase) | 181.75 -> 192.6 |
+| `7b672e3d` | Climate volume gets one more top layer for the fill; biome-id bitset, biome name memo | 190.85 -> 194.8 |
+| `1cdb36af` | Surface biome cache keeps each mixed quart cell's corner jitter and 8 biomes | 171.7 -> 176.55 |
+| `0e4ad05e` | 3D noise conditions sampled 16 blocks down the column (`Noise::get3_column`); conditions in a compiled rule tested without the revision cache | 174.95 -> 186.4 |
+| `9ffa1c00` | Ore vein volumes sampled only up to their gate's highest in-range height (115 rows, not ~2100) | 185.7 -> 194.55 |
+| `e09fb9dd` | Surface walk: no-op heightmap updates skipped below the tops, stone-depth scan reads reused | 193.85 -> 201.55 |
+| `aac037d2` | Column snapshot per column, vein volumes trimmed below their gate, lazy richness, Perlin 4 heights a step, inlined condition test | 201.1 -> 205.9 |
+| `df81a9de` | Block reads inlined from region to palette, multiply instead of a division per read | 169.25 -> 174.55 |
+| `b2c56c9c` | Decoration: column scans, per-chunk heightmap reads, no zoom in single-biome sections | 175.0 -> 180.75 |
+| `a9a22ec0` | Jigsaw pool templates loaded on first use, as vanilla does (abandoned camp: 180 loads -> 18) | 180.75 -> 185.45 |
+
+Discarded: 9 noise, 9 surface, 4 structures, with numbers in the laptop's
+`~/Work/ttm-bench/log2-*.md`. Of note: `#[inline(always)]` on the block-read
+path (-1.8%) and on Perlin's helpers (-0.4%); reusing the fill's 2 MB density
+buffer per thread (surface +0.3 ms a chunk every run); jigsaw string sharing
+(structures 0.8 -> 0.4 ms, but +0.3% overall).
+
+**All builds, laptop, cgu1, 7-way interleaved, 5 rounds** (median, range):
+
+| Build | Finished chunks/s |
+|---|---|
+| `9d03d424` (before round 1) | 124.2 (122.8-125.7) |
+| `4c3a22fb` (round 1) | 169.0 (168.3-171.8), **+36%** |
+| `43025047` (round-2 base) | 174.8 (173.4-178.3) |
+| noise branch alone | 197.7 |
+| surface branch alone | 207.8 |
+| structures branch alone | 189.2 |
+| **`a9a22ec0` (round 2 combined)** | **275.4 (272.0-279.4)**: +63% on round 1, **2.2x** the start |
+
+All four checksums identical in all 35 runs. Per chunk on one of 6 threads,
+start -> now: noise 12.0 -> 4.5 ms, surface 16.7 -> 6.4, structures 5.4 -> 1.1,
+biomes 6.3 -> 4.1, decoration 6.3 -> 4.4.
+
+**Ideas left after round 2:**
+- Biomes: still 4.1 ms on 6 threads against ~3.7 ms on one; the rest of the
+  biome-chunk waiting.
+- Noise: spline volumes compute coordinates only where needed (<= ~2% of CPU);
+  the aquifer's `compute_substance_below` neighbourhood search (~2%); carver
+  biome checks from cached biome chunks (~1%, only if single-point and bulk
+  climate agree, which the checksums would show).
+- Structures: one trial_chambers start (82-89 ms, chunk 14 5) plus a thread
+  waiting on it is most of the stage; template NBT parsing is a third of it.
+- Decoration: no single item; ore loop hoists, a tag-lookup memo, a cheaper
+  uniform-section test and palette skips together come to ~0.7% overall.
+
 ## Profile of the To The Max world (seed 0, 6 threads, i7 4c/8t)
 
 - One-time **stronghold ring search: ~25 CPU-seconds per world load**. Chunk
@@ -188,8 +259,9 @@ Numbers are per machine: take a new baseline there before comparing.
 1. ~~Cache stronghold ring positions with the world~~: done (5 above). Not yet
    seen in the game itself: the log should say "stronghold positions kept in"
    on the first load and "read from" on the next.
-2. **Chunk generation speed**: loop done, 10 kept commits, see "Autoresearch
-   loop" (+37% on the Windows PC, then +37% more on the laptop).
+2. **Chunk generation speed**: round 1 done, 10 kept commits, see "Autoresearch
+   loop" (+37% on the Windows PC, then +37% more on the laptop); round 2 kept
+   13 more, 2.2x the round-1 start on the laptop.
 3. **Confirm the mouse fix** in real play on Windows (alt-tab, notifications).
 4. **Clean timing of baked LODs**: launch the same world twice with nothing else
    running and log `lod.sampled_target_tiles` / `target_tiles` from
