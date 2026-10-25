@@ -242,6 +242,39 @@ biomes 6.3 -> 4.1, decoration 6.3 -> 4.4.
 - Decoration: no single item; ore loop hoists, a tag-lookup memo, a cheaper
   uniform-section test and palette skips together come to ~0.7% overall.
 
+## Far terrain speed (branch `ttm/lod-far`, on top of round 2)
+
+Goal from the user: distant terrain appears far faster; it may be barebones
+and approximate as long as its shape matches, structures can come later.
+
+| Commit | Change |
+|---|---|
+| `f10ded8b` | `lod_grid`: one biome per 4x4 far columns (cells up to 64 blocks). Painting asked through the biome zoom, whose strays missed the per-quart memo: ~40% of a tile was climate samples |
+| `7480abc9` | `lod_grid`: density only in the surface band found on a 64-block coarse lattice (16-22% of the layers); `SamplerContext::with_planes` keeps y-fixed slice planes (2D noise, 57% of a tile) so the two passes share them |
+| `089dcb2e` | `SavedLodSampler::grid`: saved chunks only in tiles up to 4 blocks a column; region chunk lists kept 10 s; decoded saved chunks shared by the sampling threads (1024, 30 s) |
+| `5566da17` | Up to hardware threads - 2 far-sampling threads once the near terrain has loaded (not measured on its own) |
+
+- `lod_grid_bench` (TTM seed 0, 25 tiles a level), ms per tile, before ->
+  after: level 2 47 -> 17-20, level 3 61 -> 16-18, level 4 62 -> 17-22,
+  level 6 56 -> 34-37. Surface and water heights are identical (the bench's
+  `heights` checksum); surface blocks identical at levels 2-4; biomes differ
+  in 0.1% / 6% / 16% of level 2 / 3 / 4 columns (coarser biome cells).
+- In game the limit was elsewhere: the saved-chunk overlay decoded up to 256
+  saved chunks per far tile (11.7k saved chunks in the To The Max save). On a
+  copy of that save (render 6, 6291 far tiles, nothing baked), far tiles at
+  60 s: ~1450 before the branch, ~3400 after; the whole view in ~2 minutes
+  instead of over 15. With the overlay off entirely it was 61 s: tiles of 4
+  blocks a column still decode saved chunks (`SAVED_LOD_STRIDE` in save.rs).
+- How to measure: `ar/fill.py`-style runs (fresh world copy without
+  `horizon_lod/`, the player's `options.txt` and `horizon-graphics.txt`,
+  `horizon-ctl launch --offscreen`, poll `status` -> `lod.sampled_target_tiles`).
+  Launch with no output pipes: the game inherits horizon-ctl's and a capturing
+  caller then waits for the game to exit.
+- Next ideas: lower `SAVED_LOD_STRIDE` to 2 (saved terrain within ~512 blocks
+  only), keep saved-chunk summaries in the bake keyed by their timestamp (so
+  later sessions skip decoding), and the far view's frame rate drops to ~30
+  with ~10M far quads resident.
+
 ## Profile of the To The Max world (seed 0, 6 threads, i7 4c/8t)
 
 - One-time **stronghold ring search: ~25 CPU-seconds per world load**. Chunk
@@ -275,7 +308,10 @@ biomes 6.3 -> 4.1, decoration 6.3 -> 4.4.
 
 ## The Windows setup this was tested on
 
-- Game: `%APPDATA%\horizon-ttm\` (`play.bat`, `new-world.bat`, saves, options;
+- Game: `E:\Horizon To The Max\` (moved from `%APPDATA%\horizon-ttm\`, where
+  the Claude desktop app redirected AppData writes into its own package
+  storage, then off the C: drive) (`play.bat`, `new-world.bat`, saves, options, `shaderpacks/`;
+  `play.bat` opens the title screen;
   the previous client is kept as `horizon-client.previous.exe`). Desktop
   shortcut "Horizon To The Max" runs `play.bat`. `play.bat` uses the prepared
   resources of any installed Horizon launcher version
