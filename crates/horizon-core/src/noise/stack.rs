@@ -7,11 +7,12 @@ pub trait Noise: std::fmt::Debug + Send + Sync {
     fn range(&self) -> Result<[f32; 2], NanRange>;
     fn get2(&self, x: f64, z: f64) -> f32;
     fn get3(&self, x: f64, y: f64, z: f64) -> f32;
-    /// `out[i] = self.get3(x, ys[i], z)` for one X/Z column (`out` as long
-    /// as `ys`). Implementations share the column's X/Z work, bit for bit.
-    fn get3_column(&self, x: f64, z: f64, ys: &[f64], out: &mut [f32]) {
+    /// `out[i] = self.get3(x, ys[i] * y_scale, z)` for one X/Z column (`out`
+    /// as long as `ys`). Implementations share the column's X/Z work, bit
+    /// for bit.
+    fn get3_column(&self, x: f64, z: f64, ys: &[f64], y_scale: f64, out: &mut [f32]) {
         for (out, y) in out.iter_mut().zip(ys) {
-            *out = self.get3(x, *y, z);
+            *out = self.get3(x, *y * y_scale, z);
         }
     }
     fn add_to_volume(
@@ -52,8 +53,8 @@ impl Noise for PerlinNoise {
     fn get3(&self, x: f64, y: f64, z: f64) -> f32 {
         PerlinNoise::get3(self, x, y, z)
     }
-    fn get3_column(&self, x: f64, z: f64, ys: &[f64], out: &mut [f32]) {
-        PerlinNoise::get3_column(self, x, z, ys, out)
+    fn get3_column(&self, x: f64, z: f64, ys: &[f64], y_scale: f64, out: &mut [f32]) {
+        PerlinNoise::get3_column(self, x, z, ys, y_scale, out)
     }
     fn add_to_volume(
         &self,
@@ -146,11 +147,11 @@ impl Noise for NoiseStack {
         }
         value
     }
-    fn get3_column(&self, x: f64, z: f64, ys: &[f64], out: &mut [f32]) {
+    fn get3_column(&self, x: f64, z: f64, ys: &[f64], y_scale: f64, out: &mut [f32]) {
         const MAX: usize = 64;
         if ys.len() > MAX || out.len() < ys.len() {
             for (out, y) in out.iter_mut().zip(ys) {
-                *out = self.get3(x, *y, z);
+                *out = self.get3(x, *y * y_scale, z);
             }
             return;
         }
@@ -159,14 +160,29 @@ impl Noise for NoiseStack {
         let mut scaled = [0.0; MAX];
         let mut layer_values = [0.0; MAX];
         for layer in &self.layers {
-            let scaled = &mut scaled[..ys.len()];
-            for (scaled, y) in scaled.iter_mut().zip(ys) {
-                *scaled = y * layer.frequency;
-            }
             let values = &mut layer_values[..ys.len()];
-            layer
-                .noise
-                .get3_column(x * layer.frequency, z * layer.frequency, scaled, values);
+            if y_scale == 1.0 {
+                // `y * 1.0` is `y`: the layer scales the heights itself.
+                layer.noise.get3_column(
+                    x * layer.frequency,
+                    z * layer.frequency,
+                    ys,
+                    layer.frequency,
+                    values,
+                );
+            } else {
+                let scaled = &mut scaled[..ys.len()];
+                for (scaled, y) in scaled.iter_mut().zip(ys) {
+                    *scaled = *y * y_scale * layer.frequency;
+                }
+                layer.noise.get3_column(
+                    x * layer.frequency,
+                    z * layer.frequency,
+                    scaled,
+                    1.0,
+                    values,
+                );
+            }
             for (value, layer_value) in out.iter_mut().zip(values.iter()) {
                 *value += layer.amplitude * *layer_value;
             }

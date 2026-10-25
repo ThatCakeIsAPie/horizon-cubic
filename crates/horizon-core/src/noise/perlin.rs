@@ -30,11 +30,11 @@ impl PerlinNoise {
         self.sample(cell, point, point[1])
     }
 
-    /// `get3` down one X/Z column: the X/Z cells, offsets, permutations and
+    /// `get3(x, y * y_scale, z)` for each `y` of `ys`, down one X/Z column: the X/Z cells, offsets, permutations and
     /// fades are found once, and the heights sharing a Y cell share its
     /// corner gradients and are computed side by side (each value with
     /// `get3`'s arithmetic, in its order).
-    pub fn get3_column(&self, x: f64, z: f64, ys: &[f64], out: &mut [f32]) {
+    pub fn get3_column(&self, x: f64, z: f64, ys: &[f64], y_scale: f64, out: &mut [f32]) {
         const LANES: usize = 16;
         let (cell, relative) = self.coordinates([x, 0.0, z]);
         let p = self.table.permute(cell[0]);
@@ -46,7 +46,7 @@ impl PerlinNoise {
             let mut cells = [0_i32; LANES];
             let mut points = [0.0_f32; LANES];
             for i in 0..n {
-                let shifted = wrap(ys[i]) + self.table.offsets[1];
+                let shifted = wrap(ys[i] * y_scale) + self.table.offsets[1];
                 cells[i] = floor_i32(shifted);
                 points[i] = (shifted - f64::from(cells[i])) as f32;
             }
@@ -64,7 +64,38 @@ impl PerlinNoise {
                 let z_terms: [f32; 8] =
                     std::array::from_fn(|k| gradients[k][2] * (pz - ((k >> 2) & 1) as f32));
                 let y_gradients: [f32; 8] = std::array::from_fn(|k| gradients[k][1]);
-                for (out, &py) in out[i..end].iter_mut().zip(&points[i..end]) {
+                // Four heights at a time, each lane with the scalar steps
+                // below (`lerp3`'s order), so the compiler can pack them.
+                let mut lane = i;
+                while lane + 4 <= end {
+                    let py: [f32; 4] = std::array::from_fn(|j| points[lane + j]);
+                    let fade_y = py.map(smoothstep);
+                    let values: [[f32; 4]; 8] = std::array::from_fn(|k| {
+                        std::array::from_fn(|j| {
+                            x_terms[k]
+                                + y_gradients[k] * (py[j] - ((k >> 1) & 1) as f32)
+                                + z_terms[k]
+                        })
+                    });
+                    let lerp4 = |delta: [f32; 4], start: [f32; 4], end: [f32; 4]| -> [f32; 4] {
+                        std::array::from_fn(|j| start[j] + delta[j] * (end[j] - start[j]))
+                    };
+                    let fx = [fade_x; 4];
+                    let low = lerp4(
+                        fade_y,
+                        lerp4(fx, values[0], values[1]),
+                        lerp4(fx, values[2], values[3]),
+                    );
+                    let high = lerp4(
+                        fade_y,
+                        lerp4(fx, values[4], values[5]),
+                        lerp4(fx, values[6], values[7]),
+                    );
+                    let result = lerp4([fade_z; 4], low, high);
+                    out[lane..lane + 4].copy_from_slice(&result);
+                    lane += 4;
+                }
+                for (out, &py) in out[lane..end].iter_mut().zip(&points[lane..end]) {
                     let values = std::array::from_fn(|k| {
                         x_terms[k] + y_gradients[k] * (py - ((k >> 1) & 1) as f32) + z_terms[k]
                     });

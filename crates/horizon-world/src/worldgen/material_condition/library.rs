@@ -14,7 +14,7 @@ use crate::{
 };
 use horizon_core::density::{
     DensitySampler,
-    graph::{DensityCompiler, FunctionId, GraphNode},
+    graph::{DensityCompiler, DensityGraph, FunctionId, GraphNode},
 };
 use serde_json::value::RawValue;
 use std::{
@@ -152,7 +152,7 @@ impl MaterialRuleLibrary {
                 density: self.compiler.get_sampler(self.roots[roots[0]])?,
                 richness: self.compiler.get_sampler(self.roots[roots[1]])?,
                 filler_gap: self.compiler.get_sampler(self.roots[roots[2]])?,
-                gate: self.height_gate(self.roots[roots[0]])?,
+                gate: self.height_gate(self.roots[roots[0]], self.roots[roots[1]])?,
             },
         });
         self.compiled.insert(key, value.clone());
@@ -163,7 +163,11 @@ impl MaterialRuleLibrary {
     /// A density of the form `range_choice(input, min, max, inside, c)` with
     /// an `input` that varies only with Y and a constant `c <= 0`: outside
     /// the heights where `input` is in range, the density is never above zero.
-    fn height_gate(&mut self, mut id: FunctionId) -> Result<Option<DensityGate>, DecodeError> {
+    fn height_gate(
+        &mut self,
+        mut id: FunctionId,
+        richness: FunctionId,
+    ) -> Result<Option<DensityGate>, DecodeError> {
         let graph = self.compiler.graph();
         let resolve = |mut id: FunctionId| {
             for _ in 0..256 {
@@ -196,11 +200,55 @@ impl MaterialRuleLibrary {
         if !constant.is_some_and(|c| c <= 0.0) || graph.domain_axes(input)? & !2 != 0 {
             return Ok(None);
         }
+        let lattices = [root, richness].map(|id| lattice_y(graph, id, 0));
         Ok(Some(DensityGate {
             input: self.compiler.get_sampler(input)?,
             min_inclusive: min,
             max_exclusive: max,
+            lattices,
         }))
+    }
+}
+/// A Y period `p` of `id`'s volume samples: sampling a volume whose minimum Y
+/// moves by a multiple of `p` gives every shared block the same value. The
+/// graph may hold only nodes whose value is a function of the block alone
+/// (its volume path included), and interpolations of such nodes, whose
+/// lattice and fill order then stay the same (`p` is their cell heights'
+/// least common multiple). `None` for anything else.
+fn lattice_y(graph: &DensityGraph, id: FunctionId, depth: usize) -> Option<i32> {
+    fn lcm(a: i32, b: i32) -> Option<i32> {
+        fn gcd(a: i32, b: i32) -> i32 {
+            if b == 0 { a } else { gcd(b, a % b) }
+        }
+        let value = (a / gcd(a, b)).checked_mul(b)?;
+        (value <= 1 << 10).then_some(value)
+    }
+    if depth >= 64 {
+        return None;
+    }
+    let child = |id: FunctionId| lattice_y(graph, id, depth + 1);
+    match graph.node(id)? {
+        GraphNode::Constant(_) | GraphNode::Gradient { .. } => Some(1),
+        GraphNode::Noise {
+            shift_x,
+            shift_y,
+            shift_z,
+            ..
+        } => lcm(lcm(child(*shift_x)?, child(*shift_y)?)?, child(*shift_z)?),
+        GraphNode::Reference { input, .. }
+        | GraphNode::Unary { input, .. }
+        | GraphNode::Clamp { input, .. }
+        | GraphNode::Cache(input) => child(*input),
+        GraphNode::Binary { left, right, .. } => lcm(child(*left)?, child(*right)?),
+        GraphNode::Choice {
+            input,
+            inside,
+            outside,
+            ..
+        } => lcm(lcm(child(*input)?, child(*inside)?)?, child(*outside)?),
+        // One level: the cells are filled from the input's lattice samples.
+        GraphNode::Interpolated { input, y, .. } if *y > 0 && child(*input)? == 1 => Some(*y),
+        _ => None,
     }
 }
 struct Loader<'a, 'b> {

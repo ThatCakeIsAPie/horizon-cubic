@@ -43,13 +43,16 @@ pub trait MaterialSurfaceQueries {
     }
     /// `bind_density(sampler, true)` for a density read only where `gate`'s
     /// input is in range (or, with `gated`, that `gate` describes): the eager
-    /// sample may stop above the highest such height. With `gated`,
-    /// `density_heights` also covers the heights above it.
+    /// sample may stop above the highest such height and, given a `lattice`
+    /// period of the sampler's volume samples, start at the last multiple
+    /// of it at or below the lowest. With `gated`, `density_heights` also
+    /// covers the heights outside it.
     fn bind_gated_density(
         &mut self,
         sampler: Arc<dyn horizon_core::density::DensitySampler>,
         _gate: &DensityGate,
         _gated: bool,
+        _lattice: Option<i32>,
     ) -> Result<usize, DecodeError> {
         self.bind_density(sampler, true)
     }
@@ -118,8 +121,9 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
         sampler: Arc<dyn horizon_core::density::DensitySampler>,
         gate: &DensityGate,
         gated: bool,
+        lattice: Option<i32>,
     ) -> Result<usize, DecodeError> {
-        (**self).bind_gated_density(sampler, gate, gated)
+        (**self).bind_gated_density(sampler, gate, gated, lattice)
     }
     fn density(&mut self, index: usize, position: BlockPos) -> Result<f32, MaterialRuleError> {
         (**self).density(index, position)
@@ -342,6 +346,7 @@ impl<S: MaterialSurfaceQueries> Context<S> {
                     f64::from(self.position.x),
                     f64::from(self.position.z),
                     &ys,
+                    1.0,
                     &mut noise.column,
                 );
                 noise.column_top = y;

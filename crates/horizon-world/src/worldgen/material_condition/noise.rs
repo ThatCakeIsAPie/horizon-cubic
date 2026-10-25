@@ -63,8 +63,10 @@ impl<P: PositionalRandom, S: MaterialSurfaceQueries> MaterialSurfaceQueries
         sampler: Arc<dyn horizon_core::density::DensitySampler>,
         gate: &super::DensityGate,
         gated: bool,
+        lattice: Option<i32>,
     ) -> Result<usize, DecodeError> {
-        self.surface.bind_gated_density(sampler, gate, gated)
+        self.surface
+            .bind_gated_density(sampler, gate, gated, lattice)
     }
     fn density(&mut self, index: usize, position: BlockPos) -> Result<f32, MaterialRuleError> {
         self.surface.density(index, position)
