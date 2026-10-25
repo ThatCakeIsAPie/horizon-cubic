@@ -1135,6 +1135,10 @@ where
         );
         let context = &mut worker.biome_context;
         context.capture_lattice();
+        // One quart layer above the chunk's: the noise fill's 4-block cell
+        // lattice reaches one layer past the top quart, and sampling that
+        // layer alone there redid every column's Y-independent inputs.
+        // Pointwise values, so the quarts below are unchanged.
         let volume = resolver.prepare_volume(
             context,
             [
@@ -1142,7 +1146,7 @@ where
                 min >> 2,
                 pos.z.wrapping_shl(4) >> 2,
             ],
-            [4, height >> 2, 4],
+            [4, (height >> 2).wrapping_add(1), 4],
         );
         let lattice = context.take_lattice_capture();
         let volume = volume.map_err(stage("biomes"))?;
