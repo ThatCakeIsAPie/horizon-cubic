@@ -261,10 +261,10 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
     let rule = worker.add_rule(rule)?;
     let cx = chunk.position().x.wrapping_shl(4);
     let cz = chunk.position().z.wrapping_shl(4);
-    // The blocks a stone-depth scan read below the current height, from
-    // `scanned_top` down. The column writes only the block it is at, so they
-    // are still the column's blocks when the walk reaches them.
-    let mut scanned: Vec<BlockStateId> = Vec::new();
+    // The column's blocks from its top down, read once per column. The walk
+    // writes only the block it is at, so the blocks below (which it and the
+    // stone-depth scan read) are still these when it reads them.
+    let mut blocks: Vec<BlockStateId> = Vec::new();
     let mut stage_heightmaps = false;
     for lx in 0..16 {
         for lz in 0..16 {
@@ -307,8 +307,8 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
             let mut bottom = i32::MAX;
             let mut y = top;
             let mut budget = 1 << 20;
-            scanned.clear();
-            let mut scanned_top = 0i32;
+            chunk.column_blocks(x, z, top, min - 1, &mut blocks);
+            let block_at = |y: i32| blocks[(i64::from(top) - i64::from(y)) as usize];
             let mut column = Column {
                 chunk,
                 x,
@@ -319,11 +319,7 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
             };
             while y >= min {
                 tick(&mut budget)?;
-                let below_top = i64::from(scanned_top) - i64::from(y);
-                let state = match usize::try_from(below_top).ok().and_then(|i| scanned.get(i)) {
-                    Some(state) => *state,
-                    None => column.block(y)?,
-                };
+                let state = block_at(y);
                 let properties = column.chunk.block_properties(state);
                 if properties.is_air() {
                     above = 0;
@@ -336,12 +332,9 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
                     if bottom >= y {
                         bottom = -32512; // DimensionType.MIN_Y << 4 for 26.3.
                         let mut below = y.wrapping_sub(1);
-                        scanned.clear();
-                        scanned_top = below;
                         while below >= min - 1 {
                             tick(&mut budget)?;
-                            let state = column.block(below)?;
-                            scanned.push(state);
+                            let state = block_at(below);
                             let properties = column.chunk.block_properties(state);
                             if properties.is_air() || properties.has_fluid() {
                                 bottom = below.wrapping_add(1);

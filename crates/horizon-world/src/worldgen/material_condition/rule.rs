@@ -43,6 +43,10 @@ pub struct DensityGate {
     pub input: Arc<dyn DensitySampler>,
     pub min_inclusive: f32,
     pub max_exclusive: f32,
+    /// For the density and the richness: a Y period of their volume samples
+    /// (moving a volume's minimum Y by a multiple of it keeps every shared
+    /// block's value), when known.
+    pub lattices: [Option<i32>; 2],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterialRuleError {
@@ -131,8 +135,18 @@ impl<R: RandomSource> Node<R> {
                 let (density, richness) = match &gate {
                     // The richness is only read where the density is above zero.
                     Some(gate) => (
-                        context.surface.bind_gated_density(density, gate, true)?,
-                        context.surface.bind_gated_density(richness, gate, false)?,
+                        context.surface.bind_gated_density(
+                            density,
+                            gate,
+                            true,
+                            gate.lattices[0],
+                        )?,
+                        context.surface.bind_gated_density(
+                            richness,
+                            gate,
+                            false,
+                            gate.lattices[1],
+                        )?,
                     ),
                     None => (
                         context.surface.bind_density(density, true)?,

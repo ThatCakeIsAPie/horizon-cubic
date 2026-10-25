@@ -311,13 +311,18 @@ mod tests {
             .create(&mut random)
             .unwrap();
         let perlin = PerlinNoise::new(&mut random);
-        let noises: [&dyn Noise; 2] = [&stack, &perlin];
+        // A stack inside a stack scales its layers' heights twice.
+        let nested = NoiseStack::builder()
+            .add(std::sync::Arc::new(stack.clone()), 0.37, 0.5)
+            .build()
+            .unwrap();
+        let noises: [&dyn Noise; 3] = [&stack, &perlin, &nested];
         for noise in noises {
             for (x, z) in [(0.0, 0.0), (-17.0, 33.0), (1.0e9, -3.0e7), (123.5, -0.25)] {
                 for step in [1, 7] {
                     let ys: Vec<f64> = (0..40).map(|i| f64::from(100 - step * i)).collect();
                     let mut out = vec![0.0; ys.len()];
-                    noise.get3_column(x, z, &ys, &mut out);
+                    noise.get3_column(x, z, &ys, 1.0, &mut out);
                     for (y, value) in ys.iter().zip(&out) {
                         assert_eq!(
                             value.to_bits(),

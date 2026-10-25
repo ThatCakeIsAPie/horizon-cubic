@@ -339,6 +339,42 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
         }
         Some(bound)
     }
+    /// `block(x, y, z)` for every `y` from `top` down to `bottom`, into `out`
+    /// (cleared first), reading each section's column in one pass.
+    pub fn column_blocks(
+        &self,
+        x: i32,
+        z: i32,
+        top: i32,
+        bottom: i32,
+        out: &mut Vec<BlockStateId>,
+    ) {
+        out.clear();
+        let mut y = i64::from(top);
+        let bottom = i64::from(bottom);
+        let min = i64::from(self.blocks.min_y);
+        while y >= bottom {
+            let Some(section) = self.blocks.section_index(y as i32) else {
+                out.push(self.blocks.void_air);
+                y -= 1;
+                continue;
+            };
+            let low = bottom.max(min + section as i64 * 16);
+            if self.blocks.non_air[section] == 0 {
+                out.extend(std::iter::repeat_n(self.blocks.air, (y - low + 1) as usize));
+            } else {
+                let blocks = &self.blocks.sections[section];
+                for block_y in (low..=y).rev() {
+                    out.push(
+                        blocks
+                            .get(local_index(x, block_y as i32, z))
+                            .expect("valid section coordinates"),
+                    );
+                }
+            }
+            y = low - 1;
+        }
+    }
     pub fn position(&self) -> ChunkPos {
         self.position
     }

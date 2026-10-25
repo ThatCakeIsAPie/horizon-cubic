@@ -42,13 +42,16 @@ pub trait MaterialSurfaceQueries {
     }
     /// `bind_density(sampler, true)` for a density read only where `gate`'s
     /// input is in range (or, with `gated`, that `gate` describes): the eager
-    /// sample may stop above the highest such height. With `gated`,
-    /// `density_heights` also covers the heights above it.
+    /// sample may stop above the highest such height and, given a `lattice`
+    /// period of the sampler's volume samples, start at the last multiple
+    /// of it at or below the lowest. With `gated`, `density_heights` also
+    /// covers the heights outside it.
     fn bind_gated_density(
         &mut self,
         sampler: Arc<dyn horizon_core::density::DensitySampler>,
         _gate: &DensityGate,
         _gated: bool,
+        _lattice: Option<i32>,
     ) -> Result<usize, DecodeError> {
         self.bind_density(sampler, true)
     }
@@ -117,8 +120,9 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
         sampler: Arc<dyn horizon_core::density::DensitySampler>,
         gate: &DensityGate,
         gated: bool,
+        lattice: Option<i32>,
     ) -> Result<usize, DecodeError> {
-        (**self).bind_gated_density(sampler, gate, gated)
+        (**self).bind_gated_density(sampler, gate, gated, lattice)
     }
     fn density(&mut self, index: usize, position: BlockPos) -> Result<f32, MaterialRuleError> {
         (**self).density(index, position)
@@ -341,6 +345,7 @@ impl<S: MaterialSurfaceQueries> Context<S> {
                     f64::from(self.position.x),
                     f64::from(self.position.z),
                     &ys,
+                    1.0,
                     &mut noise.column,
                 );
                 noise.column_top = y;
@@ -516,12 +521,40 @@ impl<R: RandomSource> Compiled<R> {
     /// once per block: a block-level result is never asked for twice, and
     /// column-level ones (hole, steep) are pure in the column's state, so the
     /// revision cache would change nothing.
-    #[inline]
+    ///
+    /// Inlined into the rule program's loop: `eval`'s steps without its
+    /// recursion (an inversion only flips the result).
+    #[inline(always)]
     fn test_once<S: MaterialSurfaceQueries>(
-        &mut self,
+        &self,
         context: &mut Context<S>,
     ) -> Result<bool, MaterialRuleError> {
-        self.eval::<false, S>(context)
+        let mut node = self;
+        let mut invert = false;
+        while let Kind::Not(child) = &node.kind {
+            invert = !invert;
+            node = child;
+        }
+        let value = match &node.kind {
+            Kind::Constant(value) => *value,
+            Kind::Noise { sampler, min, max } => {
+                let value = context.noise(*sampler);
+                value >= *min && value <= *max
+            }
+            Kind::Simple(MaterialCondition::AbovePreliminarySurface) => {
+                context.position.y >= context.minimum_surface_level()?
+            }
+            Kind::Simple(MaterialCondition::Temperature) => {
+                let biome = context.biome()?.ok_or(MaterialRuleError::MissingBiome)?;
+                context.surface.cold_enough_to_snow(
+                    &biome,
+                    context.position,
+                    context.generation.sea_level,
+                )?
+            }
+            _ => node.compute(context)?,
+        };
+        Ok(value != invert)
     }
     #[inline]
     fn eval<const CACHE: bool, S: MaterialSurfaceQueries>(
