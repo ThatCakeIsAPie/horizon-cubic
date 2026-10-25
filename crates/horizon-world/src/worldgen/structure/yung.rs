@@ -14,7 +14,7 @@
 //! layout is done each piece's modifiers can turn it into another template
 //! or place it last.
 use super::{
-    BoundingBox, Rotation, StructureResources, StructureTemplate,
+    BoundingBox, LazyTemplate, Rotation, StructureResources, StructureTemplate,
     jigsaw::{
         Free, JigsawConfig, JigsawContext, Junction, PoolElement, PoolPiece, Pools, Projection,
         can_attach, shuffle, step,
@@ -385,7 +385,7 @@ impl At<'_> {
             let b = other.bounding_box;
             !self.gone.get(i).copied().unwrap_or(false)
                 && b != piece
-                && matches(template)
+                && matches(template.arc())
                 && b.intersects(search)
                 && !b.intersects(&piece)
         })
@@ -887,7 +887,7 @@ fn transform(piece: &mut PoolPiece, output: &[Arc<StructureTemplate>], offset: [
     else {
         return;
     };
-    *template = output[chosen].clone();
+    *template = LazyTemplate::loaded(output[chosen].clone());
     piece.waterlogging = waterlogging.unwrap_or(true);
     let [dx, dy, dz] = offset;
     let [dx, dz] = match piece.rotation {
@@ -909,7 +909,7 @@ mod tests {
 
     fn single(template: &Arc<StructureTemplate>, rules: Option<Rules>) -> Arc<PoolElement> {
         Arc::new(PoolElement::Single {
-            template: template.clone(),
+            template: LazyTemplate::loaded(template.clone()),
             processors: Default::default(),
             legacy: false,
             projection: Projection::Rigid,
@@ -1110,7 +1110,7 @@ mod tests {
         let PoolElement::Single { template, yung, .. } = piece.element.as_ref() else {
             panic!("not a single element");
         };
-        assert!(Arc::ptr_eq(template, chosen));
+        assert!(Arc::ptr_eq(template.arc(), chosen));
         assert_eq!(
             yung.as_ref().and_then(|r| r.name.as_deref()),
             Some("pillar")
