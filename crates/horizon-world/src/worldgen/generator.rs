@@ -1741,17 +1741,20 @@ impl UniformSurfaceBiomes {
         if *slot != SurfaceCell::Unknown {
             return *slot;
         }
-        // These are immutable stored lookups, in quart_at_block's corner order.
+        // These are immutable stored lookups (`BiomeRegion::noise_biome`), in
+        // quart_at_block's corner order; the two Y corners share a chunk.
         let mut biomes = [BiomeId(0); 8];
-        for (corner, biome) in biomes.iter_mut().enumerate() {
-            let offsets = [(corner >> 2) & 1, (corner >> 1) & 1, corner & 1];
-            match region.noise_biome(std::array::from_fn(|i| {
-                base[i].wrapping_add(offsets[i] as i32)
-            })) {
-                Ok(id) => *biome = *id,
-                Err(_) => {
+        for x in 0..2 {
+            for z in 0..2 {
+                let qx = base[0].wrapping_add(x);
+                let qz = base[2].wrapping_add(z);
+                let Ok(chunk) = region.chunk(ChunkPos::new(qx >> 2, qz >> 2)) else {
                     *slot = SurfaceCell::Lookup;
                     return SurfaceCell::Lookup;
+                };
+                for y in 0..2 {
+                    biomes[(x as usize) << 2 | (y as usize) << 1 | z as usize] =
+                        *chunk.noise_biome([qx, base[1].wrapping_add(y), qz]);
                 }
             }
         }

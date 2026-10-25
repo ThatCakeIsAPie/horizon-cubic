@@ -84,6 +84,9 @@ struct Column<'a, 'r, B: TerrainBlockStates> {
     z: i32,
     min: i32,
     max: i32,
+    /// `TerrainChunk::settled_height` of this column, known since its last
+    /// heightmap-changing write.
+    settled: Option<i32>,
 }
 impl<B: TerrainBlockStates> MaterialColumn for Column<'_, '_, B> {
     type Error = SurfaceError;
@@ -92,7 +95,20 @@ impl<B: TerrainBlockStates> MaterialColumn for Column<'_, '_, B> {
     }
     fn set_block(&mut self, y: i32, state: BlockStateId) -> Result<(), SurfaceError> {
         if y >= self.min && y <= self.max {
-            self.chunk.set_block_worldgen(self.x, y, self.z, state)?;
+            if self.settled.is_none() {
+                self.settled = self.chunk.settled_height(self.x, self.z);
+            }
+            // Below every heightmap's top (and not air, which
+            // `set_block_worldgen` may skip in an empty section), the write
+            // changes no heightmap: `Heightmap::update` returns at once.
+            if self.settled.is_some_and(|bound| y <= bound)
+                && !self.chunk.block_properties(state).is_air()
+            {
+                self.chunk.set_block_raw(self.x, y, self.z, state)?;
+            } else {
+                self.chunk.set_block_worldgen(self.x, y, self.z, state)?;
+                self.settled = None;
+            }
             if self.chunk.block_properties(state).has_fluid() {
                 self.chunk.mark_postprocessing(self.x, y, self.z);
             }
@@ -245,6 +261,11 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
     let rule = worker.add_rule(rule)?;
     let cx = chunk.position().x.wrapping_shl(4);
     let cz = chunk.position().z.wrapping_shl(4);
+    // The blocks a stone-depth scan read below the current height, from
+    // `scanned_top` down. The column writes only the block it is at, so they
+    // are still the column's blocks when the walk reaches them.
+    let mut scanned: Vec<BlockStateId> = Vec::new();
+    let mut stage_heightmaps = false;
     for lx in 0..16 {
         for lz in 0..16 {
             let x = cx.wrapping_add(lx);
@@ -261,6 +282,7 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
                         z,
                         min: write_min_y,
                         max: write_max_y,
+                        settled: None,
                     },
                     x,
                     z,
@@ -285,16 +307,23 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
             let mut bottom = i32::MAX;
             let mut y = top;
             let mut budget = 1 << 20;
+            scanned.clear();
+            let mut scanned_top = 0i32;
             let mut column = Column {
                 chunk,
                 x,
                 z,
                 min: write_min_y,
                 max: write_max_y,
+                settled: None,
             };
             while y >= min {
                 tick(&mut budget)?;
-                let state = column.block(y)?;
+                let below_top = i64::from(scanned_top) - i64::from(y);
+                let state = match usize::try_from(below_top).ok().and_then(|i| scanned.get(i)) {
+                    Some(state) => *state,
+                    None => column.block(y)?,
+                };
                 let properties = column.chunk.block_properties(state);
                 if properties.is_air() {
                     above = 0;
@@ -307,9 +336,12 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
                     if bottom >= y {
                         bottom = -32512; // DimensionType.MIN_Y << 4 for 26.3.
                         let mut below = y.wrapping_sub(1);
+                        scanned.clear();
+                        scanned_top = below;
                         while below >= min - 1 {
                             tick(&mut budget)?;
                             let state = column.block(below)?;
+                            scanned.push(state);
                             let properties = column.chunk.block_properties(state);
                             if properties.is_air() || properties.has_fluid() {
                                 bottom = below.wrapping_add(1);
@@ -326,7 +358,11 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
                             // there. Rewriting it changes no block and, with
                             // the stage's heightmaps kept, no height: only the
                             // fluid mark of the write remains.
-                            if new == state && column.chunk.has_stage_heightmaps() {
+                            // Heightmaps are only ever added, so once present
+                            // they stay.
+                            stage_heightmaps =
+                                stage_heightmaps || column.chunk.has_stage_heightmaps();
+                            if new == state && stage_heightmaps {
                                 if column.chunk.block_properties(new).has_fluid() {
                                     column.chunk.mark_postprocessing(x, y, z);
                                 }

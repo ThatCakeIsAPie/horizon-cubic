@@ -325,6 +325,20 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
         }
         Ok(previous)
     }
+    /// The highest height at local `x, z` where `set_block_worldgen` of a
+    /// non-air state leaves every heightmap of this stage as it is (each is
+    /// at least two above it), or `None` while one of them is missing.
+    pub fn settled_height(&self, x: i32, z: i32) -> Option<i32> {
+        let mut bound = i32::MAX;
+        for &kind in self.stage.heightmaps() {
+            let first = self.heightmaps[kind as usize]
+                .as_ref()?
+                .first_available(x & 15, z & 15)
+                .ok()?;
+            bound = bound.min(first.wrapping_sub(2));
+        }
+        Some(bound)
+    }
     pub fn position(&self) -> ChunkPos {
         self.position
     }

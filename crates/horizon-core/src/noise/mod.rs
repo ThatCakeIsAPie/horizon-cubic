@@ -314,15 +314,17 @@ mod tests {
         let noises: [&dyn Noise; 2] = [&stack, &perlin];
         for noise in noises {
             for (x, z) in [(0.0, 0.0), (-17.0, 33.0), (1.0e9, -3.0e7), (123.5, -0.25)] {
-                let ys: Vec<f64> = (0..40).map(|i| f64::from(100 - 7 * i)).collect();
-                let mut out = vec![0.0; ys.len()];
-                noise.get3_column(x, z, &ys, &mut out);
-                for (y, value) in ys.iter().zip(&out) {
-                    assert_eq!(
-                        value.to_bits(),
-                        noise.get3(x, *y, z).to_bits(),
-                        "{x} {y} {z}"
-                    );
+                for step in [1, 7] {
+                    let ys: Vec<f64> = (0..40).map(|i| f64::from(100 - step * i)).collect();
+                    let mut out = vec![0.0; ys.len()];
+                    noise.get3_column(x, z, &ys, &mut out);
+                    for (y, value) in ys.iter().zip(&out) {
+                        assert_eq!(
+                            value.to_bits(),
+                            noise.get3(x, *y, z).to_bits(),
+                            "{x} {y} {z}"
+                        );
+                    }
                 }
             }
         }

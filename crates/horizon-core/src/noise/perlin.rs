@@ -30,36 +30,48 @@ impl PerlinNoise {
         self.sample(cell, point, point[1])
     }
 
-    /// `get3` down one X/Z column: the X/Z cells, offsets and permutations
-    /// are found once, and corner gradients are reused while Y stays in its
-    /// cell. Each value is computed with `get3`'s arithmetic.
+    /// `get3` down one X/Z column: the X/Z cells, offsets, permutations and
+    /// fades are found once, and the heights sharing a Y cell share its
+    /// corner gradients and are computed side by side (each value with
+    /// `get3`'s arithmetic, in its order).
     pub fn get3_column(&self, x: f64, z: f64, ys: &[f64], out: &mut [f32]) {
+        const LANES: usize = 16;
         let (cell, relative) = self.coordinates([x, 0.0, z]);
         let p = self.table.permute(cell[0]);
         let q = self.table.permute(cell[0].wrapping_add(1));
-        let mut previous_y = None;
-        let mut gradients = [[0.0; 3]; 8];
-        for (out, y) in out.iter_mut().zip(ys) {
-            let shifted = wrap(*y) + self.table.offsets[1];
-            let cell_y = floor_i32(shifted);
-            let point = [
-                relative[0] as f32,
-                (shifted - f64::from(cell_y)) as f32,
-                relative[2] as f32,
-            ];
-            if previous_y != Some(cell_y) {
-                gradients = self.gradients_at(p, q, cell_y, cell[2]);
-                previous_y = Some(cell_y);
+        let (px, pz) = (relative[0] as f32, relative[2] as f32);
+        let (fade_x, fade_z) = (smoothstep(px), smoothstep(pz));
+        for (ys, out) in ys.chunks(LANES).zip(out.chunks_mut(LANES)) {
+            let n = ys.len().min(out.len());
+            let mut cells = [0_i32; LANES];
+            let mut points = [0.0_f32; LANES];
+            for i in 0..n {
+                let shifted = wrap(ys[i]) + self.table.offsets[1];
+                cells[i] = floor_i32(shifted);
+                points[i] = (shifted - f64::from(cells[i])) as f32;
             }
-            let values = Self::corner_values(gradients, point);
-            *out = lerp3(
-                [
-                    smoothstep(point[0]),
-                    smoothstep(point[1]),
-                    smoothstep(point[2]),
-                ],
-                values,
-            );
+            let mut i = 0;
+            while i < n {
+                let cell_y = cells[i];
+                let mut end = i + 1;
+                while end < n && cells[end] == cell_y {
+                    end += 1;
+                }
+                let gradients = self.gradients_at(p, q, cell_y, cell[2]);
+                // `dot`'s X and Z products per corner.
+                let x_terms: [f32; 8] =
+                    std::array::from_fn(|k| gradients[k][0] * (px - (k & 1) as f32));
+                let z_terms: [f32; 8] =
+                    std::array::from_fn(|k| gradients[k][2] * (pz - ((k >> 2) & 1) as f32));
+                let y_gradients: [f32; 8] = std::array::from_fn(|k| gradients[k][1]);
+                for (out, &py) in out[i..end].iter_mut().zip(&points[i..end]) {
+                    let values = std::array::from_fn(|k| {
+                        x_terms[k] + y_gradients[k] * (py - ((k >> 1) & 1) as f32) + z_terms[k]
+                    });
+                    *out = lerp3([fade_x, smoothstep(py), fade_z], values);
+                }
+                i = end;
+            }
         }
     }
 
