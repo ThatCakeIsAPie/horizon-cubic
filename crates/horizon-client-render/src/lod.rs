@@ -26,7 +26,7 @@ const MAX_SAVED: usize = 1024;
 /// How many resident chunks may wait for the worker's summary at once
 /// (`Lod::observing`).
 pub const OBSERVE_AHEAD: usize = 8;
-const SAMPLE_JOBS: usize = 6;
+const SAMPLE_JOBS: usize = 10;
 /// Threads that sample far tiles beside the mesher. Machines with 12 or more
 /// threads use up to 6 (measured: a cold 1024-chunk LoD loads about a quarter
 /// sooner than with 3); smaller ones half their threads less one (a 4-core,
@@ -642,6 +642,8 @@ struct Shared {
     stop: AtomicBool,
     /// Reduced far detail: samplers approximate wide cells.
     approximate: AtomicBool,
+    /// The near terrain has loaded: the extra sampling threads may work.
+    extra: AtomicBool,
 }
 /// One background worker, sampling threads and at most `SAMPLE_JOBS`
 /// outstanding sample jobs. Only the
@@ -707,6 +709,7 @@ impl Lod {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             approximate: AtomicBool::new(false),
+            extra: AtomicBool::new(false),
         });
         let worker = shared.clone();
         let mesh_context = context.clone();
@@ -718,8 +721,12 @@ impl Lod {
                 horizon_threads::behind_server();
                 let mut sampler = source.sampler();
                 let count = sampling_threads(cores);
+                // Once the near terrain has loaded its workers are idle: up to
+                // all hardware threads but two then sample far tiles.
+                let total = cores.saturating_sub(2).clamp(count, 8);
                 let mut sampling = Vec::new();
-                for _ in 0..count {
+                for index in 0..total {
+                    let extra = index >= count;
                     let Some(mut sample) = sampler.fork() else {
                         break;
                     };
@@ -731,6 +738,14 @@ impl Lod {
                             .spawn(move || {
                                 horizon_threads::behind_server();
                                 loop {
+                                    // Not on `wake` while held back, so as not to
+                                    // swallow the notification of a job.
+                                    while extra && !shared.extra.load(Ordering::Relaxed) {
+                                        if shared.stop.load(Ordering::Relaxed) {
+                                            return;
+                                        }
+                                        thread::sleep(std::time::Duration::from_millis(100));
+                                    }
                                     let key = {
                                         let mut jobs = shared.jobs.lock().unwrap();
                                         loop {
@@ -745,11 +760,15 @@ impl Lod {
                                                 else {
                                                     unreachable!()
                                                 };
-                                                break key;
+                                                break Some(key);
+                                            }
+                                            if extra && !shared.extra.load(Ordering::Relaxed) {
+                                                break None;
                                             }
                                             jobs = shared.wake.wait(jobs).unwrap();
                                         }
                                     };
+                                    let Some(key) = key else { continue };
                                     let [x, _, z] = key.origin();
                                     sample.set_approximate(
                                         shared.approximate.load(Ordering::Relaxed),
@@ -1142,6 +1161,7 @@ impl Lod {
     /// terrain then holds back (`HELD_SAMPLE_STEP`).
     pub fn set_near_loading(&mut self, loading: bool) {
         self.near_loading = loading;
+        self.shared.extra.store(!loading, Ordering::Relaxed);
     }
     /// Reduced far detail (`graphics::FarDetail::Reduced`): the next update
     /// replans when it changes, and tiles sampled from then on approximate
