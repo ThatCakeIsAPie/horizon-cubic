@@ -50,7 +50,7 @@ impl<P: FluidPicker> TerrainAquifer for DisabledAquifer<P> {
 impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> TerrainAquifer
     for NoiseBasedAquifer<P, F, B>
 {
-    #[inline]
+    #[inline(always)]
     fn compute_substance(
         &mut self,
         context: &mut SamplerContext,
@@ -59,7 +59,7 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> TerrainAquifer
     ) -> Result<Option<BlockStateId>, AquiferError> {
         NoiseBasedAquifer::compute_substance(self, context, position, density)
     }
-    #[inline]
+    #[inline(always)]
     fn should_schedule_fluid_update(&self) -> bool {
         NoiseBasedAquifer::should_schedule_fluid_update(self)
     }

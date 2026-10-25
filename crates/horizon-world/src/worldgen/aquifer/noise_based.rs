@@ -237,6 +237,7 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
     pub fn cached_surfaces(&self) -> impl Iterator<Item = (i64, i32)> + '_ {
         self.surfaces.iter().map(|(key, value)| (*key, *value))
     }
+    #[inline(always)]
     pub fn should_schedule_fluid_update(&self) -> bool {
         self.schedule
     }
@@ -487,7 +488,9 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
     }
     /// Solid and above-surface blocks (most of a chunk) return here; the rest
     /// goes to the out-of-line cell search.
-    #[inline]
+    // Always, not a hint: whether the hint was taken depended on the size of
+    // unrelated code inlined into the caller, swinging the noise stage ~20%.
+    #[inline(always)]
     pub fn compute_substance(
         &mut self,
         context: &mut SamplerContext,
