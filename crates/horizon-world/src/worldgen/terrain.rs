@@ -469,9 +469,16 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     }
 }
 
-/// Evaluate final density in bulk before writes, then visit Z/X/descending Y.
+/// Evaluate final density in bulk before writes, then visit each chunk section
+/// from the top down, Z/X/descending Y within it, and write its blocks after
+/// visiting it, in the same order. Every column is still visited from the top
+/// down, heightmap updates only read the column below the updated block (not
+/// written yet in either order), and aquifer results depend on the position
+/// and density alone, so the chunk ends as if each block were written as its
+/// column is visited top to bottom. A section filled with the default block
+/// throughout becomes uniform at once instead of through 4096 writes.
 /// The aquifer and final density must share this already prepared sampler context.
-/// Failures retain earlier writes and aquifer/cache state; there is no rollback.
+/// Failures retain earlier sections' writes and aquifer/cache state; there is no rollback.
 /// Regular gameplay only: developer preliminary-surface markers are not applied.
 pub fn fill_noise<B: TerrainBlockStates>(
     chunk: &mut TerrainChunk<'_, B>,
@@ -499,49 +506,102 @@ pub fn fill_noise<B: TerrainBlockStates>(
     let mut density = vec![0.; volume.size()];
     final_density.sample_volume(context, &mut density, volume)?;
     const MAPS: [HeightmapType; 2] = [HeightmapType::OceanFloorWg, HeightmapType::WorldSurfaceWg];
-    for z in 0..sz {
-        let world_z = bz.wrapping_add(z as i32);
-        for x in 0..sx {
-            let world_x = bx.wrapping_add(x as i32);
-            // Heightmap updates at or below first-available - 2 are no-ops; the
-            // bound only changes through an update, so skip those calls.
-            let mut settled = MAPS.map(|kind| {
+    let air = chunk.blocks.air;
+    // Heightmap updates at or below first-available - 2 are no-ops; the bound
+    // only changes through an update, so skip those calls. Per column x + 16z.
+    let mut settled: Vec<[Result<i32, HeightmapError>; 2]> = (0..256)
+        .map(|column| {
+            MAPS.map(|kind| {
                 chunk.heightmaps[kind as usize]
                     .as_ref()
                     .expect("ensured heightmap")
-                    .first_available(x as i32, z as i32)
+                    .first_available(column % 16, column / 16)
                     .map(|first| first.wrapping_sub(2))
-            });
-            // Layout is Z, X, Y with Y innermost: this column is one run.
-            let column = volume.index([x, 0, z]).expect("valid density coordinates");
-            let column = &density[column..column + sy];
-            for (y, &value) in column.iter().enumerate().rev() {
-                let world_y = by.wrapping_add(y as i32);
-                let state = aquifer
-                    .compute_substance(context, [world_x, world_y, world_z], f64::from(value))?
-                    .unwrap_or(default_block);
-                if state == chunk.blocks.air {
-                    continue;
-                }
-                chunk.set_block_raw(x as i32, world_y, z as i32, state)?;
-                for (kind, settled) in MAPS.into_iter().zip(&mut settled) {
-                    if matches!(settled, Ok(bound) if world_y <= *bound) {
+            })
+        })
+        .collect();
+    // The visited section's states, by (16z + x) * 16 + y - low.
+    let mut states = [air; 4096];
+    let mut high = sy;
+    while high > 0 {
+        // The chunk section holding the highest Y not visited yet.
+        let world_top = by.wrapping_add(high as i32 - 1);
+        let below = (i64::from(world_top) - i64::from(chunk.min_y())).rem_euclid(16) as usize;
+        let low = high.saturating_sub(below + 1);
+        let section = chunk
+            .blocks
+            .section_index(world_top)
+            .ok_or(TerrainError::OutsideBuildHeight)?;
+        let mut uniform = high - low == 16;
+        for z in 0..sz {
+            let world_z = bz.wrapping_add(z as i32);
+            for x in 0..sx {
+                let world_x = bx.wrapping_add(x as i32);
+                let settled = &mut settled[x + 16 * z];
+                // Layout is Z, X, Y with Y innermost: this column is one run.
+                let start = volume.index([x, 0, z]).expect("valid density coordinates");
+                let column = &density[start + low..start + high];
+                let column_states = &mut states[(16 * z + x) * 16..(16 * z + x) * 16 + 16];
+                for (y, &value) in column.iter().enumerate().rev() {
+                    let world_y = by.wrapping_add((low + y) as i32);
+                    let state = aquifer
+                        .compute_substance(context, [world_x, world_y, world_z], f64::from(value))?
+                        .unwrap_or(default_block);
+                    column_states[y] = state;
+                    uniform &= state == default_block;
+                    if state == air {
                         continue;
                     }
-                    chunk.update_heightmap(kind, x as i32, world_y, z as i32, state)?;
-                    *settled = chunk.heightmaps[kind as usize]
-                        .as_ref()
-                        .expect("ensured heightmap")
-                        .first_available(x as i32, z as i32)
-                        .map(|first| first.wrapping_sub(2));
-                }
-                if aquifer.should_schedule_fluid_update()
-                    && chunk.blocks.properties.heightmap_state(state).has_fluid()
-                {
-                    chunk.mark_postprocessing(world_x, world_y, world_z);
+                    for (kind, settled) in MAPS.into_iter().zip(settled.iter_mut()) {
+                        if matches!(settled, Ok(bound) if world_y <= *bound) {
+                            continue;
+                        }
+                        chunk.update_heightmap(kind, x as i32, world_y, z as i32, state)?;
+                        *settled = chunk.heightmaps[kind as usize]
+                            .as_ref()
+                            .expect("ensured heightmap")
+                            .first_available(x as i32, z as i32)
+                            .map(|first| first.wrapping_sub(2));
+                    }
+                    if aquifer.should_schedule_fluid_update()
+                        && chunk.blocks.properties.heightmap_state(state).has_fluid()
+                    {
+                        chunk.mark_postprocessing(world_x, world_y, world_z);
+                    }
                 }
             }
         }
+        if uniform && default_block != air {
+            chunk.blocks.sections[section].fill(default_block)?;
+            chunk.blocks.non_air[section] = if chunk
+                .blocks
+                .properties
+                .heightmap_state(default_block)
+                .is_air()
+            {
+                0
+            } else {
+                4096
+            };
+        } else {
+            for z in 0..sz {
+                for x in 0..sx {
+                    let column_states = &states[(16 * z + x) * 16..(16 * z + x) * 16 + 16];
+                    for y in (0..high - low).rev() {
+                        let state = column_states[y];
+                        if state != air {
+                            chunk.set_block_raw(
+                                x as i32,
+                                by.wrapping_add((low + y) as i32),
+                                z as i32,
+                                state,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        high = low;
     }
     Ok(())
 }

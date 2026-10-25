@@ -427,6 +427,22 @@ impl<'r> BlockSection<'r> {
         section.extra = container.extra;
         Ok(section)
     }
+    /// Set every entry to `state`, leaving the section as `set` on all 4,096
+    /// entries (in any order) would: uniform, extra data kept.
+    pub fn fill(&mut self, state: BlockStateId) -> io::Result<()> {
+        if state.0 as usize >= self.registry.len() {
+            return Err(invalid("state ID outside registry"));
+        }
+        if self.storage.is_none() && self.palette[0] == state {
+            return Ok(());
+        }
+        self.palette = vec![state];
+        self.local_ids = local_ids(state);
+        self.counts = vec![4096];
+        self.free.clear();
+        self.storage = None;
+        Ok(())
+    }
     /// Test current distinct states without unpacking all 4,096 cells. The
     /// predicate should be pure; unused palette slots are intentionally skipped.
     pub fn any_state(&self, mut predicate: impl FnMut(BlockStateId) -> bool) -> bool {
