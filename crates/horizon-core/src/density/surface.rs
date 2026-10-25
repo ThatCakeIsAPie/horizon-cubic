@@ -1,4 +1,5 @@
 use super::*;
+use std::{collections::HashMap, sync::Mutex};
 
 /// The unsliced search primitive. Compiled terrain graphs wrap this in a Y=0
 /// slice through `compile_surface_search`, so their upper bound is horizontal.
@@ -8,6 +9,23 @@ pub struct FindTopSurfaceSampler {
     upper_bound: Arc<dyn DensitySampler>,
     lower_bound: i32,
     cell_height: i32,
+    /// Searches already made, shared by every context and thread, when each
+    /// density value depends on its position alone ([`is_pointwise_scalar`]):
+    /// a search is then a function of its column and upper bound. Neighbouring
+    /// chunks' aquifers, surfaces and structures search the same columns.
+    searches: Option<Arc<SearchMemo>>,
+}
+#[derive(Debug, Default)]
+struct SearchMemo {
+    shards: [Mutex<HashMap<(i32, i32, u32), i32>>; 16],
+}
+impl SearchMemo {
+    const SHARD_LIMIT: usize = 1 << 16;
+    fn shard(&self, key: (i32, i32, u32)) -> &Mutex<HashMap<(i32, i32, u32), i32>> {
+        let mix =
+            (key.0 as u32).wrapping_mul(0x9E37_79B9) ^ (key.1 as u32).wrapping_mul(0x85EB_CA6B);
+        &self.shards[(mix >> 28) as usize]
+    }
 }
 impl FindTopSurfaceSampler {
     pub fn new(
@@ -20,6 +38,7 @@ impl FindTopSurfaceSampler {
             return Err(DensityError::NonpositiveSteps.into());
         }
         Ok(Self {
+            searches: is_pointwise_scalar(&density).then(Default::default),
             density,
             upper_bound,
             lower_bound,
@@ -27,6 +46,29 @@ impl FindTopSurfaceSampler {
         })
     }
     fn find_surface_from(
+        &self,
+        context: &mut SamplerContext,
+        x: i32,
+        z: i32,
+        upper: f32,
+    ) -> Result<i32, SampleError> {
+        let Some(searches) = &self.searches else {
+            return self.search(context, x, z, upper);
+        };
+        let key = (x, z, upper.to_bits());
+        let shard = searches.shard(key);
+        if let Some(&surface) = shard.lock().unwrap().get(&key) {
+            return Ok(surface);
+        }
+        let surface = self.search(context, x, z, upper)?;
+        let mut shard = shard.lock().unwrap();
+        if shard.len() >= SearchMemo::SHARD_LIMIT {
+            shard.clear();
+        }
+        shard.insert(key, surface);
+        Ok(surface)
+    }
+    fn search(
         &self,
         context: &mut SamplerContext,
         x: i32,
