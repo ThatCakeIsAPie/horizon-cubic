@@ -296,6 +296,9 @@ fn lerp(alpha: f32, first: f32, second: f32) -> f32 {
     first + alpha * (second - first)
 }
 impl DensitySampler for InterpolatedSampler {
+    fn bulk_differs(&self) -> bool {
+        true
+    }
     fn sample_value(
         &self,
         context: &mut SamplerContext,

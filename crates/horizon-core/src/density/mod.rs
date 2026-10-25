@@ -182,14 +182,37 @@ pub trait DensitySampler: std::fmt::Debug + Send + Sync {
     fn pointwise_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
         None
     }
+
+    /// Whether this sampler's own arithmetic differs between `sample_volume`
+    /// and `sample_value` at the same position (interpolation does). Context
+    /// caches answer scalar queries from cached volumes, so with such a
+    /// sampler below them a scalar value depends on what the context holds.
+    fn bulk_differs(&self) -> bool {
+        false
+    }
 }
 /// Whether every sampler reachable from `root` is pointwise.
 pub fn is_pointwise(root: &Arc<dyn DensitySampler>) -> bool {
+    all_pointwise(root, |_| true)
+}
+/// Whether every sampler reachable from `root` is pointwise and computes the
+/// same value in bulk as alone: a scalar value then depends on its position
+/// only, whatever the context's caches hold.
+pub fn is_pointwise_scalar(root: &Arc<dyn DensitySampler>) -> bool {
+    all_pointwise(root, |sampler| !sampler.bulk_differs())
+}
+fn all_pointwise(
+    root: &Arc<dyn DensitySampler>,
+    accept: impl Fn(&dyn DensitySampler) -> bool,
+) -> bool {
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![root];
     while let Some(sampler) = stack.pop() {
         if !seen.insert(Arc::as_ptr(sampler) as *const () as usize) {
             continue;
+        }
+        if !accept(sampler.as_ref()) {
+            return false;
         }
         match sampler.pointwise_inputs() {
             Some(inputs) => stack.extend(inputs),
