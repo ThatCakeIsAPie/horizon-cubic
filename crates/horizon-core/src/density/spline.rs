@@ -266,6 +266,127 @@ impl CubicSpline {
 pub struct SplineSampler {
     spline: CubicSpline,
     coordinates: Vec<Arc<dyn DensitySampler>>,
+    /// The spline as flat arrays for the volume path.
+    flat: FlatSpline,
+}
+
+/// A multipoint node: its coordinate and its run of points.
+#[derive(Clone, Copy, Debug)]
+struct FlatNode {
+    coordinate: u32,
+    first: u32,
+    count: u32,
+}
+/// A compiled spline in arrays, evaluated with `CubicSpline::sample`'s
+/// arithmetic and in its order. Node 0 is the root.
+#[derive(Clone, Debug, Default)]
+struct FlatSpline {
+    nodes: Vec<FlatNode>,
+    locations: Vec<f32>,
+    derivatives: Vec<f32>,
+    /// Per point: its constant value, or `u32::MAX` there and its node in
+    /// `children`.
+    constants: Vec<f32>,
+    children: Vec<u32>,
+}
+impl FlatSpline {
+    fn new(spline: &CubicSpline) -> Self {
+        let mut flat = Self::default();
+        if let CubicSpline::Multipoint(node) = spline {
+            flat.push(node);
+        }
+        flat
+    }
+    fn push(&mut self, node: &MultipointSpline) -> u32 {
+        let id = self.nodes.len() as u32;
+        let first = self.locations.len();
+        self.nodes.push(FlatNode {
+            coordinate: node.coordinate as u32,
+            first: first as u32,
+            count: node.points.len() as u32,
+        });
+        for point in &node.points {
+            self.locations.push(point.location);
+            self.derivatives.push(point.derivative);
+            self.constants.push(0.0);
+            self.children.push(u32::MAX);
+        }
+        for (i, point) in node.points.iter().enumerate() {
+            match &point.value {
+                CubicSpline::Constant(value) => self.constants[first + i] = *value,
+                CubicSpline::Multipoint(child) => {
+                    let child = self.push(child);
+                    self.children[first + i] = child;
+                }
+            }
+        }
+        id
+    }
+    #[inline]
+    fn value(
+        &self,
+        point: usize,
+        coordinates: &[Option<Vec<f32>>],
+        index: usize,
+        missing: &mut u32,
+    ) -> f32 {
+        match self.children[point] {
+            u32::MAX => self.constants[point],
+            child => self.sample(child as usize, coordinates, index, missing),
+        }
+    }
+    /// The node's value at `index`. A coordinate not sampled yet is recorded
+    /// in `missing` (the first one only) and the value is then meaningless.
+    fn sample(
+        &self,
+        node: usize,
+        coordinates: &[Option<Vec<f32>>],
+        index: usize,
+        missing: &mut u32,
+    ) -> f32 {
+        let node = self.nodes[node];
+        let Some(buffer) = &coordinates[node.coordinate as usize] else {
+            if *missing == u32::MAX {
+                *missing = node.coordinate;
+            }
+            return 0.0;
+        };
+        let input = buffer[index];
+        let start = node.first as usize;
+        let locations = &self.locations[start..start + node.count as usize];
+        let mut first = 0;
+        let mut remaining = locations.len();
+        while remaining != 0 {
+            let half = remaining / 2;
+            let middle = first + half;
+            if input < locations[middle] {
+                remaining = half;
+            } else {
+                first = middle + 1;
+                remaining -= half + 1;
+            }
+        }
+        if first == 0 || first == locations.len() {
+            let endpoint = start + if first == 0 { 0 } else { first - 1 };
+            let value = self.value(endpoint, coordinates, index, missing);
+            let derivative = self.derivatives[endpoint];
+            return if derivative == 0.0 {
+                value
+            } else {
+                value + derivative * (input - self.locations[endpoint])
+            };
+        }
+        let (left, right) = (start + first - 1, start + first);
+        let width = self.locations[right] - self.locations[left];
+        let alpha = (input - self.locations[left]) / width;
+        let left_value = self.value(left, coordinates, index, missing);
+        let right_value = self.value(right, coordinates, index, missing);
+        let left_correction = self.derivatives[left] * width - (right_value - left_value);
+        let right_correction = -self.derivatives[right] * width + (right_value - left_value);
+        let linear = left_value + alpha * (right_value - left_value);
+        let correction = left_correction + alpha * (right_correction - left_correction);
+        linear + (alpha * (1.0 - alpha)) * correction
+    }
 }
 impl SplineSampler {
     /// Equal coordinate IDs share evaluation results. Structural function
@@ -280,6 +401,7 @@ impl SplineSampler {
         let mut coordinates = Vec::new();
         let spline = spline.compile(inputs, &mut HashMap::new(), &mut coordinates)?;
         Ok(Self {
+            flat: FlatSpline::new(&spline),
             spline,
             coordinates,
         })
@@ -323,20 +445,26 @@ impl DensitySampler for SplineSampler {
             (0..self.coordinates.len()).map(|_| None).collect();
         let result = (|| {
             for (index, value) in output.iter_mut().enumerate() {
-                *value = self.spline.sample(&mut |id| {
-                    if buffers[id].is_none() {
-                        let mut buffer = context.scratch.pop().unwrap_or_default();
-                        buffer.resize(volume.size(), 0.0);
-                        if let Err(error) =
-                            self.coordinates[id].sample_volume(context, &mut buffer, volume)
-                        {
-                            context.scratch.push(buffer);
-                            return Err(error);
-                        }
-                        buffers[id] = Some(buffer);
+                loop {
+                    let mut missing = u32::MAX;
+                    let sampled = self.flat.sample(0, &buffers, index, &mut missing);
+                    if missing == u32::MAX {
+                        *value = sampled;
+                        break;
                     }
-                    Ok(buffers[id].as_ref().unwrap()[index])
-                })?;
+                    // The coordinate this point needs first: sample it over
+                    // the volume, as the recursive path does, and retry.
+                    let id = missing as usize;
+                    let mut buffer = context.scratch.pop().unwrap_or_default();
+                    buffer.resize(volume.size(), 0.0);
+                    if let Err(error) =
+                        self.coordinates[id].sample_volume(context, &mut buffer, volume)
+                    {
+                        context.scratch.push(buffer);
+                        return Err(error);
+                    }
+                    buffers[id] = Some(buffer);
+                }
             }
             Ok(())
         })();
