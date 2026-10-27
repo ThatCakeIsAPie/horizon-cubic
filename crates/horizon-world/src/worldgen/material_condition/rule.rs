@@ -1,7 +1,7 @@
 //! Compiled material rule composition, sharing the condition worker's context.
 use super::{
     Compiled, Context, DensityHeights, MaterialCondition, MaterialConditions,
-    MaterialSurfaceQueries,
+    MaterialSurfaceQueries, RunTrace,
 };
 use crate::{registry::BlockStateId, worldgen::DecodeError};
 use horizon_core::{
@@ -318,6 +318,89 @@ impl<R: RandomSource> CompiledRule<R> {
         }
         Ok(None)
     }
+    /// `apply`, also telling down to which height of the current run of
+    /// solid blocks (and for which biome) the result holds: see `RunMemo`.
+    fn apply_traced<S: MaterialSurfaceQueries>(
+        &mut self,
+        position: BlockPos,
+        context: &mut Context<S>,
+        run: &mut RunTrace,
+    ) -> Result<Option<BlockStateId>, MaterialRuleError> {
+        let mut at = 0;
+        while let Some(op) = self.ops.get(at) {
+            match op {
+                Op::Block(block) => return Ok(Some(*block)),
+                Op::Bandlands => {
+                    run.varies = true;
+                    return context.surface.band(position).map(Some);
+                }
+                Op::Condition { condition, skip } => {
+                    let condition = &self.conditions[*condition];
+                    let value = condition.test_once(context)?;
+                    condition.stable_below(value, context, run);
+                    at = if value { at + 1 } else { *skip };
+                }
+                Op::OreVein {
+                    blocks,
+                    raw_ore_chance,
+                    densities,
+                    heights,
+                    random,
+                } => {
+                    match heights {
+                        Some(heights) if heights.never_positive(context.position) => {
+                            let y = context.position.y;
+                            let low = if y > heights.y[1] {
+                                heights.y[1].wrapping_add(1).max(heights.min[1])
+                            } else {
+                                heights.min[1]
+                            };
+                            run.low = run.low.max(i64::from(low));
+                        }
+                        _ => run.varies = true,
+                    }
+                    if let Some(block) = ore_vein(
+                        blocks,
+                        *raw_ore_chance,
+                        densities,
+                        heights,
+                        random,
+                        position,
+                        context,
+                    )? {
+                        return Ok(Some(block));
+                    }
+                    at += 1;
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+/// Results of a rule program down one run of solid blocks of a column (no
+/// air or fluid in between: the stone above grows by one a block, while the
+/// water height, the stone below's bottom and the column stay). Each entry
+/// holds while every condition its program run tested keeps its value, which
+/// for the tests that are height bounds is down to a known height; programs
+/// that tested something varying block by block (3D noise, gradients inside
+/// their band, ore veins where they may be dense, bands, temperatures) give no
+/// entry. Clear it whenever the run ends.
+#[derive(Default)]
+pub struct RunMemo {
+    entries: Vec<RunEntry>,
+}
+#[derive(Clone, Copy)]
+struct RunEntry {
+    /// The biome the program tested, `None` when it tested none.
+    biome: Option<u32>,
+    low: i64,
+    result: Option<BlockStateId>,
+}
+impl RunMemo {
+    #[inline]
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 fn ore_vein<P: PositionalRandom, S: MaterialSurfaceQueries>(
     blocks: &[BlockStateId; 3],
@@ -367,6 +450,72 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
         self.rules.push(compiled);
         Ok(index)
     }
+    /// `update_y(stone_above, stone_below, water_height, position.y)` then
+    /// `try_apply(index, position)`, for the blocks of a column's runs of
+    /// solid blocks walked down in y, reusing `memo`'s results where they
+    /// provably hold (the caller clears `memo` when a run ends). Also gives
+    /// a height down to which the result is the same for every block of the
+    /// run (`position.y` when not known; `floor`, the run's lowest block,
+    /// bounds how far down it looks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_apply_in_run(
+        &mut self,
+        index: usize,
+        position: BlockPos,
+        memo: &mut RunMemo,
+        stone_above: i32,
+        stone_below: i32,
+        water_height: i32,
+        floor: i32,
+    ) -> Result<(Option<BlockStateId>, i32), MaterialRuleError> {
+        let y = i64::from(position.y);
+        let mut biome = None;
+        if !memo.entries.is_empty() {
+            for entry in &memo.entries {
+                if entry.biome.is_none() && y >= entry.low {
+                    return Ok((entry.result, entry.low.max(i64::from(floor)) as i32));
+                }
+            }
+            // A failed lookup is left for the program to report, if it asks.
+            if let Ok(Some((id, low))) = self.context.surface.biome_id_down(position, floor) {
+                biome = Some(id);
+                for entry in &memo.entries {
+                    if entry.biome == Some(id) && y >= entry.low {
+                        return Ok((entry.result, entry.low.max(i64::from(low)) as i32));
+                    }
+                }
+            }
+        }
+        self.update_y(stone_above, stone_below, water_height, position.y);
+        self.context.biome_id = biome;
+        let rule = self
+            .rules
+            .get_mut(index)
+            .ok_or(MaterialRuleError::UnknownRule)?;
+        let mut run = RunTrace {
+            low: i64::MIN,
+            biome: false,
+            varies: false,
+        };
+        let result = rule.apply_traced(position, &mut self.context, &mut run)?;
+        let key = match (run.biome, self.context.biome_id) {
+            (false, _) => Some(None),
+            (true, Some(id)) => Some(Some(id)),
+            (true, None) => None,
+        };
+        if let Some(biome) = key.filter(|_| !run.varies && run.low <= y) {
+            // Entries ending above this block no longer serve.
+            memo.entries.retain(|entry| entry.low <= y);
+            if memo.entries.len() < 8 {
+                memo.entries.push(RunEntry {
+                    biome,
+                    low: run.low,
+                    result,
+                });
+            }
+        }
+        Ok((result, position.y))
+    }
     /// Predicates read the worker's updated context. Position arguments are
     /// forwarded to block-producing rules independently, as in vanilla.
     pub fn try_apply(
@@ -378,5 +527,217 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
             .get_mut(index)
             .ok_or(MaterialRuleError::UnknownRule)?
             .apply(position, &mut self.context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worldgen::anchor::{VerticalAnchor, WorldGenerationContext};
+    use horizon_core::random::{RandomSource, XoroshiroRandom};
+
+    struct Surface;
+    impl MaterialSurfaceQueries for Surface {
+        fn surface_depth(&mut self, x: i32, z: i32) -> i32 {
+            (x ^ z) & 3
+        }
+        fn surface_secondary(&mut self, x: i32, _: i32) -> f64 {
+            f64::from(x % 5) / 5.0
+        }
+        fn preliminary_surface(&mut self, p: BlockPos) -> Result<f32, MaterialRuleError> {
+            Ok(14.5 + p.x as f32)
+        }
+        fn biome_index(&self, name: &str) -> Option<Option<u32>> {
+            Some(name.strip_prefix("minecraft:b").map(|n| n.parse().unwrap()))
+        }
+        fn biome_id(&mut self, p: BlockPos) -> Result<Option<u32>, MaterialRuleError> {
+            Ok(Some(((p.y.div_euclid(5) + p.x) % 3) as u32))
+        }
+        fn biome_id_down(
+            &mut self,
+            p: BlockPos,
+            _: i32,
+        ) -> Result<Option<(u32, i32)>, MaterialRuleError> {
+            Ok(self.biome_id(p)?.map(|id| (id, p.y.div_euclid(5) * 5)))
+        }
+        fn band(&mut self, p: BlockPos) -> Result<BlockStateId, MaterialRuleError> {
+            Ok(BlockStateId(100 + p.y.rem_euclid(3) as u32))
+        }
+    }
+    fn when(condition: MaterialCondition, rule: MaterialRule) -> MaterialRule {
+        MaterialRule::Condition {
+            if_true: condition,
+            then_run: Box::new(rule),
+        }
+    }
+    fn block(id: u32) -> MaterialRule {
+        MaterialRule::Block(BlockStateId(id))
+    }
+    fn stone_depth(
+        offset: i32,
+        add_surface_depth: bool,
+        range: i32,
+        ceiling: bool,
+    ) -> MaterialCondition {
+        MaterialCondition::StoneDepth {
+            offset,
+            add_surface_depth,
+            secondary_depth_range: range,
+            ceiling,
+        }
+    }
+
+    /// Runs memoized down a column give what the program gives block by block.
+    #[test]
+    fn run_memo_matches_each_block() {
+        let rule = MaterialRule::Sequence(vec![
+            when(
+                MaterialCondition::VerticalGradient {
+                    random_name: "minecraft:floor".into(),
+                    true_at_and_below: VerticalAnchor::Absolute(-30),
+                    false_at_and_above: VerticalAnchor::Absolute(-25),
+                },
+                block(1),
+            ),
+            when(stone_depth(0, false, 0, false), block(2)),
+            when(
+                MaterialCondition::Biome(vec!["minecraft:b1".into()]),
+                MaterialRule::Sequence(vec![
+                    when(
+                        MaterialCondition::YAbove {
+                            anchor: VerticalAnchor::Absolute(10),
+                            surface_depth_multiplier: 1,
+                            add_stone_depth: false,
+                        },
+                        when(stone_depth(1, true, 4, true), block(3)),
+                    ),
+                    when(
+                        MaterialCondition::Water {
+                            offset: -2,
+                            surface_depth_multiplier: 0,
+                            add_stone_depth: false,
+                        },
+                        block(4),
+                    ),
+                    when(
+                        MaterialCondition::Not(Box::new(MaterialCondition::YAbove {
+                            anchor: VerticalAnchor::Absolute(30),
+                            surface_depth_multiplier: -1,
+                            add_stone_depth: true,
+                        })),
+                        block(5),
+                    ),
+                ]),
+            ),
+            when(
+                MaterialCondition::Biome(vec!["minecraft:b2".into()]),
+                when(
+                    MaterialCondition::AbovePreliminarySurface,
+                    MaterialRule::Bandlands,
+                ),
+            ),
+            when(
+                MaterialCondition::Water {
+                    offset: 0,
+                    surface_depth_multiplier: 1,
+                    add_stone_depth: true,
+                },
+                when(stone_depth(3, true, 0, false), block(6)),
+            ),
+            when(
+                MaterialCondition::Not(Box::new(stone_depth(2, false, 3, true))),
+                when(MaterialCondition::Hole, block(7)),
+            ),
+            when(MaterialCondition::Steep, block(8)),
+        ]);
+        let new = || {
+            let mut worker = MaterialConditions::<XoroshiroRandom, _>::new(
+                WorldGenerationContext::new(-32, 96, 20),
+                XoroshiroRandom::new(5).fork_positional(),
+                Surface,
+            );
+            let index = worker.add_rule(rule.clone()).unwrap();
+            (worker, index)
+        };
+        let (mut memoized, rule_m) = new();
+        let (mut plain, rule_p) = new();
+        let mut memo = RunMemo::default();
+        let mut seed = 12345u64;
+        let mut hits = 0;
+        let mut long_spans = 0;
+        for column in 0..40 {
+            let (x, z) = (column % 7 - 3, column / 7);
+            // 0 air, 1 fluid, 2 solid; from y 63 down to -32.
+            let mut kinds = Vec::new();
+            while kinds.len() < 96 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let kind = [2, 2, 2, 0, 1][(seed >> 33) as usize % 5];
+                let len = 1 + (seed >> 40) as usize % 30;
+                kinds.extend(std::iter::repeat_n(kind, len));
+            }
+            kinds.truncate(96);
+            let kind = |y: i32| if y < -32 { 0 } else { kinds[(63 - y) as usize] };
+            let gradient = [(column % 9) - 4, (column % 11) - 5];
+            memoized.update_xz(x, z, gradient[0], gradient[1]);
+            plain.update_xz(x, z, gradient[0], gradient[1]);
+            memo.clear();
+            let (mut above, mut water, mut bottom) = (0, i32::MIN, i32::MAX);
+            let mut spans = Vec::new();
+            let mut expected_at = std::collections::HashMap::new();
+            for y in (-32..=63).rev() {
+                match kind(y) {
+                    0 => {
+                        memo.clear();
+                        above = 0;
+                        water = i32::MIN;
+                    }
+                    1 => {
+                        memo.clear();
+                        if water == i32::MIN {
+                            water = y + 1;
+                        }
+                    }
+                    _ => {
+                        if bottom >= y {
+                            bottom = -33;
+                            for below in (-33..y).rev() {
+                                if kind(below) != 2 {
+                                    bottom = below + 1;
+                                    break;
+                                }
+                            }
+                        }
+                        above += 1;
+                        let below = y - bottom + 1;
+                        let position = BlockPos::new(x, y, z);
+                        let before = memo.entries.len();
+                        let (got, low) = memoized
+                            .try_apply_in_run(
+                                rule_m, position, &mut memo, above, below, water, bottom,
+                            )
+                            .unwrap();
+                        assert!(low <= y);
+                        spans.push((y, low, got));
+                        hits += usize::from(memo.entries.len() == before && before > 0);
+                        plain.update_y(above, below, water, y);
+                        let expected = plain.try_apply(rule_p, position).unwrap();
+                        assert_eq!(got, expected, "{x} {y} {z}");
+                        expected_at.insert(y, (bottom, expected));
+                    }
+                }
+            }
+            // A span holds for every block of its run down to its low end.
+            for (y, low, got) in spans {
+                let run = expected_at[&y].0;
+                for below in low.max(run)..=y {
+                    assert_eq!(expected_at[&below], (run, got), "{x} {y} {below} {z}");
+                }
+                long_spans += usize::from(y - low.max(run) >= 3);
+            }
+        }
+        assert!(hits > 100, "{hits}");
+        assert!(long_spans > 20, "{long_spans}");
     }
 }

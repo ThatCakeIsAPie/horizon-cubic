@@ -4,7 +4,7 @@ use super::{
     anchor::WorldGenerationContext,
     material_condition::{
         MaterialConditions, MaterialDensitySources, MaterialRule, MaterialRuleError,
-        MaterialSurfaceQueries,
+        MaterialSurfaceQueries, RunMemo,
     },
     material_extensions::{ExtensionError, MaterialColumn, MaterialExtensions},
     terrain::{TerrainBlockStates, TerrainChunk, TerrainError},
@@ -266,6 +266,7 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
     // stone-depth scan read) are still these when it reads them.
     let mut blocks: Vec<BlockStateId> = Vec::new();
     let mut stage_heightmaps = false;
+    let mut memo = RunMemo::default();
     for lx in 0..16 {
         for lz in 0..16 {
             let x = cx.wrapping_add(lx);
@@ -322,9 +323,11 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
                 let state = block_at(y);
                 let properties = column.chunk.block_properties(state);
                 if properties.is_air() {
+                    memo.clear();
                     above = 0;
                     water = i32::MIN;
                 } else if properties.has_fluid() {
+                    memo.clear();
                     if water == i32::MIN {
                         water = y.wrapping_add(1);
                     }
@@ -344,9 +347,18 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
                         }
                     }
                     above = above.wrapping_add(1);
-                    worker.update_y(above, y.wrapping_sub(bottom).wrapping_add(1), water, y);
+                    let below = y.wrapping_sub(bottom).wrapping_add(1);
                     if y >= write_min_y && y <= write_max_y {
-                        if let Some(new) = worker.try_apply(rule, BlockPos::new(x, y, z))? {
+                        let (result, low) = worker.try_apply_in_run(
+                            rule,
+                            BlockPos::new(x, y, z),
+                            &mut memo,
+                            above,
+                            below,
+                            water,
+                            bottom.max(write_min_y),
+                        )?;
+                        if let Some(new) = result {
                             // Most rules give deep blocks the stone already
                             // there. Rewriting it changes no block and, with
                             // the stage's heightmaps kept, no height: only the
@@ -363,10 +375,36 @@ fn build_columns<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStat
                                 column.set_block(y, new)?;
                             }
                         }
+                        // The blocks below down to `low` (all solid: the run
+                        // reaches `bottom`) get the same result: when that
+                        // changes nothing, step over them.
+                        let low = low.max(bottom).max(write_min_y);
+                        let skipped = y.wrapping_sub(low);
+                        if skipped > 0 && budget >= skipped as usize {
+                            let unchanged = match result {
+                                None => true,
+                                Some(new) => {
+                                    let first = (i64::from(top) - i64::from(y) + 1) as usize;
+                                    let last = (i64::from(top) - i64::from(low)) as usize;
+                                    stage_heightmaps
+                                        && !column.chunk.block_properties(new).has_fluid()
+                                        && blocks[first..=last].iter().all(|state| *state == new)
+                                }
+                            };
+                            if unchanged {
+                                budget -= skipped as usize;
+                                above = above.wrapping_add(skipped);
+                                y = low;
+                            }
+                        }
+                    } else {
+                        memo.clear();
+                        worker.update_y(above, below, water, y);
                     }
                 }
                 y = y.wrapping_sub(1);
             }
+            memo.clear();
             if matches!(
                 biome.as_ref(),
                 "minecraft:frozen_ocean" | "minecraft:deep_frozen_ocean"

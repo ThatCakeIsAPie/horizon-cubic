@@ -23,7 +23,7 @@ use horizon_core::{
 pub use library::MaterialRuleLibrary;
 pub use noise::MaterialNoiseSources;
 use rule::CompiledRule;
-pub use rule::{DensityGate, MaterialRule, MaterialRuleError};
+pub use rule::{DensityGate, MaterialRule, MaterialRuleError, RunMemo};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -76,6 +76,16 @@ pub trait MaterialSurfaceQueries {
     /// number their biomes: biome conditions then compare numbers.
     fn biome_id(&mut self, _position: BlockPos) -> Result<Option<u32>, MaterialRuleError> {
         Err(MaterialRuleError::MissingBiomeProvider)
+    }
+    /// `biome_id` at `position`, with the lowest height down to which the
+    /// column has that biome at every block (`position.y` when not known;
+    /// it need not look below `floor`).
+    fn biome_id_down(
+        &mut self,
+        position: BlockPos,
+        _floor: i32,
+    ) -> Result<Option<(u32, i32)>, MaterialRuleError> {
+        Ok(self.biome_id(position)?.map(|id| (id, position.y)))
     }
     /// `Some` when `biome_id` answers: the index of the biome `name` (`None`
     /// inside when no biome has that name).
@@ -141,6 +151,13 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
     }
     fn biome_id(&mut self, position: BlockPos) -> Result<Option<u32>, MaterialRuleError> {
         (**self).biome_id(position)
+    }
+    fn biome_id_down(
+        &mut self,
+        position: BlockPos,
+        floor: i32,
+    ) -> Result<Option<(u32, i32)>, MaterialRuleError> {
+        (**self).biome_id_down(position, floor)
     }
     fn biome_index(&self, name: &str) -> Option<Option<u32>> {
         (**self).biome_index(name)
@@ -383,6 +400,15 @@ impl<S: MaterialSurfaceQueries> Context<S> {
         self.secondary
     }
 }
+/// What a rule program's run at one block depended on (`CompiledRule::apply_traced`).
+struct RunTrace {
+    /// The result holds down to this height of the run...
+    low: i64,
+    /// ...when the block's biome is the same (if `biome`)...
+    biome: bool,
+    /// ...unless something tested varies block by block.
+    varies: bool,
+}
 struct Compiled<R: RandomSource> {
     kind: Kind<R>,
     revision: i64,
@@ -555,6 +581,131 @@ impl<R: RandomSource> Compiled<R> {
             _ => node.compute(context)?,
         };
         Ok(value != invert)
+    }
+    /// After `test_once` gave `value` at the context's block: raise `run.low`
+    /// to the lowest height down the current run of solid blocks
+    /// (y falls by one and the stone above grows by one per block; water,
+    /// the bottom of the run and the column stay) where the test still gives
+    /// `value`. Marks `run` as varying when that isn't a plain height bound.
+    fn stable_below<S: MaterialSurfaceQueries>(
+        &self,
+        value: bool,
+        context: &mut Context<S>,
+        run: &mut RunTrace,
+    ) {
+        let mut node = self;
+        let mut value = value;
+        while let Kind::Not(child) = &node.kind {
+            value = !value;
+            node = child;
+        }
+        let y = i64::from(context.position.y);
+        // Lowest height of the run giving `value`, for a test `y >= bound`.
+        let at_least = |bound: i32| if value { i64::from(bound) } else { i64::MIN };
+        let low = match &node.kind {
+            Kind::Constant(_) => i64::MIN,
+            Kind::BiomeIds(_) => {
+                run.biome = true;
+                i64::MIN
+            }
+            Kind::Noise { sampler, .. } => {
+                if context.noises[*sampler].is_3d {
+                    run.varies = true;
+                }
+                i64::MIN
+            }
+            Kind::Gradient { low, high, .. } => {
+                if context.position.y <= *low {
+                    i64::MIN
+                } else if context.position.y >= *high {
+                    i64::from(*high).max(i64::from(*low) + 1)
+                } else {
+                    run.varies = true;
+                    i64::MIN
+                }
+            }
+            Kind::Simple(MaterialCondition::Hole | MaterialCondition::Steep) => i64::MIN,
+            Kind::Simple(MaterialCondition::AbovePreliminarySurface) => {
+                // Column-cached: computed by the test that gave `value`.
+                match context.minimum_surface_level() {
+                    Ok(minimum) => at_least(minimum),
+                    Err(_) => {
+                        run.varies = true;
+                        i64::MIN
+                    }
+                }
+            }
+            Kind::Simple(MaterialCondition::YAbove {
+                anchor,
+                surface_depth_multiplier,
+                add_stone_depth,
+            }) => {
+                if *add_stone_depth {
+                    // y + stone above is the same down the run.
+                    i64::MIN
+                } else {
+                    at_least(
+                        anchor
+                            .resolve(context.generation)
+                            .wrapping_add(context.depth.wrapping_mul(*surface_depth_multiplier)),
+                    )
+                }
+            }
+            Kind::Simple(MaterialCondition::Water {
+                offset,
+                surface_depth_multiplier,
+                add_stone_depth,
+            }) => {
+                if context.water_height == i32::MIN || *add_stone_depth {
+                    i64::MIN
+                } else {
+                    at_least(
+                        context
+                            .water_height
+                            .wrapping_add(*offset)
+                            .wrapping_add(context.depth.wrapping_mul(*surface_depth_multiplier)),
+                    )
+                }
+            }
+            Kind::Simple(MaterialCondition::StoneDepth {
+                offset,
+                add_surface_depth,
+                secondary_depth_range,
+                ceiling,
+            }) => {
+                let surface = if *add_surface_depth { context.depth } else { 0 };
+                let secondary = if *secondary_depth_range == 0 {
+                    0
+                } else {
+                    (0.0 + ((context.secondary() - -1.0) / (1.0 - -1.0))
+                        * (f64::from(*secondary_depth_range) - 0.0)) as i32
+                };
+                let limit = i64::from(
+                    1i32.wrapping_add(*offset)
+                        .wrapping_add(surface)
+                        .wrapping_add(secondary),
+                );
+                if *ceiling {
+                    // The stone below shrinks down the run: once within the
+                    // limit, it stays.
+                    if value {
+                        i64::MIN
+                    } else {
+                        y - (i64::from(context.stone_below) - limit) + 1
+                    }
+                } else if value {
+                    // The stone above grows down the run.
+                    y - (limit - i64::from(context.stone_above))
+                } else {
+                    i64::MIN
+                }
+            }
+            _ => {
+                run.varies = true;
+                i64::MIN
+            }
+        };
+        run.low = run.low.max(low);
     }
     #[inline]
     fn eval<const CACHE: bool, S: MaterialSurfaceQueries>(

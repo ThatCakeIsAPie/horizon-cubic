@@ -1776,9 +1776,12 @@ impl UniformSurfaceBiomes {
             last: ([0; 3], SurfaceCell::Unknown),
         }
     }
+    /// The coordinates come as scalars: a `BlockPos` argument goes by
+    /// reference, and reading its x and y as one 8-byte load right after
+    /// the caller's 4-byte stores stalled on store forwarding.
     #[inline]
-    fn get(&mut self, region: &BiomeRegion<BiomeId>, p: BlockPos) -> Option<BiomeId> {
-        let base = [p.x, p.y, p.z].map(|v| v.wrapping_sub(2) >> 2);
+    fn get(&mut self, region: &BiomeRegion<BiomeId>, x: i32, y: i32, z: i32) -> Option<BiomeId> {
+        let base = [x, y, z].map(|v| v.wrapping_sub(2) >> 2);
         let cell = if self.last.0 == base && self.last.1 != SurfaceCell::Unknown {
             self.last.1
         } else {
@@ -1790,10 +1793,37 @@ impl UniformSurfaceBiomes {
             SurfaceCell::Uniform(id) => Some(id),
             SurfaceCell::Mixed(index) => {
                 let mixed = &self.mixed[index as usize];
-                Some(mixed.biomes[BiomeZoom::select_corner(p, &mixed.jitter)])
+                Some(mixed.biomes[BiomeZoom::select_corner(BlockPos::new(x, y, z), &mixed.jitter)])
             }
             SurfaceCell::Unknown | SurfaceCell::Lookup => None,
         }
+    }
+    /// `get`, with the lowest height (not below `floor`, unless the cell
+    /// reaches lower) down to which the column keeps that biome: through
+    /// the uniform cells of the same biome below.
+    fn get_down(
+        &mut self,
+        region: &BiomeRegion<BiomeId>,
+        x: i32,
+        y: i32,
+        z: i32,
+        floor: i32,
+    ) -> Option<(BiomeId, i32)> {
+        let id = self.get(region, x, y, z)?;
+        let SurfaceCell::Uniform(_) = self.last.1 else {
+            return Some((id, y));
+        };
+        let mut base = self.last.0;
+        // A cell holds the blocks whose `(y - 2) >> 2` is its base.
+        let mut low = base[1].wrapping_mul(4).wrapping_add(2);
+        while low > floor {
+            base[1] = base[1].wrapping_sub(1);
+            if self.cell(region, base) != SurfaceCell::Uniform(id) {
+                break;
+            }
+            low = low.wrapping_sub(4);
+        }
+        Some((id, low))
     }
     fn cell(&mut self, region: &BiomeRegion<BiomeId>, base: [i32; 3]) -> SurfaceCell {
         let d: [i32; 3] = std::array::from_fn(|i| base[i].wrapping_sub(self.origin[i]));
@@ -1890,7 +1920,7 @@ impl<R: RandomSource> MaterialSurfaceQueries for SurfaceQueries<'_, '_, R> {
             Biomes::Region(region) => match self
                 .uniform_biomes
                 .as_mut()
-                .and_then(|cache| cache.get(region, p))
+                .and_then(|cache| cache.get(region, p.x, p.y, p.z))
             {
                 Some(id) => id,
                 None => *region
@@ -1912,6 +1942,18 @@ impl<R: RandomSource> MaterialSurfaceQueries for SurfaceQueries<'_, '_, R> {
             )?,
         };
         Ok(Some(id.0))
+    }
+    fn biome_id_down(
+        &mut self,
+        p: BlockPos,
+        floor: i32,
+    ) -> Result<Option<(u32, i32)>, MaterialRuleError> {
+        if let (Biomes::Region(region), Some(cache)) = (&self.biome, self.uniform_biomes.as_mut())
+            && let Some(found) = cache.get_down(region, p.x, p.y, p.z, floor)
+        {
+            return Ok(Some((found.0.0, found.1)));
+        }
+        Ok(self.biome_id(p)?.map(|id| (id, p.y)))
     }
     fn cold_enough_to_snow(
         &mut self,
@@ -3176,21 +3218,34 @@ mod tests {
                     let region = BiomeRegion::new(chunks, seed).unwrap();
                     let mut cache = UniformSurfaceBiomes::new(pos, -64, 128);
                     let mut hits = 0;
+                    let mut spans = 0;
                     for x in 0..16 {
                         for z in 0..16 {
                             // Include clamped Y, out-of-cache Y, and revisit each
                             // cached proof in the ordinary descending traversal.
                             for y in (-70..70).rev() {
                                 let p = BlockPos::new(pos.x * 16 + x, y, pos.z * 16 + z);
-                                let shortcut = cache.get(&region, p);
+                                let shortcut = cache.get(&region, p.x, p.y, p.z);
                                 hits += usize::from(shortcut.is_some());
                                 let actual = shortcut.map_or_else(|| region.biome(p).copied(), Ok);
                                 assert_eq!(actual, region.biome(p).copied());
+                                // The column keeps the biome down to the span's end.
+                                if let Some((id, low)) =
+                                    cache.get_down(&region, p.x, p.y, p.z, y - 20)
+                                {
+                                    assert!(low <= y);
+                                    spans += usize::from(y - low >= 4);
+                                    for below in low..=y {
+                                        let q = BlockPos::new(p.x, below, p.z);
+                                        assert_eq!(region.biome(q).copied(), Ok(id), "{q:?}");
+                                    }
+                                }
                             }
                         }
                     }
                     if !mixed && pos.x != i32::MIN >> 4 {
                         assert!(hits > 0);
+                        assert!(spans > 0);
                     }
                 }
             }
@@ -3208,7 +3263,7 @@ mod tests {
             for z in -2..18 {
                 let p = BlockPos::new(x, 7, z);
                 let actual = cache
-                    .get(&region, p)
+                    .get(&region, p.x, p.y, p.z)
                     .map_or_else(|| region.biome(p).copied(), Ok);
                 assert_eq!(actual, region.biome(p).copied());
                 successes += usize::from(actual.is_ok());
