@@ -74,6 +74,8 @@ impl InterpolatedSampler {
                             });
                             samples[coarse.index(position).unwrap()]
                         });
+                        // Negated so a NaN corner, which is not above 0, still counts as open.
+                        #[allow(clippy::neg_cmp_op_on_partial_ord)]
                         let open = open_from.is_some_and(|from| {
                             i64::from(coarse.coordinate(1, y as usize)) >= i64::from(from)
                         }) && corners.iter().all(|&corner| !(corner > 0.0));
