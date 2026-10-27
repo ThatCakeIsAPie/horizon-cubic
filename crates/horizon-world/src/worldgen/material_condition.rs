@@ -406,9 +406,14 @@ struct RunTrace {
     low: i64,
     /// ...when the block's biome is the same (if `biome`)...
     biome: bool,
-    /// ...unless something tested varies block by block.
+    /// ...and these tests (condition index, value), which vary block by
+    /// block as pure functions of the position, give the same values...
+    guards: [(u32, bool); RUN_GUARDS],
+    guard_count: usize,
+    /// ...unless something else tested varies block by block.
     varies: bool,
 }
+const RUN_GUARDS: usize = 4;
 struct Compiled<R: RandomSource> {
     kind: Kind<R>,
     revision: i64,
@@ -587,12 +592,16 @@ impl<R: RandomSource> Compiled<R> {
     /// (y falls by one and the stone above grows by one per block; water,
     /// the bottom of the run and the column stay) where the test still gives
     /// `value`. Marks `run` as varying when that isn't a plain height bound.
+    ///
+    /// Returns true, leaving `run` as it is, for a test that varies block by
+    /// block as a pure function of the position (3D noise, a gradient inside
+    /// its band): the caller can test it again at another block.
     fn stable_below<S: MaterialSurfaceQueries>(
         &self,
         value: bool,
         context: &mut Context<S>,
         run: &mut RunTrace,
-    ) {
+    ) -> bool {
         let mut node = self;
         let mut value = value;
         while let Kind::Not(child) = &node.kind {
@@ -610,7 +619,7 @@ impl<R: RandomSource> Compiled<R> {
             }
             Kind::Noise { sampler, .. } => {
                 if context.noises[*sampler].is_3d {
-                    run.varies = true;
+                    return true;
                 }
                 i64::MIN
             }
@@ -620,8 +629,7 @@ impl<R: RandomSource> Compiled<R> {
                 } else if context.position.y >= *high {
                     i64::from(*high).max(i64::from(*low) + 1)
                 } else {
-                    run.varies = true;
-                    i64::MIN
+                    return true;
                 }
             }
             Kind::Simple(MaterialCondition::Hole | MaterialCondition::Steep) => i64::MIN,
@@ -706,6 +714,7 @@ impl<R: RandomSource> Compiled<R> {
             }
         };
         run.low = run.low.max(low);
+        false
     }
     #[inline]
     fn eval<const CACHE: bool, S: MaterialSurfaceQueries>(

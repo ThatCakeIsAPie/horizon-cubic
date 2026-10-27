@@ -1,7 +1,7 @@
 //! Compiled material rule composition, sharing the condition worker's context.
 use super::{
     Compiled, Context, DensityHeights, MaterialCondition, MaterialConditions,
-    MaterialSurfaceQueries, RunTrace,
+    MaterialSurfaceQueries, RUN_GUARDS, RunTrace,
 };
 use crate::{registry::BlockStateId, worldgen::DecodeError};
 use horizon_core::{
@@ -335,9 +335,17 @@ impl<R: RandomSource> CompiledRule<R> {
                     return context.surface.band(position).map(Some);
                 }
                 Op::Condition { condition, skip } => {
-                    let condition = &self.conditions[*condition];
+                    let index = *condition;
+                    let condition = &self.conditions[index];
                     let value = condition.test_once(context)?;
-                    condition.stable_below(value, context, run);
+                    if !run.varies && condition.stable_below(value, context, run) {
+                        if run.guard_count < RUN_GUARDS {
+                            run.guards[run.guard_count] = (index as u32, value);
+                            run.guard_count += 1;
+                        } else {
+                            run.varies = true;
+                        }
+                    }
                     at = if value { at + 1 } else { *skip };
                 }
                 Op::OreVein {
@@ -388,18 +396,25 @@ impl<R: RandomSource> CompiledRule<R> {
 #[derive(Default)]
 pub struct RunMemo {
     entries: Vec<RunEntry>,
+    /// The biome of the run's last biome lookup, and the height down to
+    /// which the column keeps it.
+    biome: Option<(u32, i32)>,
 }
 #[derive(Clone, Copy)]
 struct RunEntry {
     /// The biome the program tested, `None` when it tested none.
     biome: Option<u32>,
     low: i64,
+    /// Tests to give these values again at the block (`RunTrace::guards`).
+    guards: [(u32, bool); RUN_GUARDS],
+    guard_count: usize,
     result: Option<BlockStateId>,
 }
 impl RunMemo {
     #[inline]
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.biome = None;
     }
 }
 fn ore_vein<P: PositionalRandom, S: MaterialSurfaceQueries>(
@@ -472,16 +487,59 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
         let mut biome = None;
         if !memo.entries.is_empty() {
             for entry in &memo.entries {
-                if entry.biome.is_none() && y >= entry.low {
+                if entry.biome.is_none() && entry.guard_count == 0 && y >= entry.low {
                     return Ok((entry.result, entry.low.max(i64::from(floor)) as i32));
                 }
             }
-            // A failed lookup is left for the program to report, if it asks.
-            if let Ok(Some((id, low))) = self.context.surface.biome_id_down(position, floor) {
+            let span = match memo.biome {
+                Some((id, low)) if position.y >= low => Some((id, low)),
+                // A failed lookup is left for the program to report, if it asks.
+                _ => self
+                    .context
+                    .surface
+                    .biome_id_down(position, floor)
+                    .ok()
+                    .flatten(),
+            };
+            memo.biome = span;
+            if let Some((id, low)) = span {
                 biome = Some(id);
+                let mut guarded = false;
                 for entry in &memo.entries {
-                    if entry.biome == Some(id) && y >= entry.low {
-                        return Ok((entry.result, entry.low.max(i64::from(low)) as i32));
+                    if entry.biome.is_none_or(|biome| biome == id) && y >= entry.low {
+                        if entry.guard_count == 0 {
+                            let low = if entry.biome.is_some() {
+                                entry.low.max(i64::from(low))
+                            } else {
+                                entry.low.max(i64::from(floor))
+                            };
+                            return Ok((entry.result, low as i32));
+                        }
+                        guarded = true;
+                    }
+                }
+                if guarded {
+                    // Position-pure tests, read at this block.
+                    self.context.position.y = position.y;
+                    let rule = self
+                        .rules
+                        .get(index)
+                        .ok_or(MaterialRuleError::UnknownRule)?;
+                    'entries: for entry in &memo.entries {
+                        if entry.guard_count == 0
+                            || !entry.biome.is_none_or(|biome| biome == id)
+                            || y < entry.low
+                        {
+                            continue;
+                        }
+                        for &(condition, value) in &entry.guards[..entry.guard_count] {
+                            if rule.conditions[condition as usize].test_once(&mut self.context)?
+                                != value
+                            {
+                                continue 'entries;
+                            }
+                        }
+                        return Ok((entry.result, position.y));
                     }
                 }
             }
@@ -495,6 +553,8 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
         let mut run = RunTrace {
             low: i64::MIN,
             biome: false,
+            guards: [(0, false); RUN_GUARDS],
+            guard_count: 0,
             varies: false,
         };
         let result = rule.apply_traced(position, &mut self.context, &mut run)?;
@@ -506,10 +566,12 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
         if let Some(biome) = key.filter(|_| !run.varies && run.low <= y) {
             // Entries ending above this block no longer serve.
             memo.entries.retain(|entry| entry.low <= y);
-            if memo.entries.len() < 8 {
+            if memo.entries.len() < 16 {
                 memo.entries.push(RunEntry {
                     biome,
                     low: run.low,
+                    guards: run.guards,
+                    guard_count: run.guard_count,
                     result,
                 });
             }
