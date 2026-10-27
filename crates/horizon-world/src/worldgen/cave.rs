@@ -124,14 +124,20 @@ impl LakeFeature {
             let xp = random.next_double() * (16.0 - xr - 2.0) + 1.0 + xr / 2.0;
             let yp = random.next_double() * (8.0 - yr - 4.0) + 2.0 + yr / 2.0;
             let zp = random.next_double() * (16.0 - zr - 2.0) + 1.0 + zr / 2.0;
+            // Each axis term once per coordinate: the same expressions and
+            // sum as vanilla's, without three divisions per cell.
+            let square = |v: i32, p: f64, r: f64| {
+                let d = (f64::from(v) - p) / (r / 2.0);
+                d * d
+            };
+            let xs: [f64; 16] = std::array::from_fn(|v| square(v as i32, xp, xr));
+            let ys: [f64; 8] = std::array::from_fn(|v| square(v as i32, yp, yr));
+            let zs: [f64; 16] = std::array::from_fn(|v| square(v as i32, zp, zr));
             for xx in 1..15 {
                 for zz in 1..15 {
                     for yy in 1..7 {
-                        let xd = (f64::from(xx) - xp) / (xr / 2.0);
-                        let yd = (f64::from(yy) - yp) / (yr / 2.0);
-                        let zd = (f64::from(zz) - zp) / (zr / 2.0);
-                        if xd * xd + yd * yd + zd * zd < 1.0 {
-                            grid[((xx * 16 + zz) * 8 + yy) as usize] = true;
+                        if xs[xx] + ys[yy] + zs[zz] < 1.0 {
+                            grid[(xx * 16 + zz) * 8 + yy] = true;
                         }
                     }
                 }
