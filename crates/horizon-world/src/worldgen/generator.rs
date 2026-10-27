@@ -18,7 +18,7 @@ use super::{
     biome_chunk::{BiomeChunk, BiomeRegion},
     biome_source::{BiomeSourceCatalog, ResolvedBiomeSource},
     biome_temperature::{BiomeTemperature, BiomeTemperatureSettings},
-    carver::{CarverCatalog, WorldCarver, generate_carving_mask},
+    carver::{CarverCatalog, WorldCarver, generate_carving_mask, large_feature_random},
     carving::{CarvingBlocks, apply_carving_mask},
     climate::{ClimateSampler, decode_parameter, quantize},
     decode_noise,
@@ -713,6 +713,10 @@ struct Pipeline<R: RandomSource> {
     lattice_cache: LatticeCache,
     biome_work: ChunkWork,
     carver_cache: Mutex<HashMap<(i32, i32), BiomeId>>,
+    /// The distinct carver lists of the source's possible biomes, when every
+    /// possible biome has an id and a list the mask accepts: an origin where
+    /// none of their carvers starts carves nothing, whatever its biome.
+    carver_lists: Option<Vec<Vec<Arc<WorldCarver>>>>,
     pub(super) decoration: Option<super::generator_decoration::Decoration>,
     pub(super) structures: Option<super::generator_structures::StructureState>,
     /// The noise settings' `spawn_target` points.
@@ -947,11 +951,13 @@ where
             lattice_cache: Mutex::new(HashMap::new()),
             biome_work: ChunkWork::new(),
             carver_cache: Mutex::new(HashMap::new()),
+            carver_lists: None,
             decoration: None,
             structures: None,
             spawn_target,
             spawn_position: std::sync::OnceLock::new(),
         };
+        pipeline.carver_lists = pipeline.carver_lists();
         pipeline.decoration =
             super::generator_decoration::Decoration::new(&pipeline.data, &pipeline.source)?;
         if with_structures {
@@ -1062,6 +1068,38 @@ where
         }
         cache.insert((pos.x, pos.z), chunk.clone());
         Ok(Some(chunk))
+    }
+    fn carver_lists(&self) -> Option<Vec<Vec<Arc<WorldCarver>>>> {
+        let mut lists: Vec<Vec<Arc<WorldCarver>>> = Vec::new();
+        for name in self.source.possible_biomes() {
+            let list = self
+                .data
+                .biome_carvers
+                .get(self.data.biome_id(name)?.0 as usize)?;
+            if list.len() > 1024 {
+                return None;
+            }
+            let same = |other: &Vec<Arc<WorldCarver>>| {
+                other.len() == list.len() && other.iter().zip(list).all(|(a, b)| Arc::ptr_eq(a, b))
+            };
+            if !lists.iter().any(same) {
+                lists.push(list.clone());
+            }
+        }
+        Some(lists)
+    }
+    /// Whether no carver of any possible biome starts at `origin`: the
+    /// mask's start test (a fresh random per list index) for every list.
+    fn no_carver_starts(&self, origin: ChunkPos) -> bool {
+        let Some(lists) = &self.carver_lists else {
+            return false;
+        };
+        lists.iter().all(|list| {
+            list.iter().enumerate().all(|(index, carver)| {
+                let mut random = large_feature_random(self.seed.wrapping_add(index as i64), origin);
+                !carver.is_start_chunk(&mut random)
+            })
+        })
     }
     fn carver_biome(&self, worker: &mut WorkerState, origin: ChunkPos) -> Result<BiomeId, String> {
         let key = (origin.x, origin.z);
@@ -1339,6 +1377,11 @@ where
         worker.timings.surface += lap(&mut clock);
         let carvers = &data.biome_carvers;
         let mask = generate_carving_mask(self.seed, pos, generation, false, |origin| {
+            // The origin's biome only selects carvers; skip its climate sample
+            // when no carver it could select would start there.
+            if self.no_carver_starts(origin) {
+                return Ok(&[][..]);
+            }
             self.carver_biome(worker, origin)
                 .map(|id| carvers[id.0 as usize].as_slice())
         })
