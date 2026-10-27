@@ -724,6 +724,20 @@ impl<K: JavaKey, V> JavaHashMap<K, V> {
         self.free.push(i);
         n.value
     }
+    /// `iterator().next()` then `iterator.remove()`, the bucket scan starting
+    /// at `from`: the caller knows every bucket before it is empty (no entry
+    /// was put since a pop found its first entry there). Also returns the
+    /// bucket the entry was in.
+    pub fn pop_first_from(&mut self, from: usize) -> Option<(usize, K)>
+    where
+        K: Clone,
+    {
+        let bucket = (from..self.table.len()).find(|&b| self.table[b].is_some())?;
+        let i = self.table[bucket]?;
+        let key = self.node(i).key.clone();
+        self.remove_node(i, false);
+        Some((bucket, key))
+    }
     pub fn remove(&mut self, key: &K) -> Option<V> {
         self.find(key).map(|i| self.remove_node(i, true))
     }
