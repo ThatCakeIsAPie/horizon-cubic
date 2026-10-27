@@ -484,68 +484,65 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
         floor: i32,
     ) -> Result<(Option<BlockStateId>, i32), MaterialRuleError> {
         let y = i64::from(position.y);
-        let mut biome = None;
-        if !memo.entries.is_empty() {
-            for entry in &memo.entries {
-                if entry.biome.is_none() && entry.guard_count == 0 && y >= entry.low {
-                    return Ok((entry.result, entry.low.max(i64::from(floor)) as i32));
-                }
+        // The block's biome and its span, looked up when an entry asks.
+        let mut biome: Option<Option<(u32, i32)>> = None;
+        let mut found = None;
+        let mut guard_y = false;
+        let rules = &self.rules;
+        let context = &mut self.context;
+        'entries: for (at, entry) in memo.entries.iter().enumerate() {
+            if y < entry.low {
+                continue;
             }
-            let span = match memo.biome {
-                Some((id, low)) if position.y >= low => Some((id, low)),
-                // A failed lookup is left for the program to report, if it asks.
-                _ => self
-                    .context
-                    .surface
-                    .biome_id_down(position, floor)
-                    .ok()
-                    .flatten(),
+            let span = match entry.biome {
+                None => floor,
+                Some(want) => {
+                    let span = *biome.get_or_insert_with(|| match memo.biome {
+                        Some((id, low)) if position.y >= low => Some((id, low)),
+                        // A failed lookup is left for the program to report, if it asks.
+                        _ => context
+                            .surface
+                            .biome_id_down(position, floor)
+                            .ok()
+                            .flatten(),
+                    });
+                    match span {
+                        Some((id, low)) if id == want => low,
+                        _ => continue,
+                    }
+                }
             };
-            memo.biome = span;
-            if let Some((id, low)) = span {
-                biome = Some(id);
-                let mut guarded = false;
-                for entry in &memo.entries {
-                    if entry.biome.is_none_or(|biome| biome == id) && y >= entry.low {
-                        if entry.guard_count == 0 {
-                            let low = if entry.biome.is_some() {
-                                entry.low.max(i64::from(low))
-                            } else {
-                                entry.low.max(i64::from(floor))
-                            };
-                            return Ok((entry.result, low as i32));
-                        }
-                        guarded = true;
-                    }
-                }
-                if guarded {
-                    // Position-pure tests, read at this block.
-                    self.context.position.y = position.y;
-                    let rule = self
-                        .rules
-                        .get(index)
-                        .ok_or(MaterialRuleError::UnknownRule)?;
-                    'entries: for entry in &memo.entries {
-                        if entry.guard_count == 0
-                            || !entry.biome.is_none_or(|biome| biome == id)
-                            || y < entry.low
-                        {
-                            continue;
-                        }
-                        for &(condition, value) in &entry.guards[..entry.guard_count] {
-                            if rule.conditions[condition as usize].test_once(&mut self.context)?
-                                != value
-                            {
-                                continue 'entries;
-                            }
-                        }
-                        return Ok((entry.result, position.y));
-                    }
+            if entry.guard_count == 0 {
+                found = Some((at, entry.result, entry.low.max(i64::from(span)) as i32));
+                break;
+            }
+            // Position-pure tests, read at this block.
+            if !guard_y {
+                context.position.y = position.y;
+                context.noise_floor = floor;
+                guard_y = true;
+            }
+            let rule = rules.get(index).ok_or(MaterialRuleError::UnknownRule)?;
+            for &(condition, value) in &entry.guards[..entry.guard_count] {
+                if rule.conditions[condition as usize].test_once(context)? != value {
+                    continue 'entries;
                 }
             }
+            found = Some((at, entry.result, position.y));
+            break;
         }
+        if let Some(span) = biome {
+            memo.biome = span;
+        }
+        if let Some((at, result, low)) = found {
+            // The next block most likely takes the same entry.
+            memo.entries.swap(0, at);
+            return Ok((result, low));
+        }
+        let biome = biome.flatten().map(|(id, _)| id);
         self.update_y(stone_above, stone_below, water_height, position.y);
         self.context.biome_id = biome;
+        self.context.noise_floor = floor;
         let rule = self
             .rules
             .get_mut(index)
@@ -598,8 +595,27 @@ mod tests {
     use crate::worldgen::anchor::{VerticalAnchor, WorldGenerationContext};
     use horizon_core::random::{RandomSource, XoroshiroRandom};
 
+    #[derive(Debug)]
+    struct Wavy;
+    impl horizon_core::noise::Noise for Wavy {
+        fn range(&self) -> Result<[f32; 2], horizon_core::noise::NanRange> {
+            Ok([-1.0, 1.0])
+        }
+        fn get2(&self, x: f64, z: f64) -> f32 {
+            self.get3(x, 0.0, z)
+        }
+        fn get3(&self, x: f64, y: f64, z: f64) -> f32 {
+            ((x * 0.7 + y * 1.3 + z * 0.3).sin() * 0.9) as f32
+        }
+    }
     struct Surface;
     impl MaterialSurfaceQueries for Surface {
+        fn bind_noise(
+            &mut self,
+            _: &str,
+        ) -> Result<Arc<dyn horizon_core::noise::Noise>, DecodeError> {
+            Ok(Arc::new(Wavy))
+        }
         fn surface_depth(&mut self, x: i32, z: i32) -> i32 {
             (x ^ z) & 3
         }
@@ -649,6 +665,14 @@ mod tests {
         }
     }
 
+    fn noise(min: f64, max: f64) -> MaterialCondition {
+        MaterialCondition::NoiseThreshold {
+            noise: "minecraft:wavy".into(),
+            min,
+            max,
+            is_3d: true,
+        }
+    }
     /// Runs memoized down a column give what the program gives block by block.
     #[test]
     fn run_memo_matches_each_block() {
@@ -662,6 +686,14 @@ mod tests {
                 block(1),
             ),
             when(stone_depth(0, false, 0, false), block(2)),
+            when(
+                MaterialCondition::Biome(vec!["minecraft:b0".into()]),
+                MaterialRule::Sequence(vec![
+                    when(noise(-0.4, -0.1), block(9)),
+                    when(noise(0.0, 0.4), block(10)),
+                    when(noise(0.4, f64::MAX), block(9)),
+                ]),
+            ),
             when(
                 MaterialCondition::Biome(vec!["minecraft:b1".into()]),
                 MaterialRule::Sequence(vec![

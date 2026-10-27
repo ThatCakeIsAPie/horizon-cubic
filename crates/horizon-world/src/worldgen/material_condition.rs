@@ -281,6 +281,10 @@ struct Context<S> {
     possible_biomes: Option<BTreeSet<String>>,
     biome: Option<Arc<str>>,
     biome_id: Option<u32>,
+    /// The lowest height a 3D noise is asked for before the column's next
+    /// `noise_floor` (the bottom of the current run of solid blocks): the
+    /// values sampled ahead stop there.
+    noise_floor: i32,
 }
 struct CachedNoise {
     sampler: Arc<dyn Noise>,
@@ -291,6 +295,8 @@ struct CachedNoise {
     /// together (the surface walks each column down in y).
     column: [f32; NOISE_COLUMN],
     column_top: i32,
+    /// How many of `column` are sampled.
+    column_count: u8,
     column_revision: i64,
 }
 const NOISE_COLUMN: usize = 16;
@@ -341,6 +347,7 @@ impl<S: MaterialSurfaceQueries> Context<S> {
             value: 0.0,
             column: [0.0; NOISE_COLUMN],
             column_top: 0,
+            column_count: 0,
             column_revision: self.column_revision.wrapping_sub(1),
         });
         self.noise_indices.insert(key, index);
@@ -354,18 +361,21 @@ impl<S: MaterialSurfaceQueries> Context<S> {
             let y = self.position.y;
             let below = i64::from(noise.column_top) - i64::from(y);
             if noise.column_revision != self.column_revision
-                || !(0..NOISE_COLUMN as i64).contains(&below)
+                || !(0..i64::from(noise.column_count)).contains(&below)
             {
                 let ys: [f64; NOISE_COLUMN] =
                     std::array::from_fn(|i| f64::from(y.wrapping_sub(i as i32)));
+                let count = (i64::from(y) - i64::from(self.noise_floor) + 1)
+                    .clamp(1, NOISE_COLUMN as i64) as usize;
                 noise.sampler.get3_column(
                     f64::from(self.position.x),
                     f64::from(self.position.z),
-                    &ys,
+                    &ys[..count],
                     1.0,
-                    &mut noise.column,
+                    &mut noise.column[..count],
                 );
                 noise.column_top = y;
+                noise.column_count = count as u8;
                 noise.column_revision = self.column_revision;
                 return f64::from(noise.column[0]);
             }
@@ -894,6 +904,7 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
                 possible_biomes,
                 biome: None,
                 biome_id: None,
+                noise_floor: i32::MIN,
             },
             conditions: Vec::new(),
             rules: Vec::new(),
@@ -922,6 +933,7 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
         self.context.block_revision = self.context.block_revision.wrapping_add(1);
         self.context.biome = None;
         self.context.biome_id = None;
+        self.context.noise_floor = i32::MIN;
         self.context.position.y = y;
         self.context.stone_above = stone_above;
         self.context.stone_below = stone_below;

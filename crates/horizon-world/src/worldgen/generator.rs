@@ -1760,6 +1760,21 @@ struct UniformSurfaceBiomes {
     mixed: Vec<MixedCell>,
     /// The cell of the previous lookup (columns are walked down in y).
     last: ([i32; 3], SurfaceCell),
+    /// The cells' corner columns (6 x 6 quart columns from the origin),
+    /// read on first use.
+    corners: Vec<CornerColumn>,
+}
+/// One quart column of stored biomes (`BiomeRegion::noise_biome`, which
+/// clamps Y), from the cache's lowest cell up to one above its highest.
+enum CornerColumn {
+    Unknown,
+    /// Its chunk is missing.
+    Lookup,
+    Known {
+        ids: Vec<BiomeId>,
+        /// For each height, where the run of equal biomes holding it starts.
+        run_low: Vec<u32>,
+    },
 }
 impl UniformSurfaceBiomes {
     fn new(pos: ChunkPos, min_y: i32, height: i32) -> Self {
@@ -1774,7 +1789,33 @@ impl UniformSurfaceBiomes {
             cells: vec![SurfaceCell::Unknown; 25 * height as usize],
             mixed: Vec::new(),
             last: ([0; 3], SurfaceCell::Unknown),
+            corners: (0..36).map(|_| CornerColumn::Unknown).collect(),
         }
+    }
+    /// Read the corner column `d` (quarts from the origin, 0..6) if not yet.
+    fn load_corner(&mut self, region: &BiomeRegion<BiomeId>, d: [i32; 2]) {
+        let slot = &mut self.corners[(d[0] * 6 + d[1]) as usize];
+        if !matches!(slot, CornerColumn::Unknown) {
+            return;
+        }
+        let qx = self.origin[0].wrapping_add(d[0]);
+        let qz = self.origin[2].wrapping_add(d[1]);
+        let Ok(chunk) = region.chunk(ChunkPos::new(qx >> 2, qz >> 2)) else {
+            *slot = CornerColumn::Lookup;
+            return;
+        };
+        let ids: Vec<BiomeId> = (0..=self.height)
+            .map(|dy| *chunk.noise_biome([qx, self.origin[1].wrapping_add(dy), qz]))
+            .collect();
+        let mut run_low = Vec::with_capacity(ids.len());
+        for (i, id) in ids.iter().enumerate() {
+            run_low.push(if i > 0 && ids[i - 1] == *id {
+                run_low[i - 1]
+            } else {
+                i as u32
+            });
+        }
+        *slot = CornerColumn::Known { ids, run_low };
     }
     /// The coordinates come as scalars: a `BlockPos` argument goes by
     /// reference, and reading its x and y as one 8-byte load right after
@@ -1798,56 +1839,69 @@ impl UniformSurfaceBiomes {
             SurfaceCell::Unknown | SurfaceCell::Lookup => None,
         }
     }
-    /// `get`, with the lowest height (not below `floor`, unless the cell
-    /// reaches lower) down to which the column keeps that biome: through
-    /// the uniform cells of the same biome below.
+    /// `get`, with the lowest height down to which the column keeps that
+    /// biome: through the uniform cells of the same biome below (`floor`,
+    /// where the caller stops looking, is not needed).
     fn get_down(
         &mut self,
         region: &BiomeRegion<BiomeId>,
         x: i32,
         y: i32,
         z: i32,
-        floor: i32,
+        _floor: i32,
     ) -> Option<(BiomeId, i32)> {
         let id = self.get(region, x, y, z)?;
         let SurfaceCell::Uniform(_) = self.last.1 else {
             return Some((id, y));
         };
-        let mut base = self.last.0;
-        // A cell holds the blocks whose `(y - 2) >> 2` is its base.
-        let mut low = base[1].wrapping_mul(4).wrapping_add(2);
-        while low > floor {
-            base[1] = base[1].wrapping_sub(1);
-            if self.cell(region, base) != SurfaceCell::Uniform(id) {
-                break;
+        // Its corner columns were read when the cell was. The cells below
+        // stay uniform while each corner column's run of `id` holding the
+        // cell's top corner goes on down.
+        let d: [i32; 3] = std::array::from_fn(|i| self.last.0[i].wrapping_sub(self.origin[i]));
+        let mut low = 0;
+        for x in 0..2 {
+            for z in 0..2 {
+                let CornerColumn::Known { run_low, .. } =
+                    &self.corners[((d[0] + x) * 6 + d[2] + z) as usize]
+                else {
+                    return Some((id, y));
+                };
+                low = low.max(run_low[(d[1] + 1) as usize] as i32);
             }
-            low = low.wrapping_sub(4);
         }
-        Some((id, low))
+        // A cell holds the blocks whose `(y - 2) >> 2` is its base.
+        Some((
+            id,
+            self.origin[1]
+                .wrapping_add(low)
+                .wrapping_mul(4)
+                .wrapping_add(2),
+        ))
     }
     fn cell(&mut self, region: &BiomeRegion<BiomeId>, base: [i32; 3]) -> SurfaceCell {
         let d: [i32; 3] = std::array::from_fn(|i| base[i].wrapping_sub(self.origin[i]));
         if !(0..5).contains(&d[0]) || !(0..self.height).contains(&d[1]) || !(0..5).contains(&d[2]) {
             return SurfaceCell::Lookup;
         }
-        let slot = &mut self.cells[((d[0] * 5 + d[2]) * self.height + d[1]) as usize];
-        if *slot != SurfaceCell::Unknown {
-            return *slot;
+        let at = ((d[0] * 5 + d[2]) * self.height + d[1]) as usize;
+        if self.cells[at] != SurfaceCell::Unknown {
+            return self.cells[at];
         }
         // These are immutable stored lookups (`BiomeRegion::noise_biome`), in
-        // quart_at_block's corner order; the two Y corners share a chunk.
+        // quart_at_block's corner order.
         let mut biomes = [BiomeId(0); 8];
         for x in 0..2 {
             for z in 0..2 {
-                let qx = base[0].wrapping_add(x);
-                let qz = base[2].wrapping_add(z);
-                let Ok(chunk) = region.chunk(ChunkPos::new(qx >> 2, qz >> 2)) else {
-                    *slot = SurfaceCell::Lookup;
+                self.load_corner(region, [d[0] + x, d[2] + z]);
+                let CornerColumn::Known { ids, .. } =
+                    &self.corners[((d[0] + x) * 6 + d[2] + z) as usize]
+                else {
+                    self.cells[at] = SurfaceCell::Lookup;
                     return SurfaceCell::Lookup;
                 };
                 for y in 0..2 {
                     biomes[(x as usize) << 2 | (y as usize) << 1 | z as usize] =
-                        *chunk.noise_biome([qx, base[1].wrapping_add(y), qz]);
+                        ids[(d[1] + y) as usize];
                 }
             }
         }
@@ -1860,7 +1914,7 @@ impl UniformSurfaceBiomes {
             });
             SurfaceCell::Mixed(self.mixed.len() as u32 - 1)
         };
-        *slot = value;
+        self.cells[at] = value;
         value
     }
 }
