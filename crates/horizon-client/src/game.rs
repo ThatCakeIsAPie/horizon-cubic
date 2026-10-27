@@ -7476,6 +7476,14 @@ impl Game<'_> {
         }
         self.join_world_rest()?;
         let save_root = std::env::current_dir()?.join("saves").join(folder);
+        // Create World's data packs, in the world before its first chunk.
+        if let Some(dir) = create.and_then(|o| o.pack_dir.as_deref()) {
+            let packs = create.map_or(&[][..], |o| &o.data_packs[..]);
+            if let Err(e) = horizon_client::datapack::install(dir, &save_root, packs) {
+                log::warn!("Horizon: data packs for {folder}: {e}");
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
         // A local world's levels and column: its dimension types, data
         // packs' included (docs/world-height.md). A server joined before may
         // have left others.
@@ -11021,6 +11029,12 @@ impl ApplicationHandler for Game<'_> {
                         }
                         Action::Connect { address } => {
                             self.connect_server(&address, &self.options.player_name())?
+                        }
+                        Action::DataPacks { dir, selected } => {
+                            self.keys.clear();
+                            self.screen = Screen::Options;
+                            self.options_from_title = true;
+                            self.ui.options.open_data_packs(dir, selected);
                         }
                         Action::None => {}
                     }

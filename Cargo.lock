@@ -1426,6 +1426,7 @@ dependencies = [
  "horizon-dualsense",
  "horizon-friends",
  "horizon-mods",
+ "horizon-port-pack",
  "horizon-protocol",
  "horizon-server-files",
  "horizon-shaderpack",

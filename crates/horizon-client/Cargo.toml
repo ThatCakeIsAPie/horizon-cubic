@@ -19,6 +19,8 @@ horizon-server-files = { path = "../horizon-server-files" }
 horizon-friends = { path = "../horizon-friends" }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/mods.md).
 horizon-mods = { path = "../horizon-mods" }
+# Create World's Data Packs: a 26.2 pack's world generation upgraded on its way into the world.
+horizon-port-pack = { path = "../horizon-port-pack" }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl"] }
 winit = "0.30.13"
 pollster = "0.4"
