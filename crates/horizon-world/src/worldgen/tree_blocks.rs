@@ -461,6 +461,36 @@ mod tests {
         assert_eq!(set.pop_first(), Some(expected[0]));
         assert!(!set.contains(expected[0]));
     }
+    /// Without removals, Java's HashMap iterates bucket by bucket of its
+    /// final table (16, doubled past 3/4 full), each in insertion order:
+    /// what the resizes' lo/hi splits must keep.
+    #[test]
+    fn pos_set_resizes_keep_bucket_and_insertion_order() {
+        let mut set = PosSet::default();
+        let mut random = LegacyRandom::new(11);
+        let mut inserted = Vec::new();
+        while inserted.len() < 3000 {
+            let p = [0, 1, 2].map(|_| random.next_int_bound(1 << 20).unwrap());
+            if set.insert(p) {
+                inserted.push(p);
+            }
+        }
+        let mut capacity = 16;
+        while inserted.len() > capacity * 3 / 4 {
+            capacity *= 2;
+        }
+        let mut expected: Vec<(usize, usize)> = inserted
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let h = crate::java_hash_map::JavaKey::java_hash(&JavaPos(*p)) as u32;
+                (((h ^ (h >> 16)) as usize) & (capacity - 1), i)
+            })
+            .collect();
+        expected.sort();
+        let expected: Vec<[i32; 3]> = expected.iter().map(|&(_, i)| inserted[i]).collect();
+        assert_eq!(set.to_vec(), expected);
+    }
     /// Pops interleaved with inserts (and the resizes they cause) come out
     /// as a fresh iterator's first entry each time.
     #[test]

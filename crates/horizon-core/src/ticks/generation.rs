@@ -3,12 +3,32 @@ use super::{ChunkTicks, SavedTick, ScheduledTick, TickTypeId};
 use crate::position::BlockPos;
 use std::collections::HashSet;
 
+/// Multiplicative (Fx-style) hash of the type and position words. The set
+/// only answers membership, so no order depends on it; SipHash was a few
+/// percent of decoration (leaf ticks from tree shape updates).
+#[derive(Clone, Copy, Default)]
+struct PositionHasher(u64);
+impl std::hash::Hasher for PositionHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u32(u32::from(b));
+        }
+    }
+    fn write_u32(&mut self, value: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(value)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+type PositionSet = HashSet<(TickTypeId, BlockPos), std::hash::BuildHasherDefault<PositionHasher>>;
+
 /// Proto chunks retain the first request for a type/position in insertion order.
 /// Newly scheduled delays are zero; loaded delays and priorities are preserved.
 #[derive(Clone, Debug, Default)]
 pub struct ProtoChunkTicks {
     ticks: Vec<SavedTick>,
-    positions: HashSet<(TickTypeId, BlockPos)>,
+    positions: PositionSet,
 }
 impl ProtoChunkTicks {
     pub fn from_saved(ticks: impl IntoIterator<Item = SavedTick>) -> Self {

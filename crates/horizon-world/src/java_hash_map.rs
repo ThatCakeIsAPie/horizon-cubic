@@ -407,6 +407,24 @@ impl<K: JavaKey, V> JavaHashMap<K, V> {
                 continue;
             };
             let tree = self.node(first).tree;
+            if !tree {
+                // HashMap.resize's lo/hi split of a plain bin, relinked in place.
+                let mut ends: [Link; 2] = [None; 2];
+                let mut p = Some(first);
+                while let Some(i) = p {
+                    p = self.node(i).next;
+                    let side = usize::from((self.node(i).hash as usize & old_len) != 0);
+                    match ends[side] {
+                        Some(tail) => self.node_mut(tail).next = Some(i),
+                        None => self.table[bucket + side * old_len] = Some(i),
+                    }
+                    let n = self.node_mut(i);
+                    n.prev = ends[side];
+                    n.next = None;
+                    ends[side] = Some(i);
+                }
+                continue;
+            }
             let mut groups = [Vec::new(), Vec::new()];
             let mut p = Some(first);
             while let Some(i) = p {
