@@ -1147,3 +1147,68 @@ fn sign_volumes_keep_exact_values_below_and_signs_above() {
         }
     }
 }
+
+#[test]
+fn flat_spline_volumes_match_scalar_samples_bit_for_bit() {
+    let gradient = |axis, low: i32, high: i32, from: f32, to: f32| -> Arc<dyn DensitySampler> {
+        Arc::new(GradientSampler::new(
+            axis,
+            TilingMode::ClampToEdge,
+            low,
+            high,
+            from,
+            to,
+        ))
+    };
+    let inputs = vec![
+        gradient(Axis::Y, -8, 40, -1.3, 1.7),
+        gradient(Axis::X, 0, 15, 2.0, -2.0),
+        gradient(Axis::Z, 3, 9, -0.5, 0.5),
+    ];
+    let point = |location: f32, value: CubicSpline, derivative: f32| SplinePoint {
+        location,
+        value,
+        derivative,
+    };
+    let leaf = |coordinate: usize, offset: f32| {
+        CubicSpline::multipoint(
+            coordinate,
+            vec![
+                point(-1.0, CubicSpline::Constant(offset), 0.5),
+                point(0.0, CubicSpline::Constant(offset * 2.0), 0.0),
+                point(0.0, CubicSpline::Constant(-offset), 1.0),
+                point(1.5, CubicSpline::Constant(3.0), -0.25),
+            ],
+        )
+        .unwrap()
+    };
+    let spline = CubicSpline::multipoint(
+        0,
+        vec![
+            point(-0.5, leaf(1, 0.3), 0.0),
+            point(0.2, leaf(2, -1.1), 0.7),
+            point(0.9, CubicSpline::Constant(0.25), 0.0),
+            point(1.2, leaf(1, 2.0), -1.0),
+        ],
+    )
+    .unwrap();
+    let sampler = SplineSampler::new(&spline, &inputs).unwrap();
+    let volume = DensityVolume::new([16, 48, 9], [-2, -12, 1], [1, 1, 1]).unwrap();
+    let mut context = SamplerContext::default();
+    let mut bulk = vec![0.0; volume.size()];
+    sampler
+        .sample_volume(&mut context, &mut bulk, volume)
+        .unwrap();
+    let mut index = 0;
+    for z in 0..9 {
+        for x in 0..16 {
+            for y in 0..48 {
+                let scalar = sampler
+                    .sample_value(&mut context, [-2 + x, -12 + y, 1 + z])
+                    .unwrap();
+                assert_eq!(scalar.to_bits(), bulk[index].to_bits());
+                index += 1;
+            }
+        }
+    }
+}
