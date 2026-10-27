@@ -330,6 +330,23 @@ impl<T> ClimateIndex<T> {
 /// that leaf: the search is exact and keeps the previous result on ties.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SearchHint(Option<(TargetPoint, u32)>);
+/// A fresh search's answer (no previous result) and its fitness: a function
+/// of the target alone, so it can be found on any thread ahead of time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nearest {
+    leaf: u32,
+    fitness: i64,
+}
+impl<T> ClimateIndex<T> {
+    pub fn nearest(&self, target: TargetPoint) -> Result<Nearest, IndexError> {
+        let values = target.parameters();
+        let leaf = self.search(0, &values, None)?;
+        Ok(Nearest {
+            leaf: leaf as u32,
+            fitness: distance(&self.spaces[leaf], &values),
+        })
+    }
+}
 #[derive(Debug)]
 pub struct ClimateSearch<'a, T> {
     index: &'a ClimateIndex<T>,
@@ -338,6 +355,29 @@ pub struct ClimateSearch<'a, T> {
 impl<'a, T> ClimateSearch<'a, T> {
     pub fn find(&mut self, target: TargetPoint) -> Result<&'a T, IndexError> {
         let result = self.index.search(0, &target.parameters(), self.last)?;
+        self.answer(result)
+    }
+    /// [`Self::find`] for a target whose fresh answer is `nearest`
+    /// ([`ClimateIndex::nearest`]). The search's strict comparisons keep the
+    /// previous result only when it ties the best fitness; otherwise they
+    /// reach the first best leaf in tree order whatever they started from,
+    /// which is the fresh answer.
+    pub fn find_nearest(
+        &mut self,
+        target: TargetPoint,
+        nearest: Nearest,
+    ) -> Result<&'a T, IndexError> {
+        let result = match self.last {
+            Some(last)
+                if distance(&self.index.spaces[last], &target.parameters()) == nearest.fitness =>
+            {
+                last
+            }
+            _ => nearest.leaf as usize,
+        };
+        self.answer(result)
+    }
+    fn answer(&mut self, result: usize) -> Result<&'a T, IndexError> {
         self.last = Some(result);
         let (entry, 0) = self.index.links[result] else {
             unreachable!("search returns a leaf");

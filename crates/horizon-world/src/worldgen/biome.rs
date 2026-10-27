@@ -3,8 +3,8 @@
 use super::{
     DecodeError,
     climate::{
-        ClimateIndex, ClimateSampler, ClimateSearch, ClimateVolume, IndexError, Parameter,
-        ParameterPoint, SearchHint,
+        ClimateIndex, ClimateLattice, ClimateSampler, ClimateSearch, ClimateVolume, IndexError,
+        Parameter, ParameterPoint, SearchHint,
     },
     density::identifier,
 };
@@ -140,6 +140,23 @@ impl<'a> BiomeResolver<'a> {
         extents: [i32; 3],
     ) -> Result<ClimateVolume, BiomeError> {
         Ok(self.climate.sample_volume(context, minimum, extents)?)
+    }
+    /// [`Self::sample`] at a quart of `lattice`, in the same query order.
+    pub fn sample_lattice(
+        &mut self,
+        context: &mut SamplerContext,
+        lattice: &ClimateLattice,
+        quart: [i32; 3],
+    ) -> Result<&'a str, BiomeError> {
+        if let Some((target, nearest)) = lattice.nearest(quart) {
+            let nearest = nearest.ok_or(IndexError::NoResult)?;
+            return Ok(self.search.find_nearest(target, nearest)?.as_str());
+        }
+        let target = self
+            .climate
+            .sample_with_lattice(context, lattice, quart)?
+            .ok_or(BiomeError::OutsideVolume)?;
+        Ok(self.search.find(target)?.as_str())
     }
     /// Query order shares the same previous-leaf state as scalar resolution.
     pub fn sample_prepared(

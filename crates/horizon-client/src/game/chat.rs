@@ -892,7 +892,9 @@ impl Game<'_> {
         if let Some(command) = message.strip_prefix('/') {
             // A native mod's command first.
             if !self.client_mod_command(command) {
+                self.typed_command = true;
                 self.run_command(command);
+                self.typed_command = false;
             }
         } else {
             let line = Text::translate(
