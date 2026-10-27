@@ -346,6 +346,7 @@ impl Decoration {
             shape_ticks: std::cell::RefCell::new(crate::level::Ticks::new(0)),
             tick_buffer: std::cell::RefCell::new(Vec::new()),
             last_tag: None,
+            floor_bounds: [None; 9],
         };
         let mut stats = DecorateStats::default();
         let blocks = self.blocks;
@@ -512,6 +513,42 @@ impl World<'_> {
         };
         self.uniform_biomes[slot]
     }
+    /// The region chunk slot of chunk `cx`, `cz` (as `uniform_section`).
+    fn chunk_slot(&self, cx: i32, cz: i32) -> Option<usize> {
+        let (dx, dz) = (
+            i64::from(cx) - i64::from(self.center.x) + 1,
+            i64::from(cz) - i64::from(self.center.z) + 1,
+        );
+        ((0..3).contains(&dx) && (0..3).contains(&dz)).then_some((dz * 3 + dx) as usize)
+    }
+    /// A block write at `[x, y, z]` may raise its chunk's heights up to y + 1.
+    fn raise_floor_bound(&mut self, [x, y, z]: [i32; 3]) {
+        if let Some(slot) = self.chunk_slot(x >> 4, z >> 4) {
+            if let Some(bound) = &mut self.floor_bounds[slot] {
+                *bound = (*bound).max(y.saturating_add(1));
+            }
+        }
+    }
+    /// `floor_bounds` for chunk `cx`, `cz`, computed from its heightmap on
+    /// first use; `None` outside the region or without the heightmap.
+    fn floor_bound(&mut self, cx: i32, cz: i32) -> Option<i32> {
+        let slot = self.chunk_slot(cx, cz)?;
+        if self.floor_bounds[slot].is_none() {
+            let map = self
+                .region
+                .chunk(cx, cz)
+                .ok()?
+                .heightmap(HeightmapType::OceanFloorWg)?;
+            let mut bound = i32::MIN;
+            for x in 0..16 {
+                for z in 0..16 {
+                    bound = bound.max(map.first_available(x, z).ok()?);
+                }
+            }
+            self.floor_bounds[slot] = Some(bound);
+        }
+        self.floor_bounds[slot]
+    }
     /// BiomeManager.getBiome without the zoom when every quart it can pick
     /// lies in biome sections of one and the same biome.
     fn uniform_biome(&mut self, [x, y, z]: [i32; 3]) -> Option<BiomeId> {
@@ -565,6 +602,10 @@ struct World<'a> {
     tick_buffer: std::cell::RefCell<Vec<crate::level::ticks::CapturedTick>>,
     /// `block_matches_tag`'s last tag and its states.
     last_tag: Option<(Box<str>, Option<Arc<BTreeSet<BlockStateId>>>)>,
+    /// Per region chunk (X-major in Z rows, as `uniform_biomes`): a bound no
+    /// OCEAN_FLOOR_WG first-available height in it exceeds, once asked.
+    /// Heightmaps change only through this world's writes, which raise it.
+    floor_bounds: [Option<i32>; 9],
 }
 /// Read-only `LevelAccess` view of the decoration region for
 /// `BlockState.updateShape` (writes go through `World::set_block`).
@@ -732,6 +773,7 @@ impl FeatureWorld for World<'_> {
         }
         let old = self.region.block(position)?;
         self.region.set_block_worldgen(position, state)?;
+        self.raise_floor_bound(position);
         // ProtoChunk keeps a block entity that already exists when the same kind
         // of block is set again (a chest turning waterlogged); other changes drop it.
         let registry = self.decoration.bindings.registry();
@@ -1123,6 +1165,7 @@ impl PlacementContext for World<'_> {
         self.region
             .set_block_worldgen(position, state)
             .map_err(|e| query(format!("{e:?}")))?;
+        self.raise_floor_bound(position);
         Ok(())
     }
     /// BulkSectionAccess write: section storage only, no heightmap updates.
@@ -1307,6 +1350,19 @@ impl PlacementContext for World<'_> {
         let (x1, z1) = (x0.wrapping_add(size), z0.wrapping_add(size));
         if size < 0 || x1 < x0 || z1 < z0 {
             return Ok(None);
+        }
+        // Most ore attempts in To The Max's tall range sit above every
+        // column: answered from the chunks' bounds without reading columns.
+        if kind == HeightmapType::OceanFloorWg {
+            let mut below = true;
+            for cx in x0 >> 4..=x1 >> 4 {
+                for cz in z0 >> 4..=z1 >> 4 {
+                    below &= self.floor_bound(cx, cz).is_some_and(|bound| bound < y);
+                }
+            }
+            if below {
+                return Ok(Some(false));
+            }
         }
         for cx in x0 >> 4..=x1 >> 4 {
             for cz in z0 >> 4..=z1 >> 4 {

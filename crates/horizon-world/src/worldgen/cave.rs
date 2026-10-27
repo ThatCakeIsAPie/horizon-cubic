@@ -115,7 +115,8 @@ impl LakeFeature {
             return Ok(false);
         }
         let origin = tb::offset(origin, -8, -4, -8);
-        let mut grid = [false; 2048];
+        // Vanilla's 16x16x8 grid, one byte per column (bit y).
+        let mut grid = [0u8; 256];
         let spots = random.next_int_bound(4)? + 4;
         for _ in 0..spots {
             let xr = random.next_double() * 6.0 + 3.0;
@@ -137,38 +138,48 @@ impl LakeFeature {
                 for zz in 1..15 {
                     for yy in 1..7 {
                         if xs[xx] + ys[yy] + zs[zz] < 1.0 {
-                            grid[(xx * 16 + zz) * 8 + yy] = true;
+                            grid[xx * 16 + zz] |= 1 << yy;
                         }
                     }
                 }
             }
         }
-        let at = |x: i32, y: i32, z: i32| grid[((x * 16 + z) * 8 + y) as usize];
-        let edge = |x: i32, y: i32, z: i32| {
-            !at(x, y, z)
-                && ((x < 15 && at(x + 1, y, z))
-                    || (x > 0 && at(x - 1, y, z))
-                    || (z < 15 && at(x, y, z + 1))
-                    || (z > 0 && at(x, y, z - 1))
-                    || (y < 7 && at(x, y + 1, z))
-                    || (y > 0 && at(x, y - 1, z)))
-        };
+        // Vanilla's edge test (not in the lake, a lake neighbour within the
+        // grid) for a whole column at once.
+        let edges: [u8; 256] = std::array::from_fn(|i| {
+            let (x, z) = (i / 16, i % 16);
+            let c = grid[i];
+            let mut near = (c << 1) | (c >> 1);
+            if x < 15 {
+                near |= grid[i + 16];
+            }
+            if x > 0 {
+                near |= grid[i - 16];
+            }
+            if z < 15 {
+                near |= grid[i + 1];
+            }
+            if z > 0 {
+                near |= grid[i - 1];
+            }
+            !c & near
+        });
+        // The Ys of a column's set bits, ascending (vanilla's Y loop order).
+        let ys = |bits: u8| (0..8).filter(move |y| bits >> y & 1 != 0);
         let fluid = sample_state(&self.fluid, world, random, origin)?;
         for xx in 0..16 {
             for zz in 0..16 {
-                for yy in 0..8 {
-                    if edge(xx, yy, zz) {
-                        let p = tb::offset(origin, xx, yy, zz);
-                        let state = read(world, p)?;
-                        if yy >= 4 && self.blocks.has(state, tb::LIQUID) {
-                            return Ok(false);
-                        }
-                        if yy < 4 && !self.blocks.has(state, tb::SOLID) && state != fluid {
-                            return Ok(false);
-                        }
-                        if !self.can_place.test(world, p).map_err(query)? {
-                            return Ok(false);
-                        }
+                for yy in ys(edges[(xx * 16 + zz) as usize]) {
+                    let p = tb::offset(origin, xx, yy, zz);
+                    let state = read(world, p)?;
+                    if yy >= 4 && self.blocks.has(state, tb::LIQUID) {
+                        return Ok(false);
+                    }
+                    if yy < 4 && !self.blocks.has(state, tb::SOLID) && state != fluid {
+                        return Ok(false);
+                    }
+                    if !self.can_place.test(world, p).map_err(query)? {
+                        return Ok(false);
                     }
                 }
             }
@@ -176,20 +187,18 @@ impl LakeFeature {
         let cave_air = state(&self.blocks, "minecraft:cave_air")?;
         for xx in 0..16 {
             for zz in 0..16 {
-                for yy in 0..8 {
-                    if at(xx, yy, zz) {
-                        let p = tb::offset(origin, xx, yy, zz);
-                        if self
-                            .can_replace_air_or_fluid
-                            .test(world, p)
-                            .map_err(query)?
-                        {
-                            let air = yy >= 4;
-                            write(world, p, if air { cave_air } else { fluid }, 2)?;
-                            if air {
-                                world.schedule_block_tick(p, cave_air, 0).map_err(query)?;
-                                mark_above(world, &self.blocks, p)?;
-                            }
+                for yy in ys(grid[(xx * 16 + zz) as usize]) {
+                    let p = tb::offset(origin, xx, yy, zz);
+                    if self
+                        .can_replace_air_or_fluid
+                        .test(world, p)
+                        .map_err(query)?
+                    {
+                        let air = yy >= 4;
+                        write(world, p, if air { cave_air } else { fluid }, 2)?;
+                        if air {
+                            world.schedule_block_tick(p, cave_air, 0).map_err(query)?;
+                            mark_above(world, &self.blocks, p)?;
                         }
                     }
                 }
@@ -199,8 +208,8 @@ impl LakeFeature {
         if !self.blocks.is_air(barrier) {
             for xx in 0..16 {
                 for zz in 0..16 {
-                    for yy in 0..8 {
-                        if edge(xx, yy, zz) && (yy < 4 || random.next_int_bound(2)? != 0) {
+                    for yy in ys(edges[(xx * 16 + zz) as usize]) {
+                        if yy < 4 || random.next_int_bound(2)? != 0 {
                             let p = tb::offset(origin, xx, yy, zz);
                             let state = read(world, p)?;
                             if self.blocks.has(state, tb::SOLID)
