@@ -31,6 +31,16 @@ pub trait TerrainAquifer {
         density: f64,
     ) -> Result<Option<BlockStateId>, AquiferError>;
     fn should_schedule_fluid_update(&self) -> bool;
+    /// True when a density above zero always gives None and no fluid update,
+    /// with no other effect: the noise fill then skips those calls.
+    fn solid_is_default(&self) -> bool {
+        false
+    }
+    /// Some((y, air)) when above `y` a density not above zero (or NaN) always
+    /// gives `Some(air)` and no fluid update, with no other effect.
+    fn open_above(&self) -> Option<(i32, BlockStateId)> {
+        None
+    }
 }
 impl<P: FluidPicker> TerrainAquifer for DisabledAquifer<P> {
     #[inline]
@@ -45,6 +55,12 @@ impl<P: FluidPicker> TerrainAquifer for DisabledAquifer<P> {
     #[inline]
     fn should_schedule_fluid_update(&self) -> bool {
         false
+    }
+    fn solid_is_default(&self) -> bool {
+        true
+    }
+    fn open_above(&self) -> Option<(i32, BlockStateId)> {
+        DisabledAquifer::open_above(self)
     }
 }
 impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> TerrainAquifer
@@ -62,6 +78,12 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> TerrainAquifer
     #[inline(always)]
     fn should_schedule_fluid_update(&self) -> bool {
         NoiseBasedAquifer::should_schedule_fluid_update(self)
+    }
+    fn solid_is_default(&self) -> bool {
+        true
+    }
+    fn open_above(&self) -> Option<(i32, BlockStateId)> {
+        NoiseBasedAquifer::open_above(self)
     }
 }
 
@@ -613,6 +635,13 @@ pub fn fill_noise<B: TerrainBlockStates>(
             })
         })
         .collect();
+    // Column runs all above zero are the default block, and all at or below
+    // zero above `open` are air, without calling the aquifer.
+    let solid_is_default = aquifer.solid_is_default();
+    let open = match aquifer.open_above() {
+        Some((y, state)) if state == air => y,
+        _ => i32::MAX,
+    };
     // The visited section's states, by (16z + x) * 16 + y - low.
     let mut states = [air; 4096];
     let mut high = sy;
@@ -626,6 +655,8 @@ pub fn fill_noise<B: TerrainBlockStates>(
             .section_index(world_top)
             .ok_or(TerrainError::OutsideBuildHeight)?;
         let mut uniform = high - low == 16;
+        let mut all_air = true;
+        let open_section = by.wrapping_add(low as i32) > open;
         for z in 0..sz {
             let world_z = bz.wrapping_add(z as i32);
             for x in 0..sx {
@@ -635,6 +666,47 @@ pub fn fill_noise<B: TerrainBlockStates>(
                 let start = volume.index([x, 0, z]).expect("valid density coordinates");
                 let column = &density[start + low..start + high];
                 let column_states = &mut states[(16 * z + x) * 16..(16 * z + x) * 16 + 16];
+                let solid = column.iter().fold(0, |n, &v| n + usize::from(v > 0.));
+                if solid == column.len() && solid_is_default {
+                    column_states[..column.len()].fill(default_block);
+                    all_air &= default_block == air;
+                    if default_block == air {
+                        continue;
+                    }
+                    // Heightmap updates from the top until both maps' bounds
+                    // are at or above the next block, as below.
+                    for y in (0..column.len()).rev() {
+                        let world_y = by.wrapping_add((low + y) as i32);
+                        let mut settled_all = true;
+                        for (kind, settled) in MAPS.into_iter().zip(settled.iter_mut()) {
+                            if matches!(settled, Ok(bound) if world_y <= *bound) {
+                                continue;
+                            }
+                            settled_all = false;
+                            chunk.update_heightmap(
+                                kind,
+                                x as i32,
+                                world_y,
+                                z as i32,
+                                default_block,
+                            )?;
+                            *settled = chunk.heightmaps[kind as usize]
+                                .as_ref()
+                                .expect("ensured heightmap")
+                                .first_available(x as i32, z as i32)
+                                .map(|first| first.wrapping_sub(2));
+                        }
+                        if settled_all {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if solid == 0 && open_section {
+                    column_states[..column.len()].fill(air);
+                    uniform &= air == default_block;
+                    continue;
+                }
                 for (y, &value) in column.iter().enumerate().rev() {
                     let world_y = by.wrapping_add((low + y) as i32);
                     let state = aquifer
@@ -645,6 +717,7 @@ pub fn fill_noise<B: TerrainBlockStates>(
                     if state == air {
                         continue;
                     }
+                    all_air = false;
                     for (kind, settled) in MAPS.into_iter().zip(settled.iter_mut()) {
                         if matches!(settled, Ok(bound) if world_y <= *bound) {
                             continue;
@@ -676,7 +749,7 @@ pub fn fill_noise<B: TerrainBlockStates>(
             } else {
                 4096
             };
-        } else {
+        } else if !all_air {
             for z in 0..sz {
                 for x in 0..sx {
                     let column_states = &states[(16 * z + x) * 16..(16 * z + x) * 16 + 16];

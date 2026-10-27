@@ -244,6 +244,15 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
     pub fn skip_sampling_above_y(&self) -> i32 {
         self.skip_above_y
     }
+    /// Above this height a density not above zero gives air (and no fluid
+    /// update): the cell search is skipped there and the picker gives air.
+    pub fn open_above(&self) -> Option<(i32, BlockStateId)> {
+        let from = self.picker.air_from()?;
+        Some((
+            self.skip_above_y.max(from.saturating_sub(1)),
+            self.blocks.air(),
+        ))
+    }
     fn sample(
         &self,
         field: AquiferField,

@@ -19,10 +19,18 @@ impl FluidStatus {
 }
 pub trait FluidPicker: std::fmt::Debug + Send + Sync {
     fn compute(&self, position: [i32; 3]) -> FluidStatus;
+    /// A height from which up `compute(p).at(p.y, air)` is air at every
+    /// position, if the picker knows one. None is the conservative answer.
+    fn air_from(&self) -> Option<i32> {
+        None
+    }
 }
 impl<P: FluidPicker + ?Sized> FluidPicker for &P {
     fn compute(&self, position: [i32; 3]) -> FluidStatus {
         P::compute(self, position)
+    }
+    fn air_from(&self) -> Option<i32> {
+        P::air_from(self)
     }
 }
 /// State IDs must come from one immutable block registry. Default fluid can be
@@ -75,6 +83,15 @@ impl FluidPicker for GlobalFluidPicker {
             }
         }
     }
+    /// Lava stops at -54 below the lower of -54 and the sea level, the
+    /// default fluid at the sea level.
+    fn air_from(&self) -> Option<i32> {
+        Some(if self.disabled {
+            i32::MIN
+        } else {
+            self.sea_level
+        })
+    }
 }
 #[derive(Debug)]
 pub struct DisabledAquifer<P> {
@@ -96,5 +113,33 @@ impl<P: FluidPicker> DisabledAquifer<P> {
     }
     pub const fn should_schedule_fluid_update(&self) -> bool {
         false
+    }
+    /// Above this height a density not above zero gives air.
+    pub fn open_above(&self) -> Option<(i32, BlockStateId)> {
+        let from = self.picker.air_from()?;
+        Some((from.saturating_sub(1), self.air))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_picker_is_air_from_its_air_height() {
+        let (fluid, lava, air) = (BlockStateId(1), BlockStateId(2), BlockStateId(0));
+        for sea in [-100, -54, -10, 63, 300] {
+            for disabled in [false, true] {
+                let picker = GlobalFluidPicker::new(sea, fluid, lava, air).with_disabled(disabled);
+                let from = picker.air_from().unwrap();
+                for y in (-200..400).filter(|&y| y >= from) {
+                    assert_eq!(picker.compute([0, y, 0]).at(y, air), air, "{sea} {y}");
+                }
+                if !disabled {
+                    let below = from - 1;
+                    assert_ne!(picker.compute([0, below, 0]).at(below, air), air);
+                }
+            }
+        }
     }
 }
