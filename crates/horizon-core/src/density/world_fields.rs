@@ -108,6 +108,19 @@ impl DensitySampler for ContextBoundSampler {
     ) -> Result<(), SampleError> {
         self.resolve(context).sample_volume(context, buffer, volume)
     }
+    fn constant(&self, context: &SamplerContext) -> Option<f32> {
+        self.resolve(context).constant(context)
+    }
+    fn sample_volume_signs(
+        &self,
+        context: &mut SamplerContext,
+        buffer: &mut [f32],
+        volume: DensityVolume,
+        open_from: i32,
+    ) -> Result<(), SampleError> {
+        self.resolve(context)
+            .sample_volume_signs(context, buffer, volume, open_from)
+    }
 }
 
 #[derive(Clone, Debug)]

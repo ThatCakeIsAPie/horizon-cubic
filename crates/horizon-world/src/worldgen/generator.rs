@@ -20,7 +20,7 @@ use super::{
     biome_temperature::{BiomeTemperature, BiomeTemperatureSettings},
     carver::{CarverCatalog, WorldCarver, generate_carving_mask, large_feature_random},
     carving::{CarvingBlocks, apply_carving_mask},
-    climate::{ClimateSampler, decode_parameter, quantize},
+    climate::{ClimateSampler, SearchHint, decode_parameter, quantize},
     decode_noise,
     density::DensityRegistry,
     material_condition::{
@@ -1046,10 +1046,21 @@ where
         // Names point into the source's parameter list: neighbouring quarts
         // mostly resolve to the same entry, so skip the map lookup for it.
         let mut last: Option<(*const str, BiomeId)> = None;
+        // Per quart column, its last search: above the terrain a column's
+        // climate is mostly the same quart after quart.
+        let mut hints = [SearchHint::default(); 16];
+        let (column_x, column_z) = (pos.x.wrapping_shl(4) >> 2, pos.z.wrapping_shl(4) >> 2);
         chunk
             .fill(min, min + height - 1, |quart| -> Result<BiomeId, String> {
+                let column = (quart[0].wrapping_sub(column_x) & 3)
+                    | ((quart[2].wrapping_sub(column_z) & 3) << 2);
                 let name = resolver
-                    .sample_prepared(context, volume.as_ref(), quart)
+                    .sample_prepared_hinted(
+                        context,
+                        volume.as_ref(),
+                        quart,
+                        &mut hints[column as usize],
+                    )
                     .map_err(|e| e.to_string())?;
                 if let Some((pointer, id)) = last {
                     if std::ptr::eq(pointer, name) {

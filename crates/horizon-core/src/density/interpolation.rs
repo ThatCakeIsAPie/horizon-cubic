@@ -32,11 +32,16 @@ impl InterpolatedSampler {
         })
     }
 
+    /// With `open_from`, a cell starting at or above that block Y whose
+    /// corners are all at or below zero (or NaN) is written as zeros: every
+    /// value it interpolates is at or below zero or NaN as well (each lerp of
+    /// two such values is: `a + t * (b - a)` with `t` in [0, 1]).
     fn sample_block_volume(
         &self,
         context: &mut SamplerContext,
         output: &mut [f32],
         volume: DensityVolume,
+        open_from: Option<i32>,
     ) -> Result<(), SampleError> {
         let minimum = volume.minimum();
         let maximum = volume.maximum();
@@ -63,13 +68,20 @@ impl InterpolatedSampler {
                 for x in 0..counts[0] {
                     for y in 0..counts[1] {
                         let cell = [x as usize, y as usize, z as usize];
-                        let corners = std::array::from_fn(|corner| {
+                        let corners: [f32; 8] = std::array::from_fn(|corner| {
                             let position = std::array::from_fn(|axis| {
                                 (cell[axis] + ((corner >> axis) & 1)).min(coarse.sizes()[axis] - 1)
                             });
                             samples[coarse.index(position).unwrap()]
                         });
-                        self.fill_cell(output, volume, coarse, cell, corners)?;
+                        let open = open_from.is_some_and(|from| {
+                            i64::from(coarse.coordinate(1, y as usize)) >= i64::from(from)
+                        }) && corners.iter().all(|&corner| !(corner > 0.0));
+                        if open {
+                            self.fill_cell_with(output, volume, coarse, cell, 0.0)?;
+                        } else {
+                            self.fill_cell(output, volume, coarse, cell, corners)?;
+                        }
                     }
                 }
             }
@@ -232,6 +244,51 @@ impl InterpolatedSampler {
         Ok(())
     }
 
+    /// The cell's blocks of `volume`, as `fill_cell` visits them, set to `value`.
+    fn fill_cell_with(
+        &self,
+        output: &mut [f32],
+        volume: DensityVolume,
+        coarse: DensityVolume,
+        cell: [usize; 3],
+        value: f32,
+    ) -> Result<(), SampleError> {
+        let offset: [i32; 3] = std::array::from_fn(|i| {
+            coarse.minimum()[i]
+                .wrapping_add((cell[i] as i32).wrapping_mul(self.cell_size[i]))
+                .wrapping_sub(volume.minimum()[i])
+        });
+        let start = offset.map(|offset| offset.wrapping_neg().max(0));
+        let end: [i32; 3] = std::array::from_fn(|i| {
+            self.cell_size[i]
+                .min((volume.sizes()[i] as i32).wrapping_sub(offset[i]))
+                .wrapping_sub(1)
+        });
+        if end[1] < start[1] {
+            return Ok(());
+        }
+        for z in start[2]..=end[2] {
+            for x in start[0]..=end[0] {
+                let index = volume
+                    .index([
+                        offset[0].wrapping_add(x) as usize,
+                        offset[1].wrapping_add(start[1]) as usize,
+                        offset[2].wrapping_add(z) as usize,
+                    ])
+                    .ok_or(DensityError::VolumeTooLarge)?;
+                let length = (end[1] - start[1] + 1) as usize;
+                let end_index = index
+                    .checked_add(length)
+                    .ok_or(DensityError::VolumeTooLarge)?;
+                output
+                    .get_mut(index..end_index)
+                    .ok_or(DensityError::VolumeTooLarge)?
+                    .fill(value);
+            }
+        }
+        Ok(())
+    }
+
     fn fill_cell(
         &self,
         output: &mut [f32],
@@ -332,6 +389,24 @@ impl DensitySampler for InterpolatedSampler {
             Ok(lerp(alpha[2], xy0, xy1))
         })
     }
+    fn sample_volume_signs(
+        &self,
+        context: &mut SamplerContext,
+        output: &mut [f32],
+        volume: DensityVolume,
+        open_from: i32,
+    ) -> Result<(), SampleError> {
+        check_buffer(output, volume)?;
+        // The block-resolution path of `sample_volume`, with open cells.
+        let aligned = (0..3).all(|i| {
+            (volume.steps()[i] == self.cell_size[i] || volume.sizes()[i] == 1)
+                && volume.minimum()[i].rem_euclid(self.cell_size[i]) == 0
+        });
+        if context.sparse || aligned || volume.steps() != [1; 3] {
+            return self.sample_volume(context, output, volume);
+        }
+        self.sample_block_volume(context, output, volume, Some(open_from))
+    }
     fn sample_volume(
         &self,
         context: &mut SamplerContext,
@@ -376,7 +451,7 @@ impl DensitySampler for InterpolatedSampler {
             return Ok(());
         }
         if volume.steps() == [1; 3] {
-            return self.sample_block_volume(context, output, volume);
+            return self.sample_block_volume(context, output, volume, None);
         }
         // The reference evaluates the complete block-resolution bounding volume
         // before selecting strided samples, including trailing unsampled blocks.
@@ -386,7 +461,7 @@ impl DensitySampler for InterpolatedSampler {
             [1; 3],
         )?;
         context.with_buffer(dense.size(), |context, samples| {
-            self.sample_block_volume(context, samples, dense)?;
+            self.sample_block_volume(context, samples, dense, None)?;
             let [sx, sy, sz] = volume.sizes();
             for z in 0..sz {
                 for x in 0..sx {

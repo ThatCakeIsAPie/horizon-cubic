@@ -286,6 +286,24 @@ impl BinaryOp {
             }
         }
     }
+    /// `apply_bulk` with every right value `right`.
+    fn apply_constant(self, buffer: &mut [f32], right: f32) {
+        macro_rules! apply {
+            ($operation:expr) => {
+                for left in buffer.iter_mut() {
+                    *left = ($operation)(*left, right);
+                }
+            };
+        }
+        match self {
+            Self::Add => apply!(|left, right| left + right),
+            Self::Subtract => apply!(|left, right| left - right),
+            Self::Multiply => apply!(|left, right| left * right),
+            Self::Divide => apply!(|left, right| left / right),
+            Self::Minimum { .. } => apply!(|left, right| if right < left { right } else { left }),
+            Self::Maximum { .. } => apply!(|left, right| if right > left { right } else { left }),
+        }
+    }
     fn apply_bulk(self, buffer: &mut [f32], right: &[f32]) {
         macro_rules! apply {
             ($operation:expr) => {
@@ -340,11 +358,36 @@ impl DensitySampler for BinarySampler {
         // Vanilla reads a volume-sized temporary through every output index.
         // Restrict this API to the valid equal-size case before invoking children.
         self.left.sample_volume(context, buffer, volume)?;
+        // A constant right side (an unbound world field) needs no buffer.
+        if let Some(right) = self.right.constant(context) {
+            self.operation
+                .apply_constant(&mut buffer[..volume.size()], right);
+            return Ok(());
+        }
         context.with_buffer(volume.size(), |context, right| {
             self.right.sample_volume(context, right, volume)?;
             self.operation.apply_bulk(buffer, right);
             Ok(())
         })
+    }
+    fn sample_volume_signs(
+        &self,
+        context: &mut SamplerContext,
+        buffer: &mut [f32],
+        volume: DensityVolume,
+        open_from: i32,
+    ) -> Result<(), SampleError> {
+        // Adding zero keeps whether each value is above zero.
+        match (self.operation, self.right.constant(context)) {
+            (BinaryOp::Add, Some(right)) if right == 0.0 => {
+                check_exact_buffer(buffer, volume)?;
+                self.left
+                    .sample_volume_signs(context, buffer, volume, open_from)?;
+                self.operation.apply_constant(buffer, right);
+                Ok(())
+            }
+            _ => self.sample_volume(context, buffer, volume),
+        }
     }
 }
 

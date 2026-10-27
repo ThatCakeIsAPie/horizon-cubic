@@ -618,8 +618,7 @@ pub fn fill_noise<B: TerrainBlockStates>(
     }
     chunk.ensure_heightmap(HeightmapType::OceanFloorWg);
     chunk.ensure_heightmap(HeightmapType::WorldSurfaceWg);
-    let mut density = vec![0.; volume.size()];
-    final_density.sample_volume(context, &mut density, volume)?;
+
     const MAPS: [HeightmapType; 2] = [HeightmapType::OceanFloorWg, HeightmapType::WorldSurfaceWg];
     let air = chunk.blocks.air;
     // Heightmap updates at or below first-available - 2 are no-ops; the bound
@@ -642,6 +641,14 @@ pub fn fill_noise<B: TerrainBlockStates>(
         Some((y, state)) if state == air => y,
         _ => i32::MAX,
     };
+    let mut density = vec![0.; volume.size()];
+    // Above `open` only whether each density is above zero matters.
+    match open.checked_add(1) {
+        Some(open_from) => {
+            final_density.sample_volume_signs(context, &mut density, volume, open_from)?
+        }
+        None => final_density.sample_volume(context, &mut density, volume)?,
+    }
     // The visited section's states, by (16z + x) * 16 + y - low.
     let mut states = [air; 4096];
     let mut high = sy;

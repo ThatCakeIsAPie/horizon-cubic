@@ -1098,3 +1098,52 @@ fn kept_planes_match_fresh_slices_across_vertical_lattices() {
     // Two fresh evaluations and one kept plane.
     assert_eq!(input.1.load(Ordering::Relaxed), 3);
 }
+
+#[test]
+fn sign_volumes_keep_exact_values_below_and_signs_above() {
+    #[derive(Debug)]
+    struct Wavy;
+    impl DensitySampler for Wavy {
+        fn pointwise_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+            Some(Vec::new())
+        }
+        fn sample_value(
+            &self,
+            _: &mut SamplerContext,
+            [x, y, z]: [i32; 3],
+        ) -> Result<f32, SampleError> {
+            let v = (x as f32 * 0.37).sin() + (z as f32 * 0.21).cos() - y as f32 * 0.05;
+            Ok(if (x + z) % 7 == 0 { -v.abs() } else { v })
+        }
+    }
+    let interpolated = Arc::new(InterpolatedSampler::new(Arc::new(Wavy), 4, 4).unwrap());
+    let sampler = BinarySampler {
+        left: interpolated.clone(),
+        right: Arc::new(ContextBoundSampler::new(WorldField::Beardifier)),
+        operation: BinaryOp::Add,
+    };
+    let volume = DensityVolume::new([16, 96, 16], [-8, -16, 5], [1; 3]).unwrap();
+    for open_from in [-100, -16, 0, 13, 40, 1000] {
+        let mut context = SamplerContext::default();
+        let mut exact = vec![0.0; volume.size()];
+        sampler
+            .sample_volume(&mut context, &mut exact, volume)
+            .unwrap();
+        let mut signs = vec![0.0; volume.size()];
+        sampler
+            .sample_volume_signs(&mut context, &mut signs, volume, open_from)
+            .unwrap();
+        let mut index = 0;
+        for _ in 0..16 * 16 {
+            for y in 0..96 {
+                let (a, b) = (exact[index], signs[index]);
+                if -16 + y < open_from {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                } else {
+                    assert_eq!(a > 0.0, b > 0.0);
+                }
+                index += 1;
+            }
+        }
+    }
+}

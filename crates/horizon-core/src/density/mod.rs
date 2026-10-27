@@ -195,6 +195,27 @@ pub trait DensitySampler: std::fmt::Debug + Send + Sync {
     fn bulk_differs(&self) -> bool {
         false
     }
+
+    /// The one value `sample_volume` writes everywhere, whatever the volume,
+    /// when this sampler knows it (in this context). None is conservative.
+    fn constant(&self, _context: &SamplerContext) -> Option<f32> {
+        None
+    }
+
+    /// `sample_volume` for a caller that, at block Y `open_from` and above,
+    /// only tests whether each value is above zero: values there may differ
+    /// from `sample_volume`'s, but each is above zero exactly when it is.
+    /// Values below `open_from` are `sample_volume`'s, as are errors.
+    fn sample_volume_signs(
+        &self,
+        context: &mut SamplerContext,
+        buffer: &mut [f32],
+        volume: DensityVolume,
+        open_from: i32,
+    ) -> Result<(), SampleError> {
+        let _ = open_from;
+        self.sample_volume(context, buffer, volume)
+    }
 }
 /// Whether every sampler reachable from `root` is pointwise.
 pub fn is_pointwise(root: &Arc<dyn DensitySampler>) -> bool {
@@ -268,6 +289,9 @@ impl DensitySampler for ConstantSampler {
     }
     fn sample_value(&self, _: &mut SamplerContext, _: [i32; 3]) -> Result<f32, SampleError> {
         Ok(self.0)
+    }
+    fn constant(&self, _: &SamplerContext) -> Option<f32> {
+        Some(self.0)
     }
     fn sample_volume(
         &self,

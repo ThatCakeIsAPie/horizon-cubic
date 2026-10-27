@@ -6,7 +6,7 @@ use super::{
 use crate::worldgen::{
     DecodeError,
     biome::{BiomeError, BiomeResolver, MultiNoiseBiomeSource},
-    climate::{ClimateSampler, ClimateVolume},
+    climate::{ClimateSampler, ClimateVolume, SearchHint},
 };
 use horizon_core::density::{DensitySampler, SampleError, SamplerContext};
 use std::collections::{BTreeMap, BTreeSet};
@@ -163,6 +163,21 @@ impl<'a> BiomeSourceResolver<'a> {
         if let Self::MultiNoise(source) = self {
             if let Some(volume) = volume {
                 return Ok(source.sample_prepared(volume, quart)?);
+            }
+        }
+        self.sample(context, quart)
+    }
+    /// `sample_prepared`, with a search hint for prepared multi-noise volumes.
+    pub fn sample_prepared_hinted(
+        &mut self,
+        context: &mut SamplerContext,
+        volume: Option<&ClimateVolume>,
+        quart: [i32; 3],
+        hint: &mut SearchHint,
+    ) -> Result<&'a str, BiomeSourceError> {
+        if let Self::MultiNoise(source) = self {
+            if let Some(volume) = volume {
+                return Ok(source.sample_prepared_hinted(volume, quart, hint)?);
             }
         }
         self.sample(context, quart)
