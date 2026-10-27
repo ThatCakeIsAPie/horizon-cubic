@@ -1212,3 +1212,42 @@ fn flat_spline_volumes_match_scalar_samples_bit_for_bit() {
         }
     }
 }
+
+#[test]
+fn interpolation_is_scalar_pure_unless_a_cache_sits_above() {
+    let noise: Arc<dyn DensitySampler> = Arc::new(NoiseSampler {
+        noise: Arc::new(PerlinNoise::new(&mut LegacyRandom::new(3))),
+        xz_scale: 0.2,
+        y_scale: 0.4,
+    });
+    let interpolated: Arc<dyn DensitySampler> =
+        Arc::new(interpolation::InterpolatedSampler::new(noise.clone(), 4, 8).unwrap());
+    assert!(!is_pointwise_scalar(&interpolated));
+    assert!(is_scalar_pure(&interpolated));
+    let cached_below: Arc<dyn DensitySampler> = Arc::new(
+        interpolation::InterpolatedSampler::new(
+            Arc::new(CachingDensitySampler::new(0, noise).unwrap()),
+            4,
+            8,
+        )
+        .unwrap(),
+    );
+    assert!(is_scalar_pure(&cached_below));
+    let cached_above: Arc<dyn DensitySampler> =
+        Arc::new(CachingDensitySampler::new(1, interpolated.clone()).unwrap());
+    assert!(!is_scalar_pure(&cached_above));
+    // Pure: the same scalar values after the context sampled it in bulk.
+    let volume = DensityVolume::new([3, 5, 3], [-8, -16, 4], [4, 8, 4]).unwrap();
+    let mut used = SamplerContext::default();
+    let mut bulk = vec![0.0; volume.size()];
+    interpolated
+        .sample_volume(&mut used, &mut bulk, volume)
+        .unwrap();
+    for position in [[-7, -13, 5], [0, 0, 0], [3, 21, -9]] {
+        let fresh = interpolated
+            .sample_value(&mut SamplerContext::default(), position)
+            .unwrap();
+        let again = interpolated.sample_value(&mut used, position).unwrap();
+        assert_eq!(fresh.to_bits(), again.to_bits(), "{position:?}");
+    }
+}

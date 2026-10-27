@@ -589,7 +589,9 @@ impl Game<'_> {
             return;
         }
         if let Some(command) = message.strip_prefix('/') {
+            self.typed_command = true;
             self.run_command(command);
+            self.typed_command = false;
         } else {
             let line = Text::translate(
                 "chat.type.text",

@@ -81,6 +81,49 @@ fn format_double(v: f64) -> String {
     format!("{v:.6}")
 }
 
+/// A `/locate biome` the player typed, searching on a thread of its own.
+pub(super) struct PendingLocate {
+    biome: String,
+    from: [i32; 3],
+    /// The world it searches: one left meanwhile gets no answer.
+    world: std::sync::Arc<horizon_client::vanillagen::VanillaTerrain>,
+    result: std::sync::mpsc::Receiver<Option<(String, [i32; 3])>>,
+}
+fn locate_biome_not_found(biome: &str) -> CommandError {
+    CommandError::new(Text::tr("commands.locate.biome.not_found", &[&biome]))
+}
+/// LocateCommand.showLocateResult for a biome found from `from`, and the
+/// distance the command returns.
+fn locate_biome_message(
+    biome: &str,
+    from: [i32; 3],
+    found: Option<(String, [i32; 3])>,
+) -> R<(Text, i32)> {
+    let Some((name, p)) = found else {
+        return Err(locate_biome_not_found(biome));
+    };
+    let d2 = [p[0] - from[0], p[1] - from[1], p[2] - from[2]]
+        .map(|d| f64::from(d) * f64::from(d))
+        .iter()
+        .sum::<f64>();
+    let shown = if biome.starts_with('#') {
+        format!("{biome} ({name})")
+    } else {
+        biome.to_owned()
+    };
+    let link = Text::teleport_link(p[0], Some(p[1]), p[2]);
+    let distance = (d2 as f32).sqrt().floor() as i32;
+    let message = Text::translate(
+        "commands.locate.biome.success",
+        &[
+            Text::literal(shown),
+            link,
+            Text::literal(distance.to_string()),
+        ],
+    );
+    Ok((message, distance))
+}
+
 impl Game<'_> {
     /// Commands.performCommand for a line without its slash.
     pub(super) fn run_command(&mut self, command: &str) {
@@ -2661,6 +2704,34 @@ impl Game<'_> {
         ));
         Ok(distance)
     }
+    /// Answer the typed `/locate biome` searches that finished in this world.
+    pub(super) fn poll_locates(&mut self) {
+        if self.locates.is_empty() {
+            return;
+        }
+        let current = self.end.locator();
+        let mut done = Vec::new();
+        self.locates
+            .retain(|pending| match pending.result.try_recv() {
+                Ok(found) => {
+                    if current
+                        .as_ref()
+                        .is_some_and(|world| std::sync::Arc::ptr_eq(world, &pending.world))
+                    {
+                        done.push((pending.biome.clone(), pending.from, found));
+                    }
+                    false
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            });
+        for (biome, from, found) in done {
+            match locate_biome_message(&biome, from, found) {
+                Ok((message, _)) => self.feedback(message),
+                Err(e) => self.command_failure(e.message),
+            }
+        }
+    }
     fn cmd_locate(&mut self, id: &str, ctx: &Context) -> R<i32> {
         let origin = self.source_position();
         if id == "locate.biome" {
@@ -2670,45 +2741,49 @@ impl Game<'_> {
             // LocateCommand.locateBiome: BiomeSource.findClosestBiome3d with
             // a 6400-block radius, 32-block columns and 64-block layers.
             let from = origin.map(|v| v.floor() as i32);
-            let allowed = |name: &str| self.biome_matches(&biome, name);
-            let search = horizon_world::worldgen::generator::BiomeSearch {
-                allowed: &allowed,
-                origin: from,
-                radius: 6400,
-                horizontal: 32,
-                vertical: 64,
-                min_y: horizon_client::chunk::layout().min_y(),
-                max_y: horizon_client::chunk::layout().max_y() - 1,
+            let Some(terrain) = self.end.locator() else {
+                return Err(locate_biome_not_found(&biome));
             };
-            let found = self
-                .end
-                .locator()
-                .and_then(|t| t.find_closest_biome(&search));
-            let Some((name, p)) = found else {
-                return Err(CommandError::new(Text::tr(
-                    "commands.locate.biome.not_found",
-                    &[&biome],
-                )));
+            // The search only reads which names are wanted: chosen here.
+            let allowed: std::collections::HashSet<String> = terrain
+                .biome_names()
+                .into_iter()
+                .filter(|name| self.biome_matches(&biome, name))
+                .collect();
+            let world = terrain.clone();
+            let search = move || {
+                let allowed = |name: &str| allowed.contains(name);
+                terrain.find_closest_biome(&horizon_world::worldgen::generator::BiomeSearch {
+                    allowed: &allowed,
+                    origin: from,
+                    radius: 6400,
+                    horizontal: 32,
+                    vertical: 64,
+                    min_y: horizon_client::chunk::layout().min_y(),
+                    max_y: horizon_client::chunk::layout().max_y() - 1,
+                })
             };
-            let d2 = [p[0] - from[0], p[1] - from[1], p[2] - from[2]]
-                .map(|d| f64::from(d) * f64::from(d))
-                .iter()
-                .sum::<f64>();
-            let shown = if biome.starts_with('#') {
-                format!("{biome} ({name})")
-            } else {
-                biome.clone()
-            };
-            let link = Text::teleport_link(p[0], Some(p[1]), p[2]);
-            let distance = (d2 as f32).sqrt().floor() as i32;
-            self.feedback(Text::translate(
-                "commands.locate.biome.success",
-                &[
-                    Text::literal(shown),
-                    link,
-                    Text::literal(distance.to_string()),
-                ],
-            ));
+            if self.typed_command && self.command_source.is_none() && self.chat_capture.is_none() {
+                // Typed in chat, so nothing reads the result: search off the
+                // game thread and answer in chat once done, rather than stop
+                // the game for a far biome (minutes over To The Max's height).
+                let (send, result) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .name("Locate biome".into())
+                    .spawn(move || {
+                        let _ = send.send(search());
+                    })
+                    .map_err(|e| CommandError::new(Text::literal(e.to_string())))?;
+                self.locates.push(PendingLocate {
+                    biome,
+                    from,
+                    world,
+                    result,
+                });
+                return Ok(1);
+            }
+            let (message, distance) = locate_biome_message(&biome, from, search())?;
+            self.feedback(message);
             return Ok(distance);
         }
         let Some(Arg::Resource(s)) = ctx.get("structure").cloned() else {

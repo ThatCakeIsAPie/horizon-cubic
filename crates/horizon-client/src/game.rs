@@ -1329,6 +1329,11 @@ struct Game<'a> {
     shield_cooldown: u32,
     /// The source of a command run through /execute (the player otherwise).
     command_source: Option<commands::execute::Source>,
+    /// A command line the player typed in chat is running (not a function's,
+    /// a command block's or a guest's).
+    typed_command: bool,
+    /// `/locate biome` searches the player typed, running off the game thread.
+    locates: Vec<commands::PendingLocate>,
     titles: titles::Titles,
     /// `Hud.toolHighlightTimer`: the selected item name.
     tool_highlight: horizon_client::hud_overlays::ToolHighlight,
@@ -3970,6 +3975,7 @@ impl Game<'_> {
             None => 0.0,
         };
         self.ticks += 1;
+        self.poll_locates();
         self.track_experience_display();
         // `/tick freeze` stops the world but not the player.
         let running = self.clock.world_runs();
@@ -11736,6 +11742,8 @@ impl<'a> Game<'a> {
             hand: Hand::Main,
             shield_cooldown: 0,
             command_source: None,
+            typed_command: false,
+            locates: Vec::new(),
             titles: Default::default(),
             tool_highlight: Default::default(),
             applied_modifiers: Vec::new(),

@@ -358,6 +358,9 @@ impl DensitySampler for InterpolatedSampler {
     fn bulk_differs(&self) -> bool {
         true
     }
+    fn scalar_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+        Some(vec![&self.input])
+    }
     fn sample_value(
         &self,
         context: &mut SamplerContext,

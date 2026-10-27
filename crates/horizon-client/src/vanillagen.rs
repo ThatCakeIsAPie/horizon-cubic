@@ -269,14 +269,22 @@ impl VanillaTerrain {
     ) -> Option<(String, [i32; 3])> {
         self.generator.worker().locate(names, from, radius)
     }
-    /// `/locate biome`: `BiomeSource.findClosestBiome3d`.
+    /// `/locate biome`: `BiomeSource.findClosestBiome3d`, with a worker of
+    /// its own (a far search takes long: it holds up no other query).
     pub fn find_closest_biome(
         &self,
         search: &horizon_world::worldgen::generator::BiomeSearch<'_>,
     ) -> Option<(String, [i32; 3])> {
-        let mut worker = self.query.lock().unwrap_or_else(|e| e.into_inner());
-        let worker = worker.get_or_insert_with(|| self.generator.worker());
-        worker.find_closest_biome(search)
+        self.generator.worker().find_closest_biome(search)
+    }
+    /// Every biome the generator knows, by name.
+    pub fn biome_names(&self) -> Vec<String> {
+        self.generator
+            .data()
+            .biome_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect()
     }
     /// `BiomeSource.getNoiseBiome` at quart positions, for places that may not
     /// be generated yet (`MapItem.renderBiomePreviewMap`).

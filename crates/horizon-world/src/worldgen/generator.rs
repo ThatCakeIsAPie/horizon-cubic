@@ -20,7 +20,7 @@ use super::{
     biome_temperature::{BiomeTemperature, BiomeTemperatureSettings},
     carver::{CarverCatalog, WorldCarver, generate_carving_mask, large_feature_random},
     carving::{CarvingBlocks, apply_carving_mask},
-    climate::{ClimateSampler, SearchHint, decode_parameter, quantize},
+    climate::{ClimateLattice, ClimateSampler, SearchHint, decode_parameter, quantize},
     decode_noise,
     density::DensityRegistry,
     material_condition::{
@@ -2279,12 +2279,119 @@ where
             search.vertical,
         );
         let radius = search.radius.div_euclid(search.horizontal);
+        // Climate and each sample's fresh climate-tree answer found a tile of
+        // columns at a time on the search's own lattice, the tiles ahead of
+        // the spiral on all cores (fields exact in bulk run their 2D inputs
+        // once per column, not once per layer: To The Max has 33). The spiral
+        // then only settles ties with the previous answer, in its own order,
+        // and stops at the first wanted biome as before.
+        const TILE: i32 = 16;
+        let (step, layer) = (search.horizontal, search.vertical);
+        let index = match &self.source {
+            ResolvedBiomeSource::MultiNoise(source) => Some(source.parameters()),
+            _ => None,
+        };
+        let lattice = index.is_some()
+            && step > 0
+            && layer > 0
+            && step % 4 == 0
+            && layer % 4 == 0
+            && !ys.is_empty()
+            && radius < 1 << 16
+            && search.origin.iter().all(|v| v.unsigned_abs() < 1 << 28)
+            && (radius + 1).saturating_mul(step) < 1 << 28;
+        let lowest = ys.iter().copied().min().unwrap_or(0);
+        let (origin, layers) = (search.origin, ys.len() as i32);
+        // Each tile's columns, as spiral offsets, and the rings it spans.
+        let span = |key: [i32; 2]| {
+            let lo = key.map(|t| (t * TILE).max(-radius));
+            let hi = key.map(|t| (t * TILE + TILE - 1).min(radius));
+            let near = |a: i32, b: i32| {
+                if a <= 0 && 0 <= b {
+                    0
+                } else {
+                    a.abs().min(b.abs())
+                }
+            };
+            let first = near(lo[0], hi[0]).max(near(lo[1], hi[1]));
+            let last = lo.iter().chain(&hi).map(|v| v.abs()).max().unwrap_or(0);
+            (lo, hi, first, last)
+        };
+        let prepare = |context: &mut SamplerContext, key: [i32; 2]| {
+            let (lo, hi, ..) = span(key);
+            let (q, layer_q) = (step >> 2, layer >> 2);
+            self.climate
+                .sample_lattice(
+                    context,
+                    [
+                        (origin[0] >> 2) + lo[0] * q,
+                        lowest >> 2,
+                        (origin[2] >> 2) + lo[1] * q,
+                    ],
+                    [hi[0] - lo[0] + 1, layers, hi[1] - lo[1] + 1],
+                    [q, layer_q, q],
+                    index,
+                )
+                .ok()
+                .flatten()
+        };
+        let keys = (-radius).div_euclid(TILE)..=radius.div_euclid(TILE);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut tiles: HashMap<[i32; 2], (i32, Option<ClimateLattice>)> = HashMap::new();
+        let mut ring = 0;
         for [sx, sz] in spiral_around(radius) {
             let x = search.origin[0].wrapping_add(sx.wrapping_mul(search.horizontal));
             let z = search.origin[2].wrapping_add(sz.wrapping_mul(search.horizontal));
+            let key = [sx.div_euclid(TILE), sz.div_euclid(TILE)];
+            if lattice && sx.abs().max(sz.abs()) > ring {
+                // Tiles the spiral has passed for good.
+                ring = sx.abs().max(sz.abs());
+                tiles.retain(|_, (last, _)| *last >= ring);
+            }
+            if lattice && !tiles.contains_key(&key) {
+                // This tile and the others the next TILE rings reach.
+                let batch: Vec<[i32; 2]> = keys
+                    .clone()
+                    .flat_map(|tx| keys.clone().map(move |tz| [tx, tz]))
+                    .filter(|k| {
+                        let (.., first, last) = span(*k);
+                        first <= ring + TILE && last >= ring && !tiles.contains_key(k)
+                    })
+                    .collect();
+                let workers = threads.min(batch.len()).max(1);
+                let prepared: Vec<_> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..workers)
+                        .map(|w| {
+                            let (batch, prepare) = (&batch, &prepare);
+                            scope.spawn(move || {
+                                let mut context = SamplerContext::default();
+                                batch
+                                    .iter()
+                                    .skip(w)
+                                    .step_by(workers)
+                                    .map(|k| (*k, prepare(&mut context, *k)))
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap_or_default())
+                        .collect()
+                });
+                for (k, tile) in prepared {
+                    tiles.insert(k, (span(k).3, tile));
+                }
+                tiles.entry(key).or_insert((span(key).3, None));
+            }
+            let tile = tiles.get(&key).and_then(|(_, tile)| tile.as_ref());
             for &y in &ys {
                 let quart = [x >> 2, y >> 2, z >> 2];
-                let Ok(name) = resolver.sample(&mut worker.carver_context, quart) else {
+                let sample = match tile {
+                    Some(tile) => resolver.sample_lattice(&mut worker.carver_context, tile, quart),
+                    None => resolver.sample(&mut worker.carver_context, quart),
+                };
+                let Ok(name) = sample else {
                     continue;
                 };
                 if candidates.contains(name) {

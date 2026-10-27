@@ -6,7 +6,7 @@ use super::{
 use crate::worldgen::{
     DecodeError,
     biome::{BiomeError, BiomeResolver, MultiNoiseBiomeSource},
-    climate::{ClimateSampler, ClimateVolume, SearchHint},
+    climate::{ClimateLattice, ClimateSampler, ClimateVolume, SearchHint},
 };
 use horizon_core::density::{DensitySampler, SampleError, SamplerContext};
 use std::collections::{BTreeMap, BTreeSet};
@@ -140,6 +140,19 @@ impl<'a> BiomeSourceResolver<'a> {
             Self::End(source, erosion) => source.noise_biome(quart, *erosion, context)?.as_str(),
             Self::MultiNoise(source) => source.sample(context, quart)?,
         })
+    }
+    /// [`Self::sample`], with a multi-noise source's climate partly read from
+    /// `lattice` (the other sources sample no climate).
+    pub fn sample_lattice(
+        &mut self,
+        context: &mut SamplerContext,
+        lattice: &ClimateLattice,
+        quart: [i32; 3],
+    ) -> Result<&'a str, BiomeSourceError> {
+        match self {
+            Self::MultiNoise(source) => Ok(source.sample_lattice(context, lattice, quart)?),
+            _ => self.sample(context, quart),
+        }
     }
     /// Native fixed/checkerboard/End sources do not pre-sample a climate volume.
     /// Multi-noise preparation samples the full supplied quart extent once.

@@ -216,6 +216,19 @@ pub trait DensitySampler: std::fmt::Debug + Send + Sync {
         let _ = open_from;
         self.sample_volume(context, buffer, volume)
     }
+
+    /// For a sampler that [differs in bulk](Self::bulk_differs): `Some(inputs)`
+    /// when its `sample_value` depends only on its position and on samples
+    /// of `inputs` (interpolation reads its cell corners so). `None` (the
+    /// default) is the conservative answer.
+    fn scalar_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+        None
+    }
+
+    /// Whether this sampler answers from caches kept in the context.
+    fn caches_in_context(&self) -> bool {
+        false
+    }
 }
 /// Whether every sampler reachable from `root` is pointwise.
 pub fn is_pointwise(root: &Arc<dyn DensitySampler>) -> bool {
@@ -226,6 +239,35 @@ pub fn is_pointwise(root: &Arc<dyn DensitySampler>) -> bool {
 /// only, whatever the context's caches hold.
 pub fn is_pointwise_scalar(root: &Arc<dyn DensitySampler>) -> bool {
     all_pointwise(root, |sampler| !sampler.bulk_differs())
+}
+/// Whether `root`'s scalar value depends on its position only, whatever the
+/// context holds, although it may differ from its bulk value: every sampler
+/// reachable is pointwise, except samplers that differ in bulk and read only
+/// inputs exact in bulk ([`is_pointwise_scalar`]), with no context cache
+/// above them (it could hold their bulk values).
+pub fn is_scalar_pure(root: &Arc<dyn DensitySampler>) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![(root, false)];
+    while let Some((sampler, cached)) = stack.pop() {
+        if !seen.insert((Arc::as_ptr(sampler) as *const () as usize, cached)) {
+            continue;
+        }
+        if sampler.bulk_differs() {
+            if cached {
+                return false;
+            }
+            match sampler.scalar_inputs() {
+                Some(inputs) if inputs.iter().all(|input| is_pointwise_scalar(input)) => continue,
+                _ => return false,
+            }
+        }
+        let cached = cached || sampler.caches_in_context();
+        match sampler.pointwise_inputs() {
+            Some(inputs) => stack.extend(inputs.into_iter().map(|input| (input, cached))),
+            None => return false,
+        }
+    }
+    true
 }
 fn all_pointwise(
     root: &Arc<dyn DensitySampler>,
