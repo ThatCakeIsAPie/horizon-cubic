@@ -4,7 +4,7 @@ use super::{
     DecodeError,
     climate::{
         ClimateIndex, ClimateSampler, ClimateSearch, ClimateVolume, IndexError, Parameter,
-        ParameterPoint,
+        ParameterPoint, SearchHint,
     },
     density::identifier,
 };
@@ -149,5 +149,15 @@ impl<'a> BiomeResolver<'a> {
     ) -> Result<&'a str, BiomeError> {
         let target = volume.target(quart).ok_or(BiomeError::OutsideVolume)?;
         Ok(self.search.find(target)?.as_str())
+    }
+    /// `sample_prepared` with a search hint (see `ClimateSearch::find_hinted`).
+    pub fn sample_prepared_hinted(
+        &mut self,
+        volume: &ClimateVolume,
+        quart: [i32; 3],
+        hint: &mut SearchHint,
+    ) -> Result<&'a str, BiomeError> {
+        let target = volume.target(quart).ok_or(BiomeError::OutsideVolume)?;
+        Ok(self.search.find_hinted(target, hint)?.as_str())
     }
 }

@@ -325,6 +325,11 @@ impl<T> ClimateIndex<T> {
         best.ok_or(IndexError::NoResult)
     }
 }
+/// A caller's memo of one search: its target and the leaf found. Searching
+/// the same target again while that leaf is still the previous result gives
+/// that leaf: the search is exact and keeps the previous result on ties.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SearchHint(Option<(TargetPoint, u32)>);
 #[derive(Debug)]
 pub struct ClimateSearch<'a, T> {
     index: &'a ClimateIndex<T>,
@@ -338,5 +343,78 @@ impl<'a, T> ClimateSearch<'a, T> {
             unreachable!("search returns a leaf");
         };
         Ok(&self.index.entries[entry as usize].1)
+    }
+    /// `find`, answered from `hint` when it holds this target and its leaf
+    /// is the previous result; `hint` then holds this search.
+    pub fn find_hinted(
+        &mut self,
+        target: TargetPoint,
+        hint: &mut SearchHint,
+    ) -> Result<&'a T, IndexError> {
+        if let Some((known, leaf)) = hint.0
+            && known == target
+            && self.last == Some(leaf as usize)
+        {
+            let (entry, 0) = self.index.links[leaf as usize] else {
+                unreachable!("hints hold leaves");
+            };
+            return Ok(&self.index.entries[entry as usize].1);
+        }
+        let found = self.find(target)?;
+        hint.0 = self.last.map(|leaf| (target, leaf as u32));
+        Ok(found)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hinted_search_matches_plain_search_with_ties() {
+        let mut seed = 0x2545f4914f6cdd1d_u64;
+        let mut next = |n: i64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as i64
+        };
+        // Coarse, overlapping boxes: many targets tie between entries.
+        let entries: Vec<_> = (0..300)
+            .map(|id| {
+                let coordinates = std::array::from_fn(|_| {
+                    let low = next(8) - 4;
+                    Parameter::new(low, low + next(4))
+                });
+                let offset = next(2);
+                (
+                    ParameterPoint {
+                        coordinates,
+                        offset,
+                    },
+                    id,
+                )
+            })
+            .collect();
+        let index = ClimateIndex::new(entries).unwrap();
+        let (mut plain, mut hinted) = (index.searcher(), index.searcher());
+        let mut hints = [SearchHint::default(); 4];
+        let mut columns: [Option<TargetPoint>; 4] = [None; 4];
+        for step in 0..20_000 {
+            let column = step % 4;
+            // Repeat the column's last target most of the time.
+            let target = match columns[column] {
+                Some(target) if next(4) != 0 => target,
+                _ => TargetPoint::from_values(std::array::from_fn(|_| {
+                    (next(12) - 6) as f32 / 10_000.0
+                })),
+            };
+            columns[column] = Some(target);
+            assert_eq!(
+                plain.find(target).unwrap(),
+                hinted.find_hinted(target, &mut hints[column]).unwrap()
+            );
+            assert_eq!(plain.last, hinted.last);
+        }
     }
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 mod codec;
 mod index;
 pub use codec::{decode_parameter, decode_parameter_point};
-pub use index::{ClimateIndex, ClimateSearch, IndexError, Parameter, ParameterPoint};
+pub use index::{ClimateIndex, ClimateSearch, IndexError, Parameter, ParameterPoint, SearchHint};
 
 /// Vanilla multiplies in float precision before the saturating Java long cast.
 pub fn quantize(value: f32) -> i64 {
