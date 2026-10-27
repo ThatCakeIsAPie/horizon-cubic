@@ -63,8 +63,9 @@ pub(super) struct Decoration {
     names: Vec<String>,
     /// Executable roots by identity, or why the root cannot be executed.
     features: Vec<Result<PlacedFeatureDefinition, String>>,
-    /// Placed features of each biome's generation settings, by BiomeId.
-    biome_features: Vec<BTreeSet<FeatureIdentity>>,
+    /// Placed features of each biome's generation settings, by BiomeId: a
+    /// bit per FeatureIdentity.
+    biome_features: Vec<Vec<u64>>,
     bindings: FeatureBlockBindings<'static>,
     weather: Option<BiomeWeatherBindings>,
     blocks: FeatureBlocks,
@@ -181,7 +182,7 @@ impl Decoration {
                 id
             })
         };
-        let mut biome_features = vec![BTreeSet::new(); data.biome_names().len()];
+        let mut biome_features = vec![Vec::new(); data.biome_names().len()];
         let mut plan = Vec::new();
         for name in possible_biomes(source) {
             let id = data
@@ -210,7 +211,12 @@ impl Decoration {
                 for entry in entries {
                     let feature = identity(&super::tags::identifier(&entry)?);
                     list.push(feature);
-                    biome_features[id.0 as usize].insert(feature);
+                    let bits: &mut Vec<u64> = &mut biome_features[id.0 as usize];
+                    let word = feature.0 as usize / 64;
+                    if bits.len() <= word {
+                        bits.resize(word + 1, 0);
+                    }
+                    bits[word] |= 1 << (feature.0 % 64);
                 }
                 steps.push(list);
             }
@@ -338,6 +344,7 @@ impl Decoration {
             // WorldGenRegion.isOutsideBuildHeight: the level's range, not the noise's.
             build: (min_y, min_y + height),
             shape_ticks: std::cell::RefCell::new(crate::level::Ticks::new(0)),
+            last_tag: None,
         };
         let mut stats = DecorateStats::default();
         let blocks = self.blocks;
@@ -544,6 +551,8 @@ struct World<'a> {
     build: (i32, i32),
     /// The tick capture `shape_update` passes to `updateShape`.
     shape_ticks: std::cell::RefCell<crate::level::Ticks>,
+    /// `block_matches_tag`'s last tag and its states.
+    last_tag: Option<(Box<str>, Option<Arc<BTreeSet<BlockStateId>>>)>,
 }
 /// Read-only `LevelAccess` view of the decoration region for
 /// `BlockState.updateShape` (writes go through `World::set_block`).
@@ -1224,17 +1233,37 @@ impl PlacementContext for World<'_> {
         feature: FeatureIdentity,
     ) -> Result<bool, PlacementQueryError> {
         let biome = self.biome_identity(position)?;
-        Ok(self.decoration.biome_features[biome.0 as usize].contains(&feature))
+        let bits = &self.decoration.biome_features[biome.0 as usize];
+        let word = feature.0 as usize / 64;
+        Ok(bits
+            .get(word)
+            .is_some_and(|w| w >> (feature.0 % 64) & 1 != 0))
     }
     fn block_state(&mut self, position: [i32; 3]) -> Result<BlockStateId, PlacementQueryError> {
         self.region.block_state(position)
     }
+    /// TerrainRegion::block_matches_tag (the region holds the same tag
+    /// table), with the last tag's states kept: predicates ask one tag for
+    /// many positions (environment scans), and the table is keyed by name.
     fn block_matches_tag(
         &mut self,
         position: [i32; 3],
         tag: &str,
     ) -> Result<bool, PlacementQueryError> {
-        self.region.block_matches_tag(position, tag)
+        let state = self.region.block(position)?;
+        if self
+            .last_tag
+            .as_ref()
+            .is_none_or(|(name, _)| **name != *tag)
+        {
+            let states = self.decoration.bindings.tags.get(tag).cloned();
+            self.last_tag = Some((tag.into(), states));
+        }
+        let states = self
+            .last_tag
+            .as_ref()
+            .and_then(|(_, states)| states.as_ref());
+        Ok(states.is_some_and(|states| states.contains(&state)))
     }
     fn max_y(&mut self) -> Result<i32, PlacementQueryError> {
         self.region.max_y()
