@@ -344,6 +344,7 @@ impl Decoration {
             // WorldGenRegion.isOutsideBuildHeight: the level's range, not the noise's.
             build: (min_y, min_y + height),
             shape_ticks: std::cell::RefCell::new(crate::level::Ticks::new(0)),
+            tick_buffer: std::cell::RefCell::new(Vec::new()),
             last_tag: None,
         };
         let mut stats = DecorateStats::default();
@@ -472,6 +473,7 @@ const MIXED_BIOMES: u32 = u32::MAX - 1;
 impl World<'_> {
     /// The biome of a biome section when all its quarts hold the same one
     /// (and its chunk has biomes); `None` when mixed or outside the region.
+    #[inline]
     fn uniform_section(&mut self, cx: i32, cz: i32, section: usize) -> Option<BiomeId> {
         let (dx, dz) = (
             i64::from(cx) - i64::from(self.center.x) + 1,
@@ -485,25 +487,30 @@ impl World<'_> {
             return None;
         }
         let slot = (dz * 3 + dx) as usize * sections + section;
-        if self.uniform_biomes[slot] == UNKNOWN_BIOME {
-            let chunk = ChunkPos::new(cx, cz);
-            let ready = self.region.chunk(cx, cz).is_ok_and(|c| {
-                c.highest_generated_status() >= crate::chunk_status::ChunkStatus::Biomes
-            });
-            let values = self
-                .biomes
-                .chunk(chunk)
-                .ok()
-                .and_then(|c| c.section(section));
-            self.uniform_biomes[slot] = match values {
-                Some(values) if ready && values.iter().all(|b| *b == values[0]) => values[0].0,
-                _ => MIXED_BIOMES,
-            };
+        let mut id = self.uniform_biomes[slot];
+        if id == UNKNOWN_BIOME {
+            id = self.fill_uniform_section(slot, cx, cz, section);
         }
-        match self.uniform_biomes[slot] {
-            MIXED_BIOMES => None,
-            id => Some(BiomeId(id)),
-        }
+        (id != MIXED_BIOMES).then_some(BiomeId(id))
+    }
+    /// `uniform_section`'s first look at a section.
+    #[cold]
+    #[inline(never)]
+    fn fill_uniform_section(&mut self, slot: usize, cx: i32, cz: i32, section: usize) -> u32 {
+        let chunk = ChunkPos::new(cx, cz);
+        let ready = self.region.chunk(cx, cz).is_ok_and(|c| {
+            c.highest_generated_status() >= crate::chunk_status::ChunkStatus::Biomes
+        });
+        let values = self
+            .biomes
+            .chunk(chunk)
+            .ok()
+            .and_then(|c| c.section(section));
+        self.uniform_biomes[slot] = match values {
+            Some(values) if ready && values.iter().all(|b| *b == values[0]) => values[0].0,
+            _ => MIXED_BIOMES,
+        };
+        self.uniform_biomes[slot]
     }
     /// BiomeManager.getBiome without the zoom when every quart it can pick
     /// lies in biome sections of one and the same biome.
@@ -516,10 +523,13 @@ impl World<'_> {
         let (z0, z1) = span(base[2] >> 2, base[2].wrapping_add(1) >> 2);
         let (s0, s1) = span(section(base[1]), section(base[1].wrapping_add(1)));
         let found = self.uniform_section(x0, z0, s0)?;
+        if (x1, z1, s1) == (None, None, None) {
+            return Some(found);
+        }
         for cx in std::iter::once(x0).chain(x1) {
             for cz in std::iter::once(z0).chain(z1) {
                 for s in std::iter::once(s0).chain(s1) {
-                    if self.uniform_section(cx, cz, s)? != found {
+                    if (cx, cz, s) != (x0, z0, s0) && self.uniform_section(cx, cz, s)? != found {
                         return None;
                     }
                 }
@@ -551,6 +561,8 @@ struct World<'a> {
     build: (i32, i32),
     /// The tick capture `shape_update` passes to `updateShape`.
     shape_ticks: std::cell::RefCell<crate::level::Ticks>,
+    /// The emptied capture `schedule_captured` hands back to `shape_update`.
+    tick_buffer: std::cell::RefCell<Vec<crate::level::ticks::CapturedTick>>,
     /// `block_matches_tag`'s last tag and its states.
     last_tag: Option<(Box<str>, Option<Arc<BTreeSet<BlockStateId>>>)>,
 }
@@ -611,7 +623,7 @@ impl World<'_> {
         // capturing, scheduling leaves the rest of `Ticks` untouched, so the
         // region keeps one instead of building one per update.
         let mut ticks = self.shape_ticks.borrow_mut();
-        ticks.capture = Some(Vec::new());
+        ticks.capture = Some(std::mem::take(&mut *self.tick_buffer.borrow_mut()));
         let updated = behaviours.update_shape(
             &mut level,
             &mut ticks,
@@ -627,9 +639,9 @@ impl World<'_> {
     fn schedule_captured(
         &mut self,
         behaviours: &crate::level::Behaviours,
-        ticks: Vec<crate::level::ticks::CapturedTick>,
+        mut ticks: Vec<crate::level::ticks::CapturedTick>,
     ) -> Result<(), PlacementQueryError> {
-        for t in ticks {
+        for &t in &ticks {
             let at = [t.pos.x, t.pos.y, t.pos.z];
             if t.fluid {
                 let fluid = crate::fluid::FluidKind::ALL[t.kind as usize];
@@ -641,6 +653,9 @@ impl World<'_> {
                 self.schedule_block_tick(at, state, t.delay)?;
             }
         }
+        // The next shape update captures into the same allocation.
+        ticks.clear();
+        *self.tick_buffer.get_mut() = ticks;
         Ok(())
     }
 }

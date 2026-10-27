@@ -578,7 +578,7 @@ impl Assembler<'_> {
             let Some(target) = self.pool(&jigsaw.pool) else {
                 continue;
             };
-            if target.templates.is_empty() && jigsaw.pool != "minecraft:empty" {
+            if target.templates.is_empty() && *jigsaw.pool != *"minecraft:empty" {
                 continue;
             }
             let Some(fallback) = self.pool(&target.fallback) else {

@@ -64,13 +64,13 @@ pub struct Jigsaw {
     pub front: Direction,
     pub top: Direction,
     pub rollable: bool,
-    pub name: Option<String>,
-    pub pool: String,
-    pub target: String,
+    pub name: Option<Arc<str>>,
+    pub pool: Arc<str>,
+    pub target: Arc<str>,
     pub placement_priority: i32,
     pub selection_priority: i32,
 }
-fn direction(name: &str) -> Direction {
+pub(super) fn direction(name: &str) -> Direction {
     match name {
         "down" => Direction::Down,
         "up" => Direction::Up,
@@ -299,16 +299,11 @@ fn template_jigsaws(
         .map(|j| {
             let relative = StructureTemplate::transform(j.info.pos, Mirror::None, rotation, [0; 3]);
             let state = resources.transforms.rotate(j.info.state, rotation);
-            let orientation = resources
-                .registry
-                .state(state)
-                .and_then(|s| s.properties.get("orientation").cloned())
-                .unwrap_or_default();
-            let (front, top) = orientation.split_once('_').unwrap_or(("north", "up"));
+            let (front, top) = resources.jigsaw_orientation(state);
             Jigsaw {
                 pos: std::array::from_fn(|i| relative[i] + position[i]),
-                front: direction(front),
-                top: direction(top),
+                front,
+                top,
                 rollable: j.rollable,
                 name: Some(j.name.clone()),
                 pool: j.pool.clone(),
@@ -793,7 +788,7 @@ impl Placer<'_, '_> {
             let Some(target_pool) = self.pool(&jigsaw.pool) else {
                 continue;
             };
-            if target_pool.templates.is_empty() && jigsaw.pool != "minecraft:empty" {
+            if target_pool.templates.is_empty() && *jigsaw.pool != *"minecraft:empty" {
                 continue;
             }
             let Some(fallback) = self.pool(&target_pool.fallback) else {

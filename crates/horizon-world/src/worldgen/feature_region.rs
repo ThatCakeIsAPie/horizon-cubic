@@ -80,8 +80,8 @@ pub struct TerrainRegion<'r, B: TerrainBlockStates> {
 enum ChunkIndex {
     Grid {
         origin: (i32, i32),
-        columns: i64,
-        rows: i64,
+        columns: u32,
+        rows: u32,
         /// Row by row from `origin`; `u32::MAX` where no chunk is.
         cells: Vec<u32>,
     },
@@ -106,9 +106,10 @@ impl ChunkIndex {
             return Some(Self::Sparse(map));
         }
         let mut cells = vec![u32::MAX; (columns * rows) as usize];
+        let (columns, rows) = (columns as u32, rows as u32);
         for (i, &(x, z)) in positions.iter().enumerate() {
-            let cell = (i64::from(z) - i64::from(z0)) * columns + (i64::from(x) - i64::from(x0));
-            let cell = &mut cells[cell as usize];
+            let cell = (z.wrapping_sub(z0) as u32 * columns + x.wrapping_sub(x0) as u32) as usize;
+            let cell = &mut cells[cell];
             if *cell != u32::MAX {
                 return None;
             }
@@ -130,11 +131,13 @@ impl ChunkIndex {
                 rows,
                 cells,
             } => {
+                // An X (or Z) below the origin wraps to at least 2^31 - origin.0,
+                // past the last column (origin.0 + columns - 1 <= i32::MAX).
                 let (dx, dz) = (
-                    i64::from(x) - i64::from(origin.0),
-                    i64::from(z) - i64::from(origin.1),
+                    x.wrapping_sub(origin.0) as u32,
+                    z.wrapping_sub(origin.1) as u32,
                 );
-                if !(0..*columns).contains(&dx) || !(0..*rows).contains(&dz) {
+                if dx >= *columns || dz >= *rows {
                     return None;
                 }
                 match cells[(dz * columns + dx) as usize] {

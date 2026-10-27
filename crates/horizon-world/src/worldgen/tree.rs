@@ -771,7 +771,11 @@ fn update_leaves<W: FeatureWorld, R>(
             if smallest != 0 {
                 let state = read(run.world, pos)?;
                 let updated = blocks
-                    .with(state, "distance", &smallest.to_string())
+                    .with(
+                        state,
+                        "distance",
+                        ["0", "1", "2", "3", "4", "5", "6"][smallest],
+                    )
                     .ok_or(FeatureExecutionError::InvalidState)?;
                 write(run.world, pos, updated, 19)?;
             }

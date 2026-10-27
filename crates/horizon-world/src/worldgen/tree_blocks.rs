@@ -397,11 +397,17 @@ impl crate::java_hash_map::JavaKey for JavaPos {
         }
     }
 }
+/// The native HashSet, and the bucket `pop_first` last took an entry from:
+/// buckets before it stay empty until the next insert.
 #[derive(Default)]
-pub(crate) struct PosSet(crate::java_hash_map::JavaHashMap<JavaPos, ()>);
+pub(crate) struct PosSet(crate::java_hash_map::JavaHashMap<JavaPos, ()>, usize);
 impl PosSet {
     pub(crate) fn insert(&mut self, p: [i32; 3]) -> bool {
-        self.0.put(JavaPos(p), ()).is_none()
+        let added = self.0.put(JavaPos(p), ()).is_none();
+        if added {
+            self.1 = 0;
+        }
+        added
     }
     pub(crate) fn contains(&self, p: [i32; 3]) -> bool {
         self.0.get(&JavaPos(p)).is_some()
@@ -415,10 +421,9 @@ impl PosSet {
     }
     /// iterator().next() followed by iterator.remove().
     pub(crate) fn pop_first(&mut self) -> Option<[i32; 3]> {
-        let mut cursor = self.0.cursor();
-        let first = self.0.next_entry(&mut cursor).ok().flatten()?.0.0;
-        self.0.remove_current(&mut cursor).ok()?;
-        Some(first)
+        let (bucket, first) = self.0.pop_first_from(self.1)?;
+        self.1 = bucket;
+        Some(first.0)
     }
 }
 
@@ -455,6 +460,26 @@ mod tests {
         assert_eq!(set.to_vec(), expected);
         assert_eq!(set.pop_first(), Some(expected[0]));
         assert!(!set.contains(expected[0]));
+    }
+    /// Pops interleaved with inserts (and the resizes they cause) come out
+    /// as a fresh iterator's first entry each time.
+    #[test]
+    fn pos_set_pops_in_iteration_order() {
+        let mut set = PosSet::default();
+        let mut random = LegacyRandom::new(7);
+        for round in 0..2000 {
+            if round % 3 != 2 || set.is_empty() {
+                let p = [0, 1, 2].map(|_| random.next_int_bound(40).unwrap() - 20);
+                set.insert(p);
+            } else {
+                let expected = set.to_vec()[0];
+                assert_eq!(set.pop_first(), Some(expected));
+            }
+        }
+        while let Some(&expected) = set.to_vec().first() {
+            assert_eq!(set.pop_first(), Some(expected));
+        }
+        assert_eq!(set.pop_first(), None);
     }
     #[test]
     fn fisher_yates_matches_native_draw_order() {

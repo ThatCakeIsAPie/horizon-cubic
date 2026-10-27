@@ -345,6 +345,8 @@ pub struct StructureResources {
     templates: Arc<TemplateStore>,
     pub processor_lists: BTreeMap<String, String>,
     jigsaw_states: BTreeMap<BlockStateId, bool>,
+    /// Each jigsaw state's (front, top) from its `orientation`.
+    jigsaw_orientations: HashMap<BlockStateId, (Direction, Direction)>,
     pub(crate) waterlogged: HashMap<BlockStateId, BlockStateId>,
     sources: BTreeSet<BlockStateId>,
     /// Block names in each block tag, for processors matching tags by block.
@@ -366,6 +368,7 @@ impl StructureResources {
         let mut sources = BTreeSet::new();
         let fluids = crate::fluid::FluidStateTable::new(registry).ok();
         let mut jigsaw_states = BTreeMap::new();
+        let mut jigsaw_orientations = HashMap::new();
         let mut waterlogged = HashMap::new();
         for id in 0..registry.len() {
             let id = BlockStateId(id as u32);
@@ -378,6 +381,8 @@ impl StructureResources {
                     .unwrap_or_default();
                 let front = orientation.split('_').next().unwrap_or("");
                 jigsaw_states.insert(id, !matches!(front, "up" | "down"));
+                let (front, top) = orientation.split_once('_').unwrap_or(("north", "up"));
+                jigsaw_orientations.insert(id, (jigsaw::direction(front), jigsaw::direction(top)));
             }
             if fluids
                 .as_ref()
@@ -411,6 +416,7 @@ impl StructureResources {
             }),
             processor_lists,
             jigsaw_states,
+            jigsaw_orientations,
             waterlogged,
             sources,
             block_tags: block_tags
@@ -436,6 +442,14 @@ impl StructureResources {
     /// Whether the state's fluid is a source (water/lava level 0, waterlogged).
     pub fn source_fluid(&self, state: BlockStateId) -> bool {
         self.sources.contains(&state)
+    }
+    /// A jigsaw state's (front, top); other states face north, top up (as
+    /// a missing `orientation` property reads).
+    pub fn jigsaw_orientation(&self, state: BlockStateId) -> (Direction, Direction) {
+        self.jigsaw_orientations
+            .get(&state)
+            .copied()
+            .unwrap_or((Direction::North, Direction::Up))
     }
     pub fn jigsaw_horizontal(&self, state: BlockStateId) -> Option<bool> {
         self.jigsaw_states.get(&state).copied()

@@ -5,7 +5,7 @@ use crate::{
     nbt::{Compound, Tag},
     registry::{BlockRegistry, BlockStateId},
 };
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockInfo {
@@ -17,9 +17,9 @@ pub struct BlockInfo {
 pub struct JigsawInfo {
     pub info: BlockInfo,
     pub rollable: bool,
-    pub name: String,
-    pub pool: String,
-    pub target: String,
+    pub name: Arc<str>,
+    pub pool: Arc<str>,
+    pub target: Arc<str>,
     pub placement_priority: i32,
     pub selection_priority: i32,
 }
@@ -341,8 +341,8 @@ impl StructureTemplate {
                     let horizontal = jigsaw_states(info.state)?;
                     let nbt = info.nbt.clone().unwrap_or_default();
                     let joint = string(get(&nbt, "joint"));
-                    let text = |key: &str, default: &str| {
-                        string(get(&nbt, key)).unwrap_or_else(|| default.to_owned())
+                    let text = |key: &str, default: &str| -> Arc<str> {
+                        string(get(&nbt, key)).map_or_else(|| default.into(), Into::into)
                     };
                     let int = |key: &str| match get(&nbt, key) {
                         Some(Tag::Int(v)) => *v,
