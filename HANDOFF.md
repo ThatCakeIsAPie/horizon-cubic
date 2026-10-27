@@ -242,6 +242,59 @@ biomes 6.3 -> 4.1, decoration 6.3 -> 4.4.
 - Decoration: no single item; ore loop hoists, a tag-lookup memo, a cheaper
   uniform-section test and palette skips together come to ~0.7% overall.
 
+### Round 3 (Linux laptop, 2026-10-27)
+
+Same loop and rules on `1278802c` (round 2 plus far terrain), branches
+`ttm/cg3-{noise,surface,deco}`, combined as `ttm/cg3-combined`. The laptop ran
+in power-saver throughout (one ~15:31-15:43 performance window; the A/B run in
+it was redone), so absolute numbers are lower than round 2's table. All three
+agents stopped early, each finding nothing left in its area likely to clear 2%:
+4 kept / 13 discarded (noise), 3 / 7 (surface), 3 / 6 (decoration). Every kept
+commit was rebuilt and is byte-identical to the binary its A/B measured.
+
+| Commit | Change | Interleaved finished chunks/s |
+|---|---|---|
+| `2b83c652` | Noise fill by 16-block column runs: all-positive runs are the default block, all-non-positive runs above the aquifer's skip height and sea level are air, only mixed runs ask the aquifer; all-air sections not written | 224.15 -> 239.05 |
+| `37d71e97` | Carving mask: an origin's biome is not sampled when no carver of any possible biome's carver lists passes its start test there (exact) | 239.6 -> 246.1 |
+| `7ddd0446` | Per-quart-column climate search hint; above the air height the fill computes densities for their sign only (no 2 MB beardifier buffer, all-negative cells written as 0) | 242.85 -> 254.05 |
+| `23c19a3e` | Spline volumes evaluated from flat arrays instead of per-node closures returning `Result` (same coordinate sampling order) | 253.35 -> 259.35 |
+| `e8acd99c` | Surface rule results reused down runs of solid blocks, unchanged spans stepped over; biome cache takes scalar x, y, z (removes a store-forwarding stall) | 226.2 -> 231.85 |
+| `7e151553` | Reused surface results guarded by position-only tests (the sulfur caves' 3D noise sent a quarter of blocks down the slow path) | 233.0 -> 239.85 |
+| `c497bd19` | One-pass memo lookup, biome corner columns, 3D noise batches stop at the run's bottom | 240.95 -> 247.25 |
+| `73907c4d` | Ore blobs by rows, lake spot terms per axis, tag and biome-list lookups as bitsets/memos | 224.6 -> 230.0 |
+| `373fb71c` | Jigsaw names as `Arc<str>`, jigsaw orientation table; tree and biome-check upkeep (structures 1.4 -> 0.5 ms) | 228.95 -> 236.45 |
+| `37cb991b` | Per-chunk OCEAN_FLOOR_WG bounds answer most ore attempts without column reads; pure ore rules memoized; fewer re-reads; Fx hasher for `ProtoChunkTicks` positions | 234.35 -> 241.45 |
+
+**All builds, laptop power-saver, cgu1, 4-way interleaved, 5 rounds** (median, range):
+
+| Build | Finished chunks/s |
+|---|---|
+| `9d03d424` (before round 1) | 101.5 (100.4-101.6) |
+| `1278802c` (round 2 + far terrain) | 229.3 (227.7-230.4) |
+| round 3 without `37cb991b` | 320.8 (315.5-324.8) |
+| **round 3 combined** | **324.0 (321.0-326.1)**: **+41%** on round 2, **3.2x** the start |
+
+All four checksums identical in all 20 runs. Per chunk on one of 6 threads,
+round 2 -> round 3: noise 5.4 -> 3.3 ms, surface 7.6 -> 5.4, biomes 4.9 -> 4.0,
+decoration 5.6 -> 4.6, structures 1.3 -> 0.5, carvers 0.6 -> 0.0. `37cb991b`'s
+own evidence was mixed (a reversed run gave +1.2%); combined it is +1.0% with
+decoration 5.2 -> 4.6 ms in every run, so it stays.
+
+**Ideas left after round 3** (attempt logs in the laptop's `~/Work/ttm-bench/log3-*.md`):
+- Biomes: Perlin `add_volume` (~40%) and the flat spline (~38%) are near their
+  limit without a new design, e.g. lazy right-hand sides in bulk min/multiply.
+- Noise: the aquifer's `compute_substance_below` is ~30% of the stage, mostly
+  cave and underwater blocks where neighbour statuses differ.
+- Surface: 3D noise is ~37% of the stage (real evaluations; trimming batches
+  cost as much as it saved); block writes ~7.5% (`BlockSection::set` palette
+  lookup per write, a bulk write would help); eager ore-vein volumes ~7%
+  (~28k samples a chunk, ~500 read).
+- Decoration: flat profile; the block-read path (`TerrainBlocks::block`,
+  packed storage, `ChunkIndex::get`) is ~12% of the stage. Unmeasured small
+  patches `deco-r3-scan-foliage.patch`, `deco-r3-scan-lake.patch` (~0.1 ms).
+- Structures: ~80 ms of build CPU plus ~45 ms of waits left in the measured
+  phase; preloading pool templates on a waiting thread is worth <= 1%.
+
 ## Far terrain speed (branch `ttm/lod-far`, on top of round 2)
 
 Goal from the user: distant terrain appears far faster; it may be barebones
@@ -294,7 +347,8 @@ and approximate as long as its shape matches, structures can come later.
    on the first load and "read from" on the next.
 2. **Chunk generation speed**: round 1 done, 10 kept commits, see "Autoresearch
    loop" (+37% on the Windows PC, then +37% more on the laptop); round 2 kept
-   13 more, 2.2x the round-1 start on the laptop.
+   13 more, 2.2x the round-1 start on the laptop; round 3 kept 10 more, +41%,
+   3.2x the start.
 3. **Confirm the mouse fix** in real play on Windows (alt-tab, notifications).
 4. **Clean timing of baked LODs**: launch the same world twice with nothing else
    running and log `lod.sampled_target_tiles` / `target_tiles` from
