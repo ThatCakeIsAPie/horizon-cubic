@@ -60,11 +60,17 @@ impl TargetPoint {
 #[derive(Clone, Debug)]
 pub struct ClimateSampler {
     samplers: [Arc<dyn DensitySampler>; 6],
+    /// Per field, for [`Self::sample_lattice`]: exact in bulk, and its scalar
+    /// value a function of position. Found once.
+    lattice_kinds: Arc<std::sync::OnceLock<[(bool, bool); 6]>>,
 }
 impl ClimateSampler {
     /// Temperature, humidity, continentalness, erosion, depth, weirdness.
     pub fn new(samplers: [Arc<dyn DensitySampler>; 6]) -> Self {
-        Self { samplers }
+        Self {
+            samplers,
+            lattice_kinds: Default::default(),
+        }
     }
     /// Coordinates are biome quart positions, converted with wrapped << 2.
     /// Every child uses the same context and runs in field declaration order.
@@ -115,11 +121,11 @@ impl ClimateSampler {
         index: Option<&ClimateIndex<T>>,
     ) -> Result<Option<ClimateLattice>, SampleError> {
         use horizon_core::density::{is_pointwise_scalar, is_scalar_pure};
-        let kinds = self.samplers.each_ref().map(|s| {
-            (
-                is_pointwise_scalar(s),
-                is_pointwise_scalar(s) || is_scalar_pure(s),
-            )
+        let kinds = *self.lattice_kinds.get_or_init(|| {
+            self.samplers.each_ref().map(|s| {
+                let bulk = is_pointwise_scalar(s);
+                (bulk, bulk || is_scalar_pure(s))
+            })
         });
         if !kinds.iter().any(|(_, pure)| *pure) {
             return Ok(None);
