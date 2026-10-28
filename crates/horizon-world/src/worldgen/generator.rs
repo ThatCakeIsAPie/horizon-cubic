@@ -2285,7 +2285,7 @@ where
         // once per column, not once per layer: To The Max has 33). The spiral
         // then only settles ties with the previous answer, in its own order,
         // and stops at the first wanted biome as before.
-        const TILE: i32 = 16;
+        const TILE: i32 = 8;
         let (step, layer) = (search.horizontal, search.vertical);
         let index = match &self.source {
             ResolvedBiomeSource::MultiNoise(source) => Some(source.parameters()),
@@ -2349,13 +2349,14 @@ where
                 tiles.retain(|_, (last, _)| *last >= ring);
             }
             if lattice && !tiles.contains_key(&key) {
-                // This tile and the others the next TILE rings reach.
+                // This tile and the others this ring reaches: a ring of tiles
+                // at a time, so a near biome samples little.
                 let batch: Vec<[i32; 2]> = keys
                     .clone()
                     .flat_map(|tx| keys.clone().map(move |tz| [tx, tz]))
                     .filter(|k| {
                         let (.., first, last) = span(*k);
-                        first <= ring + TILE && last >= ring && !tiles.contains_key(k)
+                        first <= ring && last >= ring && !tiles.contains_key(k)
                     })
                     .collect();
                 let workers = threads.min(batch.len()).max(1);
