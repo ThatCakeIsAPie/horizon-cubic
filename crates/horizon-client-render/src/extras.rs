@@ -10,6 +10,10 @@ pub const FILE: &str = "horizon-extras.txt";
 pub const SORT_KEY: &str = "horizon.sort";
 /// The 3D skin layers line, here and in the `options.txt` that held it first.
 const SKIN_LAYERS_KEY: &str = "threeDSkinLayers";
+/// The Ultimine key's name on the options screen (as `SORT_KEY`).
+pub const ULTIMINE_KEY: &str = "horizon.ultimine";
+/// The most blocks one Ultimine operation may be set to take.
+pub const MAX_ULTIMINE_BLOCKS: u32 = 1024;
 
 /// The minimap's sizes in GUI pixels, and its zooms in blocks per pixel.
 pub const MINIMAP_SIZES: [(u8, &str); 3] = [(64, "Small"), (96, "Medium"), (128, "Large")];
@@ -130,6 +134,13 @@ pub struct Extras {
     pub chat_animation: bool,
     /// The indicator bar at the left of a chat line (on by default, as vanilla).
     pub chat_indicator: bool,
+    /// A vanilla key name: held, breaking a block also breaks what the
+    /// Ultimine shape selects (`crate::ultimine`). Unbound turns it off.
+    pub ultimine_key: String,
+    /// Ultimine's limits (`crate::ultimine::Config`).
+    pub ultimine_max_blocks: u32,
+    pub ultimine_exhaustion_per_block: f32,
+    pub ultimine_prevent_tool_break: u32,
     /// No AI: every AI feature hidden and off (`horizon_core::no_ai`; the launcher writes it too).
     pub no_ai: bool,
     /// Agents may control the game the player starts: it opens its control socket for
@@ -222,6 +233,10 @@ impl Default for Extras {
             sort_key: "key.keyboard.unknown".into(),
             chat_animation: false,
             chat_indicator: true,
+            ultimine_key: "key.keyboard.grave.accent".into(),
+            ultimine_max_blocks: crate::ultimine::Config::DEFAULT.max_blocks,
+            ultimine_exhaustion_per_block: crate::ultimine::Config::DEFAULT.exhaustion_per_block,
+            ultimine_prevent_tool_break: crate::ultimine::Config::DEFAULT.prevent_tool_break,
             no_ai: false,
             agent_control: false,
             repro_keys: false,
@@ -326,6 +341,24 @@ impl Extras {
                 "sortKey" if value.starts_with("key.") => e.sort_key = value.to_owned(),
                 "chatAnimation" => e.chat_animation = flag(e.chat_animation),
                 "chatIndicator" => e.chat_indicator = flag(e.chat_indicator),
+                "ultimineKey" if value.starts_with("key.") => e.ultimine_key = value.to_owned(),
+                "ultimineMaxBlocks" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        e.ultimine_max_blocks = v.clamp(1, MAX_ULTIMINE_BLOCKS);
+                    }
+                }
+                "ultimineExhaustionPerBlock" => {
+                    if let Ok(v) = value.parse::<f32>()
+                        && v.is_finite()
+                    {
+                        e.ultimine_exhaustion_per_block = v.max(0.0);
+                    }
+                }
+                "ultiminePreventToolBreak" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        e.ultimine_prevent_tool_break = v;
+                    }
+                }
                 horizon_core::no_ai::KEY => e.no_ai = flag(e.no_ai),
                 "agentControl" => e.agent_control = flag(e.agent_control),
                 "reproKeys" => e.repro_keys = flag(e.repro_keys),
@@ -367,7 +400,7 @@ impl Extras {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "packBrowser:{}\npregen:{}\nfullbright:{}\ndynamicLights:{}\nzoom:{}\nzoomKey:{}\nzoomLevel:{}\nzoomSmooth:{}\nzoomSensitivity:{}\nlodZoomDetail:{}\nfps:{}\nfpsCorner:{}\nfpsLows:{}\nkeystrokes:{}\nkeystrokesCorner:{}\nkeystrokesCps:{}\nmovedToMods:{}\nminimap:{}\nminimapCorner:{}\nminimapSize:{}\nminimapShape:{}\nminimapZoom:{}\nminimapRotate:{}\nautoReconnect:{}\nuiSoundReserve:{}\nownNameTag:{}\nhideBlockParticles:{}\nmouseTweaks:{}\nmouseTweaksWheel:{}\nsort:{}\nsortKey:{}\nchatAnimation:{}\nchatIndicator:{}\n{}:{}\nagentControl:{}\nreproKeys:{}\ndiscordPresence:{}\nsplitscreen:{}\nsplitscreenTwo:{}\nsplitscreenThree:{}\nsplitscreenNames:{}\nwheelCyclesListSettings:{}\nmusicOff:{}\nmusicPage:{}\ncosmeticsMine:{}\n{}cosmeticsHideFx:{}\ncosmeticsSolo:{}\n{}:{}\n{}:{}\n{}:{}\n",
+            "packBrowser:{}\npregen:{}\nfullbright:{}\ndynamicLights:{}\nzoom:{}\nzoomKey:{}\nzoomLevel:{}\nzoomSmooth:{}\nzoomSensitivity:{}\nlodZoomDetail:{}\nfps:{}\nfpsCorner:{}\nfpsLows:{}\nkeystrokes:{}\nkeystrokesCorner:{}\nkeystrokesCps:{}\nmovedToMods:{}\nminimap:{}\nminimapCorner:{}\nminimapSize:{}\nminimapShape:{}\nminimapZoom:{}\nminimapRotate:{}\nautoReconnect:{}\nuiSoundReserve:{}\nownNameTag:{}\nhideBlockParticles:{}\nmouseTweaks:{}\nmouseTweaksWheel:{}\nsort:{}\nsortKey:{}\nchatAnimation:{}\nchatIndicator:{}\nultimineKey:{}\nultimineMaxBlocks:{}\nultimineExhaustionPerBlock:{}\nultiminePreventToolBreak:{}\n{}:{}\nagentControl:{}\nreproKeys:{}\ndiscordPresence:{}\nsplitscreen:{}\nsplitscreenTwo:{}\nsplitscreenThree:{}\nsplitscreenNames:{}\nwheelCyclesListSettings:{}\nmusicOff:{}\nmusicPage:{}\ncosmeticsMine:{}\n{}cosmeticsHideFx:{}\ncosmeticsSolo:{}\n{}:{}\n{}:{}\n{}:{}\n",
             bool_text(self.pack_browser),
             bool_text(self.pregen),
             bool_text(self.fullbright),
@@ -405,6 +438,10 @@ impl Extras {
             self.sort_key,
             bool_text(self.chat_animation),
             bool_text(self.chat_indicator),
+            self.ultimine_key,
+            self.ultimine_max_blocks,
+            self.ultimine_exhaustion_per_block,
+            self.ultimine_prevent_tool_break,
             horizon_core::no_ai::KEY,
             bool_text(self.no_ai),
             bool_text(self.agent_control),
@@ -456,9 +493,23 @@ impl Extras {
     pub fn set_key(&mut self, name: &str, value: String) -> bool {
         match name {
             SORT_KEY => self.sort_key = value,
+            ULTIMINE_KEY => self.ultimine_key = value,
             _ => return false,
         }
         true
+    }
+    /// Ultimine's limits as these settings have them.
+    pub fn ultimine(&self) -> crate::ultimine::Config {
+        crate::ultimine::Config {
+            max_blocks: self.ultimine_max_blocks,
+            exhaustion_per_block: self.ultimine_exhaustion_per_block,
+            prevent_tool_break: self.ultimine_prevent_tool_break,
+        }
+    }
+    pub fn set_ultimine(&mut self, c: crate::ultimine::Config) {
+        self.ultimine_max_blocks = c.max_blocks;
+        self.ultimine_exhaustion_per_block = c.exhaustion_per_block;
+        self.ultimine_prevent_tool_break = c.prevent_tool_break;
     }
     /// Written only once something differs from the defaults, so a vanilla
     /// setup gains no file.
@@ -586,6 +637,7 @@ pub enum Item {
     ChatAnimation,
     /// The coloured bar at the left of a chat line.
     ChatIndicator,
+    UltimineKey,
     /// Not on the Extras page: Horizon Settings shows No AI, its AI Agent page Agent Control.
     NoAi,
     AgentControl,
@@ -625,6 +677,8 @@ pub fn rows() -> Vec<Result<Item, &'static str>> {
         Err("horizon.extras.header.chat"),
         Ok(ChatAnimation),
         Ok(ChatIndicator),
+        Err("horizon.extras.header.ultimine"),
+        Ok(UltimineKey),
         Err("horizon.extras.header.world"),
         Ok(Pregen),
         Err("horizon.extras.header.multiplayer"),
@@ -664,6 +718,7 @@ impl Item {
             Item::MouseTweaksWheel => "horizon.extras.mouse_tweaks_wheel",
             Item::Sort => "horizon.extras.sort",
             Item::SortKey => "horizon.extras.sort_key",
+            Item::UltimineKey => "horizon.extras.ultimine_key",
             Item::NoAi => "horizon.extras.no_ai",
             Item::AgentControl => "horizon.extras.agent_control",
             Item::ReproKeys => "horizon.extras.repro_keys",
@@ -697,6 +752,7 @@ impl Item {
             Item::MouseTweaksWheel => "horizon.extras.mouse_tweaks_wheel.tooltip",
             Item::Sort => "horizon.extras.sort.tooltip",
             Item::SortKey => "horizon.extras.sort_key.tooltip",
+            Item::UltimineKey => "horizon.extras.ultimine_key.tooltip",
             Item::NoAi => "horizon.extras.no_ai.tooltip",
             Item::AgentControl => "horizon.extras.agent_control.tooltip",
             Item::ReproKeys => "horizon.extras.repro_keys.tooltip",
@@ -741,6 +797,7 @@ impl Item {
             Item::SortKey => "Sort key",
             Item::ChatAnimation => "Smooth chat",
             Item::ChatIndicator => "Message indicator",
+            Item::UltimineKey => "Ultimine key",
             Item::NoAi => "No AI",
             Item::AgentControl => "Agent Control",
             Item::ReproKeys => "Recording shortcuts",
@@ -771,7 +828,7 @@ impl Item {
             | AutoReconnect | NoAi | AgentControl | ReproKeys | DiscordPresence | Splitscreen
             | ChatAnimation | WheelCyclesSettings | MusicPage | PackBrowser | CosmeticsMine
             | CosmeticsOthers | CosmeticsHideFx | CosmeticsSolo | HorizonMarks | HorizonMe
-            | Pregen => {
+            | Pregen | UltimineKey => {
                 return None;
             }
         })
@@ -817,6 +874,9 @@ impl Item {
                 "A new chat line slides in from the left while it fades in, instead of appearing whole."
             }
             Item::ChatIndicator => "The coloured bar at the left of a chat line.",
+            Item::UltimineKey => {
+                "Hold it while breaking a block to break the connected blocks too; Sneak + scroll changes the shape. Escape unbinds it."
+            }
             Item::NoAi => {
                 "Hides and turns off every AI feature: agent control, horizon-ctl and the MCP servers. The launcher's switch too."
             }
@@ -937,6 +997,7 @@ impl Item {
                     }
                 }
             }
+            Item::UltimineKey => crate::keybinds::display_name(&e.ultimine_key).plain(),
             other => match other.switch(e) {
                 Some(true) => crate::lang::get_or("On", "On"),
                 _ => crate::lang::get_or("Off", "Off"),
@@ -978,13 +1039,14 @@ impl Item {
             Item::HorizonMarks => e.horizon_marks = !e.horizon_marks,
             Item::HorizonMe => e.horizon_listed = !e.horizon_listed,
             Item::Pvp(o) => o.cycle(&mut e.pvp, back),
-            Item::SortKey => {}
+            Item::SortKey | Item::UltimineKey => {}
         }
     }
     /// The key name the options screen waits on for a key item.
     pub fn key_name(self) -> Option<&'static str> {
         match self {
             Item::SortKey => Some(SORT_KEY),
+            Item::UltimineKey => Some(ULTIMINE_KEY),
             _ => None,
         }
     }
@@ -1143,6 +1205,29 @@ mod tests {
         assert_eq!(e.zoom_key, "key.keyboard.z");
     }
 
+    #[test]
+    fn ultimine_settings_round_trip_and_its_key_is_free_in_vanilla() {
+        let key = Extras::default().ultimine_key;
+        assert_eq!(key, "key.keyboard.grave.accent");
+        assert!(crate::keybinds::MAPPINGS.iter().all(|m| m.1 != key));
+        assert_eq!(
+            Extras::default().ultimine(),
+            crate::ultimine::Config::DEFAULT
+        );
+        let mut e = Extras::default();
+        assert!(e.set_key(ULTIMINE_KEY, "key.keyboard.v".into()));
+        e.set_ultimine(crate::ultimine::Config {
+            max_blocks: 128,
+            exhaustion_per_block: 2.5,
+            prevent_tool_break: 3,
+        });
+        let back = Extras::parse(&e.serialize());
+        assert_eq!(back, e);
+        assert_eq!(back.ultimine().max_blocks, 128);
+        let clamped = Extras::parse("ultimineMaxBlocks:0\nultimineExhaustionPerBlock:-1\n");
+        assert_eq!(clamped.ultimine_max_blocks, 1);
+        assert_eq!(clamped.ultimine_exhaustion_per_block, 0.0);
+    }
     #[test]
     fn a_mods_zoom_eases_like_the_spyglass() {
         // Camera.tickFov halves the distance to the target each tick.

@@ -120,6 +120,7 @@ pub mod testgen;
 pub mod title_edition;
 pub mod trims;
 pub mod ui;
+pub mod ultimine;
 pub mod vault;
 pub mod weather;
 pub mod widgets;

@@ -137,6 +137,8 @@ pub(super) struct GuestPlay {
     /// What `ServerPlayer` last recorded for the guest's scoreboard criteria
     /// (`lastRecordedHealthAndAbsorption` and the others).
     score_recorded: super::scoreboard::Recorded,
+    /// The guest's Ultimine key and shape (game/ultimine.rs).
+    ultimine: horizon_client::ultimine::Input,
 }
 
 /// A guest's command waiting for the hub (`LanHost::commands`).
@@ -239,6 +241,8 @@ pub(super) struct GuestSwap {
     projectiles: usize,
     /// The host's equipment modifiers.
     modifiers: Vec<(String, String)>,
+    /// The host's Ultimine input.
+    ultimine: horizon_client::ultimine::Input,
 }
 
 impl GuestPlay {
@@ -635,6 +639,7 @@ impl Game<'_> {
             &mut self.applied_modifiers,
             std::mem::take(&mut play.modifiers),
         );
+        let ultimine = std::mem::replace(&mut self.ultimine.input, play.ultimine);
         // Its worn armour on its attributes, when it changed.
         let mut equipped: Vec<Option<ItemStack>> = self.armor.to_vec();
         equipped.push(self.inventory.get(self.selected).cloned().flatten());
@@ -715,6 +720,7 @@ impl Game<'_> {
             modifiers,
             combat: host_combat,
             building_boxes,
+            ultimine,
         })
     }
 
@@ -817,6 +823,7 @@ impl Game<'_> {
             swings,
             projectiles,
             modifiers,
+            ultimine,
         } = swap;
         // `ServerPlayer.permissions()` back to the host's after the turn.
         self.ui.registries.permission = permission;
@@ -825,6 +832,7 @@ impl Game<'_> {
         let guest_combat = std::mem::replace(&mut self.combat, combat);
         self.guest_combat.insert(conn, guest_combat);
         play.modifiers = std::mem::replace(&mut self.applied_modifiers, modifiers);
+        play.ultimine = std::mem::replace(&mut self.ultimine.input, ultimine);
         // What the guest shot is theirs (Projectile.setOwner).
         for p in self.creatures.projectiles.iter_mut().skip(projectiles) {
             if p.owner == Some(horizon_client::mobs::Who::Player) && p.guest.is_none() {
@@ -1943,6 +1951,15 @@ impl Game<'_> {
         let Some(gi) = host.hub.guests.iter().position(|g| g.conn == conn) else {
             return;
         };
+        // The Ultimine key and shape, kept whatever the player's state (game/ultimine.rs).
+        if let S::CustomPayload(p) = &packet
+            && p.channel == horizon_client::ultimine::CHANNEL
+        {
+            if let Some(input) = horizon_client::ultimine::Input::decode(&p.data) {
+                host.play.entry(conn).or_default().ultimine = input;
+            }
+            return;
+        }
         // A dead player acts no more, but the death screen still respawns and chats: its
         // commands run as anyone's (ServerGamePacketListenerImpl.handleChatCommand doesn't
         // look at the player's health).

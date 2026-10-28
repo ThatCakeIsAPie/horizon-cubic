@@ -21,6 +21,8 @@ again restores vanilla's behaviour completely.
 | The music page's rows, and the pools it filters | `options_ui.rs` (`Page::Music`), `crates/horizon-client/src/music.rs` (`track_groups`, `MusicManager::set_off`), `sound_events.rs` (`sound_except`) |
 | Cosmetics (show mine, show others'), off with their flag | `extras.rs`, `crates/horizon-client/src/game/cosmetics.rs` ([cosmetics.md](cosmetics.md)) |
 | The settings page | `options_ui.rs` (`Page::Extras`): **Options → Horizon Settings... → Extras...**; fullbright, dynamic lights and hiding block-break particles change the picture, so they are on the graphics screen's Quality page instead (`graphics_ui.rs`, **Options → Video Settings...**) |
+| Ultimine: shapes, kinds, selection, outline, limits | `crates/horizon-client-render/src/ultimine.rs` (pure, unit tested), `game/ultimine.rs` |
+| The settings page | `options_ui.rs` (`Page::Extras`): **Options → Horizon Settings... → Extras...** |
 
 The settings are grouped by extra, under a header each, two buttons to a row as
 vanilla's options lists are, and each says what it does in its tooltip. An
@@ -263,6 +265,47 @@ of P1: the others follow P1's answer.
   `horizon-extras.txt`.
 - The pools are filtered where they are picked (`sound_except` in
   `sound_events.rs`), the manager is `music.rs`, and the page is in `options_ui.rs`.
+### Ultimine (`ultimineKey`, default `` ` ``)
+
+A vein miner in the manner of FTB Ultimine. It is the one extra that is on by
+default, because it does nothing until its key is held: unbinding the key
+(Escape on the Extras page) turns it off.
+
+- Hold the key and break a block: the blocks the shape selects break after it,
+  each as a normal player break (`break_block_as_player`: vanilla loot with
+  fortune and silk touch, experience, statistics, one tool use each), plus
+  `0.005 × ultimineExhaustionPerBlock` exhaustion per extra block in all. It
+  stops before the tool would break (keeping more than
+  `ultiminePreventToolBreak` uses), when the held item changes, and when food
+  reaches 0. Creative costs nothing and drops nothing, as vanilla's creative
+  breaks.
+- Shapes, changed with Sneak + wheel or Up/Down while the key is held:
+  Shapeless (connected blocks of the same kind, diagonals included, nearest
+  first), Small Tunnel (1x1 into the clicked face), Large Tunnel (3x3), Small
+  Square (the clicked face's 3x3 plane), Mining Tunnel and Escape Tunnel (a 1
+  wide, 2 high staircase down or up along the player's facing). Shapes take any
+  block the tool can harvest; air, fluids and unbreakable blocks never.
+- Kinds that merge: `#minecraft:base_stone_overworld`, each `#c:ores/<x>` (or
+  `X_ore` with `deepslate_X_ore` by name), and a wood's logs with its wood.
+- Right click with the key held: ripe crops are harvested and planted again
+  (one seed kept back), a hoe tills, a shovel makes paths, an axe strips logs
+  and scrapes or unwaxes copper, over the selection.
+- At most `ultimineMaxBlocks` (64) blocks per operation, the clicked one
+  included. `/ultimine` shows the limits; `/ultimine max_blocks <n>`,
+  `exhaustion_per_block <x>`, `prevent_tool_break <n>` and `reset` change them
+  for the worlds this game runs (in-frame, its server thread, LAN). The client
+  runs the command itself.
+- Paths: the game's break (`Game::break_block`) and right click (`use_hand`)
+  are shared by the local player, the server thread's players and LAN guests.
+  A client sends its key and shape on the `horizon:ultimine` serverbound
+  custom payload when they change; a vanilla server ignores it.
+- While the key is held the targeted selection is outlined in white and a top
+  left panel shows the shape and the block count. The selection is computed
+  again only when the target, its block, the shape or the held tool changes.
+- With the mod registry's Veinminer (a native mod, id `veinminer`) installed,
+  Ultimine stays off: its key does nothing and `/ultimine` says why, so a
+  break is not mined by both. A client mod's own `/ultimine` command runs
+  before Horizon's, as client mod commands do.
 
 ## Shared rules
 

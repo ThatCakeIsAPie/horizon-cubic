@@ -550,6 +550,8 @@ pub(super) struct Remote {
     /// The ClientInformation last sent (`Options.broadcastOptions` sends it
     /// again when a view distance, Chat, skin or Main Hand option changes).
     sent_info: horizon_protocol::packets::configuration::ClientInformation,
+    /// The Ultimine input last sent to the server (game/ultimine.rs).
+    pub(super) ultimine_sent: Option<horizon_client::ultimine::Input>,
     /// BlockStatePredictionHandler: blocks changed ahead of the server (a predicted break),
     /// with the sequence of the last action that changed them and the state the server
     /// last said they have. Until the server acknowledges that sequence its block updates
@@ -1101,6 +1103,7 @@ impl Game<'_> {
             native_epoch: None,
             level_load: horizon_client::level_loading::LevelLoadTracker::new(0),
             sent_info: info,
+            ultimine_sent: None,
             predictions: HashMap::new(),
             menu: None,
             craft_result: None,

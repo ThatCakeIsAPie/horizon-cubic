@@ -639,8 +639,10 @@ impl Game<'_> {
                     }
                     return ok();
                 }
+                self.ultimine_key(physical, action != "up");
                 self.native_key_event(physical, action != "up", action == "repeat");
                 if action == "tap" {
+                    self.ultimine_key(physical, false);
                     self.native_key_event(physical, false, false);
                 }
                 // The merchant's focused offer and the recipe book's last

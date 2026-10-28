@@ -365,6 +365,7 @@ mod trident;
 mod tutorial;
 mod tweaks;
 mod ui_control;
+mod ultimine;
 mod vault;
 mod vehicle_teleport;
 mod villagers;
@@ -3197,6 +3198,8 @@ struct Game<'a> {
     /// +2): the pick helpers' `&self` reach.
     entity_reach: f64,
     block_reach: f64,
+    /// Ultimine: the acting player's key and shape, the window's preview (game/ultimine.rs).
+    ultimine: ultimine::UltimineState,
     /// The part of a right click a guest's packet asks for (game/lan_actions.rs).
     guest_use: Option<GuestUse>,
     /// The last `use_hand` that ended the click did so with `FAIL`, which
@@ -6305,8 +6308,14 @@ impl Game<'_> {
         self.award_stat("used", &stack.item, 1);
     }
     fn break_block(&mut self, pos: [i32; 3]) -> Result<()> {
+        // With the Ultimine key held, the blocks its shape selects go after it.
+        // A guest's events for them are not its own break's (`lan_break_pos`).
+        let extra = self.ultimine_plan_break(pos);
         self.lan_break_pos = Some(pos);
-        let broken = self.with_player_actor(|game| game.break_block_as_player(pos));
+        let broken = self.with_player_actor(|game| {
+            game.break_block_as_player(pos)?;
+            game.ultimine_break_extra(&extra)
+        });
         self.lan_break_pos = None;
         broken
     }
@@ -6669,6 +6678,14 @@ impl Game<'_> {
                 return Ok(true);
             }
         }
+        // Ultimine: ripe crops in the selection are harvested and planted again.
+        if let Some(hit) = block_hit
+            && self.ultimine.input.held
+            && self.ultimine_harvest(hit)?
+        {
+            self.swing_arm();
+            return Ok(true);
+        }
         // MultiPlayerGameMode.useItemOn: blocks react first.
         let block_phase = horizon_client::spans::guard("use_block");
         if !(sneaking && hands_full)
@@ -6927,8 +6944,27 @@ impl Game<'_> {
         let spawn_egg = stack.item.ends_with("_spawn_egg");
         use horizon_client::first_person::UseResult;
         let swings = self.swings_started;
+        // Ultimine: a hoe, shovel or axe changes the rest of the selection after the clicked block.
+        let ultimine = match block_hit {
+            Some(hit) if self.ultimine.input.held => {
+                let before = self.world.block(hit.pos[0], hit.pos[1], hit.pos[2]);
+                Some((
+                    hit.pos,
+                    hit.face,
+                    before,
+                    self.ultimine_transform_plan(hit, &stack),
+                ))
+            }
+            _ => None,
+        };
         match self.use_tool(&stack, block_hit.is_some())? {
             UseResult::Success { swing } => {
+                if let Some((pos, face, before, blocks)) = ultimine
+                    && !blocks.is_empty()
+                    && self.world.block(pos[0], pos[1], pos[2]) != before
+                {
+                    self.ultimine_transform(&blocks, face)?;
+                }
                 if (UseResult::Success { swing }).should_swing(swings, self.swings_started) {
                     self.swing_arm();
                 }
@@ -7853,6 +7889,7 @@ impl Game<'_> {
                 self.screen = Screen::Inventory;
             }
         }
+        self.ultimine_client_tick();
         if self.remote.is_some() {
             return self.tick_remote();
         }
@@ -16297,7 +16334,8 @@ impl Game<'_> {
         let mut lines = self.fishing_line(alpha, size);
         let g = self.debug_gizmos(alpha as f32, camera.to_array());
         lines.extend(g.lines);
-        let on_top = g.on_top;
+        let mut on_top = g.on_top;
+        self.ultimine_gizmos(&mut lines, &mut on_top);
         let colored_lights = if self.title.is_none() {
             self.native_frame_visuals(camera, alpha, &mut lines)
         } else {
@@ -16902,6 +16940,9 @@ impl Game<'_> {
             return Ok(());
         }
         if self.sort_key_press(key) || self.hdr_key_press(key) {
+            return Ok(());
+        }
+        if self.screen == Screen::Playing && self.ultimine_arrow(key) {
             return Ok(());
         }
         if self.remote.is_some() && self.remote_key(key)? {
@@ -18465,6 +18506,7 @@ impl Game<'_> {
                     // book, lectern, sign or prompt drawn over gameplay is one.
                     if self.hotbar_takes_wheel()
                         && !self.native_wheel_event(d)
+                        && !self.ultimine_scroll(d)
                         && let Some((wheel, (horizontal_steps, vertical_steps))) = self
                             .mouse
                             .on_scroll(raw_x, raw_y, discrete, wheel_sensitivity)
@@ -19073,6 +19115,7 @@ impl Game<'_> {
                     let PhysicalKey::Code(key) = event.physical_key else {
                         return Ok(());
                     };
+                    self.ultimine_key(key, event.state == ElementState::Pressed);
                     self.native_key_event(key, event.state == ElementState::Pressed, event.repeat);
                     // Screen.keyPressed sees the physical key, repeats included.
                     if event.state == ElementState::Pressed
@@ -19974,6 +20017,7 @@ impl<'a> Game<'a> {
             hotbar_presses: Vec::new(),
             entity_reach: 3.0,
             block_reach: 4.5,
+            ultimine: Default::default(),
             guest_use: None,
             use_failed: false,
             lan_events: Vec::new(),
@@ -21619,6 +21663,7 @@ fn start_game<'a>(
         Some(settings) => settings,
         None => Settings::load(&Game::options_path()),
     };
+    horizon_client::ultimine::set_config(settings.extras.ultimine());
     if let Some(d) = options.distance_override {
         settings.render_distance = d;
     }

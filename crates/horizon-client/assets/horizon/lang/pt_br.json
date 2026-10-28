@@ -1,4 +1,5 @@
 {
+  "horizon.extras.header.ultimine": "Ultimine",
   "horizon.extras.header.world": "Mundo",
   "horizon.extras.pregen": "Pré-gerar chunks",
   "horizon.extras.pregen.tooltip": "Habilita /pregen nos seus mundos de um jogador e em LAN. Com comandos habilitados, use /pregen start para gerar uma área antes de explorá-la. Não habilita o comando nos servidores em que você entra.",
@@ -256,6 +257,8 @@
   "horizon.extras.mouse_tweaks": "Controles de ajustes do mouse",
   "horizon.extras.mouse_tweaks_wheel": "A roda de rolagem move os itens",
   "horizon.extras.sort": "Botões de classificação",
+  "horizon.extras.ultimine_key": "Tecla do Ultimine",
+  "horizon.extras.ultimine_key.tooltip": "Segure-a ao quebrar um bloco para quebrar também os blocos ligados; Agachar + rolar muda a forma. Esc a desvincula.",
   "horizon.extras.sort_key": "Chave de classificação",
   "horizon.extras.no_ai": "Sem IA",
   "horizon.extras.agent_control": "Controle de Agente",

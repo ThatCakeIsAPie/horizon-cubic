@@ -1047,6 +1047,16 @@ impl Game<'_> {
             return;
         }
         self.ui.chat.add_recent(&message);
+        // Horizon's own `/ultimine` runs here, on a server too (game/ultimine.rs),
+        // unless a client mod owns the command, as for every command.
+        if let Some(args) = message.strip_prefix("/ultimine")
+            && (args.is_empty() || args.starts_with(' '))
+        {
+            if !self.client_mod_command(&message[1..]) {
+                self.ultimine_command(args);
+            }
+            return;
+        }
         // On a server (single player's own included) the server runs it,
         // unless a client mod owns the command.
         if self.remote.is_some() {

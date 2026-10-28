@@ -34,8 +34,9 @@ impl Game<'_> {
     fn extras_now(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
     }
-    /// Mouse buttons while playing, for mods' clicks.
+    /// Mouse buttons while playing, for Ultimine's key and mods' clicks.
     pub(super) fn extras_mouse(&mut self, button: MouseButton, pressed: bool) {
+        self.ultimine_mouse(button, pressed);
         self.native_mouse_event(button, pressed);
         let i = match button {
             MouseButton::Left => 0,
@@ -56,6 +57,7 @@ impl Game<'_> {
         let playing = self.screen == Screen::Playing && self.title.is_none() && focused;
         if !playing {
             self.extras.mouse = [false; 2];
+            self.ultimine_release();
         }
         self.update_minimap();
         // For mods (`render.frame-stats`, `native_frame_rate`).
@@ -237,10 +239,17 @@ impl Game<'_> {
     /// The minimap and mods' corner panels, in the HUD layer (hidden with F1
     /// by the caller). The top left corner gives way to the debug screen.
     pub(super) fn draw_extras(&mut self, batch: &mut HudBatch) {
+        let ultimine = self.ultimine_hud();
         let map = self.minimap_shown();
         let visible = |corner| !(self.debug && corner == Corner::TopLeft);
         let mut corners = Corners::new(batch.width, batch.height, self.effect_rows_height());
         let atlas = &self.gui.atlas;
+        if let Some((corner, lines)) = &ultimine
+            && visible(*corner)
+        {
+            let lines: Vec<(&str, u32)> = lines.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+            extras_hud::draw_lines(batch, atlas, &mut corners, *corner, &lines);
+        }
         if let Some((map_corner, map_size, view)) = map
             && visible(map_corner)
             && !self.extras.minimap.image.is_empty()

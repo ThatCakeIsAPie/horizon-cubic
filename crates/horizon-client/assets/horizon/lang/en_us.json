@@ -1,4 +1,5 @@
 {
+  "horizon.extras.header.ultimine": "Ultimine",
   "horizon.extras.header.world": "World",
   "horizon.extras.pregen": "Chunk pregeneration",
   "horizon.extras.pregen.tooltip": "Enables /pregen in your single-player and LAN worlds. With cheats enabled, use /pregen start to generate an area before exploring it. Does not enable the command on servers you join.",
@@ -315,6 +316,8 @@
   "horizon.extras.mouse_tweaks": "Mouse Tweaks controls",
   "horizon.extras.mouse_tweaks_wheel": "Scroll wheel moves items",
   "horizon.extras.sort": "Sort buttons",
+  "horizon.extras.ultimine_key": "Ultimine key",
+  "horizon.extras.ultimine_key.tooltip": "Hold it while breaking a block to break the connected blocks too; Sneak + scroll changes the shape. Escape unbinds it.",
   "horizon.extras.sort_key": "Sort key",
   "horizon.extras.no_ai": "No AI",
   "horizon.extras.agent_control": "Agent Control",
