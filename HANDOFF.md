@@ -272,7 +272,7 @@ commit was rebuilt and is byte-identical to the binary its A/B measured.
 | `9d03d424` (before round 1) | 101.5 (100.4-101.6) |
 | `1278802c` (round 2 + far terrain) | 229.3 (227.7-230.4) |
 | round 3 without `37cb991b` | 320.8 (315.5-324.8) |
-| **round 3 combined** | **324.0 (321.0-326.1)**: **+41%** on round 2, **3.2x** the start |
+| **round 3 combined** | **324.0 (321.0-326.1)**: **+41%** on round 2, 3.2x `9d03d424` |
 
 All four checksums identical in all 20 runs. Per chunk on one of 6 threads,
 round 2 -> round 3: noise 5.4 -> 3.3 ms, surface 7.6 -> 5.4, biomes 4.9 -> 4.0,
@@ -294,6 +294,26 @@ decoration 5.2 -> 4.6 ms in every run, so it stays.
   patches `deco-r3-scan-foliage.patch`, `deco-r3-scan-lake.patch` (~0.1 ms).
 - Structures: ~80 ms of build CPU plus ~45 ms of waits left in the measured
   phase; preloading pool templates on a waiting thread is worth <= 1%.
+
+### All rounds (laptop, performance mode, cgu1, 5-way interleaved, 5 rounds)
+
+`20b72ebc` is the first commit with the checksum bench, before any loop
+commit; `9d03d424` already holds the Windows PC's 4 kept commits.
+
+| Build | Finished chunks/s (median, range) | vs start | vs previous | Loop time |
+|---|---|---|---|---|
+| `20b72ebc` (start) | 88.0 (87.2-88.4) | 1.0x | | |
+| `9d03d424` (round 1, Windows PC, 4 kept) | 124.8 (123.8-126.9) | 1.42x | +42% | ~2 h |
+| `4c3a22fb` (round 1, laptop, 6 kept) | 171.6 (168.3-172.7) | 1.95x | +38% | ~1 h |
+| `a9a22ec0` (round 2, 13 kept) | 277.4 (266.4-282.1) | 3.15x | +62% | ~6 h |
+| **`2a1366d6` (round 3, 10 kept)** | **405.7 (394.5-407.2)** | **4.61x** | +46% | ~6 h |
+
+The last four builds give identical checksums in all 20 runs. `20b72ebc`
+matches on rings and structure starts; its terrain and decoration checksums
+differ because the bench hashes heightmaps and post-processing marks only
+from `32ed89a8` on. Per chunk on one of 6 threads, start -> round 3: surface
+27.1 -> 4.2 ms, structures 16.1 -> 0.4, noise 11.8 -> 2.6, decoration 6.2 ->
+3.7, biomes 5.8 -> 3.2, carvers 0.4 -> 0.0.
 
 ## Far terrain speed (branch `ttm/lod-far`, on top of round 2)
 
@@ -347,8 +367,8 @@ and approximate as long as its shape matches, structures can come later.
    on the first load and "read from" on the next.
 2. **Chunk generation speed**: round 1 done, 10 kept commits, see "Autoresearch
    loop" (+37% on the Windows PC, then +37% more on the laptop); round 2 kept
-   13 more, 2.2x the round-1 start on the laptop; round 3 kept 10 more, +41%,
-   3.2x the start.
+   13 more, 2.2x the round-1 start on the laptop; round 3 kept 10 more, +41%.
+   33 kept commits in all: **4.6x** the pre-loop `20b72ebc` (see "All rounds").
 3. **Confirm the mouse fix** in real play on Windows (alt-tab, notifications).
 4. **Clean timing of baked LODs**: launch the same world twice with nothing else
    running and log `lod.sampled_target_tiles` / `target_tiles` from
