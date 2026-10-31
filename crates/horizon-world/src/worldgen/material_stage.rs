@@ -90,6 +90,9 @@ struct Column<'a, 'r, B: TerrainBlockStates> {
     cache: &'a mut Vec<BlockStateId>,
     low: i32,
     high: i32,
+    /// `TerrainChunk::settled_height` of this column, known since its last
+    /// heightmap-changing write.
+    settled: Option<i32>,
 }
 impl<'a, 'r, B: TerrainBlockStates> Column<'a, 'r, B> {
     fn new(
@@ -118,6 +121,7 @@ impl<'a, 'r, B: TerrainBlockStates> Column<'a, 'r, B> {
             cache,
             low,
             high,
+            settled: None,
         }
     }
     fn cache_index(&self, y: i32) -> Option<usize> {
@@ -144,7 +148,20 @@ impl<B: TerrainBlockStates> MaterialColumn for Column<'_, '_, B> {
         if y >= self.min && y <= self.max {
             // Most of the Nether's rule writes netherrack over netherrack.
             if self.block(y)? != state {
-                self.chunk.set_block_worldgen(self.x, y, self.z, state)?;
+                if self.settled.is_none() {
+                    self.settled = self.chunk.settled_height(self.x, self.z);
+                }
+                // Below every heightmap's top (and not air, which
+                // `set_block_worldgen` may skip in an empty section), the write
+                // changes no heightmap: `Heightmap::update` returns at once.
+                if self.settled.is_some_and(|bound| y <= bound)
+                    && !self.chunk.block_properties(state).is_air()
+                {
+                    self.chunk.set_block_raw(self.x, y, self.z, state)?;
+                } else {
+                    self.chunk.set_block_worldgen(self.x, y, self.z, state)?;
+                    self.settled = None;
+                }
                 if let Some(index) = self.cache_index(y) {
                     self.cache[index] = state;
                 }
