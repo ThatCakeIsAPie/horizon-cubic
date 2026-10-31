@@ -87,7 +87,7 @@ impl From<horizon_core::density::SampleError> for MaterialRuleError {
     }
 }
 
-pub(super) enum CompiledRule<R: RandomSource> {
+enum Node<R: RandomSource> {
     Empty,
     Block(BlockStateId),
     OreVein {
@@ -103,7 +103,7 @@ pub(super) enum CompiledRule<R: RandomSource> {
     },
     Bandlands,
 }
-impl<R: RandomSource> CompiledRule<R> {
+impl<R: RandomSource> Node<R> {
     fn compile<S: MaterialSurfaceQueries>(
         rule: MaterialRule,
         root: &R::Positional,
@@ -192,69 +192,172 @@ impl<R: RandomSource> CompiledRule<R> {
             }
         })
     }
-    fn apply<S: MaterialSurfaceQueries>(
-        &mut self,
-        position: BlockPos,
-        context: &mut Context<S>,
-    ) -> Result<Option<BlockStateId>, MaterialRuleError> {
+    /// Lay the tree out in evaluation order: a condition that fails skips
+    /// its subtree, a subtree that gives nothing falls through to the next
+    /// sibling, and the first block-producing step ends the walk.
+    fn flatten(self, rule: &mut CompiledRule<R>) {
         match self {
-            Self::Empty => Ok(None),
-            Self::Block(block) => Ok(Some(*block)),
+            Self::Empty => {}
+            Self::Block(block) => rule.ops.push(Op::Block(block)),
             Self::OreVein {
                 blocks,
                 raw_ore_chance,
                 densities,
                 random,
+            } => rule.ops.push(Op::OreVein {
+                blocks,
+                raw_ore_chance,
+                densities,
+                random,
+            }),
+            Self::Bandlands => rule.ops.push(Op::Bandlands),
+            Self::Condition {
+                condition,
+                rule: then,
             } => {
-                // Most blocks lie outside a vein's heights: the density read
-                // would give `<= 0`, and nothing happens before it. The
-                // heights are the buffer's as sampled now (`retarget` moves it).
-                if context
-                    .surface
-                    .density_heights(densities[0])
-                    .is_some_and(|heights| heights.never_positive(context.position))
-                {
-                    return Ok(None);
-                }
-                // Densities use the context; randomness uses application coordinates.
-                let density = context.surface.density(densities[0], context.position)?;
-                if density <= 0.0 {
-                    return Ok(None);
-                }
-                let mut random = random.at(position);
-                if random.next_float() > density {
-                    return Ok(None);
-                }
-                let richness = context.surface.density(densities[1], context.position)?;
-                if random.next_float() < richness
-                    && context.surface.density(densities[2], context.position)? < 0.0
-                {
-                    Ok(Some(if random.next_float() < *raw_ore_chance {
-                        blocks[1]
-                    } else {
-                        blocks[0]
-                    }))
-                } else {
-                    Ok(Some(blocks[2]))
-                }
-            }
-            Self::Bandlands => context.surface.band(position).map(Some),
-            Self::Condition { condition, rule } => {
-                if condition.test(context)? {
-                    rule.apply(position, context)
-                } else {
-                    Ok(None)
-                }
+                let at = rule.open_condition(condition);
+                then.flatten(rule);
+                rule.close_condition(at);
             }
             Self::Sequence(children) => {
                 for child in children {
-                    if let Some(block) = child.apply(position, context)? {
-                        return Ok(Some(block));
-                    }
+                    child.flatten(rule);
                 }
-                Ok(None)
             }
         }
+    }
+}
+
+/// A compiled rule as a flat program (see `Node::flatten`): no recursion or
+/// per-node call for each block.
+pub(super) struct CompiledRule<R: RandomSource> {
+    ops: Vec<Op<R>>,
+    conditions: Vec<Compiled<R>>,
+}
+enum Op<R: RandomSource> {
+    Block(BlockStateId),
+    OreVein {
+        blocks: [BlockStateId; 3],
+        raw_ore_chance: f32,
+        densities: [usize; 3],
+        random: R::Positional,
+    },
+    Bandlands,
+    /// Test `conditions[condition]`; when false, continue at `skip`.
+    Condition {
+        condition: usize,
+        skip: usize,
+    },
+}
+impl<R: RandomSource> CompiledRule<R> {
+    fn compile<S: MaterialSurfaceQueries>(
+        rule: MaterialRule,
+        root: &R::Positional,
+        context: &mut Context<S>,
+    ) -> Result<Self, DecodeError> {
+        let node = Node::compile(rule, root, context, 0, &mut 0)?;
+        let mut compiled = Self {
+            ops: Vec::new(),
+            conditions: Vec::new(),
+        };
+        node.flatten(&mut compiled);
+        Ok(compiled)
+    }
+    /// Append a condition op, whose subtree is what is appended until
+    /// `close_condition` with the op's index.
+    fn open_condition(&mut self, condition: Compiled<R>) -> usize {
+        let at = self.ops.len();
+        self.ops.push(Op::Condition {
+            condition: self.conditions.len(),
+            skip: 0,
+        });
+        self.conditions.push(condition);
+        at
+    }
+    fn close_condition(&mut self, at: usize) {
+        let end = self.ops.len();
+        if let Op::Condition { skip, .. } = &mut self.ops[at] {
+            *skip = end;
+        }
+    }
+    fn apply<S: MaterialSurfaceQueries>(
+        &mut self,
+        position: BlockPos,
+        context: &mut Context<S>,
+    ) -> Result<Option<BlockStateId>, MaterialRuleError> {
+        let mut at = 0;
+        while let Some(op) = self.ops.get(at) {
+            match op {
+                Op::Block(block) => return Ok(Some(*block)),
+                Op::Bandlands => return context.surface.band(position).map(Some),
+                Op::Condition { condition, skip } => {
+                    at = if self.conditions[*condition].test(context)? {
+                        at + 1
+                    } else {
+                        *skip
+                    };
+                }
+                Op::OreVein {
+                    blocks,
+                    raw_ore_chance,
+                    densities,
+                    random,
+                } => {
+                    if let Some(block) = ore_vein(
+                        blocks,
+                        *raw_ore_chance,
+                        densities,
+                        random,
+                        position,
+                        context,
+                    )? {
+                        return Ok(Some(block));
+                    }
+                    at += 1;
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+fn ore_vein<P: PositionalRandom, S: MaterialSurfaceQueries>(
+    blocks: &[BlockStateId; 3],
+    raw_ore_chance: f32,
+    densities: &[usize; 3],
+    random: &P,
+    position: BlockPos,
+    context: &mut Context<S>,
+) -> Result<Option<BlockStateId>, MaterialRuleError> {
+    // Most blocks lie outside a vein's heights: the density read
+    // would give `<= 0`, and nothing happens before it. The
+    // heights are the buffer's as sampled now (`retarget` moves it).
+    if context
+        .surface
+        .density_heights(densities[0])
+        .is_some_and(|heights| heights.never_positive(context.position))
+    {
+        return Ok(None);
+    }
+    // Densities use the context; randomness uses application coordinates.
+    let density = context.surface.density(densities[0], context.position)?;
+    if density <= 0.0 {
+        return Ok(None);
+    }
+    let mut random = random.at(position);
+    if random.next_float() > density {
+        return Ok(None);
+    }
+    let richness = context.surface.density(densities[1], context.position)?;
+    if random.next_float() < richness
+        && context.surface.density(densities[2], context.position)? < 0.0
+    {
+        Ok(Some(if random.next_float() < raw_ore_chance {
+            blocks[1]
+        } else {
+            blocks[0]
+        }))
+    } else {
+        Ok(Some(blocks[2]))
     }
 }
 impl<R: RandomSource> CompiledRule<R>
@@ -266,73 +369,72 @@ where
     /// first child that always produces one. For every position the facts
     /// cover it gives the block the whole rule gives.
     fn specialize(&self, facts: Facts) -> Self {
-        match self {
-            Self::Empty => Self::Empty,
-            Self::Block(block) => Self::Block(*block),
-            Self::Bandlands => Self::Bandlands,
-            Self::OreVein {
-                blocks,
-                raw_ore_chance,
-                densities,
-                random,
-            } => Self::OreVein {
-                blocks: *blocks,
-                raw_ore_chance: *raw_ore_chance,
-                densities: *densities,
-                random: random.clone(),
-            },
-            Self::Condition { condition, rule } => match condition.decided(facts) {
-                Some(false) => Self::Empty,
-                Some(true) => rule.specialize(facts),
-                None => match rule.specialize(facts) {
-                    Self::Empty => Self::Empty,
-                    rule => Self::Condition {
-                        condition: condition.clone(),
-                        rule: Box::new(rule),
-                    },
-                },
-            },
-            Self::Sequence(children) => {
-                let mut result = Vec::new();
-                for child in children {
-                    let child = child.specialize(facts);
-                    if matches!(child, Self::Empty) {
-                        continue;
+        let mut rule = Self {
+            ops: Vec::new(),
+            conditions: Vec::new(),
+        };
+        self.specialize_into(0, self.ops.len(), facts, &mut rule);
+        rule
+    }
+    /// Append the subtrees of ops `start..end` (a sequence) specialised to
+    /// `facts` to `rule`. Returns whether what it appended always produces
+    /// a block (only an error otherwise); nothing follows it then.
+    fn specialize_into(&self, start: usize, end: usize, facts: Facts, rule: &mut Self) -> bool {
+        let mut at = start;
+        while at < end {
+            match &self.ops[at] {
+                Op::Condition { condition, skip } => {
+                    let condition = &self.conditions[*condition];
+                    match condition.decided(facts) {
+                        Some(false) => {}
+                        Some(true) => {
+                            if self.specialize_into(at + 1, *skip, facts, rule) {
+                                return true;
+                            }
+                        }
+                        None => {
+                            let open = rule.open_condition(condition.clone());
+                            self.specialize_into(at + 1, *skip, facts, rule);
+                            if rule.ops.len() == open + 1 {
+                                // Nothing under it can produce a block.
+                                rule.ops.pop();
+                                rule.conditions.pop();
+                            } else {
+                                rule.close_condition(open);
+                            }
+                        }
                     }
-                    let last = child.always_produces();
-                    result.push(child);
-                    if last {
-                        break;
-                    }
+                    at = *skip;
                 }
-                match result.len() {
-                    0 => Self::Empty,
-                    1 => result.pop().unwrap(),
-                    _ => Self::Sequence(result),
+                Op::Block(block) => {
+                    rule.ops.push(Op::Block(*block));
+                    return true;
+                }
+                Op::Bandlands => {
+                    rule.ops.push(Op::Bandlands);
+                    return true;
+                }
+                Op::OreVein {
+                    blocks,
+                    raw_ore_chance,
+                    densities,
+                    random,
+                } => {
+                    rule.ops.push(Op::OreVein {
+                        blocks: *blocks,
+                        raw_ore_chance: *raw_ore_chance,
+                        densities: *densities,
+                        random: random.clone(),
+                    });
+                    at += 1;
                 }
             }
         }
-    }
-    /// Whether applying this rule never gives `None` (only an error).
-    fn always_produces(&self) -> bool {
-        match self {
-            Self::Block(_) | Self::Bandlands => true,
-            Self::Sequence(children) => children.iter().any(Self::always_produces),
-            Self::Empty | Self::OreVein { .. } | Self::Condition { .. } => false,
-        }
+        false
     }
     fn inputs(&self, gradients: &mut Vec<(i32, i32)>, surface: &mut bool) {
-        match self {
-            Self::Condition { condition, rule } => {
-                condition.inputs(gradients, surface);
-                rule.inputs(gradients, surface);
-            }
-            Self::Sequence(children) => {
-                for child in children {
-                    child.inputs(gradients, surface);
-                }
-            }
-            _ => {}
+        for condition in &self.conditions {
+            condition.inputs(gradients, surface);
         }
     }
 }
@@ -425,7 +527,7 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
         if self.rules.len() >= 8192 {
             return Err(DecodeError::Field("material rule count"));
         }
-        let compiled = CompiledRule::compile(rule, &self.root, &mut self.context, 0, &mut 0)?;
+        let compiled = CompiledRule::compile(rule, &self.root, &mut self.context)?;
         let index = self.rules.len();
         self.rules.push(compiled);
         Ok(index)
