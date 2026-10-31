@@ -8,12 +8,11 @@ generation rounds) is `git show 3ae5bf6c1:HANDOFF.md`.
 ## Prompt for the next agent
 
 > Pick up branch `merge/upstream-2026-10-31` of ThatCakeIsAPie/horizon-ttm.
-> Read `HANDOFF.md` first. Port the surface-stage commits listed under
-> "Not ported" onto upstream's specialised rule tree (`SurfaceVariants` in
-> `material_condition/rule.rs`) one at a time, measured with
-> `world_chunkgen_bench` interleaved against the previous build, kept only
-> when finished chunks/s improves with every output checksum unchanged.
-> Don't push or merge to `main` without asking me. Follow AGENTS.md.
+> Read `HANDOFF.md` first. The surface series is ported (see "Surface
+> stage, ported onto `SurfaceVariants`"); next is the To-do list: play the
+> To The Max world on this build, then bring over `ttm/ultimine` and
+> `ttm/big-ore-deposits`. Don't push or merge to `main` without asking me.
+> Follow AGENTS.md.
 
 ## How the branch was made
 
@@ -65,13 +64,27 @@ starts at `upstream/main` and re-applies only the work upstream lacks
   stop); the second never ran. Merged into one.
 - `native_hooks` test split its own source on LF; fails on a CRLF checkout.
 
+### Surface stage, ported onto `SurfaceVariants`
+
+One commit each, measured against the commit before it (numbers in each
+message): the flat rule program (`fc5a81eaa`), which `SurfaceVariants`
+now specialises op by op; the run memo with its step over unchanged spans
+(`e8acd99ce`), each entry clamped to the heights its band variant serves
+(`SurfaceVariants::rule_down`), so a hit is always for the variant that
+made it; memo guards for 3D noise and in-band gradients (`7e1515538`); the
+one-pass lookup, biome corner columns and noise batches per run
+(`c497bd194`); upstream's column cache filled section by section (the
+snapshot part of `8207c39c4`); and the settled-height write shortcut (part
+of `e09fb9dda`). The skip over unchanged spans relies on upstream's
+`Column::set_block`, which already skips writing a block that is there.
+
+Their other parts were already on the branch (ore-vein volume cuts, the
+four-lane Perlin column, the biome bitset). Not ported: `8207c39c4`'s condition test inlined without recursion
+(the memo's `test_once` is upstream's `eval::<false>`); try it next if
+the surface stage still matters.
+
 ### Not ported (upstream did the same job another way; re-measure first)
 
-- Surface flat program `fc5a81eaa` and the run memos built on it
-  (`e8acd99ce`, `7e1515538`, `c497bd194`), the column snapshot (part of
-  `8207c39c4`) and the settled-height write shortcut (part of `e09fb9dda`):
-  upstream specialises the rule per gradient band (`SurfaceVariants`) and
-  caches each column's blocks.
 - Noise fill: concrete aquifer and inline paths (`ca3dfeb89`, `43025047e`),
   per-section writes and whole column runs (`be717823f`, `2b83c6526`), signs
   above the open height (part of `7ddd0446f`, and its lint `2a1366d65`):
@@ -88,22 +101,30 @@ starts at `upstream/main` and re-applies only the work upstream lacks
 | --- | --- | --- | --- | --- |
 | old `main` (`3ae5bf6c1`) | 161-180 | 10.1-10.7 | 7.0-7.5 | 1.1-3.5 |
 | upstream + our features, no perf (`ttm-sync/perf-base`) | 70-78 | 37-41 | 15-17 | 5.4-7.4 |
-| this branch | 120-123 | 25.0-25.5 | 7.4-7.5 | 1.0-1.1 |
+| this branch before the surface series (`d48790847`) | 120-123 | 25.0-25.5 | 7.4-7.5 | 1.0-1.1 |
+| this branch (`f091f580a`) | 151.6-163.6 | 11.4-12.8 | 7.7-9.0 | 1.2-1.3 |
+
+The last row was measured in a second session, interleaved with the old main
+and `d48790847` (4 rounds, no other load): the old main 162.4-173.0 (surface
+10.4-11.5), `d48790847` 107.6-119.8 (surface 25.4-29.4) there.
 
 Terrain output `3ad45dd6b7ce4332` and decoration output `d4f45ed1658b457c` are
-the same for all three: the branch generates To The Max as the old main did.
+the same for every row: the branch generates To The Max as the old main did.
 Structure starts `30e5f7fd98d30739` match between perf-base and this branch
 (the old main's `4d8baae0...` differs through upstream's structure changes).
-The remaining gap is the surface stage: the "Not ported" surface series.
+The surface stage is now about 1 ms a chunk behind the old main; finished
+chunks/s about 5% behind.
 
 Checks: clippy `-D warnings --all-targets` and `cargo test` (lib, bins,
 tests) clean for horizon-core, -world, -client-render, -client, -port-pack,
--threads on Windows. Not run: `tools/pr_ready.py` harnesses (need `.local/`),
+-threads on Windows (after the surface series, re-run for horizon-core and
+-world only: those are the only crates it touched). Not run: `tools/pr_ready.py` harnesses (need `.local/`),
 a real play session with this build.
 
 ## To-do
 
-1. Port the surface series onto `SurfaceVariants` (the ~15 ms a chunk gap).
+1. Done: the surface series is ported (15 ms a chunk gained; about 1 ms
+   left, see "Surface stage, ported onto `SurfaceVariants`").
 2. Play the To The Max world on this build (the bake's format change re-bakes
    far terrain once; the ring cache; the cursor fix; data-pack biomes).
 3. Bring over `ttm/ultimine` and `ttm/big-ore-deposits` (laptop session,
