@@ -868,13 +868,19 @@ type LatticeCache = Mutex<HashMap<(i32, i32), Arc<Vec<LatticeSamples>>>>;
 /// ~33 KB a chunk in To The Max; misses only resample.
 const LATTICE_CACHE_LIMIT: usize = 1024;
 
+/// A noise settings block state: an id, 26.3's `{id, properties}` (what
+/// `upgrade-datapack` writes), or the older `{Name, Properties}`.
 fn state(registry: &BlockRegistry, raw: &Value) -> Result<BlockStateId, GeneratorError> {
     let name = raw
-        .get("Name")
+        .get("id")
+        .or_else(|| raw.get("Name"))
         .and_then(Value::as_str)
         .or_else(|| raw.as_str())
         .ok_or_else(|| resource("block state"))?;
-    let properties = raw.get("Properties").and_then(Value::as_object);
+    let properties = raw
+        .get("properties")
+        .or_else(|| raw.get("Properties"))
+        .and_then(Value::as_object);
     match properties {
         Some(properties) if !properties.is_empty() => {
             let descriptor = crate::chunk::BlockState {
