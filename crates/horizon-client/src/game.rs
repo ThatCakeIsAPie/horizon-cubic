@@ -17100,11 +17100,11 @@ fn load_world_rest(
     };
     let load_animate = || -> Result<_> {
         let animate = if draws {
-            horizon_client::animate_tick::AnimateTables::load(root, registry, biomes)?
+            horizon_client::animate_tick::AnimateTables::load(root, registry, &biomes)?
         } else {
             Default::default()
         };
-        Ok((animate, horizon_client::fog::FogTables::load(root, biomes)))
+        Ok((animate, horizon_client::fog::FogTables::load(root, &biomes)))
     };
     let load_mobs = || -> Result<_> {
         let mob_types: HashMap<_, _> = MobTypes::load(root)?
