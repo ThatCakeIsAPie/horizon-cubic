@@ -4,7 +4,7 @@ use super::{
     anchor::WorldGenerationContext,
     material_condition::{
         MaterialConditions, MaterialDensitySources, MaterialRule, MaterialRuleError,
-        MaterialSurfaceQueries,
+        MaterialSurfaceQueries, RunMemo,
     },
     material_extensions::{ExtensionError, MaterialColumn, MaterialExtensions},
     terrain::{TerrainBlockStates, TerrainChunk, TerrainError},
@@ -125,6 +125,14 @@ impl<'a, 'r, B: TerrainBlockStates> Column<'a, 'r, B> {
     }
     fn cache_index(&self, y: i32) -> Option<usize> {
         (y >= self.low && y <= self.high).then(|| (y - self.low) as usize)
+    }
+    /// Whether every block of `low..=high` is `state` (false when the cache
+    /// does not hold them all).
+    fn all_are(&self, low: i32, high: i32, state: BlockStateId) -> bool {
+        match (self.cache_index(low), self.cache_index(high)) {
+            (Some(low), Some(high)) => self.cache[low..=high].iter().all(|s| *s == state),
+            _ => false,
+        }
     }
 }
 impl<B: TerrainBlockStates> MaterialColumn for Column<'_, '_, B> {
@@ -322,6 +330,7 @@ where
     let cz = chunk.position().z.wrapping_shl(4);
     // One block-id buffer, refilled per column and kept across columns.
     let mut cache = Vec::new();
+    let mut memo = RunMemo::default();
     for lx in 0..16 {
         for lz in 0..16 {
             let x = cx.wrapping_add(lx);
@@ -370,9 +379,11 @@ where
                 let state = column.block(y)?;
                 let properties = column.chunk.block_properties(state);
                 if properties.is_air() {
+                    memo.clear();
                     above = 0;
                     water = i32::MIN;
                 } else if properties.has_fluid() {
+                    memo.clear();
                     if water == i32::MIN {
                         water = y.wrapping_add(1);
                     }
@@ -392,17 +403,52 @@ where
                         }
                     }
                     above = above.wrapping_add(1);
-                    worker.update_y(above, y.wrapping_sub(bottom).wrapping_add(1), water, y);
+                    let below = y.wrapping_sub(bottom).wrapping_add(1);
                     if y >= write_min_y && y <= write_max_y {
-                        let above = variants.surface && y >= worker.minimum_surface_level()?;
-                        let rule = variants.rule(y, above);
-                        if let Some(state) = worker.try_apply(rule, BlockPos::new(x, y, z))? {
+                        let (rule, rule_low) =
+                            variants.rule_down(y, || worker.minimum_surface_level())?;
+                        let floor = bottom.max(write_min_y).max(rule_low);
+                        let (result, low) = worker.try_apply_in_run(
+                            rule,
+                            BlockPos::new(x, y, z),
+                            &mut memo,
+                            above,
+                            below,
+                            water,
+                            floor,
+                        )?;
+                        if let Some(state) = result {
                             column.set_block(y, state)?;
                         }
+                        // The blocks below down to `low` (all solid: the run
+                        // reaches `bottom`) get the same result: when that
+                        // changes nothing, step over them.
+                        let low = low.max(floor);
+                        let skipped = y.wrapping_sub(low);
+                        if skipped > 0 && budget >= skipped as usize {
+                            let unchanged = match result {
+                                None => true,
+                                // `set_block` skips a block already there,
+                                // but marks fluids.
+                                Some(new) => {
+                                    !column.chunk.block_properties(new).has_fluid()
+                                        && column.all_are(low, y.wrapping_sub(1), new)
+                                }
+                            };
+                            if unchanged {
+                                budget -= skipped as usize;
+                                above = above.wrapping_add(skipped);
+                                y = low;
+                            }
+                        }
+                    } else {
+                        memo.clear();
+                        worker.update_y(above, below, water, y);
                     }
                 }
                 y = y.wrapping_sub(1);
             }
+            memo.clear();
             if matches!(
                 biome.as_ref(),
                 "minecraft:frozen_ocean" | "minecraft:deep_frozen_ocean"
