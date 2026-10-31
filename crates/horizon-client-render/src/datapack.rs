@@ -92,6 +92,23 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
     }
 }
 impl DataPack {
+    /// A pack folder or zip on its own.
+    fn open(path: &Path) -> Option<Self> {
+        let source = if path.is_dir() {
+            Source::Dir(path.to_path_buf())
+        } else {
+            Source::Zip(Box::new(Zip::open(path).ok()?))
+        };
+        Some(DataPack {
+            id: String::new(),
+            source,
+        })
+    }
+    /// `pack.mcmeta`'s `pack_format`: the format the pack was made for.
+    fn pack_format(&self) -> Option<i64> {
+        let v: serde_json::Value = serde_json::from_slice(&self.read("pack.mcmeta")?).ok()?;
+        v["pack"]["pack_format"].as_i64()
+    }
     /// The built-in `vanilla` pack: the game's own data directory.
     pub fn builtin(root: &Path) -> Self {
         DataPack {
@@ -203,23 +220,64 @@ pub fn folder_stamp(dir: &Path) -> Vec<(String, Option<std::time::SystemTime>)> 
 /// Create World's packs into the new world before it opens
 /// (`copyTempDataPackDirToNewWorld`): every pack of `dir` goes to
 /// `<world>/datapacks`, and `datapacks.json` enables those `selected`
-/// (lowest priority first) and disables the rest.
+/// (lowest priority first) and disables the rest. A pack made for an older
+/// format (`pack_format` below 26.3's, as To The Max's 26.2 zip) has its world
+/// generation upgraded on the way in, as `horizon-port-pack upgrade-datapack`
+/// does (docs/datapack-upgrade.md); a zip becomes a folder without `.zip`.
 pub fn install(dir: &Path, world: &Path, selected: &[String]) -> Result<(), String> {
+    use horizon_port_pack::upgrade;
     let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     let target = world.join("datapacks");
     std::fs::create_dir_all(&target).map_err(|e| err(&target, e))?;
+    let mut renamed: BTreeMap<String, String> = BTreeMap::new();
     let mut disabled = Vec::new();
     for pack in crate::packs::folder(dir, horizon_core::version::DATA_PACK_FORMAT) {
         let (crate::packs::Source::Dir(from) | crate::packs::Source::Zip(from)) = &pack.source;
-        copy(from, &target.join(pack.id.trim_start_matches("file/")))?;
+        let name = pack.id.trim_start_matches("file/");
+        let format = DataPack::open(from).and_then(|p| p.pack_format());
+        let upgraded = match format {
+            Some(f) if f < horizon_core::version::DATA_PACK_FORMAT.0 => {
+                let (files, report) = upgrade::upgrade_pack(&upgrade::read_pack(from)?);
+                (!report.upgraded.is_empty()).then_some((files, report))
+            }
+            _ => None,
+        };
+        let id = match upgraded {
+            Some((files, report)) => {
+                let stem = name.strip_suffix(".zip").unwrap_or(name);
+                let out = target.join(stem);
+                for (path, bytes) in files {
+                    let file = out.join(path);
+                    if let Some(parent) = file.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| err(parent, e))?;
+                    }
+                    std::fs::write(&file, bytes).map_err(|e| err(&file, e))?;
+                }
+                log::info!("Horizon: data pack {name} upgraded to 26.3 (format {format:?})");
+                for line in report.lines() {
+                    log::info!("Horizon: data pack {name}: {line}");
+                }
+                let id = format!("file/{stem}");
+                renamed.insert(pack.id.clone(), id.clone());
+                id
+            }
+            None => {
+                copy(from, &target.join(name))?;
+                pack.id.clone()
+            }
+        };
         if !selected.contains(&pack.id) {
-            disabled.push(pack.id);
+            disabled.push(id);
         }
     }
     if !selected.iter().any(|id| id == "vanilla") {
         disabled.push("vanilla".into());
     }
-    let json = serde_json::json!({ "enabled": selected, "disabled": disabled });
+    let enabled: Vec<&String> = selected
+        .iter()
+        .map(|id| renamed.get(id).unwrap_or(id))
+        .collect();
+    let json = serde_json::json!({ "enabled": enabled, "disabled": disabled });
     let file = world.join("datapacks.json");
     std::fs::write(&file, json.to_string()).map_err(|e| err(&file, e))
 }
@@ -962,6 +1020,40 @@ mod tests {
         assert_eq!(wanted.len(), 7);
         assert_eq!(p.list_kinds(&kinds), wanted);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_world_upgrades_an_old_worldgen_pack() {
+        let root = std::env::temp_dir().join(format!("hz-datapack-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, world) = (root.join("mcworld"), root.join("world"));
+        // A 26.2 zip (format 107, as To The Max declares) with a 26.2 noise.
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(dir.join("old.zip")).unwrap());
+        for (name, text) in [
+            (
+                "pack.mcmeta",
+                r#"{"pack":{"pack_format":107,"description":"Old","min_format":1,"max_format":999}}"#,
+            ),
+            (
+                "data/x/worldgen/noise/n.json",
+                r#"{"firstOctave":-3,"amplitudes":[1.0,1.0]}"#,
+            ),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zip, text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        let selected = ["vanilla", "file/old.zip"].map(String::from);
+        install(&dir, &world, &selected).unwrap();
+        let noise =
+            std::fs::read_to_string(world.join("datapacks/old/data/x/worldgen/noise/n.json"))
+                .unwrap();
+        assert!(noise.contains("base_octave"), "{noise}");
+        let packs = discover(&world);
+        assert_eq!(enabled_ids(&world, &packs), ["file/old"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

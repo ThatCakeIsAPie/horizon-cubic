@@ -1191,6 +1191,7 @@ dependencies = [
  "horizon-core",
  "horizon-hdr",
  "horizon-items",
+ "horizon-port-pack",
  "horizon-protocol",
  "horizon-shader-api",
  "horizon-shaders",

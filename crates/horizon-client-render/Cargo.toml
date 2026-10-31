@@ -15,6 +15,8 @@ horizon-command = { path = "../horizon-command" }
 horizon-core = { path = "../horizon-core" }
 horizon-hdr = { path = "../horizon-hdr" }
 horizon-items = { path = "../horizon-items" }
+# Create World's Data Packs: a 26.2 pack's world generation upgraded on its way into the world.
+horizon-port-pack = { path = "../horizon-port-pack" }
 horizon-protocol = { path = "../horizon-protocol" }
 horizon-shader-api = { path = "../horizon-shader-api" }
 horizon-shaders = { path = "../horizon-shaders" }
