@@ -38,13 +38,14 @@ pub fn paint(hwnd: isize, semibold: &[u8], mono: &[u8], logs: &[String]) {
     let hwnd = hwnd as HWND;
     FACES.call_once(|| {
         for font in [semibold, mono] {
-            let mut count = 0u32;
+            // windows-sys takes the font count as `*const u32`.
+            let count = 0u32;
             unsafe {
                 AddFontMemResourceEx(
                     font.as_ptr().cast(),
                     font.len() as u32,
                     std::ptr::null(),
-                    &mut count,
+                    &count,
                 );
             }
         }
