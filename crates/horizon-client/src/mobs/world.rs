@@ -452,7 +452,7 @@ pub(crate) fn with_built_test_world(
         thundering: false,
         nether: false,
         block_tags: &items.block_tags,
-        biomes: &biomes,
+        biomes: std::sync::Arc::new(biomes),
         mob_griefing: true,
         universal_anger: false,
         mob_drops: true,

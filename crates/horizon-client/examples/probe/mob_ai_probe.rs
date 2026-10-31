@@ -892,7 +892,7 @@ pub fn main() -> horizon_client::Result<()> {
         .iter()
         .map(|(k, v)| (k.clone(), Arc::new(v.clone())))
         .collect();
-    let biomes = Biomes::load(root)?;
+    let biomes = std::sync::Arc::new(Biomes::load(root)?);
     let items = Items::load(root, registry, &facts, &PackOverlay::NONE)?;
     let tables = LightTables::load(root, registry, &facts)?;
     let collision = collisions::load(root, registry)?;
@@ -1182,7 +1182,7 @@ pub fn main() -> horizon_client::Result<()> {
                     thundering: s.thunder,
                     nether: false,
                     block_tags: &items.block_tags,
-                    biomes: &biomes,
+                    biomes: biomes.clone(),
                     mob_griefing: true,
                     universal_anger: false,
                     mob_drops: true,

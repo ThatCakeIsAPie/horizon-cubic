@@ -384,7 +384,7 @@ impl Game<'_> {
         let raining_at = |p: [i32; 3]| {
             raining
                 && motion_blocking_height(world, properties, p[0], p[2]) <= p[1]
-                && rains_at(world, biomes, p[0], p[1], p[2])
+                && rains_at(world, &biomes, p[0], p[1], p[2])
         };
         let height_no_leaves =
             |p: [i32; 3]| motion_blocking_leaves(world, facts, p[0], p[2], i32::MAX, false);
@@ -408,7 +408,7 @@ impl Game<'_> {
             world,
             facts,
             collision: self.collision,
-            biomes,
+            biomes: &biomes,
             registry: self.pack.assets.registry,
             raining_at: &raining_at,
             height_no_leaves: &height_no_leaves,
@@ -444,7 +444,7 @@ impl Game<'_> {
                     let Some(top) = splash_height(world, properties, x, block[1], z) else {
                         continue;
                     };
-                    if !rains_at(world, biomes, x, top, z) {
+                    if !rains_at(world, &biomes, x, top, z) {
                         continue;
                     }
                     let below = top - 1;

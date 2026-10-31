@@ -610,6 +610,10 @@ impl Game<'_> {
             return Ok(());
         }
         self.join_world_rest()?;
+        // `Resources` outlives the world: a local world's data pack biomes would
+        // otherwise colour this server's and map its biome names (`set_registries`).
+        self.res
+            .set_biomes(Arc::new(self.res.biomes().builtin_only()));
         if let Err(error) = self.join_server(address, name, None, cookies, lan) {
             log::warn!("Horizon: could not join server: {error}");
             if self.title.is_none() {

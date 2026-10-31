@@ -141,7 +141,8 @@ impl WorldRequest {
             level.position = None;
         }
         let dim = Dim::from_id(&level.dimension);
-        let shapes = level_shapes(&save_root, res.biomes());
+        set_world_biomes(&save_root, res);
+        let shapes = level_shapes(&save_root, &res.biomes());
         let shape = shapes.get(dim.id());
         let (mut streaming, save, locator) = make_streaming(
             res, pack, options, settings, &save_root, dim, shape, level.seed,
@@ -437,6 +438,41 @@ fn worldgen_overrides_of(
     horizon_client::datapack::worldgen_overrides(&enabled, |b| biomes.contains(b))
 }
 
+/// Sets the world's biomes (`Resources::set_biomes`): the built-in ones with
+/// its enabled data packs' biome files over them, before its first chunk.
+pub(super) fn set_world_biomes(world_root: &std::path::Path, res: &Resources) {
+    let packs = horizon_client::datapack::discover(world_root);
+    let enabled = horizon_client::datapack::enabled_ids(world_root, &packs);
+    let enabled: Vec<_> = enabled
+        .iter()
+        .filter_map(|id| packs.iter().find(|p| &p.id == id))
+        .collect();
+    let (overrides, _) = horizon_client::datapack::worldgen_overrides(&enabled, |_| true);
+    let files: Vec<(String, serde_json::Value)> = overrides
+        .entries("biomes")
+        .filter_map(
+            |(id, json)| match serde_json::from_str::<serde_json::Value>(json) {
+                Ok(v) if v.is_object() => Some((id.to_owned(), v)),
+                _ => {
+                    log::warn!("Horizon: data pack biome {id} is not a biome file; left out");
+                    None
+                }
+            },
+        )
+        .collect();
+    let biomes = res
+        .biomes()
+        .with_packs(files.iter().map(|(id, v)| (id.as_str(), v)));
+    if biomes.has_packs() {
+        log::info!(
+            "Horizon: the world's data packs give {} biome files; {} biomes in all",
+            files.len(),
+            biomes.list.len()
+        );
+    }
+    res.set_biomes(Arc::new(biomes));
+}
+
 /// The shapes of the world's levels: their dimension types, the world's
 /// enabled data packs' over vanilla's. A type the codec refuses keeps the
 /// vanilla shape, with a warning.
@@ -499,7 +535,7 @@ pub(super) fn make_streaming(
             horizon_client::flatgen::FlatTerrain::from_settings(
                 &s,
                 pack.assets.registry,
-                res.biomes(),
+                &res.biomes(),
                 shape,
             )
         });
@@ -511,11 +547,11 @@ pub(super) fn make_streaming(
                 registry: pack.assets.clone(),
                 biomes: res.biomes().clone(),
             }),
-            pack.context.clone(),
+            pack.context_with(res.biomes()),
             res.threads(),
         )
     } else if options.test_terrain && dim == Dim::Overworld {
-        let inner = Arc::new(TestTerrain::new(pack.assets.registry, res.biomes())?);
+        let inner = Arc::new(TestTerrain::new(pack.assets.registry, &res.biomes())?);
         Streaming::new(
             Arc::new(Persistent {
                 inner,
@@ -523,7 +559,7 @@ pub(super) fn make_streaming(
                 registry: pack.assets.clone(),
                 biomes: res.biomes().clone(),
             }),
-            pack.context.clone(),
+            pack.context_with(res.biomes()),
             res.threads(),
         )
     } else {
@@ -531,8 +567,8 @@ pub(super) fn make_streaming(
         let structures =
             horizon_client::save::WorldGen::read(world_root).is_none_or(|w| w.structures);
         let preset = horizon_client::save::WorldGen::preset(world_root);
-        let overrides = world_worldgen_overrides(world_root, res.biomes());
-        let inner = Arc::new(VanillaTerrain::for_world_with(&options.resources.join("worldgen"), &overrides, pack.assets.registry, res.biomes(), seed, preset, dim.id(), structures).map_err(|e| {
+        let overrides = world_worldgen_overrides(world_root, &res.biomes());
+        let inner = Arc::new(VanillaTerrain::for_world_with(&options.resources.join("worldgen"), &overrides, pack.assets.registry, &res.biomes(), seed, preset, dim.id(), structures).map_err(|e| {
                 if overrides.is_empty() {
                     format!("{e}\nPrepare the worldgen bundle with the launcher, or: horizon-prepare --prepare")
                 } else {
@@ -560,7 +596,7 @@ pub(super) fn make_streaming(
                 registry: pack.assets.clone(),
                 biomes: res.biomes().clone(),
             }),
-            pack.context.clone(),
+            pack.context_with(res.biomes()),
             res.threads(),
         )
     };

@@ -2259,7 +2259,8 @@ pub struct MobWorld<'a> {
     pub thundering: bool,
     pub nether: bool,
     pub block_tags: &'a HashMap<String, std::collections::HashSet<String>>,
-    pub biomes: &'a crate::biome::Biomes,
+    /// The open world's biomes.
+    pub biomes: std::sync::Arc<crate::biome::Biomes>,
     /// The `mob_griefing` game rule.
     pub mob_griefing: bool,
     /// The `universal_anger` game rule (`NeutralMob.isAngryAtAllPlayers`).
