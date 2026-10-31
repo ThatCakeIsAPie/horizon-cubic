@@ -294,3 +294,24 @@ fn top_material_retains_context_on_failure_and_ignores_possible_biome_shortcuts(
         assert!(chunk.postprocessing()[0].is_empty());
     }
 }
+
+#[test]
+fn column_blocks_match_single_block_reads() {
+    let registry = registry();
+    let mut chunk = TerrainChunk::new(ChunkPos::new(0, 0), -16, 48, &registry, Properties).unwrap();
+    for y in -16..8 {
+        chunk.set_block_raw(3, y, 5, BlockStateId(2)).unwrap();
+        chunk.set_block_raw(4, y, 5, BlockStateId(3)).unwrap();
+    }
+    chunk.set_block_raw(3, -2, 5, BlockStateId(3)).unwrap();
+    // The section from 16 up stays empty.
+    let mut column = Vec::new();
+    for (x, z) in [(3, 5), (4, 5), (0, 0)] {
+        for (low, high) in [(-17, 33), (-16, 32), (7, 7), (0, 15), (-18, -17), (5, 4)] {
+            column.clear();
+            chunk.column_blocks(x, z, low, high, &mut column);
+            let expected: Vec<_> = (low..=high).map(|y| chunk.block(x, y, z)).collect();
+            assert_eq!(column, expected, "{x} {z} {low} {high}");
+        }
+    }
+}

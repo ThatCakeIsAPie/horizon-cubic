@@ -445,6 +445,18 @@ impl<'r> BlockSection<'r> {
             }
         }
     }
+    /// `state(first + i * 256)` for `i` in `0..count`: a column of blocks
+    /// upward from `first` (a `local_index`; `count` keeps it below 4096).
+    #[inline]
+    pub(crate) fn column_states(&self, first: usize, count: usize, out: &mut Vec<BlockStateId>) {
+        debug_assert!(first + count.saturating_sub(1) * 256 < 4096);
+        match &self.storage {
+            None => out.extend(std::iter::repeat_n(self.palette[0], count)),
+            Some(storage) => {
+                out.extend((0..count).map(|i| self.palette[storage.read(first + i * 256) as usize]))
+            }
+        }
+    }
     /// The state at `index`, which must be below 4096 (a `local_index`).
     #[inline]
     pub(crate) fn state(&self, index: usize) -> BlockStateId {

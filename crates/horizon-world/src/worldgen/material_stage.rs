@@ -107,10 +107,7 @@ impl<'a, 'r, B: TerrainBlockStates> Column<'a, 'r, B> {
         let low = min.max(chunk_min);
         cache.clear();
         if high >= low {
-            cache.reserve((high - low + 1) as usize);
-            for y in low..=high {
-                cache.push(chunk.block(x, y, z));
-            }
+            chunk.column_blocks(x, z, low, high, cache);
         }
         Self {
             chunk,

@@ -372,6 +372,30 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     pub fn block(&self, x: i32, y: i32, z: i32) -> BlockStateId {
         self.blocks.block(x, y, z)
     }
+    /// `block(x, y, z)` for every `y` from `low` up to `high`, appended to
+    /// `out`, looking each section up once.
+    pub fn column_blocks(&self, x: i32, z: i32, low: i32, high: i32, out: &mut Vec<BlockStateId>) {
+        let blocks = &self.blocks;
+        let mut y = i64::from(low);
+        let high = i64::from(high);
+        out.reserve((high - y + 1).max(0) as usize);
+        while y <= high {
+            let Some(section) = blocks.section_index(y as i32) else {
+                out.push(blocks.void_air);
+                y += 1;
+                continue;
+            };
+            // Blocks from y to this section's top.
+            let top = high.min(i64::from(blocks.min_y) + section as i64 * 16 + 15);
+            let count = (top - y + 1) as usize;
+            if blocks.non_air[section] == 0 {
+                out.extend(std::iter::repeat_n(blocks.air, count));
+            } else {
+                blocks.sections[section].column_states(local_index(x, y as i32, z), count, out);
+            }
+            y = top + 1;
+        }
+    }
     /// The states of the 16-block section starting at block `y` (a multiple
     /// of 16 inside this chunk), in `(y << 8) | (z << 4) | x` order, read in
     /// one pass; false (and `out` untouched) when `y` is not such a start.
