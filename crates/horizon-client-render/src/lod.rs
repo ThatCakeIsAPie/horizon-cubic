@@ -7,8 +7,8 @@ use crate::{
     mesher::SectionMesh,
     streaming::{LodSource, WorkerContext},
 };
-pub mod cache;
 pub mod bake;
+pub mod cache;
 mod mesh;
 use horizon_world::registry::BlockStateId;
 use std::{
@@ -2545,7 +2545,10 @@ mod tests {
 
     #[test]
     fn sampling_threads_by_machine_size() {
-        assert_eq!([1, 2, 4, 6, 8, 11].map(sampling_threads), [1, 1, 1, 2, 3, 4]);
+        assert_eq!(
+            [1, 2, 4, 6, 8, 11].map(sampling_threads),
+            [1, 1, 1, 2, 3, 4]
+        );
         assert_eq!([12, 16, 64].map(sampling_threads), [6, 6, 6]);
     }
 }
