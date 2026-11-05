@@ -1,24 +1,39 @@
-# Handoff: `merge/upstream-2026-11-05` (2026-11-05)
+# Handoff: Horizon Cubic (2026-11-05)
 
-The fork (ThatCakeIsAPie/horizon-ttm) brought up to upstream Horizon
-(horizon-rust/horizon, formerly ludovic111/horizon) `main` at `c4e4800d4`:
-8,851 commits since the last sync (`d6e8bd67a`, 2026-10-31). The previous
-handoff (the 2026-10-31 sync and the surface series) is
-`git show 58fc487fa:HANDOFF.md`.
+**ThatCakeIsAPie/horizon-cubic** is the Cubic Chunks fork of the fork:
 
-Cubic Chunks work continues on `feat/cubic-chunks`, branched from here:
-read `docs/cubic-chunks.md` there.
+```
+horizon-rust/horizon  (upstream Horizon)
+  └─ ThatCakeIsAPie/horizon-ttm    (Horizon To The Max: ultimine, ring cache, far terrain bake, ...)
+       └─ ThatCakeIsAPie/horizon-cubic   (this repo: vertically unbounded levels)
+```
+
+Both GitHub repos are private, and GitHub can't fork a repo into the account
+that owns it, so this is a plain repository with `ttm` and `upstream` as
+remotes (fetch only: their push URLs are disabled here).
+
+To take in TTM's and upstream's changes:
+- `git fetch ttm upstream`, then `git merge ttm/main`. When TTM is behind upstream, also merge
+  `upstream/main`.
+- Keep this file and `docs/cubic-chunks.md` as this repo has them.
+
+The port's plan and progress are in `docs/cubic-chunks.md`.
+
+This history starts from horizon-ttm's `merge/upstream-2026-11-05`: TTM brought up to upstream
+`c4e4800d4` on 2026-11-05. The rest of this file is that sync's handoff. The previous TTM handoff
+is `git show 58fc487fa:HANDOFF.md`.
 
 ## Prompt for the next agent
 
-> Pick up branch `feat/cubic-chunks` of ThatCakeIsAPie/horizon-ttm (based on
-> `merge/upstream-2026-11-05`). Read `HANDOFF.md`, then
-> `docs/cubic-chunks.md`: phase 1 is done; start phase 2 (the cube codec,
-> pulling the section encoder out of `save.rs`'s `encode_with` with vanilla
-> output byte-identical, and a cube noise generator with the stacked-cubes
-> oracle). Don't push or merge to `main` without asking me. Follow AGENTS.md.
+> Pick up `main` of ThatCakeIsAPie/horizon-cubic. Read `HANDOFF.md`, then
+> `docs/cubic-chunks.md`: phase 1 is done. Start phase 2:
+> - the cube codec: pull the section encoder out of `save.rs`'s `encode_with`, keeping vanilla's
+>   output byte-identical;
+> - a cube noise generator, with the stacked-cubes oracle.
+>
+> Ask me before pushing. Follow AGENTS.md.
 
-## What is on this branch
+## What the TTM sync brought
 
 1. `142c137d1` **Merge of upstream main.** Where the fork and upstream did the same job, upstream's
    version was kept. The commit message lists each case:
@@ -75,9 +90,9 @@ Not run:
 `cargo +stable-x86_64-pc-windows-msvc build --profile fast -p horizon-client`
 with `CARGO_TARGET_DIR` outside the checkout.
 
-| Branch | Worktree | Target directory |
+| Repository | Checkout | Target directory |
 |---|---|---|
-| This branch | `D:\ClaudeData\horizon-ttm-combine` | `D:\ClaudeData\horizon-ttm-sync-target` |
-| `feat/cubic-chunks` | `D:\ClaudeData\horizon-cubic` | `D:\ClaudeData\horizon-cubic-target` |
+| horizon-cubic (this) | `D:\ClaudeData\horizon-cubic` | `D:\ClaudeData\horizon-cubic-target` |
+| horizon-ttm `merge/upstream-2026-11-05` | `D:\ClaudeData\horizon-ttm-combine` | `D:\ClaudeData\horizon-ttm-sync-target` |
 
 `horizon-client-lib` needs Rust 1.90+. The default toolchain here (1.83 GNU) is too old.
