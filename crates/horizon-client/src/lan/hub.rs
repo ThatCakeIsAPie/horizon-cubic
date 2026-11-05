@@ -3521,9 +3521,6 @@ impl Hub {
                         events.push(HostEvent::Packet(conn, Box::new(S::Attack(p))));
                         held = self.move_queued(i);
                     }
-                    if self.move_queued(i) {
-                        break;
-                    }
                 }
                 S::Punch(p) => {
                     self.anticheat_swing(i);
