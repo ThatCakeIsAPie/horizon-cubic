@@ -228,11 +228,9 @@ impl Game<'_> {
         let (background, probe_volume) = match eye {
             Some(eye) => {
                 let (dimension, biome) = (self.dim.id(), self.biome_at(eye));
-                self.res.music().at(
-                    dimension,
-                    biome,
-                    world_biomes!(self).pack_file(biome),
-                )
+                self.res
+                    .music()
+                    .at(dimension, biome, world_biomes!(self).pack_file(biome))
             }
             None => (empty, 1.0),
         };

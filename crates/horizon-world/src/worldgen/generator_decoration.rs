@@ -1683,7 +1683,6 @@ fn block_of(nbt: &crate::nbt::Compound) -> Option<[i32; 3]> {
     }))
 }
 
-
 /// Marks `feature` in a biome's feature bitset (one bit per feature identity).
 fn set_feature_bit(bits: &mut Vec<u64>, feature: FeatureIdentity) {
     let word = feature.0 as usize / 64;
