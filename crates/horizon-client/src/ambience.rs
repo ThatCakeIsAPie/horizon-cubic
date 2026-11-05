@@ -6,7 +6,7 @@
 use crate::sound_engine::{AMBIENT, InstanceId, PLAYERS, SoundEngine, SoundInstance, Sounds};
 use horizon_core::random::{LegacyRandom, RandomSource};
 use serde_json::Value;
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, path::Path};
 
 /// `AmbientMoodSettings`.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,17 +54,19 @@ pub struct AmbientTables {
 impl AmbientTables {
     pub fn load(root: &Path) -> Self {
         let read = |dir: &str| -> HashMap<String, AmbientSounds> {
-            let Ok(entries) = fs::read_dir(root.join("data/minecraft").join(dir)) else {
+            let Ok(folder) =
+                horizon_world::json_folder::read(&root.join("data/minecraft").join(dir))
+            else {
                 return HashMap::new();
             };
-            entries
-                .flatten()
-                .filter_map(|e| {
-                    let path = e.path();
-                    let name = path.file_stem()?.to_str()?.to_owned();
-                    let json: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+            folder
+                .files
+                .iter()
+                .filter_map(|file| {
+                    let json: Value = serde_json::from_slice(file.bytes().ok()?).ok()?;
                     let v = &json["attributes"]["minecraft:audio/ambient_sounds"];
-                    (!v.is_null()).then(|| (format!("minecraft:{name}"), AmbientSounds::parse(v)))
+                    (!v.is_null())
+                        .then(|| (format!("minecraft:{}", file.name), AmbientSounds::parse(v)))
                 })
                 .collect()
         };
@@ -80,19 +82,6 @@ impl AmbientTables {
             .or_else(|| self.dimensions.get(dimension))
             .cloned()
             .unwrap_or_default()
-    }
-    /// `get` in a biome a data pack gave (`pack`, its file) or the
-    /// built-in biome `biome`.
-    pub fn at(&self, dimension: &str, biome: &str, pack: Option<&Value>) -> AmbientSounds {
-        let Some(json) = pack else {
-            return self.get(dimension, biome);
-        };
-        let v = &json["attributes"]["minecraft:audio/ambient_sounds"];
-        if v.is_null() {
-            self.dimensions.get(dimension).cloned().unwrap_or_default()
-        } else {
-            AmbientSounds::parse(v)
-        }
     }
 }
 /// What the handlers read about the player and level each tick.
@@ -175,6 +164,10 @@ impl Default for Ambience {
     }
 }
 impl Ambience {
+    /// Starts its random over from `seed`.
+    pub fn reseed(&mut self, seed: i64) {
+        self.random = LegacyRandom::new(seed);
+    }
     pub fn new(seed: i64) -> Self {
         Self {
             random: LegacyRandom::new(seed),

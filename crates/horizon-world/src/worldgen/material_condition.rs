@@ -23,7 +23,8 @@ use horizon_core::{
 pub use library::MaterialRuleLibrary;
 pub use noise::MaterialNoiseSources;
 use rule::CompiledRule;
-pub use rule::{DensityGate, MaterialRule, MaterialRuleError, RunMemo, SurfaceVariants};
+pub use rule::{CompiledSurfaceRule, SurfaceVariants};
+pub use rule::{MaterialRule, MaterialRuleError};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -40,28 +41,8 @@ pub trait MaterialSurfaceQueries {
     ) -> Result<usize, DecodeError> {
         Err(DecodeError::Field("missing material density provider"))
     }
-    /// `bind_density(sampler, true)` for a density read only where `gate`'s
-    /// input is in range (or, with `gated`, that `gate` describes): the eager
-    /// sample may stop above the highest such height and, given a `lattice`
-    /// period of the sampler's volume samples, start at the last multiple
-    /// of it at or below the lowest. With `gated`, `density_heights` also
-    /// covers the heights outside it.
-    fn bind_gated_density(
-        &mut self,
-        sampler: Arc<dyn horizon_core::density::DensitySampler>,
-        _gate: &DensityGate,
-        _gated: bool,
-        _lattice: Option<i32>,
-    ) -> Result<usize, DecodeError> {
-        self.bind_density(sampler, true)
-    }
     fn density(&mut self, _index: usize, _position: BlockPos) -> Result<f32, MaterialRuleError> {
         Err(MaterialRuleError::MissingDensityProvider)
-    }
-    /// What an eager sample already tells about `density(index, _)`: where it
-    /// can be above zero (or NaN). `None` when nothing is known.
-    fn density_heights(&self, _index: usize) -> Option<DensityHeights> {
-        None
     }
     fn preliminary_surface(&mut self, _position: BlockPos) -> Result<f32, MaterialRuleError> {
         Err(MaterialRuleError::MissingDensityProvider)
@@ -76,16 +57,6 @@ pub trait MaterialSurfaceQueries {
     /// number their biomes: biome conditions then compare numbers.
     fn biome_id(&mut self, _position: BlockPos) -> Result<Option<u32>, MaterialRuleError> {
         Err(MaterialRuleError::MissingBiomeProvider)
-    }
-    /// `biome_id` at `position`, with the lowest height down to which the
-    /// column has that biome at every block (`position.y` when not known;
-    /// it need not look below `floor`).
-    fn biome_id_down(
-        &mut self,
-        position: BlockPos,
-        _floor: i32,
-    ) -> Result<Option<(u32, i32)>, MaterialRuleError> {
-        Ok(self.biome_id(position)?.map(|id| (id, position.y)))
     }
     /// `Some` when `biome_id` answers: the index of the biome `name` (`None`
     /// inside when no biome has that name).
@@ -125,20 +96,8 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
     ) -> Result<usize, DecodeError> {
         (**self).bind_density(sampler, eager)
     }
-    fn bind_gated_density(
-        &mut self,
-        sampler: Arc<dyn horizon_core::density::DensitySampler>,
-        gate: &DensityGate,
-        gated: bool,
-        lattice: Option<i32>,
-    ) -> Result<usize, DecodeError> {
-        (**self).bind_gated_density(sampler, gate, gated, lattice)
-    }
     fn density(&mut self, index: usize, position: BlockPos) -> Result<f32, MaterialRuleError> {
         (**self).density(index, position)
-    }
-    fn density_heights(&self, index: usize) -> Option<DensityHeights> {
-        (**self).density_heights(index)
     }
     fn preliminary_surface(&mut self, position: BlockPos) -> Result<f32, MaterialRuleError> {
         (**self).preliminary_surface(position)
@@ -151,13 +110,6 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
     }
     fn biome_id(&mut self, position: BlockPos) -> Result<Option<u32>, MaterialRuleError> {
         (**self).biome_id(position)
-    }
-    fn biome_id_down(
-        &mut self,
-        position: BlockPos,
-        floor: i32,
-    ) -> Result<Option<(u32, i32)>, MaterialRuleError> {
-        (**self).biome_id_down(position, floor)
     }
     fn biome_index(&self, name: &str) -> Option<Option<u32>> {
         (**self).biome_index(name)
@@ -189,24 +141,6 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
     }
     fn band(&mut self, position: BlockPos) -> Result<BlockStateId, MaterialRuleError> {
         (**self).band(position)
-    }
-}
-/// Inside the inclusive block box `min..=max`, a density is `<= 0` at every
-/// height outside `y[0]..=y[1]` (an empty range when `y[0] > y[1]`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DensityHeights {
-    pub min: [i32; 3],
-    pub max: [i32; 3],
-    pub y: [i32; 2],
-}
-impl DensityHeights {
-    /// Whether the density at `p` is known to be `<= 0`.
-    #[inline]
-    pub fn never_positive(&self, p: BlockPos) -> bool {
-        (p.y < self.y[0] || p.y > self.y[1])
-            && (self.min[0]..=self.max[0]).contains(&p.x)
-            && (self.min[1]..=self.max[1]).contains(&p.y)
-            && (self.min[2]..=self.max[2]).contains(&p.z)
     }
 }
 impl<P: PositionalRandom> MaterialSurfaceQueries for MaterialSurface<P> {
@@ -281,25 +215,13 @@ struct Context<S> {
     possible_biomes: Option<BTreeSet<String>>,
     biome: Option<Arc<str>>,
     biome_id: Option<u32>,
-    /// The lowest height a 3D noise is asked for before the column's next
-    /// `noise_floor` (the bottom of the current run of solid blocks): the
-    /// values sampled ahead stop there.
-    noise_floor: i32,
 }
 struct CachedNoise {
     sampler: Arc<dyn Noise>,
     is_3d: bool,
     revision: i64,
     value: f64,
-    /// 3D noises: values down the current column from `column_top`, sampled
-    /// together (the surface walks each column down in y).
-    column: [f32; NOISE_COLUMN],
-    column_top: i32,
-    /// How many of `column` are sampled.
-    column_count: u8,
-    column_revision: i64,
 }
-const NOISE_COLUMN: usize = 16;
 impl<S: MaterialSurfaceQueries> Context<S> {
     fn minimum_surface_level(&mut self) -> Result<i32, MaterialRuleError> {
         if self.minimum_revision != self.column_revision {
@@ -345,42 +267,12 @@ impl<S: MaterialSurfaceQueries> Context<S> {
             }
             .wrapping_sub(1),
             value: 0.0,
-            column: [0.0; NOISE_COLUMN],
-            column_top: 0,
-            column_count: 0,
-            column_revision: self.column_revision.wrapping_sub(1),
         });
         self.noise_indices.insert(key, index);
         Ok(index)
     }
     fn noise(&mut self, index: usize) -> f64 {
         let noise = &mut self.noises[index];
-        if noise.is_3d {
-            // A pure function of the position: values sampled ahead for the
-            // blocks below are the ones `get3` would give there.
-            let y = self.position.y;
-            let below = i64::from(noise.column_top) - i64::from(y);
-            if noise.column_revision != self.column_revision
-                || !(0..i64::from(noise.column_count)).contains(&below)
-            {
-                let ys: [f64; NOISE_COLUMN] =
-                    std::array::from_fn(|i| f64::from(y.wrapping_sub(i as i32)));
-                let count = (i64::from(y) - i64::from(self.noise_floor) + 1)
-                    .clamp(1, NOISE_COLUMN as i64) as usize;
-                noise.sampler.get3_column(
-                    f64::from(self.position.x),
-                    f64::from(self.position.z),
-                    &ys[..count],
-                    1.0,
-                    &mut noise.column[..count],
-                );
-                noise.column_top = y;
-                noise.column_count = count as u8;
-                noise.column_revision = self.column_revision;
-                return f64::from(noise.column[0]);
-            }
-            return f64::from(noise.column[below as usize]);
-        }
         let revision = if noise.is_3d {
             self.block_revision
         } else {
@@ -410,20 +302,6 @@ impl<S: MaterialSurfaceQueries> Context<S> {
         self.secondary
     }
 }
-/// What a rule program's run at one block depended on (`CompiledRule::apply_traced`).
-struct RunTrace {
-    /// The result holds down to this height of the run...
-    low: i64,
-    /// ...when the block's biome is the same (if `biome`)...
-    biome: bool,
-    /// ...and these tests (condition index, value), which vary block by
-    /// block as pure functions of the position, give the same values...
-    guards: [(u32, bool); RUN_GUARDS],
-    guard_count: usize,
-    /// ...unless something else tested varies block by block.
-    varies: bool,
-}
-const RUN_GUARDS: usize = 4;
 struct Compiled<R: RandomSource> {
     kind: Kind<R>,
     revision: i64,
@@ -492,6 +370,56 @@ where
         }
     }
 }
+/// A chunk's possible biomes, by name and, where the surface numbers its
+/// biomes, as a bit per index (`Kind::BiomeIds`).
+struct PossibleBiomes<'a> {
+    names: &'a BTreeSet<String>,
+    ids: Vec<u64>,
+}
+impl<R: RandomSource> Compiled<R>
+where
+    R::Positional: Clone,
+{
+    /// This condition as `compile` makes it for a chunk with `possible`
+    /// biomes: a biome condition none of them, or all of them, meet is
+    /// constant.
+    fn fold_biomes(&self, possible: &PossibleBiomes) -> Self {
+        let decided = match &self.kind {
+            Kind::Biome(names) if names.is_disjoint(possible.names) => Some(false),
+            Kind::Biome(names) if possible.names.is_subset(names) => Some(true),
+            Kind::BiomeIds(bits) => {
+                let bit = |ids: &[u64], i: usize| ids.get(i).copied().unwrap_or(0);
+                let mut words = 0..possible.ids.len().max(bits.len());
+                if words
+                    .clone()
+                    .all(|i| bit(bits, i) & bit(&possible.ids, i) == 0)
+                {
+                    Some(false)
+                } else if words.all(|i| bit(&possible.ids, i) & !bit(bits, i) == 0) {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            Kind::Not(child) => {
+                return Self {
+                    kind: Kind::Not(Box::new(child.fold_biomes(possible))),
+                    revision: self.revision,
+                    result: self.result,
+                };
+            }
+            _ => None,
+        };
+        match decided {
+            Some(value) => Self {
+                kind: Kind::Constant(value),
+                revision: self.revision,
+                result: self.result,
+            },
+            None => self.clone(),
+        }
+    }
+}
 impl<R: RandomSource> Compiled<R> {
     /// The value `facts` decide for this condition at every position they
     /// cover. Conditions read the position and the world, never change them,
@@ -513,13 +441,15 @@ impl<R: RandomSource> Compiled<R> {
             _ => None,
         }
     }
-    /// The vertical gradients' bounds, and whether the preliminary surface
-    /// is asked for.
-    fn inputs(&self, gradients: &mut Vec<(i32, i32)>, surface: &mut bool) {
+    /// The first y of each band its vertical gradients decide differently
+    /// from the band below, and whether the preliminary surface is asked for.
+    fn inputs(&self, starts: &mut Vec<i32>, surface: &mut bool) {
         match &self.kind {
-            Kind::Gradient { low, high, .. } => gradients.push((*low, *high)),
+            // True at and below `low`, random between, false at and above
+            // `high`: decided within each band these bound.
+            Kind::Gradient { low, high, .. } => starts.extend([low.saturating_add(1), *high]),
             Kind::Simple(MaterialCondition::AbovePreliminarySurface) => *surface = true,
-            Kind::Not(child) => child.inputs(gradients, surface),
+            Kind::Not(child) => child.inputs(starts, surface),
             _ => {}
         }
     }
@@ -629,181 +559,38 @@ impl<R: RandomSource> Compiled<R> {
             result: None,
         })
     }
-    /// Test with vanilla's per-revision result cache (standalone conditions).
     fn test<S: MaterialSurfaceQueries>(
         &mut self,
         context: &mut Context<S>,
     ) -> Result<bool, MaterialRuleError> {
-        self.eval::<true, S>(context)
-    }
-    /// Test inside a compiled rule program, which reaches each node at most
-    /// once per block: a block-level result is never asked for twice, and
-    /// column-level ones (hole, steep) are pure in the column's state, so the
-    /// revision cache would change nothing.
-    fn test_once<S: MaterialSurfaceQueries>(
-        &mut self,
-        context: &mut Context<S>,
-    ) -> Result<bool, MaterialRuleError> {
-        self.eval::<false, S>(context)
-    }
-    /// After `test_once` gave `value` at the context's block: raise `run.low`
-    /// to the lowest height down the current run of solid blocks
-    /// (y falls by one and the stone above grows by one per block; water,
-    /// the bottom of the run and the column stay) where the test still gives
-    /// `value`. Marks `run` as varying when that isn't a plain height bound.
-    ///
-    /// Returns true, leaving `run` as it is, for a test that varies block by
-    /// block as a pure function of the position (3D noise, a gradient inside
-    /// its band): the caller can test it again at another block.
-    fn stable_below<S: MaterialSurfaceQueries>(
-        &self,
-        value: bool,
-        context: &mut Context<S>,
-        run: &mut RunTrace,
-    ) -> bool {
-        let mut node = self;
-        let mut value = value;
-        while let Kind::Not(child) = &node.kind {
-            value = !value;
-            node = child;
+        if let Kind::Constant(value) = self.kind {
+            return Ok(value);
         }
-        let y = i64::from(context.position.y);
-        // Lowest height of the run giving `value`, for a test `y >= bound`.
-        let at_least = |bound: i32| if value { i64::from(bound) } else { i64::MIN };
-        let low = match &node.kind {
-            Kind::Constant(_) => i64::MIN,
-            Kind::BiomeIds(_) => {
-                run.biome = true;
-                i64::MIN
-            }
-            Kind::Noise { sampler, .. } => {
-                if context.noises[*sampler].is_3d {
-                    return true;
-                }
-                i64::MIN
-            }
-            Kind::Gradient { low, high, .. } => {
-                if context.position.y <= *low {
-                    i64::MIN
-                } else if context.position.y >= *high {
-                    i64::from(*high).max(i64::from(*low) + 1)
-                } else {
-                    return true;
-                }
-            }
-            Kind::Simple(MaterialCondition::Hole | MaterialCondition::Steep) => i64::MIN,
-            Kind::Simple(MaterialCondition::AbovePreliminarySurface) => {
-                // Column-cached: computed by the test that gave `value`.
-                match context.minimum_surface_level() {
-                    Ok(minimum) => at_least(minimum),
-                    Err(_) => {
-                        run.varies = true;
-                        i64::MIN
-                    }
-                }
-            }
-            Kind::Simple(MaterialCondition::YAbove {
-                anchor,
-                surface_depth_multiplier,
-                add_stone_depth,
-            }) => {
-                if *add_stone_depth {
-                    // y + stone above is the same down the run.
-                    i64::MIN
-                } else {
-                    at_least(
-                        anchor
-                            .resolve(context.generation)
-                            .wrapping_add(context.depth.wrapping_mul(*surface_depth_multiplier)),
-                    )
-                }
-            }
-            Kind::Simple(MaterialCondition::Water {
-                offset,
-                surface_depth_multiplier,
-                add_stone_depth,
-            }) => {
-                if context.water_height == i32::MIN || *add_stone_depth {
-                    i64::MIN
-                } else {
-                    at_least(
-                        context
-                            .water_height
-                            .wrapping_add(*offset)
-                            .wrapping_add(context.depth.wrapping_mul(*surface_depth_multiplier)),
-                    )
-                }
-            }
-            Kind::Simple(MaterialCondition::StoneDepth {
-                offset,
-                add_surface_depth,
-                secondary_depth_range,
-                ceiling,
-            }) => {
-                let surface = if *add_surface_depth { context.depth } else { 0 };
-                let secondary = if *secondary_depth_range == 0 {
-                    0
-                } else {
-                    (0.0 + ((context.secondary() - -1.0) / (1.0 - -1.0))
-                        * (f64::from(*secondary_depth_range) - 0.0)) as i32
-                };
-                let limit = i64::from(
-                    1i32.wrapping_add(*offset)
-                        .wrapping_add(surface)
-                        .wrapping_add(secondary),
-                );
-                if *ceiling {
-                    // The stone below shrinks down the run: once within the
-                    // limit, it stays.
-                    if value {
-                        i64::MIN
-                    } else {
-                        y - (i64::from(context.stone_below) - limit) + 1
-                    }
-                } else if value {
-                    // The stone above grows down the run.
-                    y - (limit - i64::from(context.stone_above))
-                } else {
-                    i64::MIN
-                }
-            }
-            _ => {
-                run.varies = true;
-                i64::MIN
-            }
-        };
-        run.low = run.low.max(low);
-        false
-    }
-    #[inline]
-    fn eval<const CACHE: bool, S: MaterialSurfaceQueries>(
-        &mut self,
-        context: &mut Context<S>,
-    ) -> Result<bool, MaterialRuleError> {
-        let column = match &mut self.kind {
-            Kind::Constant(value) => return Ok(*value),
-            Kind::Noise { sampler, min, max } => {
-                let value = context.noise(*sampler);
-                return Ok(value >= *min && value <= *max);
-            }
-            Kind::Not(child) => return child.eval::<CACHE, S>(context).map(|value| !value),
-            Kind::Simple(MaterialCondition::AbovePreliminarySurface) => {
-                return Ok(context.position.y >= context.minimum_surface_level()?);
-            }
-            Kind::Simple(MaterialCondition::Temperature) => {
-                let biome = context.biome()?.ok_or(MaterialRuleError::MissingBiome)?;
-                return context.surface.cold_enough_to_snow(
-                    &biome,
-                    context.position,
-                    context.generation.sea_level,
-                );
-            }
-            Kind::Simple(MaterialCondition::Hole | MaterialCondition::Steep) => true,
-            _ => false,
-        };
-        if !CACHE {
-            return self.compute(context);
+        if matches!(
+            self.kind,
+            Kind::Simple(MaterialCondition::AbovePreliminarySurface)
+        ) {
+            return Ok(context.position.y >= context.minimum_surface_level()?);
         }
+        if matches!(self.kind, Kind::Simple(MaterialCondition::Temperature)) {
+            let biome = context.biome()?.ok_or(MaterialRuleError::MissingBiome)?;
+            return context.surface.cold_enough_to_snow(
+                &biome,
+                context.position,
+                context.generation.sea_level,
+            );
+        }
+        if let Kind::Noise { sampler, min, max } = &self.kind {
+            let value = context.noise(*sampler);
+            return Ok(value >= *min && value <= *max);
+        }
+        if let Kind::Not(child) = &mut self.kind {
+            return child.test(context).map(|value| !value);
+        }
+        let column = matches!(
+            self.kind,
+            Kind::Simple(MaterialCondition::Hole | MaterialCondition::Steep)
+        );
         let revision = if column {
             context.column_revision
         } else {
@@ -815,15 +602,6 @@ impl<R: RandomSource> Compiled<R> {
                 .ok_or(MaterialRuleError::CachedConditionUnavailable);
         }
         self.revision = revision;
-        let result = self.compute(context)?;
-        self.result = Some(result);
-        Ok(result)
-    }
-    #[inline]
-    fn compute<S: MaterialSurfaceQueries>(
-        &self,
-        context: &mut Context<S>,
-    ) -> Result<bool, MaterialRuleError> {
         let result = match &self.kind {
             Kind::Biome(names) => names.contains(
                 context
@@ -908,6 +686,7 @@ impl<R: RandomSource> Compiled<R> {
             }
             _ => unreachable!("all recursive and gradient definitions are compiled"),
         };
+        self.result = Some(result);
         Ok(result)
     }
 }
@@ -953,7 +732,6 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
                 possible_biomes,
                 biome: None,
                 biome_id: None,
-                noise_floor: i32::MIN,
             },
             conditions: Vec::new(),
             rules: Vec::new(),
@@ -982,7 +760,6 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
         self.context.block_revision = self.context.block_revision.wrapping_add(1);
         self.context.biome = None;
         self.context.biome_id = None;
-        self.context.noise_floor = i32::MIN;
         self.context.position.y = y;
         self.context.stone_above = stone_above;
         self.context.stone_below = stone_below;

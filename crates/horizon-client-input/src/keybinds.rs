@@ -23,6 +23,8 @@ pub const MAPPINGS: &[(&str, &str, &str)] = &[
     ("key.pickItem", "key.mouse.middle", "gameplay"),
     ("key.command", "key.keyboard.slash", "multiplayer"),
     ("key.friends", "key.keyboard.o", "multiplayer"),
+    // Horizon's emote wheel (docs/cosmetics.md), on a key vanilla leaves free.
+    ("key.emote", "key.keyboard.b", "multiplayer"),
     ("key.socialInteractions", "key.keyboard.p", "multiplayer"),
     ("key.toggleGui", "key.keyboard.f1", "misc"),
     (
@@ -440,6 +442,18 @@ impl KeyBinds {
         }
         vec![Ok(key)]
     }
+    /// `Minecraft.handleKeybinds`: key.pickItem and key.spectatorHotbar share the middle button by
+    /// default and are separate mappings, so a press of what `input` is bound to acts only as the
+    /// one this player can use: the spectator hotbar for a spectator, pick block otherwise. (Pick
+    /// block does nothing a spectator would see.)
+    pub fn middle_acts(&self, input: &str, spectator: bool) -> bool {
+        let mapping = if spectator {
+            "key.spectatorHotbar"
+        } else {
+            "key.pickItem"
+        };
+        self.get(mapping) == input
+    }
     /// Translate a mouse button the same way (keys bound to mouse buttons).
     pub fn translate_mouse(&self, button: MouseButton) -> Option<Result<KeyCode, MouseButton>> {
         self.translate_mouse_all(button).into_iter().next()
@@ -483,11 +497,47 @@ impl KeyBinds {
             .find(|mapping| self.get(mapping) == name)
             .and_then(|mapping| key_code(Self::default_of(mapping)))
     }
+    /// `AbstractContainerScreen.checkHotbarKeyPressed`: the off hand and the
+    /// hotbar slots, as the controls bind them now. Answers the key the menu
+    /// acts on (`KeyF` for the off hand, `DigitN` for a slot), so a rebound key
+    /// swaps instead of reaching the screen.
+    pub fn container_hotbar_key(&self, key: KeyCode) -> Option<KeyCode> {
+        let name = key_name(key)?;
+        if self.get("key.swapOffhand") == name {
+            return Some(KeyCode::KeyF);
+        }
+        MAPPINGS
+            .iter()
+            .filter(|m| m.0.starts_with("key.hotbar."))
+            .find(|m| self.get(m.0) == name)
+            .and_then(|m| key_code(Self::default_of(m.0)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mappings_sharing_the_middle_button_act_as_themselves() {
+        let middle = "key.mouse.middle";
+        let z = "key.keyboard.z";
+        let mut keys = KeyBinds::default();
+        assert!(keys.middle_acts(middle, false) && keys.middle_acts(middle, true));
+        // The spectator hotbar on Z: the middle button only picks, and Z never picks.
+        keys.set("key.spectatorHotbar", z);
+        assert!(keys.middle_acts(middle, false));
+        assert!(!keys.middle_acts(middle, true));
+        assert!(keys.middle_acts(z, true));
+        assert!(!keys.middle_acts(z, false));
+        // Pick block on Z instead: the other way round.
+        keys.reset_all();
+        keys.set("key.pickItem", z);
+        assert!(keys.middle_acts(z, false));
+        assert!(!keys.middle_acts(z, true));
+        assert!(keys.middle_acts(middle, true));
+        assert!(!keys.middle_acts(middle, false));
+    }
     #[test]
     fn container_mouse_hotkeys_follow_slot_bindings_and_pick_item_priority() {
         for button in [MouseButton::Back, MouseButton::Forward, MouseButton::Middle] {
@@ -517,6 +567,29 @@ mod tests {
         assert_eq!(keys.container_mouse_key(MouseButton::Left, false), None);
         assert_eq!(keys.container_mouse_key(MouseButton::Right, false), None);
         assert_eq!(keys.container_mouse_key(MouseButton::Forward, false), None);
+    }
+
+    #[test]
+    fn container_hotkeys_follow_the_bound_keys() {
+        let mut keys = KeyBinds::default();
+        assert_eq!(
+            keys.container_hotbar_key(KeyCode::KeyF),
+            Some(KeyCode::KeyF)
+        );
+        assert_eq!(
+            keys.container_hotbar_key(KeyCode::Digit3),
+            Some(KeyCode::Digit3)
+        );
+        assert_eq!(keys.container_hotbar_key(KeyCode::Tab), None);
+        // The report's key: bound to the off hand, the menu takes it first.
+        keys.set("key.swapOffhand", "key.keyboard.tab");
+        assert_eq!(keys.container_hotbar_key(KeyCode::Tab), Some(KeyCode::KeyF));
+        assert_eq!(keys.container_hotbar_key(KeyCode::KeyF), None);
+        keys.set("key.hotbar.3", "key.keyboard.t");
+        assert_eq!(
+            keys.container_hotbar_key(KeyCode::KeyT),
+            Some(KeyCode::Digit3)
+        );
     }
 
     #[test]

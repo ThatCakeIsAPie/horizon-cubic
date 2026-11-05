@@ -1,10 +1,10 @@
 //! Commands of the hosted game rather than the world: `/dialog`, `/kick`,
 //! `/posteffect`, `/fetchprofile`, `/spectate`, `/publish`, `/unpublish`,
 //! `/waypoint`, `/debug`, `/jfr` and `/test`; on a dedicated server only,
-//! `/op`, `/deop`, `/ban`, `/ban-ip`, `/banlist`, `/pardon`, `/pardon-ip` and
-//! `/whitelist`.
+//! `/op`, `/deop`, `/ban`, `/ban-ip`, `/banlist`, `/pardon`, `/pardon-ip`,
+//! `/setidletimeout`, `/transfer` and `/whitelist`.
 use super::{
-    Dispatcher,
+    Dispatcher, Suggests,
     args::ArgType,
     vanilla::{ENTITY, GAMEMASTERS, PLAYER, PLAYERS},
 };
@@ -229,17 +229,35 @@ pub fn register_dedicated(d: &mut Dispatcher, root: usize) {
     }
 
     // OpCommand, DeOpCommands, BanPlayerCommands, PardonCommand
-    for (name, id) in [("op", "op"), ("deop", "deop"), ("pardon", "pardon")] {
+    for (name, id, suggests) in [
+        ("op", "op", Suggests::NonOperators),
+        ("deop", "deop", Suggests::Operators),
+        ("pardon", "pardon", Suggests::BannedPlayers),
+    ] {
         let n = d.literal(root, name);
         d.requires(n, ADMINS);
         let t = d.argument(n, "targets", ArgType::GameProfile);
+        d.suggests(t, suggests);
         d.executes(t, id);
     }
     // PardonIpCommand
     let pardon_ip = d.literal(root, "pardon-ip");
     d.requires(pardon_ip, ADMINS);
     let t = d.argument(pardon_ip, "target", ArgType::Word);
+    d.suggests(t, Suggests::BannedIps);
     d.executes(t, "pardon-ip");
+
+    // SaveAllCommand (`flush` too), SaveOffCommand, SaveOnCommand, StopCommand
+    let save_all = d.literal(root, "save-all");
+    d.requires(save_all, OWNERS);
+    d.executes(save_all, "save-all");
+    let flush = d.literal(save_all, "flush");
+    d.executes(flush, "save-all");
+    for name in ["save-off", "save-on", "stop"] {
+        let n = d.literal(root, name);
+        d.requires(n, OWNERS);
+        d.executes(n, name);
+    }
 
     let ban = d.literal(root, "ban");
     d.requires(ban, ADMINS);
@@ -247,6 +265,29 @@ pub fn register_dedicated(d: &mut Dispatcher, root: usize) {
     d.executes(t, "ban");
     let reason = d.argument(t, "reason", ArgType::Message);
     d.executes(reason, "ban");
+
+    // SetPlayerIdleTimeoutCommand: minutes, 0 to never kick for idleness.
+    let idle = d.literal(root, "setidletimeout");
+    d.requires(idle, ADMINS);
+    let minutes = d.argument(
+        idle,
+        "minutes",
+        ArgType::Integer {
+            min: 0,
+            max: i32::MAX,
+        },
+    );
+    d.executes(minutes, "setidletimeout");
+
+    // TransferCommand: <hostname> [<port> [<players>]], the port 1 to 65535.
+    let transfer = d.literal(root, "transfer");
+    d.requires(transfer, ADMINS);
+    let hostname = d.argument(transfer, "hostname", ArgType::Str);
+    d.executes(hostname, "transfer");
+    let port = d.argument(hostname, "port", ArgType::Integer { min: 1, max: 65535 });
+    d.executes(port, "transfer");
+    let players = d.argument(port, "players", PLAYERS);
+    d.executes(players, "transfer");
 
     // WhitelistCommand
     let whitelist = d.literal(root, "whitelist");
@@ -259,9 +300,13 @@ pub fn register_dedicated(d: &mut Dispatcher, root: usize) {
         let w = d.literal(whitelist, word);
         d.executes(w, id);
     }
-    for (word, id) in [("add", "whitelist.add"), ("remove", "whitelist.remove")] {
+    for (word, id, suggests) in [
+        ("add", "whitelist.add", Suggests::NonWhitelisted),
+        ("remove", "whitelist.remove", Suggests::Whitelisted),
+    ] {
         let w = d.literal(whitelist, word);
         let t = d.argument(w, "targets", ArgType::GameProfile);
+        d.suggests(t, suggests);
         d.executes(t, id);
     }
     let reload = d.literal(whitelist, "reload");

@@ -3,7 +3,8 @@
 //! beside glass and leaves, back faces, cardinal shading and max(self, above)
 //! light.
 use super::{
-    Info, MeshTables, Padded, SectionMesh, TerrainVertex, lighting, pack_coords, pack_rgb, pi,
+    Info, MeshTables, Padded, SectionMesh, TerrainVertex, fluid_face, lighting, pack_coords,
+    pack_rgb, pi,
 };
 use horizon_core::{
     geometry::{Axis, Direction, VoxelShape, trig},
@@ -187,16 +188,41 @@ impl FluidFlowWorld for FlowView<'_> {
         Ok(self.info[state as usize].sturdy & 1 << d as u8 != 0)
     }
 }
+/// Whether a `shaders/` pack's fluid top with these corner heights is split into triangles along
+/// its north-east to south-west diagonal, as Iris 1.11.7 draws it, rather than along vanilla's
+/// north-west to south-east one (`FluidRenderer.tesselate` puts its vertices NW, SW, SE, NE, and
+/// `RenderSystem`'s quad indices join vertex 0 to 2).
+///
+/// Our probe packs' readings of Iris (#8464) fit this: a top is split along the diagonal whose
+/// corners differ more in height, and a top whose north-west and south-east corners are level
+/// (a still, flat top among them) along north-east to south-west. It is a fit, not Iris's code:
+/// it covers every lava top we read and every still top but one, and misses 26 of the 343 water
+/// tops we read (undiagnosed).
+pub(super) fn splits_north_east(nw: f32, ne: f32, sw: f32, se: f32) -> bool {
+    let (along_nw, along_ne) = ((nw - se).abs(), (ne - sw).abs());
+    along_nw < along_ne || along_nw == 0.0
+}
 /// Emits one fluid cell at section-relative `[x, y, z]`.
+/// `(nether, shader_pack_lighting, separate_ao, shader_pack)`: the Nether's face shading, only the
+/// up-face value when a shader pack lights the faces (`Mesher::shader_pack_lighting`), whether to
+/// keep pure alpha for separate AO, and whether a `shaders/` pack draws the terrain
+/// (`Mesher::shader_pack`: tops split as Iris splits them, [`splits_north_east`]).
 pub(super) fn tesselate(
     tables: &MeshTables,
-    nether: bool,
+    (nether, shader_pack_lighting, separate_ao, shader_pack): (bool, bool, bool, bool),
     pad: &Padded,
     water_color: u32,
     out: &mut SectionMesh,
     [x, y, z]: [i32; 3],
 ) {
     use horizon_assets::model::Direction as D;
+    let cardinal = |d: D| {
+        if shader_pack_lighting {
+            lighting::pack_flat(nether)
+        } else {
+            lighting::cardinal(nether, d)
+        }
+    };
     let info = &tables.info;
     let at = |p: [i32; 3]| &info[pad.blocks[pi(p[0], p[1], p[2])] as usize];
     let me = at([x, y, z]);
@@ -230,11 +256,15 @@ pub(super) fn tesselate(
     let emission = if water {
         0
     } else {
-        crate::mesher::INCANDESCENT
+        crate::mesher::hdr_tier("lava", 15)
     };
     let color = |by: f32| {
         let rgb = [16, 8, 0].map(|shift| lighting::scale((tint >> shift & 255) as i32, by) as u32);
-        crate::mesher::emitting(pack_rgb(rgb), emission)
+        if separate_ao {
+            pack_rgb(rgb)
+        } else {
+            crate::mesher::emitting(pack_rgb(rgb), emission)
+        }
     };
     let height = |p: [i32; 3]| -> f32 {
         let s = at(p);
@@ -310,14 +340,27 @@ pub(super) fn tesselate(
     } else {
         &mut out.solid
     };
-    let mut quad =
-        |v: [([f32; 3], [f32; 2]); 4], layer: u16, color: u32, light: u16, back: bool| {
-            let vertex = |(pos, uv)| TerrainVertex::new(pos, uv, layer, color, light);
-            target.extend(v.map(vertex));
-            if back {
-                target.extend([v[0], v[3], v[2], v[1]].map(vertex));
-            }
+    let mut sprite_layers = Vec::new();
+    let mut quad = |v: [([f32; 3], [f32; 2]); 4],
+                    layer: u16,
+                    color: u32,
+                    light: u16,
+                    back: bool,
+                    face: usize| {
+        if tables.is_animated(layer) && !sprite_layers.contains(&layer) {
+            sprite_layers.push(layer);
+        }
+        let color = if separate_ao {
+            color
+        } else {
+            fluid_face(color, face)
         };
+        let vertex = |(pos, uv)| TerrainVertex::new(pos, uv, layer, color, light);
+        target.extend(v.map(vertex));
+        if back {
+            target.extend([v[0], v[3], v[2], v[1]].map(vertex));
+        }
+    };
     let (fx, fy, fz) = (x as f32, y as f32, z as f32);
     let bottom = if render_down { EPSILON } else { 0.0 };
     if render_up && !occluded_by(Direction::Up, nw.min(sw).min(se.min(ne)), up) {
@@ -355,17 +398,24 @@ pub(super) fn tesselate(
                 !same(s) && !s.solid
             })
         });
+        let mut corners = [
+            ([fx, fy + nw, fz], uv[0]),
+            ([fx, fy + sw, fz + 1.0], uv[1]),
+            ([fx + 1.0, fy + se, fz + 1.0], uv[2]),
+            ([fx + 1.0, fy + ne, fz], uv[3]),
+        ];
+        // Starting from the south-west corner joins it to the north-east one (0 to 2), with the
+        // same winding.
+        if shader_pack && splits_north_east(nw, ne, sw, se) {
+            corners.rotate_left(1);
+        }
         quad(
-            [
-                ([fx, fy + nw, fz], uv[0]),
-                ([fx, fy + sw, fz + 1.0], uv[1]),
-                ([fx + 1.0, fy + se, fz + 1.0], uv[2]),
-                ([fx + 1.0, fy + ne, fz], uv[3]),
-            ],
+            corners,
             layer,
-            color(lighting::cardinal(nether, D::Up)),
+            color(cardinal(D::Up)),
             light([x, y, z]),
             backward,
+            Direction::Up as usize,
         );
     }
     if render_down {
@@ -378,13 +428,14 @@ pub(super) fn tesselate(
                 ([fx, y0, fz + 1.0], [0.0, 1.0]),
             ],
             still,
-            color(lighting::cardinal(nether, D::Down)),
+            color(cardinal(D::Down)),
             light([x, y - 1, z]),
             false,
+            Direction::Down as usize,
         );
     }
     let side_light = light([x, y, z]);
-    let up_shade = lighting::cardinal(nether, D::Up);
+    let up_shade = cardinal(D::Up);
     for (i, d) in [
         Direction::North,
         Direction::South,
@@ -418,10 +469,13 @@ pub(super) fn tesselate(
             Some(layer) if face_state.overlay => (layer, true),
             _ => (flow, false),
         };
-        let side = if matches!(d, Direction::North | Direction::South) {
-            lighting::cardinal(nether, D::North)
+        // Vanilla's side is the up value times the side's; a shader pack's has no side factor.
+        let side = if shader_pack_lighting {
+            1.0
+        } else if matches!(d, Direction::North | Direction::South) {
+            cardinal(D::North)
         } else {
-            lighting::cardinal(nether, D::West)
+            cardinal(D::West)
         };
         let (v0, v1) = ((1.0 - h0) * 0.5, (1.0 - h1) * 0.5);
         quad(
@@ -435,8 +489,10 @@ pub(super) fn tesselate(
             color(up_shade * side),
             side_light,
             !is_overlay,
+            d as usize,
         );
     }
+    out.sprite_layers.extend(sprite_layers);
 }
 
 #[cfg(test)]
@@ -456,6 +512,49 @@ mod tests {
             assert!((atan2(y, x) - exact).abs() < 1e-6, "{y} {x}");
         }
         assert!(atan2(f64::NAN, 1.0).is_nan());
+    }
+    /// Corner heights read back from Iris 1.11.7 with a probe pack of ours (#8464), from water
+    /// and lava spreading over a floor and from a still lake, and whether Iris split each top
+    /// along north-east to south-west. Each height is the vanilla average it reads as (for
+    /// example 13/27 for 0.48047 + 0.001), less `FluidRenderer`'s 0.001.
+    #[test]
+    fn fluid_tops_split_where_iris_splits_them() {
+        let h = |num: f32, den: f32| num / den - 0.001;
+        // (north-west, north-east, south-west, south-east)
+        let cases = [
+            // Still and flat: a lake's water, a lava pool.
+            ([h(8.0, 9.0); 4], true),
+            ([h(96.0, 117.0); 4], true),
+            // Level along one axis: both diagonals equally steep.
+            (
+                [h(5.0, 9.0), h(13.0, 27.0), h(5.0, 9.0), h(13.0, 27.0)],
+                false,
+            ),
+            (
+                [h(100.0, 117.0), h(100.0, 117.0), h(2.0, 3.0), h(2.0, 3.0)],
+                false,
+            ),
+            // North-west to south-east steeper.
+            ([h(5.0, 9.0), h(4.0, 9.0), h(4.0, 9.0), h(7.0, 18.0)], false),
+            ([h(7.0, 18.0), h(4.0, 9.0), h(4.0, 9.0), h(5.0, 9.0)], false),
+            ([h(5.0, 6.0), h(4.0, 9.0), h(2.0, 9.0), h(2.0, 9.0)], false),
+            // North-east to south-west steeper.
+            ([h(1.0, 2.0), h(5.0, 9.0), h(7.0, 18.0), h(4.0, 9.0)], true),
+            (
+                [h(4.0, 9.0), h(2.0, 9.0), h(96.0, 117.0), h(4.0, 9.0)],
+                true,
+            ),
+            // North-west and south-east level: a saddle.
+            ([h(4.0, 9.0), h(7.0, 18.0), h(7.0, 18.0), h(4.0, 9.0)], true),
+        ];
+        for ([nw, ne, sw, se], iris) in cases {
+            assert_eq!(
+                splits_north_east(nw, ne, sw, se),
+                iris,
+                "{:?}",
+                [nw, ne, sw, se]
+            );
+        }
     }
     #[test]
     fn coverage_of_full_and_partial_faces() {

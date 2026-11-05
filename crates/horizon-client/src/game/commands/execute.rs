@@ -134,12 +134,18 @@ impl Game<'_> {
                 .boats
                 .iter()
                 .find(|b| b.id == id)
-                .map_or([0.0; 2], |b| [b.yaw, 0.0]),
+                .map_or([0.0; 2], |b| [b.yaw, b.pitch]),
             Target::Cart(id) => self
                 .carts
                 .iter()
                 .find(|c| c.id == id)
-                .map_or([0.0; 2], |c| [c.yaw, 0.0]),
+                .map_or([0.0; 2], |c| [c.yaw, c.pitch]),
+            Target::Fangs(id) => self
+                .fangs
+                .list
+                .iter()
+                .find(|f| f.id == id)
+                .map_or([0.0; 2], |f| [f.yaw, 0.0]),
             Target::Other(id) => self
                 .others
                 .iter()
@@ -148,7 +154,7 @@ impl Game<'_> {
             _ => [0.0; 2],
         }
     }
-    pub(super) fn target_eye_height(&self, t: Target) -> f64 {
+    pub(in crate::game) fn target_eye_height(&self, t: Target) -> f64 {
         match t {
             Target::Player => self
                 .player
@@ -226,7 +232,7 @@ impl Game<'_> {
     /// Run one command line with `source` (no error reporting): the entry
     /// for functions and `execute run`.
     pub(in crate::game) fn execute_line(&mut self, line: &str, source: Source) -> R<i32> {
-        let d = vanilla::game_dispatcher();
+        let d = vanilla::game_dispatcher_with_features(&self.level.enabled_features);
         let parse = d.parse(line, &self.ui.registries);
         let (ctx, _) = parse.executable()?;
         let ctx = ctx.clone();
@@ -647,30 +653,54 @@ impl Game<'_> {
             _ => return Err(err("command.unknown.command", &[])),
         })
     }
-    /// The entities `on <relation>` reaches from the source entity.
+    /// `ExecuteCommand.createRelationOperations`: the entities `on <relation>` reaches.
     fn relation(&mut self, c: &Context, s: Source) -> Vec<Source> {
         let Some(entity) = s.entity else {
             return Vec::new();
         };
         let found: Vec<Target> = match c.literals.last().map(String::as_str) {
             Some("owner") => match entity {
+                // OwnableEntity.getOwner → EntityReference.getLivingEntity:
+                // a marker or a display with that UUID is not an owner.
                 Target::Mob(id) => self
                     .mobs
                     .iter()
                     .find(|m| m.id == id)
                     .and_then(|m| m.extra.owner)
-                    .and_then(|u| self.target_with_uuid(u))
+                    // A guest owner too, not only the player in place.
+                    .and_then(|u| {
+                        self.target_by_uuid(horizon_client::lan::playerdata::ints_uuid(u))
+                    })
+                    .filter(|owner| {
+                        matches!(
+                            owner,
+                            Target::Player
+                                | Target::Guest(_)
+                                | Target::Mob(_)
+                                | Target::Stand(_)
+                                | Target::Dragon(_)
+                        )
+                    })
                     .into_iter()
                     .collect(),
                 _ => Vec::new(),
             },
-            // Leashable.getLeashHolder: a fence knot is not an entity here.
-            Some("leasher") => match entity {
-                Target::Mob(id) => self
-                    .mobs
-                    .iter()
-                    .find(|m| m.id == id)
-                    .and_then(|m| m.extra.leash.map(|holder| (holder, m.extra.leash_player)))
+            // Leashable.getLeashHolder: the server's resolved holder, not a
+            // saved UUID that is still waiting for tickLeash to restore it.
+            Some("leasher") => {
+                let leash =
+                    match entity {
+                        Target::Mob(id) => self.mobs.iter().find(|m| m.id == id).and_then(|m| {
+                            m.extra.leash.map(|holder| (holder, m.extra.leash_player))
+                        }),
+                        Target::Boat(id) => self
+                            .boats
+                            .iter()
+                            .find(|b| b.id == id)
+                            .and_then(|b| b.leash.map(|holder| (holder, b.leash_player))),
+                        _ => None,
+                    };
+                leash
                     .and_then(|(holder, player)| match holder {
                         // The player who tied it (the host's when unrecorded).
                         horizon_client::mobs::leash::Holder::Player => {
@@ -682,9 +712,8 @@ impl Game<'_> {
                         | horizon_client::mobs::leash::Holder::Knot(_) => None,
                     })
                     .into_iter()
-                    .collect(),
-                _ => Vec::new(),
-            },
+                    .collect()
+            }
             // TraceableEntity.getOwner: who shot a projectile, who threw an
             // item, who summoned a vex.
             Some("origin") => match entity {
@@ -693,18 +722,29 @@ impl Game<'_> {
                     .projectiles
                     .iter()
                     .find(|p| p.id == id)
-                    .and_then(|p| match (p.owner?, p.guest) {
-                        // A guest's shot: `Who::Player` is them.
-                        (horizon_client::mobs::Who::Player, Some(conn))
-                            if self.lan_acting == Some(conn) =>
-                        {
-                            Some(Target::Player)
+                    .and_then(|p| {
+                        // Projectile.getOwner resolves EntityReference<Entity>,
+                        // including loaded owners that cannot be a Who.
+                        let Some(owner) = p.owner else {
+                            return p.owner_uuid.and_then(|uuid| {
+                                self.target_by_uuid(horizon_client::lan::playerdata::ints_uuid(
+                                    uuid,
+                                ))
+                            });
+                        };
+                        match (owner, p.guest) {
+                            // A guest's shot: `Who::Player` is them.
+                            (horizon_client::mobs::Who::Player, Some(conn))
+                                if self.lan_acting == Some(conn) =>
+                            {
+                                Some(Target::Player)
+                            }
+                            (horizon_client::mobs::Who::Player, Some(conn)) => {
+                                Some(Target::Guest(conn))
+                            }
+                            (horizon_client::mobs::Who::Player, None) => Some(Target::Player),
+                            (horizon_client::mobs::Who::Mob(id), _) => Some(Target::Mob(id)),
                         }
-                        (horizon_client::mobs::Who::Player, Some(conn)) => {
-                            Some(Target::Guest(conn))
-                        }
-                        (horizon_client::mobs::Who::Player, None) => Some(Target::Player),
-                        (horizon_client::mobs::Who::Mob(id), _) => Some(Target::Mob(id)),
                     })
                     .into_iter()
                     .collect(),
@@ -754,7 +794,18 @@ impl Game<'_> {
                             }
                         })
                         .map(|w| match w {
-                            horizon_client::mobs::Who::Player => Target::Player,
+                            horizon_client::mobs::Who::Player => {
+                                // LivingEntity.getLastHurtByMob is the player
+                                // who hit it, not whichever client is reading it.
+                                match self.last_hurt_by_player.get(&id) {
+                                    Some(Some(conn))
+                                        if attacker && self.lan_acting != Some(*conn) =>
+                                    {
+                                        Target::Guest(*conn)
+                                    }
+                                    _ => Target::Player,
+                                }
+                            }
                             horizon_client::mobs::Who::Mob(i) => Target::Mob(i),
                         })
                         .into_iter()
@@ -773,20 +824,20 @@ impl Game<'_> {
             })
             .collect()
     }
-    pub(super) fn target_with_uuid(&self, uuid: [i32; 4]) -> Option<Target> {
-        if Some(uuid) == self.level.player_uuid {
+    /// `ServerLevel.getEntity(UUID)`: any entity of the level in place, not
+    /// only mobs (displays, armor stands, items...). The map is keyed by id,
+    /// so a killed entity and a later summon of the same UUID can both be
+    /// in it; the one the level still holds is the entity.
+    pub(in crate::game) fn target_with_uuid(&self, uuid: [i32; 4]) -> Option<Target> {
+        if is_player_in_place(uuid, self.lan_acting_uuid, self.level.player_uuid) {
             return Some(Target::Player);
         }
-        let id = self
-            .persist
-            .uuids
-            .iter()
-            .find(|(_, u)| **u == uuid)
-            .map(|(id, _)| *id)?;
-        self.mobs
-            .iter()
-            .any(|m| m.id == id)
-            .then_some(Target::Mob(id))
+        self.persist.uuids.iter().find_map(|(&id, found)| {
+            if *found != uuid {
+                return None;
+            }
+            self.level_entity(i32::try_from(id).ok()?)
+        })
     }
     /// The highest block of a heightmap type at a column (`Level.getHeight`).
     fn heightmap_at(&self, kind: &str, x: i32, z: i32) -> i32 {
@@ -906,6 +957,17 @@ impl Game<'_> {
         let keep = results.iter().any(|r| r.is_some_and(|v| (v != 0) == want));
         Ok((keep, 0))
     }
+    /// `ExecuteCommand.isChunkLoaded`: an entity-ticking loading status and
+    /// completed entity loading, rather than merely a retained lit column.
+    fn command_chunk_loaded(&self, x: i32, z: i32) -> bool {
+        self.tickets.levels().loaded_entity_ticking(x, z)
+            && self.world.chunks.contains_key(&(x, z))
+            && self.streaming.is_lit(x, z)
+            // Streaming queues the saved tags before making the column resident;
+            // spawn_loaded_entities applies them before this chunk's entities run.
+            && !self.world.loaded_entities.iter().any(|(key, _)| *key == (x, z))
+    }
+
     fn condition_matches(&mut self, c: &Context) -> R<(bool, i32)> {
         let flag = |b: bool| (b, i32::from(b));
         if c.has("data") {
@@ -933,12 +995,10 @@ impl Game<'_> {
                 .coords(c, "pos")
                 .map(|co| co.block(self.source_position(), self.source_rotation()));
             let dimension = self.command_source.map_or(self.dim, |s| s.dimension);
-            // ExecuteCommand.isChunkLoaded: ENTITY_TICKING, which is past lit.
-            let loaded = |p: [i32; 3]| {
-                let key = (p[0] >> 4, p[2] >> 4);
-                self.world.chunks.contains_key(&key) && self.streaming.is_lit(key.0, key.1)
-            };
-            return Ok(flag(dimension == self.dim && p.is_some_and(loaded)));
+            return Ok(flag(
+                dimension == self.dim
+                    && p.is_some_and(|p| self.command_chunk_loaded(p[0] >> 4, p[2] >> 4)),
+            ));
         }
         if c.has("dimension") {
             let dimension = self.command_source.map_or(self.dim, |s| s.dimension);
@@ -1090,9 +1150,11 @@ impl Game<'_> {
     /// The biome name at a block position.
     fn biome_name_at_block(&self, p: [i32; 3]) -> Option<String> {
         let chunk = self.world.chunks.get(&(p[0] >> 4, p[2] >> 4))?;
+        // The world's table (`world_biomes!`): a packed biome's id is past
+        // the built-in list, and `Biomes::get` would clamp it to the last
+        // vanilla one.
         Some(
-            self.res
-                .biomes()
+            world_biomes!(self)
                 .get(chunk.biome(p[0], p[1], p[2]))
                 .name
                 .clone(),
@@ -1101,30 +1163,56 @@ impl Game<'_> {
     /// A biome id or `#tag` matched against a biome name.
     pub(super) fn biome_matches(&self, wanted: &str, biome: &str) -> bool {
         match wanted.strip_prefix('#') {
-            Some(tag) => self.biome_tag_has(tag, biome, 0),
+            Some(tag) => self.biome_tag_has(tag, biome),
             None => wanted == biome,
         }
     }
-    fn biome_tag_has(&self, tag: &str, biome: &str, depth: u32) -> bool {
-        if depth > 8 {
-            return false;
-        }
-        let (ns, path) = tag.split_once(':').unwrap_or(("minecraft", tag));
-        let file = self
-            .options
-            .resources
-            .join(format!("data/{ns}/tags/worldgen/biome/{path}.json"));
-        let Ok(bytes) = std::fs::read(file) else {
-            return self.res.mob_data().biome_has(tag, biome);
-        };
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        v["values"].as_array().is_some_and(|a| {
-            a.iter()
-                .filter_map(|e| e.as_str())
-                .any(|e| match e.strip_prefix('#') {
-                    Some(inner) => self.biome_tag_has(inner, biome, depth + 1),
-                    None => e == biome,
-                })
-        })
+    /// `#tag`: the biome tags the game's files and the world's packs define,
+    /// nested tags expanded; an unknown tag falls back to the game's built-in
+    /// table.
+    fn biome_tag_has(&self, tag: &str, biome: &str) -> bool {
+        let entries = self.tag_entries("worldgen/biome", tag);
+        entries.iter().any(|id| id == biome)
+            || (entries.is_empty() && self.res.mob_data().biome_has(tag, biome))
+    }
+}
+
+/// Whether `uuid` is the player in place (`Target::Player`): during a guest's turn that is the guest, not the
+/// level's own player (the world owner), whom `Level.getEntity(UUID)` finds only while they are in the level.
+fn is_player_in_place(
+    uuid: [i32; 4],
+    acting: Option<u128>,
+    level_player: Option<[i32; 4]>,
+) -> bool {
+    match acting {
+        Some(guest) => horizon_client::lan::playerdata::ints_uuid(uuid) == guest,
+        None => Some(uuid) == level_player,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_player_in_place;
+    use horizon_client::lan::playerdata::ints_uuid;
+
+    const OWNER: [i32; 4] = [0, 0, 0, 12];
+    const GUEST: [i32; 4] = [0, 0, 0, 13];
+
+    /// A owns the world, B is a guest: the sequence of one command each way.
+    #[test]
+    fn the_owners_uuid_is_not_the_guest_in_place() {
+        // A's own command, or the single-player one: no guest in place, the level's player is.
+        assert!(is_player_in_place(OWNER, None, Some(OWNER)));
+        assert!(!is_player_in_place(GUEST, None, Some(OWNER)));
+        // B's turn: only B is in place, the owner's UUID names someone else.
+        let b = Some(ints_uuid(GUEST));
+        assert!(is_player_in_place(GUEST, b, Some(OWNER)));
+        assert!(!is_player_in_place(OWNER, b, Some(OWNER)));
+        // A's own turn as a guest of an integrated server.
+        let a = Some(ints_uuid(OWNER));
+        assert!(is_player_in_place(OWNER, a, Some(OWNER)));
+        assert!(!is_player_in_place(GUEST, a, Some(OWNER)));
+        // No level player at all (a dedicated server): nobody is in place without a guest.
+        assert!(!is_player_in_place(OWNER, None, None));
     }
 }

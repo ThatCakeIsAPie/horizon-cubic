@@ -17,7 +17,7 @@ use crate::projectiles::{Projectile, ProjectileKind};
 use horizon_core::{geometry::Vec3, random::RandomSource};
 
 /// `Enemy` monsters an iron golem goes after (never creepers).
-fn golem_prey(s: &super::Seen) -> bool {
+pub(super) fn golem_prey(s: &super::Seen) -> bool {
     s.hostile && s.species != Species::Creeper
 }
 /// `IronGolem.registerGoals`, without `ResetUniversalAngerTargetGoal` (that
@@ -30,6 +30,7 @@ pub fn register_iron(m: &mut Mob) {
         MoveTowardsTarget {
             speed: 0.9,
             within: 32.0,
+            wanted: [0.0; 3],
         },
     );
     let mut back = Stroll::new(0.6)
@@ -237,6 +238,8 @@ impl Goal for DefendVillage {
 struct MoveTowardsTarget {
     speed: f64,
     within: f64,
+    /// The spot `canUse` picked, which `start` walks to.
+    wanted: [f64; 3],
 }
 impl Goal for MoveTowardsTarget {
     goal_clone!();
@@ -250,12 +253,23 @@ impl Goal for MoveTowardsTarget {
         if m.distance_sqr(t.position) > self.within * self.within {
             return false;
         }
-        m.nav_move_to_entity(
+        // MoveTowardsTargetGoal.canUse: a spot up to 16 blocks out and 7 up or
+        // down, within a quarter turn of the target's own position.
+        let Some(p) = m.default_random_pos_towards(
             cx.w,
+            16,
+            7,
             [t.position.x, t.position.y, t.position.z],
-            0,
-            self.speed,
-        )
+            std::f64::consts::FRAC_PI_2,
+        ) else {
+            return false;
+        };
+        self.wanted = p;
+        true
+    }
+    fn start(&mut self, m: &mut Mob, cx: &mut Cx) {
+        // MoveTowardsTargetGoal.start: `PathNavigation.moveTo(x, y, z, speed)`.
+        m.nav_move_to(cx.w, self.wanted, self.speed);
     }
     fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
         !m.ai.nav.is_done()
@@ -526,6 +540,7 @@ pub fn snow_ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
         );
         if here.name.as_ref() == "minecraft:air" && below.full_collision && !ice {
             events.push(MobEvent::SetBlockName {
+                mob: Some(m.id),
                 pos: [xx, y, zz],
                 name: "minecraft:snow",
                 effect: false,
@@ -546,6 +561,77 @@ mod tests {
         let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
         kind.species = species;
         Mob::new(id, Arc::new(kind), at, 0.0)
+    }
+
+    /// `MoveTowardsTargetGoal.canUse` picks a random spot within 16 blocks and
+    /// 7 up or down toward the target and keeps it for `start`, so the golem
+    /// walks to that spot rather than straight at the entity.
+    #[test]
+    fn an_iron_golem_walks_to_a_spot_near_its_target() {
+        let build = |world: &mut crate::world::World,
+                     registry: &horizon_world::registry::BlockRegistry| {
+            let stone = registry.default_state("minecraft:stone").unwrap();
+            for cx in -2..2 {
+                for cz in -2..2 {
+                    world.chunks.insert(
+                        (cx, cz),
+                        std::sync::Arc::new(crate::chunk::Chunk::empty(cx, cz)),
+                    );
+                }
+            }
+            for x in -24..24 {
+                for z in -24..24 {
+                    for y in 60..=63 {
+                        world.set(x, y, z, stone).unwrap();
+                    }
+                }
+            }
+        };
+        crate::mobs::world::with_built_test_world(&[], build, |w, _| {
+            let mut w = w.clone();
+            w.player = Some(test_player(Vec3::new(8.5, 64.0, 0.5)));
+            // The spot is drawn at random, and a flat world only offers a few
+            // heights: the seed follows the mob's id, so try the ids in turn
+            // (vanilla gives the pick ten candidates before giving up).
+            let mut found = None;
+            for id in 1..400 {
+                let mut m = mob(id, Species::IronGolem, Vec3::new(0.5, 64.0, 0.5));
+                m.ai.target = Some(Who::Player);
+                let mut goal = MoveTowardsTarget {
+                    speed: 0.9,
+                    within: 32.0,
+                    wanted: [0.0; 3],
+                };
+                let mut events = Vec::new();
+                let mut lr = horizon_core::random::LegacyRandom::new(0);
+                let mut cx = Cx {
+                    w: &w,
+                    lr: &mut lr,
+                    events: &mut events,
+                };
+                if goal.can_use(&mut m, &mut cx) {
+                    found = Some((m, goal));
+                    break;
+                }
+            }
+            let (m, goal) = found.expect("a spot among ten candidates");
+            let wanted = goal.wanted;
+            let (dx, dz) = (wanted[0] - m.position.x, wanted[2] - m.position.z);
+            assert!((dx * dx + dz * dz).sqrt() <= 16.0, "within 16 blocks");
+            assert!(
+                (wanted[1] - m.position.y).abs() <= 7.0,
+                "within 7 up or down"
+            );
+            // `DefaultRandomPos.getPosTowards` only accepts a spot within a
+            // quarter turn of the target, so the horizontal step to the spot
+            // is at most 90 degrees off the step to the target.
+            let to_target = (8.5 - m.position.x, 0.5 - m.position.z);
+            let to_spot = (wanted[0] - m.position.x, wanted[2] - m.position.z);
+            assert!(
+                to_target.0 * to_spot.0 + to_target.1 * to_spot.1 >= 0.0,
+                "the spot is toward the target"
+            );
+        });
     }
 
     /// `IronGolem.canAttack` refuses creepers, and `HurtByTargetGoal.canUse`
@@ -602,5 +688,147 @@ mod tests {
             goal.start(&mut golem, &mut cx);
             assert_eq!(golem.ai.target, Some(Who::Player));
         });
+    }
+}
+
+#[cfg(test)]
+mod created_golem_tests {
+    use super::*;
+    use crate::mobs::world::{test_player, with_test_world};
+    use std::sync::Arc;
+
+    /// The target `m`'s target goals pick over `ticks` ticks in `w`.
+    fn target(m: &mut Mob, w: &MobWorld<'_>, ticks: u32) -> Option<Who> {
+        let mut events = Vec::new();
+        let mut lr = horizon_core::random::LegacyRandom::new(0);
+        let mut goals = std::mem::take(&mut m.ai.targets);
+        {
+            let mut cx = Cx {
+                w,
+                lr: &mut lr,
+                events: &mut events,
+            };
+            for _ in 0..ticks {
+                goals.tick(m, &mut cx);
+            }
+        }
+        m.ai.targets = goals;
+        m.ai.target
+    }
+    /// A player-built and a village iron golem, both angry at a player, and a
+    /// zombie; `None` without the extracted vanilla data.
+    fn angry_golems() -> Option<(Mob, Mob, crate::mobs::Seen)> {
+        let mut out = None;
+        with_test_world(&[], |_, types| {
+            let golem = |id: u32, created: bool| {
+                let kind = Arc::new(types.types["minecraft:iron_golem"].clone());
+                let mut m = Mob::new(id, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+                // `CarvedPumpkinBlock.trySpawnGolem`: setPlayerCreated(true).
+                m.extra.player_created = created;
+                // The anger a player's hit gives it (`after_hurt`).
+                m.extra.anger = 400;
+                m
+            };
+            let zombie = Mob::new(
+                3,
+                Arc::new(types.types["minecraft:zombie"].clone()),
+                Vec3::new(0.5, 64.0, 2.5),
+                0.0,
+            );
+            out = Some((golem(1, true), golem(2, false), zombie.seen(None)));
+        });
+        out
+    }
+
+    /// `IronGolem.canAttack`: a golem a player built never takes a player as
+    /// its target, though a village golem does and both still go after
+    /// monsters. The world holds one player, so "its builder" and "a player"
+    /// are the same check, as they are in vanilla.
+    #[test]
+    fn a_golem_a_player_built_never_targets_one() {
+        let Some((mut built, mut village, zombie)) = angry_golems() else {
+            return;
+        };
+        with_test_world(&[], |w, _| {
+            let mut w = w.clone();
+            w.player = Some(test_player(Vec3::new(2.5, 64.0, 0.5)));
+            assert_eq!(
+                target(&mut built, &w, 200),
+                None,
+                "a golem a player built turned on its builder"
+            );
+            assert_eq!(
+                target(&mut village, &w, 200),
+                Some(Who::Player),
+                "a village golem goes after the player"
+            );
+        });
+        with_test_world(&[zombie], |w, _| {
+            assert_eq!(
+                target(&mut built, w, 200),
+                Some(Who::Mob(3)),
+                "a golem a player built still fights monsters"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod crack_sound_tests {
+    use super::*;
+    use crate::mobs::Damage;
+    use std::sync::Arc;
+
+    /// An iron golem of its 100 health, from a made-up type.
+    fn golem() -> Mob {
+        let mut kind = crate::mobs::sensor_scan_tests::kind();
+        let k = Arc::make_mut(&mut kind);
+        k.id = "minecraft:iron_golem".into();
+        k.species = Species::IronGolem;
+        k.max_health = 100.0;
+        Mob::new(1, kind, Vec3::ZERO, 0.0)
+    }
+    /// `LivingEntity.actuallyHurt`: absorbed damage from a player is credited in
+    /// tenths; other attackers and a hit with nothing absorbed credit nothing.
+    #[test]
+    fn player_hit_credits_dealt_absorbed() {
+        let mut m = golem();
+        m.absorption = 4.0;
+        assert!(m.damage(1.5, Damage::player([0.0, 0.0, 1.0])));
+        assert_eq!(m.dealt_absorbed, 15);
+        m.invulnerable = 0;
+        assert!(m.damage(10.0, Damage::player([0.0, 0.0, 1.0])));
+        assert_eq!(m.dealt_absorbed, 15 + 25);
+        m.invulnerable = 0;
+        m.damage(2.0, Damage::player([0.0, 0.0, 1.0]));
+        assert_eq!(m.dealt_absorbed, 40);
+        let mut other = golem();
+        other.absorption = 4.0;
+        other.damage(1.5, Damage::of(crate::mobs::DamageKind::Generic));
+        assert_eq!(other.dealt_absorbed, 0);
+    }
+    /// One hit of `amount` past the golem's hurt frames: how often it played
+    /// `entity.iron_golem.damage`.
+    fn cracks(m: &mut Mob, amount: f32) -> usize {
+        m.outbox.clear();
+        m.invulnerable = 0;
+        assert!(m.damage(amount, Damage::player([0.0, 0.0, 1.0])));
+        m.outbox
+            .iter()
+            .filter(|e| matches!(e, MobEvent::Sound("entity.iron_golem.damage", ..)))
+            .count()
+    }
+
+    /// `IronGolem.hurtServer`: a hit that leaves the golem in a new
+    /// `Crackiness.Level` (`Crackiness.GOLEM` is 0.75, 0.5, 0.25) plays
+    /// `entity.iron_golem.damage` once, and hits inside one level play none.
+    #[test]
+    fn a_crack_is_heard_once_at_the_threshold() {
+        let mut m = golem();
+        assert_eq!(cracks(&mut m, 30.0), 1, "100 to 70 crosses 0.75");
+        assert_eq!(cracks(&mut m, 10.0), 0, "70 to 60 stays at the same crack");
+        assert_eq!(cracks(&mut m, 20.0), 1, "60 to 40 crosses 0.5");
+        assert_eq!(cracks(&mut m, 10.0), 0, "40 to 30 stays at the same crack");
+        assert_eq!(cracks(&mut m, 10.0), 1, "30 to 20 crosses 0.25");
     }
 }

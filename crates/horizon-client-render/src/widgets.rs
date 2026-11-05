@@ -3,6 +3,7 @@
 //! click-button Respawn`) or any widget by its id in [`tree`] (`horizon-ctl
 //! click done`), whatever screen drew it. Also the mouse cursor the widget
 //! under the mouse asks for.
+use crate::gamepad::ScrollArea;
 use std::cell::{Cell, RefCell};
 
 /// The mouse cursor a frame's widgets asked for (`CursorTypes`; the others
@@ -96,6 +97,118 @@ thread_local! {
     /// on-screen keyboard's keys), labelled or not: where a controller can move focus. Drawn since
     /// `end_frame`, the last frame's, and how many frames rotated.
     static TARGETS: RefCell<(Vec<Target>, Vec<Target>, u64)> = const { RefCell::new((Vec::new(), Vec::new(), 0)) };
+    /// The buttons drawn since the last `end_frame` that declared their job, and the last frame's.
+    static ACTIONS: RefCell<(Vec<DeclaredAction>, Vec<DeclaredAction>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// The pad drives, so declared buttons show their glyph (labels leave it room).
+    static ACTION_GLYPHS: Cell<bool> = const { Cell::new(false) };
+    /// The screen the buttons in `ACTIONS` were declared on, the same two frames.
+    static ACTION_SCREENS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// The lists drawn with a scrollbar since `end_frame`, and the last frame's.
+    static SCROLL_AREAS: RefCell<(Vec<ScrollArea>, Vec<ScrollArea>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Splitscreen: one player's buttons and focus targets, kept aside while another player's game
+/// runs on this thread ([`take`] and [`put`] around each turn).
+#[derive(Default)]
+pub struct Saved(
+    (Vec<Widget>, Vec<Widget>, u64),
+    (Vec<Target>, Vec<Target>, u64),
+    (Vec<DeclaredAction>, Vec<DeclaredAction>),
+    bool,
+    (u64, u64),
+    (Vec<ScrollArea>, Vec<ScrollArea>),
+);
+
+/// This thread's buttons and targets, leaving none.
+pub fn take() -> Saved {
+    Saved(
+        WIDGETS.take(),
+        TARGETS.take(),
+        ACTIONS.take(),
+        ACTION_GLYPHS.take(),
+        ACTION_SCREENS.take(),
+        SCROLL_AREAS.take(),
+    )
+}
+
+/// Bring back what [`take`] kept.
+pub fn put(saved: Saved) {
+    WIDGETS.set(saved.0);
+    TARGETS.set(saved.1);
+    SCROLL_AREAS.set(saved.5);
+    ACTIONS.set(saved.2);
+    ACTION_GLYPHS.set(saved.3);
+    ACTION_SCREENS.set(saved.4);
+}
+
+/// A button's job on its screen. A screen declares it ([`crate::ui::action_button`]) and the
+/// controller's button, its glyph and its place on every pad follow (docs/controllers.md,
+/// "Adding a screen").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Leaves the screen, keeping what was set.
+    Done,
+    /// Goes back one screen.
+    Back,
+    /// Leaves the screen, dropping what was set.
+    Cancel,
+    /// Applies what was set and stays or leaves as the screen does.
+    Apply,
+    /// Opens the options.
+    Options,
+    /// Leaves the game or the world: the pad moves the focus here, and A confirms.
+    Exit,
+}
+
+/// A button that declared its job, as last drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeclaredAction {
+    pub action: Action,
+    pub rect: [f32; 4],
+    pub enabled: bool,
+}
+
+/// `rect` is the button doing `action` on this screen; see [`crate::ui::action_button`], for a
+/// screen that draws its buttons itself.
+pub fn declare_action(action: Action, rect: [f32; 4], enabled: bool) {
+    ACTIONS.with_borrow_mut(|(current, _)| {
+        if current.len() < 16 {
+            current.push(DeclaredAction {
+                action,
+                rect,
+                enabled,
+            });
+        }
+    });
+}
+
+/// The buttons of the last drawn frame that declared their job, if it drew `screen`: until the
+/// screen just opened is drawn, the one it replaced can't be pressed.
+pub fn last_actions(screen: u64) -> Vec<DeclaredAction> {
+    if ACTION_SCREENS.get().1 != screen {
+        return Vec::new();
+    }
+    ACTIONS.with_borrow(|(_, last)| last.clone())
+}
+
+/// The frame being drawn shows `screen` (the controller's own key for it).
+pub fn set_action_screen(screen: u64) {
+    ACTION_SCREENS.set((screen, ACTION_SCREENS.get().1));
+}
+
+/// Whether declared buttons are showing their glyph: only while the pad drives.
+pub fn set_action_glyphs(on: bool) {
+    ACTION_GLYPHS.set(on);
+}
+
+/// How much of a declared button's left the glyph takes from its label: a face button's, the only
+/// kind declared buttons show, and no family's is wider than its art.
+pub fn action_glyph_room() -> f32 {
+    if ACTION_GLYPHS.get() {
+        crate::pad_glyph::FACE_WIDTH + 3.0
+    } else {
+        0.0
+    }
 }
 
 /// An interactive rectangle (GUI pixels) a controller can focus and click.
@@ -134,6 +247,72 @@ pub fn clip_targets(mark: usize, y0: f32, y1: f32) {
             }
         }
     });
+}
+
+/// How many labelled widgets and targets the frame has so far, for [`clip_frame`].
+pub fn frame_mark() -> (usize, usize) {
+    let labelled = WIDGETS.with_borrow(|(current, _, _)| current.len());
+    (labelled, targets_mark())
+}
+
+/// Drop the labelled widgets and targets since `mark` whose middle isn't in `y0..y1` (GUI pixels):
+/// what a scrolling body clipped away, where a press wouldn't land.
+pub fn clip_frame((labelled, targets): (usize, usize), y0: f32, y1: f32) {
+    let shown = |y: f32, h: f32| (y0..y1).contains(&(y + h / 2.0));
+    WIDGETS.with_borrow_mut(|(current, _, _)| {
+        let mut at = 0;
+        current.retain(|w| {
+            at += 1;
+            at <= labelled || shown(w.y, w.h)
+        });
+    });
+    TARGETS.with_borrow_mut(|(current, _, _)| {
+        let mut at = 0;
+        current.retain(|t| {
+            at += 1;
+            at <= targets || shown(t.rect[1], t.rect[3])
+        });
+    });
+}
+
+/// A prompt comes up over what the frame drew so far: what it covers can't be reached, by the
+/// pointer or a controller, so its widgets, targets, declared buttons and lists go.
+pub fn cover_frame() {
+    WIDGETS.with_borrow_mut(|(current, _, _)| current.clear());
+    TARGETS.with_borrow_mut(|(current, _, _)| current.clear());
+    ACTIONS.with_borrow_mut(|(current, _)| current.clear());
+    SCROLL_AREAS.with_borrow_mut(|(current, _)| current.clear());
+}
+
+/// This frame drew a list with something to scroll, in `rect`, scrolled `amount`
+/// of `max`: a focus step goes through its hidden rows before it leaves
+/// (`gamepad::list_step`).
+pub fn scroll_area(rect: [f32; 4], amount: f32, max: f32) {
+    let area = ScrollArea {
+        rect,
+        amount,
+        up: amount > 0.5,
+        down: amount < max - 0.5,
+    };
+    SCROLL_AREAS.with_borrow_mut(|(current, _)| current.push(area));
+}
+
+/// The lists the last drawn frame could scroll.
+pub fn last_scroll_areas() -> Vec<ScrollArea> {
+    SCROLL_AREAS.with_borrow(|(_, last)| last.clone())
+}
+
+/// A point the open screen's list scrolls under: `at` when it is over one, else
+/// the same column at the list's middle. For the right stick, which scrolls the
+/// list wherever the hidden pointer is.
+pub fn over_scroll_area(at: (f32, f32)) -> (f32, f32) {
+    SCROLL_AREAS.with_borrow(|(_, last)| {
+        let over = |a: &ScrollArea| (a.rect[1]..a.rect[1] + a.rect[3]).contains(&at.1);
+        match last.first() {
+            Some(area) if !last.iter().any(over) => (at.0, area.rect[1] + area.rect[3] / 2.0),
+            _ => at,
+        }
+    })
 }
 
 /// The focus targets of the last drawn frame.
@@ -206,6 +385,16 @@ pub fn end_frame(frames: u64) {
                 *last = std::mem::take(current);
                 *generation += 1;
             });
+            ACTIONS.with_borrow_mut(|(current, last)| {
+                *last = std::mem::take(current);
+            });
+            ACTION_SCREENS.set((ACTION_SCREENS.get().0, ACTION_SCREENS.get().0));
+            SCROLL_AREAS.with_borrow_mut(|(current, last)| {
+                *last = std::mem::take(current);
+            });
+            NARRATION.with_borrow_mut(|(current, last)| {
+                *last = std::mem::replace(current, Narration::EMPTY);
+            });
         }
     });
 }
@@ -223,6 +412,719 @@ pub fn last() -> Vec<Widget> {
 /// Every labelled widget of the last drawn frame, sliders and tabs included.
 pub fn last_labelled() -> Vec<Widget> {
     WIDGETS.with_borrow(|(_, last, _)| last.clone())
+}
+
+// Screen narration: what a frame's screen and widgets would narrate
+// (`Screen.updateNarrationState` and each `NarratableEntry`), recorded by the
+// drawers as they draw, for horizon-client's `screen_narrator` to read once the
+// frame is done. Nothing is recorded (nor built: the record calls take
+// closures) unless the narrator asked for it with `set_narrating`.
+
+pub use horizon_narrator::screen::ElementType;
+
+/// The screen a frame drew, as `Screen` narrates it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScreenInfo {
+    /// Which screen this is: a new id is a new `Screen` (narrated as it
+    /// opens), the same id a screen still open.
+    pub id: String,
+    /// `getNarrationMessage` (TITLE at depth 0): the title, or its
+    /// override (`joinForNarration(title, message)` for confirm screens).
+    /// Empty for `CommonComponents.EMPTY`, which is narrated all the same.
+    pub title: String,
+    /// `shouldNarrateNavigation`: "Use mouse cursor or Tab button to select
+    /// element" when no widget is narrated.
+    pub navigation: bool,
+    /// `updateNarratedWidget` runs (screens that override
+    /// `updateNarrationState`, the chat, don't).
+    pub widgets: bool,
+    /// The screen's own elements beyond its title, at their depth (an
+    /// element of the title's kind and depth replaces it, as
+    /// `LevelLoadingScreen`'s progress does).
+    pub extra: Vec<(ElementType, u32, Vec<String>)>,
+    /// `getUsageNarration`, when the screen overrides it.
+    pub usage: Option<String>,
+    /// `triggerImmediateNarration(true)` every this many milliseconds
+    /// (`LevelLoadingScreen`'s progress).
+    pub repeat_ms: Option<u32>,
+}
+
+impl ScreenInfo {
+    pub fn new(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            navigation: true,
+            widgets: true,
+            extra: Vec::new(),
+            usage: None,
+            repeat_ms: None,
+        }
+    }
+    /// One more element of the screen's own.
+    pub fn element(self, kind: ElementType, depth: u32, text: impl Into<String>) -> Self {
+        self.lines(kind, depth, vec![text.into()])
+    }
+    /// One more element of several lines, read as sentences.
+    pub fn lines(mut self, kind: ElementType, depth: u32, lines: Vec<String>) -> Self {
+        self.extra.push((kind, depth, lines));
+        self
+    }
+    pub fn without_widgets(mut self) -> Self {
+        self.widgets = false;
+        self
+    }
+    pub fn without_navigation(mut self) -> Self {
+        self.navigation = false;
+        self
+    }
+    pub fn usage(mut self, usage: impl Into<String>) -> Self {
+        self.usage = Some(usage.into());
+        self
+    }
+    pub fn repeat_every(mut self, ms: u32) -> Self {
+        self.repeat_ms = Some(ms);
+        self
+    }
+}
+
+/// What a list narrates its rows as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListKind {
+    /// `ObjectSelectionList`: "Selected list row i out of n", the row's
+    /// narration, and the selection's usage when focused.
+    Object,
+    /// `TabNavigationBar`: "Selected tab i out of n", "<title> tab", and
+    /// the tab navigation's usage when focused.
+    Tabs,
+}
+
+/// A row of an `ObjectSelectionList` (its `getNarration`) or a tab (its
+/// title and `getTabExtraNarration`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Row {
+    pub index: usize,
+    pub narration: String,
+    pub hint: Option<String>,
+}
+
+impl Row {
+    pub fn new(index: usize, narration: impl Into<String>) -> Self {
+        Self {
+            index,
+            narration: narration.into(),
+            hint: None,
+        }
+    }
+}
+
+/// A narratable widget's kind and what its narration reads.
+#[derive(Clone, Debug, PartialEq)]
+pub enum What {
+    /// `Button`: "<message> button".
+    Button { message: String, active: bool },
+    /// A button whose `createNarrationMessage` is its own (TITLE as is), with
+    /// a button's usage.
+    Named { title: String, active: bool },
+    /// `AbstractSliderButton`: "<message> slider".
+    Slider { message: String, active: bool },
+    /// `CycleButton`: "<message> button" and the value a click moves to.
+    Cycle {
+        message: String,
+        next: String,
+        active: bool,
+    },
+    /// A `CycleButton` with its own narration (`withCustomNarration`):
+    /// `title` as is, and the value a click moves to.
+    NamedCycle {
+        title: String,
+        next: String,
+        active: bool,
+    },
+    /// `Checkbox`: "<message> button" and whether a click checks it.
+    Checkbox {
+        message: String,
+        selected: bool,
+        active: bool,
+    },
+    /// `EditBox`: "<message> edit box: <value>"; an inactive one (a box
+    /// that can't be edited now) isn't narrated.
+    EditBox {
+        message: String,
+        value: String,
+        active: bool,
+    },
+    /// A text widget that narrates its message and nothing else
+    /// (`FittingMultiLineTextWidget`, a list's `FocusableTextWidget` header).
+    Text { message: String },
+    /// An `ObjectSelectionList` or a `TabNavigationBar`: `total` rows, the one
+    /// under the mouse and the selected one.
+    List {
+        kind: ListKind,
+        total: usize,
+        hovered: Option<Row>,
+        selected: Option<Row>,
+    },
+    /// A `ContainerObjectSelectionList` of `rows` rows (options, key binds):
+    /// its rows' widgets are the narratables recorded with it as their
+    /// parent. `hovered_row` is the row under the mouse.
+    ContainerList {
+        rows: usize,
+        hovered_row: Option<usize>,
+    },
+    /// `RecipeButton`: "Recipe for <item>".
+    Recipe { item: String, more: bool },
+    /// `RecipeBookComponent`: one narratable, HOVERED whenever `visible`
+    /// (whatever the mouse and the focus), that narrates the widget
+    /// `findNarratableWidget` picks among its own one level in, with no
+    /// position of its own. Its widgets are the narratables recorded with it
+    /// as their parent (row 0).
+    Group { visible: bool },
+}
+
+/// A `NarratableEntry` as drawn this frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Narratable {
+    /// The widget's identity across frames (`lastNarratable`); 0 derives
+    /// one from its kind and place. A list's children need stable keys.
+    pub key: u64,
+    /// GUI pixels.
+    pub rect: [f32; 4],
+    /// `isHovered`, as the drawer saw it; `None` tests the mouse against
+    /// `rect`.
+    pub hovered: Option<bool>,
+    /// `isFocused` (a text field with the caret, a focused list).
+    pub focused: bool,
+    pub what: What,
+    /// Its tooltip's narration (HINT); empty for none. Without one, the
+    /// tooltip drawn this frame is the hovered widget's.
+    pub hint: Option<String>,
+    /// A row widget of a `ContainerList`: that list's key and the row.
+    pub parent: Option<(u64, usize)>,
+    /// `getTabOrderGroup`: narratables are numbered in this order, then in
+    /// the order they were drawn.
+    pub order: i32,
+}
+
+impl Narratable {
+    pub fn new(what: What, rect: [f32; 4]) -> Self {
+        Self {
+            key: 0,
+            rect,
+            hovered: None,
+            focused: false,
+            what,
+            hint: None,
+            parent: None,
+            order: 0,
+        }
+    }
+    pub fn button(message: impl Into<String>, rect: [f32; 4], active: bool) -> Self {
+        Self::new(
+            What::Button {
+                message: message.into(),
+                active,
+            },
+            rect,
+        )
+    }
+    pub fn slider(message: impl Into<String>, rect: [f32; 4], active: bool) -> Self {
+        Self::new(
+            What::Slider {
+                message: message.into(),
+                active,
+            },
+            rect,
+        )
+    }
+    pub fn edit_box(message: impl Into<String>, value: impl Into<String>, rect: [f32; 4]) -> Self {
+        Self::new(
+            What::EditBox {
+                message: message.into(),
+                value: value.into(),
+                active: true,
+            },
+            rect,
+        )
+    }
+    /// A button narrated by its own `createNarrationMessage`.
+    pub fn named(title: impl Into<String>, rect: [f32; 4], active: bool) -> Self {
+        Self::new(
+            What::Named {
+                title: title.into(),
+                active,
+            },
+            rect,
+        )
+    }
+    /// A `CycleButton` showing `message`; a click moves it to `next`.
+    pub fn cycle(
+        message: impl Into<String>,
+        next: impl Into<String>,
+        rect: [f32; 4],
+        active: bool,
+    ) -> Self {
+        Self::new(
+            What::Cycle {
+                message: message.into(),
+                next: next.into(),
+                active,
+            },
+            rect,
+        )
+    }
+    pub fn checkbox(
+        message: impl Into<String>,
+        selected: bool,
+        rect: [f32; 4],
+        active: bool,
+    ) -> Self {
+        Self::new(
+            What::Checkbox {
+                message: message.into(),
+                selected,
+                active,
+            },
+            rect,
+        )
+    }
+    pub fn text(message: impl Into<String>, rect: [f32; 4]) -> Self {
+        Self::new(
+            What::Text {
+                message: message.into(),
+            },
+            rect,
+        )
+    }
+    /// An `ObjectSelectionList` (or tabs) of `total` rows over `rect`.
+    pub fn list(
+        kind: ListKind,
+        total: usize,
+        hovered: Option<Row>,
+        selected: Option<Row>,
+        rect: [f32; 4],
+    ) -> Self {
+        Self::new(
+            What::List {
+                kind,
+                total,
+                hovered,
+                selected,
+            },
+            rect,
+        )
+    }
+    /// A `ContainerObjectSelectionList` of `rows` rows over `rect`.
+    pub fn container_list(rows: usize, hovered_row: Option<usize>, rect: [f32; 4]) -> Self {
+        Self::new(What::ContainerList { rows, hovered_row }, rect)
+    }
+    /// A `RecipeBookComponent`-like group over `rect`, narrated while
+    /// `visible`; its widgets are recorded with [`Self::in_group`].
+    pub fn group(visible: bool, rect: [f32; 4]) -> Self {
+        Self::new(What::Group { visible }, rect)
+    }
+    /// `RecipeButton`: the recipe's result `item`, and whether it has more
+    /// recipes than one.
+    pub fn recipe(item: impl Into<String>, more: bool, rect: [f32; 4]) -> Self {
+        Self::new(
+            What::Recipe {
+                item: item.into(),
+                more,
+            },
+            rect,
+        )
+    }
+    pub fn key(mut self, key: u64) -> Self {
+        self.key = key;
+        self
+    }
+    pub fn hovered(mut self, hovered: bool) -> Self {
+        self.hovered = Some(hovered);
+        self
+    }
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+    /// No HINT, whatever tooltip the frame draws: the tooltip isn't the
+    /// widget's (a list's row tooltip, drawn by the list).
+    pub fn without_tooltip(self) -> Self {
+        self.hint("")
+    }
+    /// A widget of row `row` of the `ContainerList` keyed `list`.
+    pub fn child_of(mut self, list: u64, row: usize) -> Self {
+        self.parent = Some((list, row));
+        self
+    }
+    /// A widget of the [`What::Group`] keyed `group`.
+    pub fn in_group(self, group: u64) -> Self {
+        self.child_of(group, 0)
+    }
+    pub fn order(mut self, order: i32) -> Self {
+        self.order = order;
+        self
+    }
+    /// `isActive`: visible and active. Inactive buttons and sliders are left
+    /// out of a screen's narratables.
+    pub fn is_active(&self) -> bool {
+        match &self.what {
+            What::Button { active, .. }
+            | What::Named { active, .. }
+            | What::Slider { active, .. }
+            | What::Cycle { active, .. }
+            | What::NamedCycle { active, .. }
+            | What::Checkbox { active, .. }
+            | What::EditBox { active, .. } => *active,
+            What::Text { .. }
+            | What::List { .. }
+            | What::ContainerList { .. }
+            | What::Recipe { .. }
+            | What::Group { .. } => true,
+        }
+    }
+    /// `key`, or one from the widget's kind and place (never 0).
+    pub fn identity(&self) -> u64 {
+        if self.key != 0 {
+            return self.key;
+        }
+        let place = self.rect.map(|v| v.round() as i32);
+        key_of(&(std::mem::discriminant(&self.what), place))
+    }
+}
+
+/// A stable key for a widget from anything that names it (a list's name, an
+/// option's id), never 0.
+pub fn key_of(name: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    hasher.finish() | 1
+}
+
+/// `CommonComponents.joinForNarration`: the parts, ". " between them.
+pub fn join_for_narration(parts: &[&str]) -> String {
+    parts.join(". ")
+}
+
+/// A frame's narration records.
+#[derive(Debug, Default)]
+pub struct Narration {
+    pub screen: Option<ScreenInfo>,
+    pub items: Vec<Narratable>,
+    /// The tooltip drawn this frame, its lines joined.
+    pub tooltip: Option<String>,
+}
+
+impl Narration {
+    const EMPTY: Narration = Narration {
+        screen: None,
+        items: Vec::new(),
+        tooltip: None,
+    };
+}
+
+thread_local! {
+    /// The narrator wants the frames' narration (`Screen.shouldRunNarration`).
+    static NARRATING: Cell<bool> = const { Cell::new(false) };
+    /// Narration recorded since the last `end_frame`, and the last frame's.
+    static NARRATION: RefCell<(Narration, Narration)> =
+        const { RefCell::new((Narration::EMPTY, Narration::EMPTY)) };
+    /// A screen asked for `triggerImmediateNarration(true)`.
+    static NARRATE_NOW: Cell<bool> = const { Cell::new(false) };
+    /// Where the narrator's focused widget was last drawn.
+    static FOCUS: Cell<Option<[f32; 4]>> = const { Cell::new(None) };
+}
+
+/// The narrator tells the drawers where its focused widget is (a click's
+/// or the controller's), so what only a hovered or focused widget narrates
+/// (a cycle button's next value) is worked out for it alone.
+pub fn set_narration_focus(rect: Option<[f32; 4]>) {
+    FOCUS.set(rect);
+}
+
+/// Whether the widget at `rect` has the narrator's focus.
+pub fn narration_focused(rect: [f32; 4]) -> bool {
+    FOCUS
+        .get()
+        .is_some_and(|f| f.iter().zip(rect).all(|(a, b)| (a - b).abs() < 0.5))
+}
+
+/// Whether the frames record their narration; the narrator switches it.
+pub fn set_narrating(on: bool) {
+    NARRATING.set(on);
+    if !on {
+        NARRATION.with_borrow_mut(|(current, _)| *current = Narration::EMPTY);
+    }
+}
+
+pub fn narrating() -> bool {
+    NARRATING.get()
+}
+
+/// The screen being drawn: what it narrates and which one it is. The
+/// narratables recorded before it in the frame are dropped: the last screen
+/// drawn (an overlay over the screen under it) is the one narrated. So are the
+/// jobs declared before it: a popup's buried buttons can't be pressed.
+pub fn begin_screen(info: impl FnOnce() -> ScreenInfo) {
+    ACTIONS.with_borrow_mut(|(current, _)| current.clear());
+    if NARRATING.get() {
+        NARRATION.with_borrow_mut(|(current, _)| {
+            current.screen = Some(info());
+            current.items.clear();
+            current.tooltip = None;
+        });
+    }
+}
+
+/// Changes the screen begun this frame, if one was.
+pub fn screen_mut(f: impl FnOnce(&mut ScreenInfo)) {
+    if NARRATING.get() {
+        NARRATION.with_borrow_mut(|(current, _)| {
+            if let Some(screen) = &mut current.screen {
+                f(screen);
+            }
+        });
+    }
+}
+
+/// A narratable widget of the screen begun this frame (nothing without one).
+pub fn narratable(narratable: impl FnOnce() -> Narratable) {
+    if NARRATING.get() {
+        NARRATION.with_borrow_mut(|(current, _)| {
+            if current.screen.is_some() && current.items.len() < 512 {
+                current.items.push(narratable());
+            }
+        });
+    }
+}
+
+/// Changes the narratable recorded last this frame (one a shared drawer
+/// recorded: an edit box's message, a button's key or row).
+pub fn last_narratable(f: impl FnOnce(&mut Narratable)) {
+    if NARRATING.get() {
+        NARRATION.with_borrow_mut(|(current, _)| {
+            if let Some(last) = current.items.last_mut() {
+                f(last);
+            }
+        });
+    }
+}
+
+/// Changes the narratable recorded last this frame and moves it to `index`
+/// among the screen's: a widget the screen adds before others it draws first.
+pub fn last_narratable_at(index: usize, f: impl FnOnce(&mut Narratable)) {
+    if NARRATING.get() {
+        NARRATION.with_borrow_mut(|(current, _)| {
+            if let Some(mut last) = current.items.pop() {
+                f(&mut last);
+                let index = index.min(current.items.len());
+                current.items.insert(index, last);
+            }
+        });
+    }
+}
+
+/// How many narratables the frame has so far, for [`move_narratables`].
+pub fn narratables_mark() -> usize {
+    if !NARRATING.get() {
+        return 0;
+    }
+    NARRATION.with_borrow(|(current, _)| current.items.len())
+}
+
+/// Moves the narratables recorded since `mark` to `index`, in their order:
+/// widgets a screen adds before others it draws first.
+pub fn move_narratables(mark: usize, index: usize) {
+    if NARRATING.get() {
+        NARRATION.with_borrow_mut(|(current, _)| {
+            let items = &mut current.items;
+            let mark = mark.min(items.len());
+            let index = index.min(mark);
+            let moved = items.len() - mark;
+            items[index..].rotate_right(moved);
+        });
+    }
+}
+
+/// Names the edit box recorded last, which a shared drawer recorded without
+/// its `getMessage`.
+pub fn name_last_edit_box(name: impl FnOnce() -> String) {
+    last_narratable(|n| {
+        if let What::EditBox { message, .. } = &mut n.what {
+            *message = name();
+        }
+    });
+}
+
+/// The tooltip drawn this frame: the hovered widget's narration hint.
+pub fn frame_tooltip(lines: &[crate::text::Text]) {
+    if NARRATING.get() {
+        NARRATION.with_borrow_mut(|(current, _)| {
+            let text: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+            current.tooltip = Some(text.join(" "));
+        });
+    }
+}
+
+/// `triggerImmediateNarration(true)`: narrate what changed at once.
+pub fn narrate_now() {
+    if NARRATING.get() {
+        NARRATE_NOW.set(true);
+    }
+}
+
+/// Whether a screen asked to narrate at once since the last call.
+pub fn take_narrate_now() -> bool {
+    NARRATE_NOW.replace(false)
+}
+
+/// The last drawn frame's narration, taken (the narrator is its only reader).
+pub fn take_last_narration() -> Narration {
+    NARRATION.with_borrow_mut(|(_, last)| std::mem::replace(last, Narration::EMPTY))
+}
+
+#[cfg(test)]
+mod narration_tests {
+    use super::*;
+
+    fn frame(n: u64) -> Narration {
+        end_frame(n);
+        take_last_narration()
+    }
+
+    #[test]
+    fn nothing_is_recorded_or_built_unless_narrating() {
+        set_narrating(false);
+        let _ = frame(1000);
+        begin_screen(|| unreachable!("not built while the narrator is off"));
+        narratable(|| unreachable!());
+        narrate_now();
+        let last = frame(1001);
+        assert!(last.screen.is_none() && last.items.is_empty());
+        assert!(!take_narrate_now());
+    }
+
+    #[test]
+    fn a_frame_keeps_the_last_screen_begun_and_its_widgets() {
+        set_narrating(true);
+        let _ = frame(2000);
+        // Without a screen, widgets aren't kept.
+        narratable(|| Narratable::button("Stray", [0.0; 4], true));
+        begin_screen(|| ScreenInfo::new("pause", "Game Menu"));
+        narratable(|| Narratable::button("Back to Game", [0.0, 0.0, 200.0, 20.0], true));
+        frame_tooltip(&[crate::text::Text::literal("Under")]);
+        // An overlay over the pause menu: its own screen and widgets.
+        begin_screen(|| ScreenInfo::new("confirm", "Sure?"));
+        narratable(|| Narratable::button("Yes", [0.0, 30.0, 100.0, 20.0], true));
+        screen_mut(|s| s.title.push('!'));
+        frame_tooltip(&[
+            crate::text::Text::literal("Two"),
+            crate::text::Text::literal("lines"),
+        ]);
+        let last = frame(2001);
+        assert_eq!(last.screen.unwrap().title, "Sure?!");
+        assert_eq!(last.items.len(), 1);
+        assert_eq!(
+            last.items[0].what,
+            What::Button {
+                message: "Yes".into(),
+                active: true
+            }
+        );
+        assert_eq!(last.tooltip.as_deref(), Some("Two lines"));
+        // Taken: read once.
+        assert!(take_last_narration().screen.is_none());
+        // A frame not drawn doesn't rotate.
+        begin_screen(|| ScreenInfo::new("title", ""));
+        assert!(frame(2001).screen.is_none());
+        assert_eq!(frame(2002).screen.unwrap().id, "title");
+        // Switching off drops what was recorded.
+        begin_screen(|| ScreenInfo::new("title", ""));
+        set_narrating(false);
+        assert!(frame(2003).screen.is_none());
+    }
+
+    #[test]
+    fn the_last_widget_recorded_can_be_named_after_the_fact() {
+        set_narrating(true);
+        let _ = frame(3000);
+        begin_screen(|| ScreenInfo::new("select_world", "Select World"));
+        // A shared drawer records the box without its message.
+        narratable(|| Narratable::edit_box("", "abc", [0.0; 4]));
+        last_narratable(|n| {
+            if let What::EditBox { message, .. } = &mut n.what {
+                *message = "Search for worlds".into();
+            }
+            n.order = -1;
+        });
+        let last = frame(3001);
+        assert_eq!(
+            last.items[0].what,
+            What::EditBox {
+                message: "Search for worlds".into(),
+                value: "abc".into(),
+                active: true,
+            }
+        );
+        assert_eq!(last.items[0].order, -1);
+        set_narrating(false);
+        last_narratable(|_| unreachable!("nothing recorded while off"));
+    }
+
+    #[test]
+    fn widgets_drawn_late_can_be_moved_to_where_they_were_added() {
+        set_narrating(true);
+        let _ = frame(4000);
+        begin_screen(|| ScreenInfo::new("command_block", ""));
+        narratable(|| Narratable::button("Done", [0.0; 4], true));
+        narratable(|| Narratable::button("Cancel", [0.0; 4], true));
+        let mark = narratables_mark();
+        narratable(|| Narratable::edit_box("Command", "", [0.0; 4]));
+        narratable(|| Narratable::button("Late", [0.0; 4], true));
+        move_narratables(mark, 0);
+        let order: Vec<String> = frame(4001)
+            .items
+            .iter()
+            .map(|n| match &n.what {
+                What::Button { message, .. } | What::EditBox { message, .. } => message.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(order, ["Command", "Late", "Done", "Cancel"]);
+        set_narrating(false);
+        assert_eq!(narratables_mark(), 0);
+    }
+
+    #[test]
+    fn widgets_know_who_they_are_and_whether_they_are_narrated() {
+        let a = Narratable::button("A", [10.0, 20.0, 200.0, 20.0], true);
+        let moved = Narratable::button("A", [10.0, 44.0, 200.0, 20.0], true);
+        let slider = Narratable::slider("A", [10.0, 20.0, 200.0, 20.0], true);
+        assert_eq!(
+            a.identity(),
+            Narratable::button("B", a.rect, false).identity()
+        );
+        assert_ne!(a.identity(), moved.identity());
+        assert_ne!(a.identity(), slider.identity());
+        assert_eq!(a.clone().key(7).identity(), 7);
+        assert_ne!(key_of(&"options"), 0);
+        assert!(a.is_active());
+        assert!(!Narratable::button("B", a.rect, false).is_active());
+        assert!(Narratable::edit_box("Search", "", a.rect).is_active());
+        let mut port = Narratable::edit_box("Port", "", a.rect);
+        if let What::EditBox { active, .. } = &mut port.what {
+            *active = false;
+        }
+        assert!(!port.is_active());
+        assert!(Narratable::group(false, a.rect).is_active());
+        let recipe = Narratable::recipe("Torch", true, a.rect).in_group(9);
+        assert_eq!(recipe.parent, Some((9, 0)));
+        assert_eq!(join_for_narration(&["Title", "Message"]), "Title. Message");
+    }
 }
 
 impl Kind {
@@ -421,6 +1323,29 @@ mod tests {
     }
 
     #[test]
+    fn declared_buttons_are_only_those_of_the_screen_drawn() {
+        let done = |x| declare_action(Action::Done, [x, 0.0, 5.0, 5.0], true);
+        done(0.0);
+        set_action_screen(7);
+        end_frame(200);
+        assert_eq!(last_actions(7).len(), 1);
+        // Another screen opened and hasn't been drawn yet.
+        assert!(last_actions(8).is_empty());
+    }
+
+    #[test]
+    fn a_popup_drops_the_buttons_declared_under_it() {
+        declare_action(Action::Done, [0.0, 0.0, 5.0, 5.0], true);
+        begin_screen(|| ScreenInfo::new("popup", ""));
+        declare_action(Action::Cancel, [9.0, 0.0, 5.0, 5.0], true);
+        set_action_screen(7);
+        end_frame(300);
+        let actions = last_actions(7);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].action, Action::Cancel);
+    }
+
+    #[test]
     fn last_lists_buttons_only() {
         end_frame(100);
         record("Back", [0.0, 0.0, 5.0, 5.0], true);
@@ -463,5 +1388,43 @@ mod tests {
             2,
             "the clipped row is gone, earlier ones stay"
         );
+    }
+
+    #[test]
+    fn a_scrolled_body_loses_what_it_clips_and_nothing_before_it() {
+        let _ = take();
+        target([0.0, 0.0, 5.0, 5.0]);
+        record("warning", [0.0, 0.0, 5.0, 5.0], true);
+        let mark = frame_mark();
+        record("shown", [0.0, 10.0, 5.0, 10.0], true);
+        target([0.0, 10.0, 5.0, 10.0]);
+        // Half in view is still pressed at its middle, which a mouse could reach.
+        record("half", [0.0, 25.0, 5.0, 10.0], true);
+        target([0.0, 25.0, 5.0, 10.0]);
+        record("gone", [0.0, 40.0, 5.0, 10.0], true);
+        target([0.0, 40.0, 5.0, 10.0]);
+        clip_frame(mark, 8.0, 32.0);
+        end_frame(101);
+        let names: Vec<String> = last_labelled().into_iter().map(|w| w.label).collect();
+        assert_eq!(names, ["warning", "shown", "half"]);
+        assert_eq!(last_targets().len(), 3);
+    }
+
+    #[test]
+    fn a_prompt_covers_what_was_drawn_before_it() {
+        let _ = take();
+        record("under", [0.0, 0.0, 5.0, 5.0], true);
+        target([0.0, 10.0, 5.0, 5.0]);
+        declare_action(Action::Done, [0.0, 0.0, 5.0, 5.0], true);
+        scroll_area([0.0, 0.0, 5.0, 5.0], 0.0, 5.0);
+        cover_frame();
+        record("over", [0.0, 20.0, 5.0, 5.0], true);
+        set_action_screen(7);
+        end_frame(102);
+        let names: Vec<String> = last_labelled().into_iter().map(|w| w.label).collect();
+        assert_eq!(names, ["over"]);
+        assert!(last_targets().is_empty());
+        assert!(last_actions(7).is_empty());
+        assert!(last_scroll_areas().is_empty());
     }
 }

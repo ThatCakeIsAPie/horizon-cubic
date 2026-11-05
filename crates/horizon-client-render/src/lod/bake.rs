@@ -393,7 +393,10 @@ fn decode(mut b: &[u8], count: usize) -> Option<Vec<Column>> {
                 })
             })
             .collect::<Option<Vec<_>>>()?;
-        columns.push(Column { surface, spans });
+        columns.push(Column {
+            surface,
+            spans: spans.into(),
+        });
     }
     b.is_empty().then_some(columns)
 }
@@ -424,7 +427,8 @@ mod tests {
                     biome: 3,
                     light: 240,
                 },
-            ],
+            ]
+            .into(),
         }
     }
     #[test]

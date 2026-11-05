@@ -1,5 +1,5 @@
 //! Preliminary surface density sampling scoped to one material context.
-use super::{DensityGate, DensityHeights, MaterialRuleError, MaterialSurfaceQueries};
+use super::{MaterialRuleError, MaterialSurfaceQueries};
 use crate::{registry::BlockStateId, worldgen::DecodeError};
 use horizon_core::{
     density::{DensitySampler, SamplerContext},
@@ -16,7 +16,7 @@ pub struct MaterialDensitySources<S: MaterialSurfaceQueries> {
     expected: DensityVolume,
     densities: Vec<BoundDensity>,
     /// Eagerly sampled volumes, shared by bindings of the same density root.
-    buffers: Vec<Eager>,
+    buffers: Vec<Vec<f32>>,
     retained_samples: usize,
     plane: DensityVolume,
     sampler: Arc<dyn DensitySampler>,
@@ -26,18 +26,6 @@ pub struct MaterialDensitySources<S: MaterialSurfaceQueries> {
 struct BoundDensity {
     sampler: Arc<dyn DensitySampler>,
     buffer: Option<usize>,
-    /// Never above zero in `expected` above its buffer's volume.
-    gated: bool,
-}
-/// An eager sample over `volume`: `expected`, or its lower part (same
-/// minimum, so interpolated densities give the same values), with the
-/// heights where it is above zero or NaN.
-struct Eager {
-    samples: Vec<f32>,
-    volume: DensityVolume,
-    heights: [i32; 2],
-    /// Not sampled until first read (`samples` empty).
-    pending: bool,
 }
 impl<S: MaterialSurfaceQueries> MaterialDensitySources<S> {
     pub fn sampler_context_mut(&mut self) -> &mut SamplerContext {
@@ -66,15 +54,10 @@ impl<S: MaterialSurfaceQueries> MaterialDensitySources<S> {
             sampled[buffer] = true;
             pending.push((bound.sampler.clone(), buffer));
         }
-        // Each sample covers the whole cell: a gated binding has nothing of
-        // `expected` above it.
         for (sampler, buffer) in pending {
-            let eager = &mut self.buffers[buffer];
-            eager.samples.resize(volume.size(), 0.0);
-            sampler.sample_volume(&mut self.context, &mut eager.samples, volume)?;
-            eager.volume = volume;
-            eager.heights = positive_heights(volume, &eager.samples);
-            eager.pending = false;
+            let out = &mut self.buffers[buffer];
+            out.resize(volume.size(), 0.0);
+            sampler.sample_volume(&mut self.context, out, volume)?;
         }
         Ok(())
     }
@@ -108,123 +91,40 @@ impl<S: MaterialSurfaceQueries> MaterialDensitySources<S> {
         })
     }
 }
-impl<S: MaterialSurfaceQueries> MaterialDensitySources<S> {
-    /// Bind `sampler`, sampled now over `volume` when given (a part of
-    /// `expected` with its minimum).
-    fn bind(
-        &mut self,
-        sampler: Arc<dyn DensitySampler>,
-        volume: Option<DensityVolume>,
-        gated: bool,
-        defer: bool,
-    ) -> Result<usize, DecodeError> {
-        if self.densities.len() >= 32768
-            || volume.is_some_and(|volume| {
-                volume.size() > 1 << 20 || self.retained_samples + volume.size() > 1 << 24
-            })
-        {
-            return Err(DecodeError::Field("material density storage bound"));
-        }
-        let buffer = match volume {
-            None => None,
-            Some(volume) => {
-                // Sampling a root over the same lattice and context is
-                // deterministic, so another binding (iron and copper veins'
-                // richness) reuses a sample covering its volume.
-                let shared = self
-                    .densities
-                    .iter()
-                    .filter(|bound| Arc::ptr_eq(&bound.sampler, &sampler))
-                    .filter_map(|bound| bound.buffer)
-                    .find(|&buffer| {
-                        let known = self.buffers[buffer].volume;
-                        known.minimum() == volume.minimum()
-                            && known.steps() == volume.steps()
-                            && (0..3).all(|i| known.sizes()[i] >= volume.sizes()[i])
-                    });
-                match shared {
-                    Some(buffer) => Some(buffer),
-                    None if defer => {
-                        self.retained_samples += volume.size();
-                        self.buffers.push(Eager {
-                            samples: Vec::new(),
-                            volume,
-                            heights: [i32::MAX, i32::MIN],
-                            pending: true,
-                        });
-                        Some(self.buffers.len() - 1)
-                    }
-                    None => {
-                        let mut samples = vec![0.0; volume.size()];
-                        sampler.sample_volume(&mut self.context, &mut samples, volume)?;
-                        self.retained_samples += samples.len();
-                        let heights = positive_heights(volume, &samples);
-                        self.buffers.push(Eager {
-                            samples,
-                            volume,
-                            heights,
-                            pending: false,
-                        });
-                        Some(self.buffers.len() - 1)
-                    }
-                }
-            }
-        };
-        let index = self.densities.len();
-        self.densities.push(BoundDensity {
-            sampler,
-            buffer,
-            gated,
-        });
-        Ok(index)
-    }
-}
 impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySources<S> {
     fn bind_density(
         &mut self,
         sampler: Arc<dyn DensitySampler>,
         eager: bool,
     ) -> Result<usize, DecodeError> {
-        let volume = eager.then_some(self.expected);
-        self.bind(sampler, volume, false, false)
-    }
-    fn bind_gated_density(
-        &mut self,
-        sampler: Arc<dyn DensitySampler>,
-        gate: &DensityGate,
-        gated: bool,
-        lattice: Option<i32>,
-    ) -> Result<usize, DecodeError> {
-        if self.expected.steps() != [1; 3] {
-            return self.bind_density(sampler, true);
+        if self.densities.len() >= 32768
+            || (eager
+                && (self.expected.size() > 1 << 20
+                    || self.retained_samples + self.expected.size() > 1 << 24))
+        {
+            return Err(DecodeError::Field("material density storage bound"));
         }
-        let [sx, sy, sz] = self.expected.sizes();
-        let minimum = self.expected.minimum();
-        // The gate's input varies with Y alone: one column gives every height.
-        let column = DensityVolume::new([1, sy as i32, 1], minimum, [1; 3])
-            .map_err(|_| DecodeError::Field("material density gate"))?;
-        let mut inputs = vec![0.0; column.size()];
-        gate.input
-            .sample_volume(&mut self.context, &mut inputs, column)?;
-        let in_range = |v: &f32| *v >= gate.min_inclusive && *v < gate.max_exclusive;
-        let top = inputs.iter().rposition(in_range).unwrap_or(0);
-        // Rows below the lowest in-range height can go too, by whole periods.
-        let bottom = match lattice {
-            Some(period) if period > 0 => {
-                let low = inputs.iter().position(in_range).unwrap_or(0);
-                low - low % period as usize
+        let shared = self
+            .densities
+            .iter()
+            .find(|bound| bound.buffer.is_some() && Arc::ptr_eq(&bound.sampler, &sampler))
+            .and_then(|bound| bound.buffer);
+        let buffer = match (eager, shared) {
+            (false, _) => None,
+            // Sampling a root over the same volume and context is deterministic,
+            // so a second binding (iron and copper veins' richness) reuses it.
+            (true, Some(buffer)) => Some(buffer),
+            (true, None) => {
+                let mut buffer = vec![0.0; self.expected.size()];
+                sampler.sample_volume(&mut self.context, &mut buffer, self.expected)?;
+                self.retained_samples += buffer.len();
+                self.buffers.push(buffer);
+                Some(self.buffers.len() - 1)
             }
-            _ => 0,
         };
-        let volume = DensityVolume::new(
-            [sx as i32, (top - bottom) as i32 + 1, sz as i32],
-            [minimum[0], minimum[1] + bottom as i32, minimum[2]],
-            [1; 3],
-        )
-        .map_err(|_| DecodeError::Field("material density gate"))?;
-        // A richness (not `gated`) is only read where its vein's density is
-        // above zero: many chunks never read it.
-        self.bind(sampler, Some(volume), gated, !gated)
+        let index = self.densities.len();
+        self.densities.push(BoundDensity { sampler, buffer });
+        Ok(index)
     }
     fn density(&mut self, index: usize, position: BlockPos) -> Result<f32, MaterialRuleError> {
         let source = self
@@ -233,44 +133,11 @@ impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySource
             .ok_or(MaterialRuleError::MissingDensityProvider)?;
         let position = [position.x, position.y, position.z];
         if let Some(buffer) = source.buffer {
-            if self.buffers[buffer].pending {
-                // Sampling is deterministic: the values eager sampling gives.
-                let volume = self.buffers[buffer].volume;
-                let mut samples = vec![0.0; volume.size()];
-                source
-                    .sampler
-                    .sample_volume(&mut self.context, &mut samples, volume)?;
-                let eager = &mut self.buffers[buffer];
-                eager.heights = positive_heights(volume, &samples);
-                eager.samples = samples;
-                eager.pending = false;
-            }
-            let eager = &self.buffers[buffer];
-            if let Some(index) = block_index(eager.volume, position) {
-                return Ok(eager.samples[index]);
+            if let Some(index) = block_index(self.expected, position) {
+                return Ok(self.buffers[buffer][index]);
             }
         }
         Ok(source.sampler.sample_value(&mut self.context, position)?)
-    }
-    fn density_heights(&self, index: usize) -> Option<DensityHeights> {
-        let bound = self.densities.get(index)?;
-        let eager = &self.buffers[bound.buffer?];
-        // A deferred sample's heights are not known before its first read.
-        if eager.pending || self.expected.steps() != [1; 3] {
-            return None;
-        }
-        let box_volume = if bound.gated {
-            self.expected
-        } else {
-            eager.volume
-        };
-        let min = box_volume.minimum();
-        let sizes = box_volume.sizes();
-        Some(DensityHeights {
-            min,
-            max: std::array::from_fn(|i| min[i].wrapping_add(sizes[i] as i32 - 1)),
-            y: eager.heights,
-        })
     }
     fn preliminary_surface(&mut self, position: BlockPos) -> Result<f32, MaterialRuleError> {
         let position = [position.x, 0, position.z];
@@ -294,13 +161,6 @@ impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySource
     }
     fn biome_id(&mut self, position: BlockPos) -> Result<Option<u32>, MaterialRuleError> {
         self.surface.biome_id(position)
-    }
-    fn biome_id_down(
-        &mut self,
-        position: BlockPos,
-        floor: i32,
-    ) -> Result<Option<(u32, i32)>, MaterialRuleError> {
-        self.surface.biome_id_down(position, floor)
     }
     fn biome_index(&self, name: &str) -> Option<Option<u32>> {
         self.surface.biome_index(name)
@@ -333,27 +193,6 @@ impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySource
     fn band(&mut self, position: BlockPos) -> Result<BlockStateId, MaterialRuleError> {
         self.surface.band(position)
     }
-}
-
-/// The lowest and highest block heights of a unit-step volume holding a
-/// sample above zero or NaN (`[i32::MAX, i32::MIN]` when none does).
-fn positive_heights(volume: DensityVolume, samples: &[f32]) -> [i32; 2] {
-    let sy = volume.sizes()[1];
-    let mut range = [usize::MAX, 0];
-    for column in samples.chunks_exact(sy) {
-        if let Some(low) = column.iter().position(|v| *v > 0.0 || v.is_nan()) {
-            let high = column.iter().rposition(|v| *v > 0.0 || v.is_nan()).unwrap();
-            range = [range[0].min(low), range[1].max(high)];
-        }
-    }
-    if range[0] == usize::MAX {
-        return [i32::MAX, i32::MIN];
-    }
-    let y = volume.minimum()[1];
-    [
-        y.wrapping_add(range[0] as i32),
-        y.wrapping_add(range[1] as i32),
-    ]
 }
 
 /// `DensityVolume::index_of_block` without its per-axis divisions for the
@@ -443,114 +282,6 @@ mod tests {
             }
         }
         assert_eq!(shared.0.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn positive_heights_cover_every_sample_above_zero_or_nan() {
-        let volume = DensityVolume::new([2, 4, 1], [0, -64, 0], [1; 3]).unwrap();
-        // Y-innermost: column x=0 then x=1, from y -64 to -61.
-        let heights = |samples: [f32; 8]| positive_heights(volume, &samples);
-        assert_eq!(
-            heights([0.0, -1.0, 0.0, -0.5, -1.0, 0.0, -0.0, -2.0]),
-            [i32::MAX, i32::MIN]
-        );
-        assert_eq!(
-            heights([0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0]),
-            [-63, -62]
-        );
-        assert_eq!(
-            heights([f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
-            [-64, -61]
-        );
-        let mut sources = sources();
-        let density = sources
-            .bind_density(Arc::new(Counted::default()), true)
-            .unwrap();
-        let lazy = sources
-            .bind_density(Arc::new(Counted::default()), false)
-            .unwrap();
-        // Every sample of `Counted` over this volume is above zero.
-        let known = sources.density_heights(density).unwrap();
-        assert_eq!(
-            (known.min, known.max, known.y),
-            ([32, -64, -16], [47, -41, -1], [-64, -41])
-        );
-        assert_eq!(sources.density_heights(lazy), None);
-    }
-
-    /// The block's Y as its value.
-    #[derive(Debug)]
-    struct Height;
-    impl DensitySampler for Height {
-        fn sample_value(&self, _: &mut SamplerContext, p: [i32; 3]) -> Result<f32, SampleError> {
-            Ok(p[1] as f32)
-        }
-    }
-
-    #[test]
-    fn gated_bindings_sample_below_the_gate_and_cover_the_heights_above() {
-        let mut sources = sources();
-        let gate = DensityGate {
-            input: Arc::new(Height),
-            min_inclusive: -60.0,
-            max_exclusive: -50.0,
-            lattices: [None; 2],
-        };
-        let shared = Arc::new(Counted::default());
-        let density = sources
-            .bind_gated_density(Arc::new(Counted::default()), &gate, true, None)
-            .unwrap();
-        let richness = sources
-            .bind_gated_density(shared.clone(), &gate, false, None)
-            .unwrap();
-        // A full-volume binding of the same root needs its own sample.
-        let full = sources.bind_density(shared.clone(), true).unwrap();
-        // The richness binding samples on its first read.
-        assert_eq!(shared.0.load(Ordering::Relaxed), 1);
-        // Heights -64..=-51 were sampled; every `Counted` value there is > 0.
-        let known = sources.density_heights(density).unwrap();
-        assert_eq!(
-            (known.min, known.max, known.y),
-            ([32, -64, -16], [47, -41, -1], [-64, -51])
-        );
-        assert!(known.never_positive(BlockPos::new(40, -45, -9)));
-        assert!(!known.never_positive(BlockPos::new(40, -51, -9)));
-        for p in [[32, -64, -16], [47, -51, -1], [40, -45, -9]] {
-            let position = BlockPos::new(p[0], p[1], p[2]);
-            let expected = (p[0] * 10_000 + p[1] * 100 + p[2]) as f32;
-            for index in [density, richness, full] {
-                assert_eq!(sources.density(index, position).unwrap(), expected);
-            }
-        }
-        assert_eq!(shared.0.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn gated_bindings_with_a_lattice_also_drop_whole_periods_below() {
-        let mut sources = sources();
-        let gate = DensityGate {
-            input: Arc::new(Height),
-            min_inclusive: -57.0,
-            max_exclusive: -50.0,
-            lattices: [Some(4); 2],
-        };
-        let density = sources
-            .bind_gated_density(Arc::new(Counted::default()), &gate, true, Some(4))
-            .unwrap();
-        // In range from -57: the sample starts at -60 (-64 plus one period).
-        assert_eq!(sources.buffers[0].volume.minimum(), [32, -60, -16]);
-        assert_eq!(sources.buffers[0].volume.sizes(), [16, 10, 16]);
-        let known = sources.density_heights(density).unwrap();
-        assert_eq!(
-            (known.min, known.max, known.y),
-            ([32, -64, -16], [47, -41, -1], [-60, -51])
-        );
-        assert!(known.never_positive(BlockPos::new(40, -62, -9)));
-        for p in [[32, -60, -16], [47, -51, -1], [40, -57, -9]] {
-            let position = BlockPos::new(p[0], p[1], p[2]);
-            let expected = (p[0] * 10_000 + p[1] * 100 + p[2]) as f32;
-            assert_eq!(sources.density(density, position).unwrap(), expected);
-        }
     }
 
     #[test]

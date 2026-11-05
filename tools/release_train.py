@@ -70,12 +70,18 @@ LAUNCHER_PATHS = [
     "launcher/",
     "crates/horizon-bench/",
     "crates/horizon-friends/",
+    "crates/horizon-mcp/",
+    "crates/horizon-mod-api-gen/",
     "crates/horizon-mods/",
     "crates/horizon-port-pack/",
     "crates/horizon-prepare/",
     "crates/horizon-release-sign/",
     "crates/horizon-telemetry/",
     "crates/horizon-theme/",
+    # Its icon, its menu entries and its AppImage are compiled or packaged into a release
+    # (launcher/build.rs, src/desktop.rs, packaging/linux/appimage.sh).
+    "packaging/icons/",
+    "packaging/linux/",
 ]
 LAUNCHER_IGNORED = ["launcher/links.json", "launcher/docs/", "launcher/tests/"]
 
@@ -89,8 +95,9 @@ PLAYERS_FOOTER = ('<h1>Want to play? Download the <a href="https://playhorizon.d
 PLAYERS = (PLAYERS_FOOTER + '<p>The launcher installs this version and keeps it up to date. You need your own copy of '
            'Minecraft: Java Edition. The files below are what the launcher installs, and the dedicated server for '
            'people who host one.</p>')
-LAUNCHER_FOOTER = ("Your launcher updates itself. New here? Download the archive for your system below, extract it, "
-                   "and run `horizon-launcher`. Website: https://playhorizon.dev")
+LAUNCHER_FOOTER = ("Your launcher updates itself. New here? On Linux take the .AppImage below, make it executable "
+                   "and run it; on Windows and macOS download the archive, extract it and run `horizon-launcher` "
+                   "(Horizon.app on macOS). Website: https://playhorizon.dev")
 DISCLAIMER = "Not an official Minecraft product. Not approved by or associated with Mojang or Microsoft."
 # An open issue with this label holds every game release (docs/release-flow.md). Only people who can triage the
 # repository can add it, and the issue's text is never read: its author could edit it afterwards.
@@ -486,16 +493,25 @@ def passed_on(workflow, sha):
 
 def green_main_head(parity=False):
     """The newest commit on main whose checks passed: what an automatic release builds. With parity (game
-    releases), the newest commit parity-main passed on, if its checks passed too: parity-main runs on batches of
-    merges, so the commits a run skipped are covered by the next one, and a superseded run counts for nothing."""
-    workflow = "parity-main" if parity else "checks"
-    runs = gh_json("run", "list", "--repo", REPO, "--workflow", workflow, "--branch", "main", "--event", "push",
-                   "--limit", "10", "--json", "headSha,status,conclusion")
+    releases), the newest commit parity-main passed on whose checks passed too: parity-main runs on batches of
+    merges, so the commits a run skipped are covered by the next one, and a superseded run counts for nothing. A
+    later batch that failed holds only the merges after that commit, which the green one doesn't contain."""
+    if parity:
+        # Only the successful runs: while merges land, one run at a time finishes (the pending one is replaced at
+        # every push), and a later failed or timed-out batch must not starve the Nightly of the commit an earlier
+        # run passed (2026-11-02: no Nightly for 30 h while main had a green commit parity-main had passed).
+        runs = gh_json("run", "list", "--repo", REPO, "--workflow", "parity-main", "--branch", "main", "--event",
+                       "push", "--status", "success", "--limit", "20", "--json", "headSha,status,conclusion")
+        for entry in runs:
+            if entry["status"] == "completed" and entry["conclusion"] == "success" and passed_on("checks", entry["headSha"]):
+                return entry["headSha"]
+        return None
+    # 50, not 10: a busy hour of merges cancels many runs, which pushes the last finished one out of a short window.
+    runs = gh_json("run", "list", "--repo", REPO, "--workflow", "checks", "--branch", "main", "--event", "push",
+                   "--limit", "50", "--json", "headSha,status,conclusion")
     for entry in runs:
         if entry["status"] == "completed" and entry["conclusion"] != "cancelled":
-            if entry["conclusion"] != "success":
-                return None
-            return entry["headSha"] if not parity or passed_on("checks", entry["headSha"]) else None
+            return entry["headSha"] if entry["conclusion"] == "success" else None
     return None
 
 

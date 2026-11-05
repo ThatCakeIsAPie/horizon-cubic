@@ -112,10 +112,6 @@ pub struct OreFeature {
     size: i32,
     discard: f32,
     air: [BlockStateId; 3],
-    /// When no target rule draws from the random source (and there are at
-    /// most 32 targets): every Y range the rules test. Which targets match
-    /// is then a function of the state and the ranges holding Y.
-    heights: Option<Vec<(i32, i32)>>,
 }
 impl OreFeature {
     pub fn from_json(json: &str, bindings: &FeatureBlockBindings<'_>) -> Result<Self, DecodeError> {
@@ -142,18 +138,11 @@ impl OreFeature {
         if !(0.0..=1.0).contains(&discard) || discard.is_sign_negative() {
             return Err(DecodeError::Field("ore air exposure"));
         }
-        let mut heights = Vec::new();
-        let pure = targets
-            .iter()
-            .try_for_each(|(rule, _)| rule.pure_heights(&mut heights));
-        let heights =
-            (pure.is_some() && targets.len() <= 32 && heights.len() <= 64).then_some(heights);
         Ok(Self {
             targets,
             size,
             discard,
             air: bindings.air,
-            heights,
         })
     }
     pub fn place<W: FeatureWorld + PlacementContext>(
@@ -166,21 +155,15 @@ impl OreFeature {
         let spread_xy = self.size as f32 / 8.0;
         let max_radius = ((self.size as f32 / 16.0 * 2.0 + 1.0) / 2.0).ceil() as i32;
         let (ox, oz) = (f64::from(origin[0]), f64::from(origin[2]));
+        let (sin, cos) = (
+            horizon_core::jmath::sin(f64::from(dir)),
+            horizon_core::jmath::cos(f64::from(dir)),
+        );
         let spread = f64::from(spread_xy);
-        // The blob's ends, needed only once a column under it is found
-        // (most attempts high in To The Max's tall range find none).
-        let ends = || {
-            let (sin, cos) = (
-                horizon_core::jmath::sin(f64::from(dir)),
-                horizon_core::jmath::cos(f64::from(dir)),
-            );
-            [
-                ox + sin * spread,
-                ox - sin * spread,
-                oz + cos * spread,
-                oz - cos * spread,
-            ]
-        };
+        let x0 = ox + sin * spread;
+        let x1 = ox - sin * spread;
+        let z0 = oz + cos * spread;
+        let z1 = oz - cos * spread;
         let y0 = f64::from(
             origin[1]
                 .wrapping_add(random.next_int_bound(3)?)
@@ -210,8 +193,7 @@ impl OreFeature {
                 true => self.do_place(
                     world,
                     random,
-                    ends(),
-                    [y0, y1],
+                    [x0, x1, z0, z1, y0, y1],
                     [x_start, y_start, z_start],
                     size_xz,
                     size_y,
@@ -229,8 +211,7 @@ impl OreFeature {
                     return self.do_place(
                         world,
                         random,
-                        ends(),
-                        [y0, y1],
+                        [x0, x1, z0, z1, y0, y1],
                         [x_start, y_start, z_start],
                         size_xz,
                         size_y,
@@ -240,13 +221,11 @@ impl OreFeature {
         }
         Ok(false)
     }
-    #[allow(clippy::too_many_arguments)]
     fn do_place<W: FeatureWorld + PlacementContext>(
         &self,
         world: &mut W,
         random: &mut impl RandomSource,
-        [x0, x1, z0, z1]: [f64; 4],
-        [y0, y1]: [f64; 2],
+        [x0, x1, z0, z1, y0, y1]: [f64; 6],
         [x_start, y_start, z_start]: [i32; 3],
         size_xz: i32,
         size_y: i32,
@@ -285,20 +264,34 @@ impl OreFeature {
                 }
             }
         }
+        let tested_len = (size_xz as usize) * (size_y as usize) * (size_xz as usize);
+        let mut tested = vec![0u64; tested_len.div_ceil(64)];
         let mut placed = 0;
-        let mut matches = TargetMemo::default();
-        sphere_blocks(
-            &mut (&mut *world, &mut *random, &mut placed),
-            &data,
-            [x_start, y_start, z_start],
-            [size_xz, size_y],
-            || FeatureExecutionError::WorkLimit,
-            |(world, _, _), y| {
-                world
+        let mut squares = SphereSquares::default();
+        for sphere in data {
+            if sphere[3] < 0.0 {
+                continue;
+            }
+            squares.each_cell(sphere, [x_start, y_start, z_start], |[x, y, z]| {
+                if world
                     .outside_build_height(y)
-                    .map_err(FeatureExecutionError::Query)
-            },
-            |(world, random, placed), p| {
+                    .map_err(FeatureExecutionError::Query)?
+                {
+                    return Ok(());
+                }
+                let index = i64::from(x.wrapping_sub(x_start))
+                    + i64::from(y.wrapping_sub(y_start)) * i64::from(size_xz)
+                    + i64::from(z.wrapping_sub(z_start)) * i64::from(size_xz) * i64::from(size_y);
+                // The sphere bounds keep indices inside the native BitSet.
+                let Some(index) = usize::try_from(index).ok().filter(|&i| i < tested_len) else {
+                    return Err(FeatureExecutionError::WorkLimit);
+                };
+                let (word, bit) = (&mut tested[index / 64], 1u64 << (index % 64));
+                if *word & bit != 0 {
+                    return Ok(());
+                }
+                *word |= bit;
+                let p = [x, y, z];
                 if !world
                     .ensure_can_write(p)
                     .map_err(FeatureExecutionError::Query)?
@@ -311,31 +304,11 @@ impl OreFeature {
                 else {
                     return Ok(());
                 };
-                let matched = match &self.heights {
-                    Some(heights) => {
-                        let ranges = heights.iter().enumerate().fold(0u64, |m, (i, &(lo, hi))| {
-                            m | u64::from(lo <= p[1] && p[1] <= hi) << i
-                        });
-                        matches.get(state, ranges, || {
-                            self.targets
-                                .iter()
-                                .enumerate()
-                                .fold(0u32, |m, (i, (rule, _))| {
-                                    m | u32::from(rule.test(state, p, *random)) << i
-                                })
-                        })
-                    }
-                    None => u32::MAX,
-                };
-                for (i, (rule, target)) in self.targets.iter().enumerate() {
-                    if self.heights.is_some() {
-                        if matched >> i & 1 == 0 {
-                            continue;
-                        }
-                    } else if !rule.test(state, p, *random) {
+                for (rule, target) in &self.targets {
+                    if !rule.test(state, p, random) {
                         continue;
                     }
-                    if !skip_air_check(*random, self.discard) {
+                    if !skip_air_check(random, self.discard) {
                         let mut exposed = false;
                         for direction in Direction::ALL {
                             let n = direction.normal();
@@ -356,118 +329,95 @@ impl OreFeature {
                     world
                         .set_section_block(p, *target)
                         .map_err(FeatureExecutionError::Query)?;
-                    **placed += 1;
+                    placed += 1;
                     break;
                 }
                 Ok(())
-            },
-        )?;
+            })?;
+        }
         Ok(placed > 0)
     }
 }
-/// The blocks OreFeature.doPlace tests, in its order: sphere by sphere, X, Y
-/// then Z ascending over each sphere's box, the ones inside the sphere and
-/// within build height (`outside` is asked only for those), each the first
-/// time any sphere reaches it (vanilla's BitSet). The squared distances are
-/// the same expressions as vanilla's, computed once per sphere and axis value
-/// instead of per block, and each Z row's tested blocks are one word.
-#[allow(clippy::too_many_arguments)]
-fn sphere_blocks<C, E>(
-    state: &mut C,
-    spheres: &[[f64; 4]],
-    [x_start, y_start, z_start]: [i32; 3],
-    [size_xz, size_y]: [i32; 2],
-    limit: impl Fn() -> E,
-    mut outside: impl FnMut(&mut C, i32) -> Result<bool, E>,
-    mut visit: impl FnMut(&mut C, [i32; 3]) -> Result<(), E>,
-) -> Result<(), E> {
-    // Vanilla indexes its BitSet by x + y * size_xz + z * size_xz * size_y;
-    // blocks inside a sphere never leave the box, so a row per X and Y with a
-    // bit per Z is the same set.
-    if !(0..64).contains(&size_xz) || size_y < 0 {
-        return Err(limit());
-    }
-    let mut tested = vec![0u64; size_xz as usize * size_y as usize];
-    let (mut ysq, mut zsq) = (Vec::new(), Vec::new());
-    for &[xx, yy, zz, r] in spheres {
-        if r < 0.0 {
-            continue;
-        }
-        let x_min = ((xx - r).floor() as i32).max(x_start);
-        let y_min = ((yy - r).floor() as i32).max(y_start);
-        let z_min = ((zz - r).floor() as i32).max(z_start);
-        let x_max = ((xx + r).floor() as i32).max(x_min);
-        let y_max = ((yy + r).floor() as i32).max(y_min);
-        let z_max = ((zz + r).floor() as i32).max(z_min);
-        if i64::from(z_max) - i64::from(z_start) >= 64 {
-            return Err(limit());
-        }
-        ysq.clear();
-        ysq.extend((y_min..=y_max).map(|y| {
-            let yd = (f64::from(y) + 0.5 - yy) / r;
-            yd * yd
-        }));
-        zsq.clear();
-        zsq.extend((z_min..=z_max).map(|z| {
-            let zd = (f64::from(z) + 0.5 - zz) / r;
-            zd * zd
-        }));
-        let z_shift = (z_min - z_start) as u32;
-        for x in x_min..=x_max {
-            let xd = (f64::from(x) + 0.5 - xx) / r;
-            let xsq = xd * xd;
-            if xsq >= 1.0 {
-                continue;
-            }
-            for (y, &ys) in (y_min..=y_max).zip(&ysq) {
-                let xy = xsq + ys;
-                if xy >= 1.0 {
-                    continue;
-                }
-                let mut inside = 0u64;
-                for (i, &zs) in zsq.iter().enumerate() {
-                    inside |= u64::from(xy + zs < 1.0) << i;
-                }
-                if inside == 0 || outside(state, y)? {
-                    continue;
-                }
-                let inside = inside << z_shift;
-                let (dx, dy) = (x - x_start, y - y_start);
-                if dx >= size_xz || dy >= size_y || inside >> size_xz != 0 {
-                    return Err(limit());
-                }
-                let row = &mut tested[dx as usize * size_y as usize + dy as usize];
-                let mut fresh = inside & !*row;
-                *row |= inside;
-                while fresh != 0 {
-                    let dz = fresh.trailing_zeros() as i32;
-                    fresh &= fresh - 1;
-                    visit(state, [x, y, z_start + dz])?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-/// Recent (state, Y ranges) -> matching targets of a pure-rule ore.
+/// The cells OreFeature.doPlace tests for one sphere `[x, y, z, r]` of a
+/// blob: those of the sphere's box (clamped below to the blob's `start`)
+/// whose `xd * xd + yd * yd + zd * zd` is under 1, in vanilla's x, y, z order.
+///
+/// Along one axis, `d * d` depends on that coordinate alone, so each axis's
+/// squares are worked out once per sphere with vanilla's expression, and
+/// every sum is bit for bit vanilla's. Along an axis the squares fall and then
+/// rise (each step rounds a monotonic function, as does adding a fixed sum),
+/// so the cells of a row that pass form one run around the smallest square:
+/// it is found from there outwards, and the cells outside the sphere are
+/// never visited.
 #[derive(Default)]
-struct TargetMemo {
-    entries: [(u32, u64, u32); 8],
-    len: usize,
-    next: usize,
+struct SphereSquares {
+    axes: [Vec<f64>; 3],
 }
-impl TargetMemo {
-    fn get(&mut self, state: BlockStateId, ranges: u64, compute: impl FnOnce() -> u32) -> u32 {
-        let key = (state.0, ranges);
-        if let Some(e) = self.entries[..self.len].iter().find(|e| (e.0, e.1) == key) {
-            return e.2;
+impl SphereSquares {
+    fn each_cell<E>(
+        &mut self,
+        [xx, yy, zz, r]: [f64; 4],
+        start: [i32; 3],
+        mut cell: impl FnMut([i32; 3]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let centre = [xx, yy, zz];
+        let mut from = [0; 3];
+        let mut lowest = [0; 3];
+        for axis in 0..3 {
+            let low = ((centre[axis] - r).floor() as i32).max(start[axis]);
+            let high = ((centre[axis] + r).floor() as i32).max(low);
+            let squares = &mut self.axes[axis];
+            squares.clear();
+            squares.extend((low..=high).map(|v| {
+                let d = (f64::from(v) + 0.5 - centre[axis]) / r;
+                d * d
+            }));
+            from[axis] = low;
+            lowest[axis] = (0..squares.len())
+                .min_by(|&a, &b| squares[a].total_cmp(&squares[b]))
+                .unwrap_or(0);
         }
-        let value = compute();
-        self.entries[self.next] = (key.0, key.1, value);
-        self.next = (self.next + 1) % self.entries.len();
-        self.len = (self.len + 1).min(self.entries.len());
-        value
+        let [xs, ys, zs] = &self.axes;
+        // Vanilla's `xd * xd >= 1.0` is `0.0 + xd * xd >= 1.0`: a square is
+        // never negative zero, and adding zero to it rounds nothing.
+        let Some((x_low, x_high)) = pass_run(xs, lowest[0], 0.0) else {
+            return Ok(());
+        };
+        for i in x_low..=x_high {
+            let xd2 = xs[i];
+            let Some((y_low, y_high)) = pass_run(ys, lowest[1], xd2) else {
+                continue;
+            };
+            for j in y_low..=y_high {
+                let xy = xd2 + ys[j];
+                let Some((z_low, z_high)) = pass_run(zs, lowest[2], xy) else {
+                    continue;
+                };
+                for k in z_low..=z_high {
+                    cell([from[0] + i as i32, from[1] + j as i32, from[2] + k as i32])?;
+                }
+            }
+        }
+        Ok(())
     }
+}
+/// The run of `squares` around index `lowest` (a smallest one) where vanilla's
+/// `base + square >= 1.0` fails, or None when even the smallest reaches 1.
+/// The sums are never NaN (a sphere's radius is at least 0.5), so failing
+/// that test is being under 1.
+fn pass_run(squares: &[f64], lowest: usize, base: f64) -> Option<(usize, usize)> {
+    let passes = |i: usize| base + squares[i] < 1.0;
+    if !passes(lowest) {
+        return None;
+    }
+    let (mut low, mut high) = (lowest, lowest);
+    while low > 0 && passes(low - 1) {
+        low -= 1;
+    }
+    while high + 1 < squares.len() && passes(high + 1) {
+        high += 1;
+    }
+    Some((low, high))
 }
 fn skip_air_check(random: &mut impl RandomSource, discard: f32) -> bool {
     if discard <= 0.0 {
@@ -481,120 +431,88 @@ fn skip_air_check(random: &mut impl RandomSource, discard: f32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::sphere_blocks;
+    use super::SphereSquares;
 
-    /// OreFeature.doPlace's loop as vanilla writes it.
-    fn reference(
-        spheres: &[[f64; 4]],
-        [x_start, y_start, z_start]: [i32; 3],
-        [size_xz, size_y]: [i32; 2],
-        bottom: i32,
-    ) -> Vec<[i32; 3]> {
-        let mut tested = vec![false; (size_xz * size_y * size_xz) as usize];
-        let mut out = Vec::new();
-        for &[xx, yy, zz, r] in spheres {
-            if r < 0.0 {
+    /// OreFeature.doPlace's loops over one sphere's whole box, as vanilla
+    /// writes them: the cells it goes on to test.
+    fn box_scan([xx, yy, zz, r]: [f64; 4], [x_start, y_start, z_start]: [i32; 3]) -> Vec<[i32; 3]> {
+        let x_min = ((xx - r).floor() as i32).max(x_start);
+        let y_min = ((yy - r).floor() as i32).max(y_start);
+        let z_min = ((zz - r).floor() as i32).max(z_start);
+        let x_max = ((xx + r).floor() as i32).max(x_min);
+        let y_max = ((yy + r).floor() as i32).max(y_min);
+        let z_max = ((zz + r).floor() as i32).max(z_min);
+        let mut cells = Vec::new();
+        for x in x_min..=x_max {
+            let xd = (f64::from(x) + 0.5 - xx) / r;
+            if xd * xd >= 1.0 {
                 continue;
             }
-            let x_min = ((xx - r).floor() as i32).max(x_start);
-            let y_min = ((yy - r).floor() as i32).max(y_start);
-            let z_min = ((zz - r).floor() as i32).max(z_start);
-            let x_max = ((xx + r).floor() as i32).max(x_min);
-            let y_max = ((yy + r).floor() as i32).max(y_min);
-            let z_max = ((zz + r).floor() as i32).max(z_min);
-            for x in x_min..=x_max {
-                let xd = (f64::from(x) + 0.5 - xx) / r;
-                if xd * xd >= 1.0 {
+            for y in y_min..=y_max {
+                let yd = (f64::from(y) + 0.5 - yy) / r;
+                if xd * xd + yd * yd >= 1.0 {
                     continue;
                 }
-                for y in y_min..=y_max {
-                    let yd = (f64::from(y) + 0.5 - yy) / r;
-                    if xd * xd + yd * yd >= 1.0 {
+                for z in z_min..=z_max {
+                    let zd = (f64::from(z) + 0.5 - zz) / r;
+                    if xd * xd + yd * yd + zd * zd >= 1.0 {
                         continue;
                     }
-                    for z in z_min..=z_max {
-                        let zd = (f64::from(z) + 0.5 - zz) / r;
-                        if xd * xd + yd * yd + zd * zd >= 1.0 || y < bottom {
-                            continue;
-                        }
-                        let index = (x - x_start)
-                            + (y - y_start) * size_xz
-                            + (z - z_start) * size_xz * size_y;
-                        if !std::mem::replace(&mut tested[index as usize], true) {
-                            out.push([x, y, z]);
-                        }
-                    }
+                    cells.push([x, y, z]);
                 }
             }
         }
-        out
+        cells
     }
 
-    /// The blobs OreFeature.place builds, from a small LCG.
     #[test]
-    fn sphere_blocks_match_vanilla_order() {
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut next = || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (seed >> 11) as f64 / (1u64 << 53) as f64
+    fn a_sphere_visits_exactly_the_cells_vanillas_box_scan_tests() {
+        // SplitMix64: any fixed spread of spheres will do.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut unit = move || {
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            ((z ^ (z >> 31)) >> 11) as f64 / (1_u64 << 53) as f64
         };
-        for case in 0..400 {
-            let size = 1 + (next() * 64.0) as i32;
-            let origin = [(next() * 40.0) as i32 - 20, (next() * 40.0) as i32 - 20, 7];
-            let dir = next() as f32 * std::f32::consts::PI;
-            let spread = f64::from(size as f32 / 8.0);
-            let max_radius = ((size as f32 / 16.0 * 2.0 + 1.0) / 2.0).ceil() as i32;
-            let (sin, cos) = (f64::from(dir).sin(), f64::from(dir).cos());
-            let [x0, x1] = [1.0, -1.0].map(|s| f64::from(origin[0]) + s * sin * spread);
-            let [z0, z1] = [1.0, -1.0].map(|s| f64::from(origin[2]) + s * cos * spread);
-            let [y0, y1] = [0, 0].map(|_| f64::from(origin[1] + (next() * 3.0) as i32 - 2));
-            let spheres: Vec<[f64; 4]> = (0..size)
-                .map(|i| {
-                    let step = f64::from(i as f32 / size as f32);
-                    let ss = next() * f64::from(size) / 16.0;
-                    let sine = (std::f64::consts::PI * step).sin();
-                    let r = if next() < 0.1 {
-                        -1.0
-                    } else {
-                        ((sine + 1.0) * ss + 1.0) / 2.0
-                    };
-                    [
-                        x0 + step * (x1 - x0),
-                        y0 + step * (y1 - y0),
-                        z0 + step * (z1 - z0),
-                        r,
-                    ]
-                })
-                .collect();
-            let spread_ceil = spread.ceil() as i32;
-            let start = [
-                origin[0] - spread_ceil - max_radius,
-                origin[1] - 2 - max_radius,
-                origin[2] - spread_ceil - max_radius,
-            ];
-            let sizes = [2 * (spread_ceil + max_radius), 2 * (2 + max_radius)];
-            let bottom = if case % 3 == 0 { origin[1] } else { i32::MIN };
-            let mut got = Vec::new();
-            sphere_blocks(
-                &mut got,
-                &spheres,
-                start,
-                sizes,
-                || (),
-                |_, y| Ok(y < bottom),
-                |got, p| {
-                    got.push(p);
+        let mut squares = SphereSquares::default();
+        let mut visited = 0;
+        for _ in 0..20_000 {
+            // Centres and radii on whole and half blocks put cells exactly on
+            // the sphere's edge, where a sum is exactly 1.
+            let mut sphere = [0.0; 4];
+            let r = 0.5 + unit() * 4.0;
+            sphere[3] = if unit() < 0.3 {
+                (r * 2.0).round() / 2.0
+            } else {
+                r
+            };
+            let mut start = [0; 3];
+            for axis in 0..3 {
+                let c = (unit() - 0.5) * 80_000.0;
+                sphere[axis] = match (unit() * 3.0) as u32 {
+                    0 => c.floor(),
+                    1 => c.floor() + 0.5,
+                    _ => c,
+                };
+                // Sometimes the blob's start cuts the sphere's box.
+                start[axis] = (sphere[axis] - sphere[3]).floor() as i32 + (unit() * 5.0) as i32 - 1;
+            }
+            let mut cells = Vec::new();
+            squares
+                .each_cell::<()>(sphere, start, |p| {
+                    cells.push(p);
                     Ok(())
-                },
-            )
-            .unwrap();
+                })
+                .unwrap();
             assert_eq!(
-                got,
-                reference(&spheres, start, sizes, bottom),
-                "case {case}"
+                cells,
+                box_scan(sphere, start),
+                "sphere {sphere:?}, start {start:?}"
             );
+            visited += cells.len();
         }
+        assert!(visited > 100_000, "only {visited} cells");
     }
 }

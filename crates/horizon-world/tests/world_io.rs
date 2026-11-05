@@ -10,10 +10,10 @@ use std::{
     fs,
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
-static NEXT: AtomicU64 = AtomicU64::new(0);
+static NEXT: AtomicU32 = AtomicU32::new(0);
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
@@ -381,4 +381,33 @@ fn a_chunk_loads_whatever_follows_its_root() {
     }
     let cut = Compression::Zlib.encode(&bytes[..bytes.len() - 2]).unwrap();
     assert!(record(Compression::Zlib, cut).nbt(Limits::saved()).is_err());
+}
+
+/// `RegionFile.write` rewrites both header sectors from memory
+/// (`writeHeader`), so entries the constructor dropped as invalid (#5064:
+/// overlapping the header, empty, past the end) are zero on disk afterwards;
+/// their timestamps stay. Vanilla 26.3 leaves this file with these bytes.
+#[test]
+fn a_chunk_write_rewrites_the_whole_region_header() {
+    let dir = Directory::new();
+    let mut header = vec![0u8; 8192];
+    header[20..24].copy_from_slice(&[0, 0, 1, 1]); // slot 5: sector 1
+    header[200..204].copy_from_slice(&[0, 0, 5, 0]); // slot 50: no sectors
+    header[400..404].copy_from_slice(&[0, 0, 0x64, 1]); // slot 100: past the end
+    header[4096 + 20..4096 + 24].copy_from_slice(&12345u32.to_be_bytes());
+    fs::write(dir.region(), &header).unwrap();
+    let root = NamedTag {
+        name: JavaString::default(),
+        tag: Tag::compound([("x", Tag::Int(7))]),
+    };
+    let record = ChunkRecord::from_nbt(&root, Compression::Zlib, 1, Limits::saved()).unwrap();
+    let mut region = RegionFile::open_writable(dir.region(), false).unwrap();
+    region.write(ChunkPos::new(-32, 0), &record).unwrap();
+    drop(region);
+    let bytes = fs::read(dir.region()).unwrap();
+    assert_eq!(bytes[0..4], [0, 0, 2, 1]);
+    for slot in [5, 50, 100] {
+        assert_eq!(bytes[slot * 4..slot * 4 + 4], [0; 4], "slot {slot}");
+    }
+    assert_eq!(bytes[4096 + 20..4096 + 24], 12345u32.to_be_bytes());
 }

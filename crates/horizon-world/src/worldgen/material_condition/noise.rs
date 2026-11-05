@@ -58,16 +58,6 @@ impl<P: PositionalRandom, S: MaterialSurfaceQueries> MaterialSurfaceQueries
     ) -> Result<usize, DecodeError> {
         self.surface.bind_density(sampler, eager)
     }
-    fn bind_gated_density(
-        &mut self,
-        sampler: Arc<dyn horizon_core::density::DensitySampler>,
-        gate: &super::DensityGate,
-        gated: bool,
-        lattice: Option<i32>,
-    ) -> Result<usize, DecodeError> {
-        self.surface
-            .bind_gated_density(sampler, gate, gated, lattice)
-    }
     fn density(&mut self, index: usize, position: BlockPos) -> Result<f32, MaterialRuleError> {
         self.surface.density(index, position)
     }
@@ -82,13 +72,6 @@ impl<P: PositionalRandom, S: MaterialSurfaceQueries> MaterialSurfaceQueries
     }
     fn biome_id(&mut self, position: BlockPos) -> Result<Option<u32>, MaterialRuleError> {
         self.surface.biome_id(position)
-    }
-    fn biome_id_down(
-        &mut self,
-        position: BlockPos,
-        floor: i32,
-    ) -> Result<Option<(u32, i32)>, MaterialRuleError> {
-        self.surface.biome_id_down(position, floor)
     }
     fn biome_index(&self, name: &str) -> Option<Option<u32>> {
         self.surface.biome_index(name)

@@ -2,8 +2,9 @@
 //! and lines without player context for the recipe book's search tree.
 use crate::text::{GRAY, Text};
 use crate::{
+    bundle::TooltipLayout,
     hud::rgba,
-    items::{ItemInfo, ItemStack},
+    items::{ItemInfo, ItemStack, Items},
 };
 use horizon_world::nbt::Tag;
 
@@ -211,6 +212,34 @@ fn is_potion_item(item: &str) -> bool {
     item.ends_with("potion") || item == "minecraft:tipped_arrow"
 }
 
+/// `PlayerHeadItem.getName`: a player head whose profile has a name is titled
+/// after it.
+pub struct PlayerHeadName(String);
+
+impl PlayerHeadName {
+    /// The title as `getName`'s `%s's Head` translation.
+    pub fn title(&self, translate: &dyn Fn(&str) -> Option<String>) -> String {
+        translate("block.minecraft.player_head.named")
+            .unwrap_or_else(|| "%s's Head".to_owned())
+            .replacen("%s", &self.0, 1)
+    }
+    /// The title as a component, for command feedback.
+    pub fn text(&self) -> crate::text::Text {
+        crate::text::Text::translate(
+            "block.minecraft.player_head.named",
+            &[crate::text::Text::literal(self.0.clone())],
+        )
+    }
+}
+
+/// The name in a player head's `minecraft:profile`, if it has one.
+pub fn player_head_name(stack: &ItemStack) -> Option<PlayerHeadName> {
+    if &*stack.item != "minecraft:player_head" {
+        return None;
+    }
+    Some(PlayerHeadName(stack.profile_name()?))
+}
+
 /// The name line of `stack`, as the item's translation or, for potions and
 /// smithing templates, its name component gives it.
 pub fn name_line(stack: &ItemStack, translate: &dyn Fn(&str) -> Option<String>) -> String {
@@ -227,6 +256,9 @@ pub fn name_line(stack: &ItemStack, translate: &dyn Fn(&str) -> Option<String>) 
     if stack.data().is_some_and(|d| d.ominous_banner) {
         return translate("block.minecraft.ominous_banner")
             .unwrap_or_else(|| "Ominous Banner".to_owned());
+    }
+    if let Some(head) = player_head_name(stack) {
+        return head.title(translate);
     }
     let key = if is_potion_item(&stack.item) {
         Some(crate::brewing::potion_name_key(&stack.item, stack.potion()))
@@ -254,12 +286,24 @@ pub fn name_line(stack: &ItemStack, translate: &dyn Fn(&str) -> Option<String>) 
         .unwrap_or_else(|| path.replace('_', " "))
 }
 
-/// ItemStack.getRarity: the ominous banner override, then the enchantment upgrade.
+/// ItemStack.getRarity: the stack's `minecraft:rarity` (the item's default
+/// unless a command or server set it; the ominous banner's uncommon), then
+/// the enchantment upgrade.
 pub fn rarity<'a>(stack: &ItemStack, default: &'a str) -> &'a str {
+    let set = match stack.data().and_then(|d| d.other("minecraft:rarity")) {
+        Some(Tag::String(s)) => match &*s.to_string_lossy() {
+            "common" => Some("common"),
+            "uncommon" => Some("uncommon"),
+            "rare" => Some("rare"),
+            "epic" => Some("epic"),
+            _ => None,
+        },
+        _ => None,
+    };
     let rarity = if stack.data().is_some_and(|d| d.ominous_banner) {
         "uncommon"
     } else {
-        default
+        set.unwrap_or(default)
     };
     if stack.enchantments().is_empty() {
         rarity
@@ -270,6 +314,23 @@ pub fn rarity<'a>(stack: &ItemStack, default: &'a str) -> &'a str {
             r => r,
         }
     }
+}
+
+/// `BundleItem.getTooltipImage`: the contents grid of a bundle, or None when
+/// the stack is not one or `minecraft:tooltip_display` hides
+/// `minecraft:bundle_contents` - the image is that component's tooltip
+/// detail, so a display that hides the component hides the grid too.
+pub fn bundle_tooltip(
+    items: &Items,
+    stack: &ItemStack,
+    x: f32,
+    y: f32,
+    box_width: f32,
+) -> Option<TooltipLayout> {
+    TooltipDisplay::for_stack(stack)
+        .shows("minecraft:bundle_contents")
+        .then(|| crate::bundle::tooltip_layout(items, stack, x, y, box_width))
+        .flatten()
 }
 
 fn is_beehive(path: &str) -> bool {
@@ -793,6 +854,19 @@ pub fn smithing_template_lines(
     ]
 }
 
+/// `DiscFragmentItem.appendHoverText`: the gray "Music Disc - 5" line; none for
+/// other items.
+pub fn disc_fragment_line(
+    stack: &ItemStack,
+    translate: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if &*stack.item != "minecraft:disc_fragment_5" {
+        return None;
+    }
+    let key = "item.minecraft.disc_fragment_5.desc";
+    Some(translate(key).unwrap_or_else(|| key.to_owned()))
+}
+
 /// The lines of `stack` below its name that its components give, in
 /// `ItemStack.addDetailsToTooltip` order.
 pub fn detail_lines(
@@ -808,6 +882,7 @@ pub fn detail_lines(
             .into_iter()
             .map(|l| l.0),
     );
+    lines.extend(disc_fragment_line(stack, translate));
     let display = TooltipDisplay::for_stack(stack);
     lines.extend(bees_line(stack, &display, translate));
     lines.extend(honey_line(stack, &display, translate));
@@ -1010,7 +1085,7 @@ pub fn lines(
 /// `ItemLore.addToTooltip`: each lore component under dark purple italic, with
 /// the component's own styles (including explicit `false`) winning on children.
 pub fn lore_texts(stack: &ItemStack) -> Vec<crate::text::Text> {
-    let Some(Tag::List(entries)) = stack.data().and_then(|d| d.other("minecraft:lore")) else {
+    let Some(raw) = stack.data().and_then(|d| d.other("minecraft:lore")) else {
         return Vec::new();
     };
     let base = crate::text::Style {
@@ -1018,10 +1093,19 @@ pub fn lore_texts(stack: &ItemStack) -> Vec<crate::text::Text> {
         italic: Some(true),
         ..Default::default()
     };
-    entries
-        .iter()
-        .map(|entry| {
-            let mut text = crate::entity_nbt::name_text(entry).resolve_legacy();
+    let lines: Vec<crate::text::Text> = match raw {
+        Tag::List(entries) => entries
+            .iter()
+            .map(|entry| crate::entity_nbt::name_text(entry).resolve_legacy())
+            .collect(),
+        Tag::Compound(_) | Tag::String(_) => {
+            vec![crate::entity_nbt::name_text(raw).resolve_legacy()]
+        }
+        _ => Vec::new(),
+    };
+    lines
+        .into_iter()
+        .map(|mut text| {
             for span in &mut text.spans {
                 span.style.inherit(&base);
             }
@@ -1050,6 +1134,27 @@ mod tests {
     use super::*;
     use horizon_world::loot::PackOverlay;
     use std::sync::Arc;
+
+    #[test]
+    fn disc_fragment_shows_music_disc_line_first() {
+        let translate = |k: &str| {
+            (k == "item.minecraft.disc_fragment_5.desc").then(|| "Music Disc - 5".to_owned())
+        };
+        let stack = ItemStack::new("minecraft:disc_fragment_5", 1);
+        assert_eq!(
+            disc_fragment_line(&stack, &translate).as_deref(),
+            Some("Music Disc - 5")
+        );
+        let lines = detail_lines(&stack, None, &translate);
+        assert_eq!(lines.first().map(String::as_str), Some("Music Disc - 5"));
+        let other = ItemStack::new("minecraft:stick", 1);
+        assert_eq!(disc_fragment_line(&other, &translate), None);
+        assert!(
+            !detail_lines(&other, None, &translate)
+                .iter()
+                .any(|l| l == "Music Disc - 5")
+        );
+    }
 
     #[test]
     fn styled_name_keeps_gradient_spans_and_explicit_italic() {
@@ -1143,6 +1248,45 @@ mod tests {
         assert!(!display.name_visible(false));
         assert!(display.name_visible(true));
         assert!(!display.shows("minecraft:attribute_modifiers"));
+    }
+
+    /// `BundleItem.getTooltipImage` is a tooltip detail of
+    /// `minecraft:bundle_contents`, so a `minecraft:tooltip_display` that
+    /// hides the component - or the whole tooltip - takes the contents grid
+    /// with it. The draw path asks for the grid through the same function.
+    #[test]
+    fn a_bundle_contents_grid_follows_the_tooltip_display() {
+        let items = Items::for_tests(Default::default());
+        let mut bundle = ItemStack::new("minecraft:bundle", 1);
+        bundle.data_mut().bundle_contents = vec![ItemStack::new("minecraft:stone", 3)];
+        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0).is_some());
+        // A stack that is not a bundle has no grid.
+        let stone = ItemStack::new("minecraft:stone", 1);
+        assert!(bundle_tooltip(&items, &stone, 0.0, 0.0, 96.0).is_none());
+        // A display that hides the contents component hides the grid.
+        bundle.data_mut().set_other(
+            "minecraft:tooltip_display",
+            Some(Tag::compound([(
+                "hidden_components",
+                Tag::List(vec![Tag::String("minecraft:bundle_contents".into())]),
+            )])),
+        );
+        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0).is_none());
+        // So does one that hides the whole tooltip.
+        bundle.data_mut().set_other(
+            "minecraft:tooltip_display",
+            Some(Tag::compound([("hide_tooltip", Tag::Byte(1))])),
+        );
+        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0).is_none());
+        // A component the display does not name leaves the grid alone.
+        bundle.data_mut().set_other(
+            "minecraft:tooltip_display",
+            Some(Tag::compound([(
+                "hidden_components",
+                Tag::List(vec![Tag::String("minecraft:lore".into())]),
+            )])),
+        );
+        assert!(bundle_tooltip(&items, &bundle, 0.0, 0.0, 96.0).is_some());
     }
 
     #[test]
@@ -1296,6 +1440,52 @@ mod tests {
         assert_eq!(rarity(&plain, "common"), "common");
     }
 
+    /// `/give @a stick[rarity=epic,enchantments={aqua_affinity:1}]`: the
+    /// stack's rarity wins over the item's, and stays epic when enchanted.
+    #[test]
+    fn a_stacks_rarity_component_sets_its_rarity() {
+        let mut stick = ItemStack::new("minecraft:stick", 1);
+        stick
+            .data_mut()
+            .other
+            .push(("minecraft:rarity".into(), Tag::String("epic".into())));
+        assert_eq!(rarity(&stick, "common"), "epic");
+        stick.enchant("minecraft:aqua_affinity", 1);
+        assert_eq!(rarity(&stick, "common"), "epic");
+        let mut sword = ItemStack::new("minecraft:diamond_sword", 1);
+        sword
+            .data_mut()
+            .other
+            .push(("minecraft:rarity".into(), Tag::String("uncommon".into())));
+        sword.enchant("minecraft:sharpness", 1);
+        assert_eq!(rarity(&sword, "common"), "rare");
+    }
+
+    #[test]
+    fn lore_texts_handles_compound_lists() {
+        // Direct command components from issue #6405
+        let cmd = r#"[custom_name=[{"text":"Simple Custom Name","italic":false}],lore=[[{"text":"Simple Custom Lore","italic":false}]],rarity=epic,enchantments={aqua_affinity:1},unbreakable={}]"#;
+        let comp = horizon_items::item_data::command_components(cmd).unwrap();
+        let (damage, extra) = horizon_items::item_data::decode_components(Some(&comp));
+        let stack = ItemStack {
+            item: "minecraft:stick".into(),
+            count: 1,
+            damage,
+            extra,
+        };
+        assert_eq!(rarity(&stack, "common"), "epic");
+        let name = styled_name(&stack, || "fallback".into());
+        assert_eq!(name.plain(), "Simple Custom Name");
+        assert_eq!(name.spans[0].style.italic, Some(false));
+
+        let lore = lore_texts(&stack);
+        assert_eq!(lore.len(), 1);
+        assert_eq!(lore[0].plain(), "Simple Custom Lore");
+        assert_eq!(lore[0].spans[0].style.italic, Some(false));
+        assert_eq!(lore[0].spans[0].style.color, Some(crate::text::DARK_PURPLE));
+        assert!(TooltipDisplay::for_stack(&stack).shows("minecraft:lore"));
+    }
+
     #[test]
     fn name_line_translates_items_of_any_namespace() {
         let translate = |key: &str| match key {
@@ -1313,6 +1503,37 @@ mod tests {
         assert_eq!(name("minecraft:diamond"), "Diamond");
         // No translation: the path, as the creative names fall back to.
         assert_eq!(name("example:raw_ruby"), "raw ruby");
+    }
+
+    #[test]
+    fn player_head_names_use_the_profile() {
+        let translate = |key: &str| match key {
+            "block.minecraft.player_head.named" => Some("%s's Head".to_owned()),
+            "block.minecraft.player_head" => Some("Player Head".to_owned()),
+            _ => None,
+        };
+        let mut named = ItemStack::new("minecraft:player_head", 1);
+        named
+            .data_mut()
+            .set_other("minecraft:profile", Some(Tag::String("Notch".into())));
+        assert_eq!(name_line(&named, &translate), "Notch's Head");
+
+        let mut compound = ItemStack::new("minecraft:player_head", 1);
+        compound.data_mut().set_other(
+            "minecraft:profile",
+            Some(Tag::compound([("name", Tag::String("Notch".into()))])),
+        );
+        assert_eq!(name_line(&compound, &translate), "Notch's Head");
+
+        let mut id_only = ItemStack::new("minecraft:player_head", 1);
+        id_only.data_mut().set_other(
+            "minecraft:profile",
+            Some(Tag::compound([("id", Tag::IntArray(vec![1, 2, 3, 4]))])),
+        );
+        assert_eq!(name_line(&id_only, &translate), "Player Head");
+
+        named.data_mut().custom_name = Some(Tag::String("Trophy".into()));
+        assert_eq!(name_line(&named, &translate), "Trophy");
     }
 
     #[test]

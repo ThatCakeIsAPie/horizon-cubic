@@ -322,7 +322,7 @@ fn rule(
                 inputs: inputs.clone(),
                 channel: Some(2),
             }),
-            gate: None,
+            positive_y: [i32::MIN, i32::MAX],
         },
         "if" => MaterialRule::Condition {
             if_true: condition(&v[1], registry),

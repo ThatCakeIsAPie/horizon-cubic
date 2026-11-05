@@ -202,6 +202,8 @@ pub struct Settings {
     /// The packs in `shaderpacks/`, listed when the Shader Packs page opens; the pick is
     /// `horizon.shader_pack`.
     pub shader_packs: Vec<crate::shader_pack_list::Entry>,
+    /// The picked pack's options while its Shader Options page is open.
+    pub shader_options: Option<crate::shader_options::ShaderOptions>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -285,6 +287,7 @@ impl Default for Settings {
             extras: Default::default(),
             mods: Default::default(),
             shader_packs: Vec::new(),
+            shader_options: None,
         }
     }
 }
@@ -329,26 +332,33 @@ impl Settings {
             .parent()
             .map(crate::graphics::Graphics::load)
             .unwrap_or_default();
+        crate::mipmap::set_dither_cutouts(horizon.dither_cutout_mips);
         let controller = path
             .parent()
             .map(crate::gamepad::PadSettings::load)
             .unwrap_or_default();
-        let extras = path
+        let extras_text = path
             .parent()
-            .map(crate::extras::Extras::load)
+            .and_then(|dir| fs::read_to_string(dir.join(crate::extras::FILE)).ok())
             .unwrap_or_default();
+        let mut extras = crate::extras::Extras::parse(&extras_text);
+        // The enabled mods are the game folder's, shared by its players (`--player-dir`).
         let mods = path
             .parent()
-            .map(crate::mod_list::ModList::load)
+            .map(|dir| crate::mod_list::ModList::load(&crate::logging::shared_dir(dir)))
             .unwrap_or_default();
         let settings = match fs::read(path) {
-            Ok(bytes) => Self {
-                horizon,
-                controller,
-                extras,
-                mods,
-                ..Self::parse(&String::from_utf8_lossy(&bytes))
-            },
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                extras.read_old_options(&extras_text, &text);
+                Self {
+                    horizon,
+                    controller,
+                    extras,
+                    mods,
+                    ..Self::parse(&text)
+                }
+            }
             Err(_) => Self {
                 horizon,
                 controller,
@@ -467,6 +477,7 @@ impl Settings {
             extras: Default::default(),
             mods: Default::default(),
             shader_packs: Vec::new(),
+            shader_options: None,
             auto_jump: f.bool("autoJump"),
             language: f.string("lang"),
             force_unicode: f.bool("forceUnicodeFont"),
@@ -621,7 +632,7 @@ impl Settings {
     /// These settings with one `options.txt` value changed (`horizon-ctl
     /// options-set`, as `OptionsFile::set_text` reads it). Horizon's own
     /// files (graphics, controller, extras, the mod list) aren't in
-    /// `options.txt`, so they stay as they are.
+    /// `options.txt`, so they stay as they are, as do the monitor's video modes.
     pub fn with_option(&self, key: &str, value: &str) -> Result<Self, String> {
         let mut file = self.to_file();
         file.set_text(key, value)?;
@@ -630,6 +641,7 @@ impl Settings {
             controller: self.controller.clone(),
             extras: self.extras.clone(),
             mods: self.mods.clone(),
+            video_modes: self.video_modes.clone(),
             ..Self::from_file(file)
         })
     }
@@ -639,12 +651,14 @@ impl Settings {
     }
     pub fn save(&self, path: &Path) {
         self.describe_for_crashes();
-        let _ = fs::write(path, self.serialize());
+        if let Err(e) = fs::write(path, self.serialize()) {
+            log::warn!("Horizon: options.txt is not saved: {e}");
+        }
         if let Some(dir) = path.parent() {
             self.horizon.save(dir);
             self.controller.save(dir);
             self.extras.save(dir);
-            self.mods.save(dir);
+            self.mods.save(&crate::logging::shared_dir(dir));
         }
     }
     /// Volume of a sound source (master excluded).
@@ -659,6 +673,22 @@ impl Settings {
                     self.volumes[i]
                 }
             })
+    }
+    /// `Options.getFinalSoundSourceVolume`: a source's volume times master's.
+    pub fn final_volume(&self, source: &str) -> f32 {
+        if source == "master" {
+            self.master_volume
+        } else {
+            self.volume(source) * self.master_volume
+        }
+    }
+    /// `Options.narrator`: the `narrator` id in options.txt.
+    pub fn narrator(&self) -> horizon_narrator::Status {
+        horizon_narrator::Status::by_id(self.file.int("narrator"))
+    }
+    pub fn set_narrator(&mut self, status: horizon_narrator::Status) {
+        self.file
+            .set("narrator", crate::options_file::V::Int(status.id()));
     }
     /// `Options.getBackgroundColor(float)`: the text backdrop colour, `default`
     /// opacity unless `backgroundForChatOnly` is off.
@@ -775,16 +805,22 @@ pub enum Opt {
     PadAdaptiveTriggers,
     PadLightbar,
     PadLookSensitivity,
+    PadPointerSpeed,
+    PadScrollSpeed,
+    PadRepeatDelay,
+    PadRepeatInterval,
     PadInvertX,
     PadInvertY,
     PadToggleSneak,
     PadMoveDeadzone,
     PadLookDeadzone,
+    PadTriggerThreshold,
     PadGlyphs,
-    PadMenuNav,
     PadKeyboard,
     /// `options.modelPart.*`: one skin layer (index into `options_file::MODEL_PARTS`).
     ModelPart(usize),
+    /// 3D skin layers: the player's outer layer as extruded slabs.
+    SkinLayers3d,
     MainHand,
     AllowServerListing,
     RealmsNotifications,
@@ -807,6 +843,44 @@ pub enum Opt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_narrator_reads_its_status_and_the_voice_under_master() {
+        let s = Settings::parse("narrator:2\nsoundCategory_master:0.5\nsoundCategory_voice:0.5\n");
+        assert_eq!(s.narrator(), horizon_narrator::Status::Chat);
+        assert_eq!(s.final_volume("voice"), 0.25);
+        assert_eq!(s.final_volume("master"), 0.5);
+        let mut s = s;
+        s.set_narrator(horizon_narrator::Status::Off);
+        assert_eq!(
+            Settings::parse(&s.serialize()).narrator(),
+            horizon_narrator::Status::Off
+        );
+    }
+    #[test]
+    fn three_d_skin_layers_move_from_options_txt_to_the_extras_file() {
+        // #8091 wrote the switch into options.txt; a player who had it on keeps
+        // it, and the next options.txt is vanilla's again.
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-skin-layers-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("options.txt"), "fov:0.5\nthreeDSkinLayers:true\n").unwrap();
+        let s = Settings::load(&dir.join("options.txt"));
+        assert!(s.extras.three_d_skin_layers);
+        assert_eq!(s.fov, 90.0);
+        assert!(!s.serialize().contains("threeDSkinLayers"));
+        assert!(crate::extras::Extras::parse(&s.extras.serialize()).three_d_skin_layers);
+        // Once horizon-extras.txt has its own line, a stale options.txt one is ignored.
+        fs::write(dir.join(crate::extras::FILE), "threeDSkinLayers:false\n").unwrap();
+        assert!(
+            !Settings::load(&dir.join("options.txt"))
+                .extras
+                .three_d_skin_layers
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
     #[test]
     fn an_option_set_keeps_horizon_files() {
         let mut s = Settings::parse("fov:70\n");

@@ -170,8 +170,17 @@ fn last_pre_minor(current: Format) -> i64 {
 /// `PackFormat.fullCodec(default_minor)`: an int, or a list of 1 to 256
 /// non-negative ints whose second is the minor. None: it does not parse.
 fn format_codec(v: &serde_json::Value, default_minor: i64) -> Option<Format> {
-    let non_negative =
-        |v: &serde_json::Value| v.as_i64().filter(|n| *n >= 0 && *n <= i64::from(i32::MAX));
+    // `Codec.INT` reads any JSON number through `Number.intValue`: a decimal such as `97.1`
+    // counts as its whole part (97), as it does for the game.
+    let non_negative = |v: &serde_json::Value| {
+        v.as_i64()
+            .or_else(|| {
+                v.as_f64()
+                    .filter(|f| f.is_finite())
+                    .map(|f| f.trunc() as i64)
+            })
+            .filter(|n| *n >= 0 && *n <= i64::from(i32::MAX))
+    };
     match v {
         serde_json::Value::Array(a) if (1..=256).contains(&a.len()) => {
             let list: Option<Vec<i64>> = a.iter().map(non_negative).collect();
@@ -448,8 +457,16 @@ fn read_meta(source: &Source) -> Option<serde_json::Value> {
         Source::Dir(d) => fs::read(d.join("pack.mcmeta")).ok()?,
         Source::Zip(z) => Zip::open(z).ok()?.read("pack.mcmeta").ok()?,
     };
-    // Gson reads past a UTF-8 byte order mark; serde_json rejects it.
-    serde_json::from_slice(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes)).ok()
+    parse_meta(&bytes)
+}
+/// The first JSON value of a `pack.mcmeta`: what follows it is ignored, as some packs sign the
+/// file with a comment after the closing brace. Gson reads past a UTF-8 byte order mark;
+/// serde_json rejects it.
+fn parse_meta(bytes: &[u8]) -> Option<serde_json::Value> {
+    serde_json::Deserializer::from_slice(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes))
+        .into_iter()
+        .next()?
+        .ok()
 }
 fn pack(id: String, title: Text, source: Source) -> Option<Pack> {
     pack_for(id, title, source, RESOURCE_FORMAT)
@@ -628,7 +645,7 @@ fn build_overlay_uncached(
     }
     // FallbackResourceManager: a file's `.mcmeta` counts only from the pack that
     // supplies the file or one above it; vanilla's own sits below every pack.
-    let hidden: BTreeSet<String> = files
+    let mut hidden: BTreeSet<String> = files
         .iter()
         .filter(|(name, _)| !name.ends_with(".mcmeta"))
         .filter_map(|(name, (owner, _))| {
@@ -639,6 +656,25 @@ fn build_overlay_uncached(
             }
         })
         .collect();
+    // A companion from below the winning colour would describe another surface.
+    // A map-only pack above it is intentional and remains valid.
+    for (name, (owner, _)) in &files {
+        let Some(stem) = name.strip_suffix(".png") else {
+            continue;
+        };
+        if stem.ends_with("_n") || stem.ends_with("_s") {
+            continue;
+        }
+        for suffix in ["_n.png", "_s.png"] {
+            let map = format!("{stem}{suffix}");
+            if files
+                .get(&map)
+                .is_none_or(|(map_owner, _)| map_owner < owner)
+            {
+                hidden.insert(map);
+            }
+        }
+    }
     for name in &hidden {
         files.remove(name);
     }
@@ -687,18 +723,20 @@ fn build_overlay_uncached(
             merged.insert(name.clone(), bytes);
         }
     }
+    /// A zip entry to write: its pack, its name in the zip and where it goes.
+    type Extract<'a> = (usize, &'a str, PathBuf);
     #[allow(clippy::too_many_arguments)]
-    fn mirror(
+    fn mirror<'a>(
         rel: &str,
         vanilla: &Path,
         out: &Path,
         touched: &BTreeSet<String>,
         hidden: &BTreeSet<String>,
-        files: &BTreeMap<String, (usize, Provided)>,
+        files: &'a BTreeMap<String, (usize, Provided)>,
         merged: &BTreeMap<String, Vec<u8>>,
         filters: &[&Filter],
-        zips: &[Option<Zip>],
         dependencies: &mut cache::Dependencies,
+        extract: &mut Vec<Extract<'a>>,
     ) -> io::Result<()> {
         let src = if rel.is_empty() {
             vanilla.to_path_buf()
@@ -725,12 +763,19 @@ fn build_overlay_uncached(
         } else {
             format!("{rel}/")
         };
-        for f in files.keys().filter_map(|f| f.strip_prefix(&prefix)) {
+        // The files under this directory are one run of the sorted map: walking only that run
+        // keeps a pack of tens of thousands of files in thousands of folders from being
+        // scanned once per folder.
+        for f in files
+            .range(prefix.clone()..)
+            .map_while(|(f, _)| f.strip_prefix(&prefix))
+        {
             names.insert(f.split('/').next().unwrap_or("").to_owned());
         }
         for name in names {
             let child = format!("{prefix}{name}");
-            if hidden.contains(&child) {
+            // Vanilla's files in one file: it describes vanilla's root, not this mirror.
+            if hidden.contains(&child) || child == horizon_core::prepared_files::FILE_NAME {
                 continue;
             }
             if let Some(bytes) = merged.get(&child) {
@@ -739,19 +784,8 @@ fn build_overlay_uncached(
                 let target = out.join(&child);
                 match path {
                     Some(p) => link(p, &target)?,
-                    None => {
-                        if let Some(Some(z)) = zips.get(*owner) {
-                            // One unreadable entry costs that file, not the
-                            // pack: an error here failed the build and the
-                            // reload dropped every server pack in the stack.
-                            match z.read(inner) {
-                                Ok(bytes) => fs::write(&target, bytes)?,
-                                Err(e) => log::warn!(
-                                    "Horizon: skipping unreadable pack entry {inner}: {e}"
-                                ),
-                            }
-                        }
-                    }
+                    // Inflated and written after the walk, on every thread.
+                    None => extract.push((*owner, inner.as_str(), target)),
                 }
             } else if filters.is_empty()
                 && !touched.contains(&child)
@@ -775,8 +809,8 @@ fn build_overlay_uncached(
                     files,
                     merged,
                     filters,
-                    zips,
                     dependencies,
+                    extract,
                 )?;
             } else if filters.iter().any(|f| f.blocks(&child)) {
                 // Hidden by a pack's filter.
@@ -790,6 +824,7 @@ fn build_overlay_uncached(
         }
         Ok(())
     }
+    let mut extract = Vec::new();
     mirror(
         "",
         vanilla,
@@ -799,9 +834,27 @@ fn build_overlay_uncached(
         &files,
         &merged,
         &filters,
-        &zips,
         dependencies,
-    )
+        &mut extract,
+    )?;
+    // Inflating and writing a big pack's files one by one was most of a cold build; its
+    // folders all exist by now.
+    crate::par::par_map(&extract, |(owner, inner, target)| {
+        let Some(Some(z)) = zips.get(*owner) else {
+            return Ok(());
+        };
+        // One unreadable entry costs that file, not the pack: an error here
+        // failed the build and the reload dropped every server pack in the stack.
+        match z.read(inner) {
+            Ok(bytes) => fs::write(target, bytes),
+            Err(e) => {
+                log::warn!("Horizon: skipping unreadable pack entry {inner}: {e}");
+                Ok(())
+            }
+        }
+    })
+    .into_iter()
+    .collect()
 }
 /// Files vanilla loads from every pack in turn (`getResourceStack`) rather
 /// than from the top pack only.
@@ -816,7 +869,14 @@ enum Merge {
     Font,
     /// `SpriteSourceList.load`: sources from the bottom pack up.
     Atlas,
+    /// `BlockStateModelLoader.loadBlockStateDefinitionStack`: every pack's
+    /// definition binds on its own, and a higher one replaces only the states
+    /// it binds. Kept as its layers ([`BLOCKSTATE_LAYERS`]) for the catalog.
+    BlockStates,
 }
+/// The key of a stacked blockstate file: its definitions, bottom first, each
+/// as the pack wrote it.
+pub const BLOCKSTATE_LAYERS: &str = "horizon:layers";
 fn merge_kind(name: &str) -> Option<Merge> {
     let (_, rest) = name.strip_prefix("assets/")?.split_once('/')?;
     if rest == "sounds.json" {
@@ -827,6 +887,7 @@ fn merge_kind(name: &str) -> Option<Merge> {
         "lang" => Some(Merge::Lang),
         "font" => Some(Merge::Font),
         "atlases" => Some(Merge::Atlas),
+        "blockstates" => Some(Merge::BlockStates),
         _ => None,
     }
 }
@@ -834,7 +895,7 @@ fn merge_kind(name: &str) -> Option<Merge> {
 /// does. Layers that do not parse are skipped, as vanilla logs and skips them.
 fn merge(kind: Merge, layers: &[Vec<u8>]) -> Option<Vec<u8>> {
     use serde_json::{Map, Value};
-    let parsed: Vec<Map<String, Value>> = layers
+    let mut parsed: Vec<Map<String, Value>> = layers
         .iter()
         // SoundManager skips a sounds.json Gson rejects, whole.
         .filter(|b| kind != Merge::Sounds || crate::sound_events::is_valid_file(b))
@@ -877,6 +938,12 @@ fn merge(kind: Merge, layers: &[Vec<u8>]) -> Option<Vec<u8>> {
         }
         Merge::Font => list("providers", &mut parsed.iter().rev()),
         Merge::Atlas => list("sources", &mut parsed.iter()),
+        // One definition is the file as it is.
+        Merge::BlockStates if parsed.len() < 2 => Value::Object(parsed.pop()?),
+        Merge::BlockStates => Value::Object(Map::from_iter([(
+            BLOCKSTATE_LAYERS.to_owned(),
+            Value::Array(parsed.into_iter().map(Value::Object).collect()),
+        )])),
     };
     serde_json::to_vec(&out).ok()
 }
@@ -960,6 +1027,30 @@ impl Selectable {
             compatible: true,
         }
     }
+    /// A server's downloaded pack (`DownloadedPackSource.DOWNLOADED_PACK_SELECTION`):
+    /// required, fixed at the top, so the pack screen cannot remove or reorder it.
+    pub fn downloaded(id: &str, compatible: bool) -> Self {
+        Self {
+            id: id.to_owned(),
+            required: true,
+            position: Position::Top,
+            fixed: true,
+            compatible,
+        }
+    }
+}
+
+/// Ids from `DownloadedPackSource` (`server/…`); they must not go into
+/// `options.txt` `resourcePacks`.
+pub fn is_downloaded_pack_id(id: &str) -> bool {
+    id.starts_with("server/")
+}
+
+/// The player's own selection: drop every downloaded server/world pack id.
+pub fn player_pack_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    ids.into_iter()
+        .filter(|id| !is_downloaded_pack_id(id))
+        .collect()
 }
 
 /// `Pack.Position.insert`: below or above the packs fixed at that end.
@@ -1093,16 +1184,55 @@ impl SelectionModel {
         ok
     }
     /// `commit`: the repository's selection, bottom first, as options.txt
-    /// stores it.
+    /// stores it (downloaded `server/…` packs stay out of that file).
     pub fn commit(&self) -> Vec<String> {
         let ids: Vec<String> = self.selected.iter().rev().map(|p| p.id.clone()).collect();
-        self.rebuild(&ids).into_iter().map(|p| p.id).collect()
+        player_pack_ids(self.rebuild(&ids).into_iter().map(|p| p.id))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `DownloadedPackSource.DOWNLOADED_PACK_SELECTION`: the pack is selected,
+    /// fixed at the top, cannot be removed, and stays out of options.txt.
+    #[test]
+    fn a_downloaded_server_pack_is_fixed_selected_and_not_committed() {
+        let server = "server/00000000000000000000000000000001/hash.zip";
+        let available = vec![
+            Selectable::optional("file/Mine", true),
+            Selectable::downloaded(server, true),
+            Selectable::vanilla(),
+        ];
+        let model = SelectionModel::new(available, &["file/Mine".into()]);
+        assert_eq!(
+            model
+                .selected
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            [server, "file/Mine", "vanilla"]
+        );
+        assert!(!model.can_unselect(true, 0));
+        // A neighbour cannot move up past the fixed server pack.
+        assert!(!model.can_move_up(true, 1));
+        assert_eq!(
+            model.commit(),
+            vec!["vanilla".to_owned(), "file/Mine".to_owned()]
+        );
+        assert!(is_downloaded_pack_id(server));
+        assert!(!is_downloaded_pack_id("file/Mine"));
+    }
+
+    #[test]
+    fn a_comment_after_the_metadata_does_not_hide_a_pack() {
+        let meta = br#"{"pack":{"description":"d","pack_format":97}}
+// Signed by the pack's author"#;
+        assert!(parse_meta(meta).is_some());
+        assert!(parse_meta(b"not json").is_none());
+    }
+
     #[test]
     fn mcmeta_with_utf8_bom_is_read() {
         let dir = std::env::temp_dir().join(format!("horizon-bom-{}", std::process::id()));
@@ -1154,6 +1284,16 @@ mod tests {
             check(r#"{"min_format":97,"max_format":98,"supported_formats":[97,98]}"#)
                 .unwrap_err()
                 .contains("deprecated")
+        );
+        // A decimal reads as its whole part, in a list or alone: `[97.1]` is format 97 (a pack
+        // that meant `[97, 1]` still loads and counts as compatible).
+        assert_eq!(
+            check(r#"{"min_format":[97.1],"max_format":[97.1]}"#),
+            Ok(((97, 0), (97, i64::from(i32::MAX))))
+        );
+        assert_eq!(
+            check(r#"{"min_format":97.9,"max_format":98.5}"#),
+            Ok(((97, 0), (98, i64::from(i32::MAX))))
         );
         assert_eq!(
             check(r#"{"min_format":97,"max_format":98}"#),
@@ -1317,6 +1457,36 @@ mod tests {
             &[json(r#"{"sources":[1]}"#), json(r#"{"sources":[2]}"#)],
         );
         assert_eq!(parse(atlas.unwrap()), serde_json::json!({"sources":[1,2]}));
+        // BlockStateModelLoader: every definition kept, bottom first, for the
+        // catalog to bind one by one; one that does not parse is skipped.
+        let gate = merge(
+            Merge::BlockStates,
+            &[
+                json(r#"{"variants":{"":{"model":"v"}}}"#),
+                b"not json".to_vec(),
+                json(r#"{"variants":{"powered=true":{"model":"p"}}}"#),
+            ],
+        );
+        assert_eq!(
+            parse(gate.unwrap()),
+            serde_json::json!({BLOCKSTATE_LAYERS:[
+                {"variants":{"":{"model":"v"}}},
+                {"variants":{"powered=true":{"model":"p"}}}
+            ]})
+        );
+        // A single definition stays the file as it is.
+        let alone = merge(
+            Merge::BlockStates,
+            &[json(r#"{"variants":{"":{"model":"p"}}}"#)],
+        );
+        assert_eq!(
+            parse(alone.unwrap()),
+            serde_json::json!({"variants":{"":{"model":"p"}}})
+        );
+        assert_eq!(
+            merge_kind("assets/minecraft/blockstates/oak_fence_gate.json"),
+            Some(Merge::BlockStates)
+        );
         assert_eq!(
             merge_kind("assets/minecraft/lang/en_us.json"),
             Some(Merge::Lang)
@@ -1335,6 +1505,61 @@ mod tests {
             Some(Merge::Atlas)
         );
         assert_eq!(merge_kind("assets/minecraft/models/block/stone.json"), None);
+    }
+    #[test]
+    fn companion_maps_follow_the_winning_colour_or_a_higher_map_only_pack() {
+        let root =
+            std::env::temp_dir().join(format!("horizon-material-owner-{}", std::process::id()));
+        let vanilla = root.join("vanilla");
+        let relative = "assets/minecraft/textures/block";
+        fs::create_dir_all(vanilla.join(relative)).unwrap();
+        let names = ["stone.png", "stone_n.png", "stone_s.png"];
+        for name in names {
+            fs::write(vanilla.join(relative).join(name), b"base").unwrap();
+        }
+        for (pack, files) in [
+            ("low", vec!["stone_n.png", "stone_s.png"]),
+            ("colour", vec!["stone.png"]),
+            ("maps", vec!["stone_n.png"]),
+        ] {
+            let dir = root.join("packs").join(pack);
+            fs::create_dir_all(dir.join(relative)).unwrap();
+            fs::write(
+                dir.join("pack.mcmeta"),
+                br#"{"pack":{"description":"fixture","pack_format":97}}"#,
+            )
+            .unwrap();
+            for name in files {
+                fs::write(dir.join(relative).join(name), pack.as_bytes()).unwrap();
+            }
+        }
+        let all = discover(&vanilla, &root.join("packs"));
+        let order = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| {
+                    all.iter()
+                        .find(|p| p.id == format!("file/{name}"))
+                        .unwrap()
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let out = root.join("out");
+        build_overlay(&vanilla, &order(&["low", "colour"]), &out).unwrap();
+        assert_eq!(
+            fs::read(out.join(relative).join("stone.png")).unwrap(),
+            b"colour"
+        );
+        assert!(!out.join(relative).join("stone_n.png").exists());
+        assert!(!out.join(relative).join("stone_s.png").exists());
+        build_overlay(&vanilla, &order(&["low", "colour", "maps"]), &out).unwrap();
+        assert_eq!(
+            fs::read(out.join(relative).join("stone_n.png")).unwrap(),
+            b"maps"
+        );
+        assert!(!out.join(relative).join("stone_s.png").exists());
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn overlay_layers_packs_over_vanilla() {
@@ -1415,6 +1640,72 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        let _ = fs::remove_dir_all(base);
+    }
+    #[test]
+    fn every_file_of_a_big_stack_comes_from_its_top_pack() {
+        use std::io::Write as _;
+        let base = std::env::temp_dir().join(format!("horizon-pack-stack-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let vanilla = base.join("vanilla");
+        // Folders whose names start alike (`item`, `item_extra`, `item2`) and files beside
+        // folders of almost their name: what a prefix lookup could mix up.
+        let names: Vec<String> = (0..400)
+            .map(|i| {
+                let folder = ["item", "item_extra", "item2", "item/sub", "block"][i % 5];
+                format!("assets/ns{}/textures/{folder}/f{i}.png", i % 3)
+            })
+            .chain(["assets/ns0/textures/item.png".to_owned()])
+            .collect();
+        let mut expected: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for name in names.iter().step_by(4) {
+            let path = vanilla.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("vanilla {name}")).unwrap();
+            expected.insert(name.clone(), format!("vanilla {name}").into_bytes());
+        }
+        let meta = br#"{"pack":{"description":"d","pack_format":97}}"#;
+        // Packs a and b are zips, c a folder; each provides a different part of the names.
+        fs::create_dir_all(base.join("packs/c")).unwrap();
+        fs::write(base.join("packs/c/pack.mcmeta"), meta).unwrap();
+        for (pack, every) in [("a", 2), ("b", 3)] {
+            let file = fs::File::create(base.join(format!("packs/{pack}.zip"))).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("pack.mcmeta", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(meta).unwrap();
+            for name in names.iter().step_by(every) {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(format!("{pack} {name}").as_bytes()).unwrap();
+                expected.insert(name.clone(), format!("{pack} {name}").into_bytes());
+            }
+            zip.finish().unwrap();
+        }
+        for name in names.iter().skip(1).step_by(5) {
+            let path = base.join("packs/c").join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("c {name}")).unwrap();
+            expected.insert(name.clone(), format!("c {name}").into_bytes());
+        }
+        let all = folder(&base.join("packs"), RESOURCE_FORMAT);
+        let ids = ["file/a.zip", "file/b.zip", "file/c"].map(String::from);
+        let out = base.join("overlay");
+        build_overlay(&vanilla, &enabled(&all, &ids), &out).unwrap();
+        fn walk(dir: &Path, root: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    let name = path.strip_prefix(root).unwrap().to_string_lossy();
+                    out.insert(name.replace('\\', "/"), fs::read(&path).unwrap());
+                }
+            }
+        }
+        let mut built = BTreeMap::new();
+        walk(&out.join("assets"), &out, &mut built);
+        assert_eq!(built, expected);
         let _ = fs::remove_dir_all(base);
     }
     #[test]
