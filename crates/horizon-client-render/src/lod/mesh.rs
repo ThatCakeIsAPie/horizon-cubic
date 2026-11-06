@@ -736,16 +736,20 @@ fn mesh_columns_with_edges(
 /// neighbours here, so no crack opens between levels). Faces are `1 << level`
 /// blocks per voxel, in node-local blocks, merged like the far columns' and
 /// appended to `out` (the caller sorts the solid quads: `SectionMesh::sort_solid`).
+/// A fluid voxel holding `sea_surface` (the sea level + 1, from
+/// `CubeSampler::sea_surface`) is drawn up to it, not to its top.
 pub(super) fn mesh_cube(
     mesher: &mut Mesher,
     node: &CubeNode,
     air: BlockStateId,
+    sea_surface: Option<i32>,
     context: &WorkerContext,
     out: &mut SectionMesh,
 ) {
     mesh_voxels(
         node,
         air,
+        sea_surface,
         |span, direction, at| mesher.material(span, direction, at, context),
         out,
     );
@@ -782,6 +786,7 @@ fn sky_lit(node: &CubeNode, mut opaque: impl FnMut(Voxel) -> bool) -> Box<[bool;
 fn mesh_voxels(
     node: &CubeNode,
     air: BlockStateId,
+    sea_surface: Option<i32>,
     mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material,
     out: &mut SectionMesh,
 ) {
@@ -789,7 +794,10 @@ fn mesh_voxels(
         return;
     }
     let scale = (1_i32 << node.key.level) as f32;
-    let [ox, _, oz] = node.key.origin();
+    let [ox, oy, oz] = node.key.origin();
+    // The sea's surface in node-local blocks: a fluid voxel holding it (one of
+    // 128 blocks or more, the generator's `water_at_sea`) stops there.
+    let surface = sea_surface.map(|top| (i64::from(top) - i64::from(oy)) as f32);
     let span = |voxel: Voxel, light: u16| Span {
         min: 0,
         max: 1,
@@ -882,29 +890,51 @@ fn mesh_voxels(
                         Direction::West => (z, y, x),
                         Direction::East => (z, y, x + 1),
                     };
-                    let rect = Rect {
+                    let mut rect = Rect {
                         u0: a as f32 * scale,
                         v0: b as f32 * scale,
                         u1: (a + 1) as f32 * scale,
                         v1: (b + 1) as f32 * scale,
                     };
+                    let mut plane = plane as f32 * scale;
+                    if let Some(surface) = surface
+                        && (y as f32 * scale) < surface
+                        && ((y + 1) as f32 * scale) > surface
+                    {
+                        let (_, own_fluid) = *hiding.entry(voxel.state.0).or_insert_with(|| {
+                            let m = material(&own, Direction::Up, at);
+                            (m.opaque, m.fluid)
+                        });
+                        if own_fluid != 0 {
+                            match direction {
+                                Direction::Up => plane = surface,
+                                Direction::Down => {}
+                                _ => rect.v1 = surface,
+                            }
+                        }
+                    }
                     // A face takes the light of the cell in front of it, as in
                     // Minecraft: a cliff's wall is in the sun when the air
                     // beside it sees the sky, not only its top voxel. Past the
-                    // node's edge it takes its own column's light at the node's
-                    // top; an underside there is shaded, as under an overhang.
+                    // node's edge a top takes its own column's light at the
+                    // node's top and an underside is shaded, as under an
+                    // overhang. A wall there faces air this node does not hold
+                    // (its own column says nothing of it: a cliff rising past
+                    // the node has rock over it): in the sun, as a cliff's.
                     let front_lit = if inside {
                         lit[CubeNode::index(nx as usize, ny as usize, nz as usize)]
-                    } else if matches!(direction, Direction::Down) {
-                        false
                     } else {
-                        !node.column_covered(x, z)
+                        match direction {
+                            Direction::Down => false,
+                            Direction::Up => !node.column_covered(x, z),
+                            _ => true,
+                        }
                     };
                     let face = span(voxel, if front_lit { SUNLIT } else { SHADED });
                     add_face(
                         &mut faces,
                         direction,
-                        plane as f32 * scale,
+                        plane,
                         rect,
                         material(&face, direction, at),
                     );
@@ -2068,7 +2098,7 @@ mod cube_tests {
     }
     fn mesh(node: &CubeNode) -> SectionMesh {
         let mut mesh = SectionMesh::default();
-        mesh_voxels(node, AIR, material, &mut mesh);
+        mesh_voxels(node, AIR, None, material, &mut mesh);
         mesh
     }
     fn quads(vertices: &[TerrainVertex]) -> Vec<[TerrainVertex; 4]> {
@@ -2209,6 +2239,73 @@ mod cube_tests {
             !wall.is_empty() && wall.iter().all(|w| w.0 == 0x40),
             "{wall:?}"
         );
+    }
+
+    #[test]
+    fn sea_water_in_a_coarse_voxel_stops_at_the_surface() {
+        // A node of 128-block voxels from y = 0: a sea floor row of stone at
+        // y = -128..0 is the node below; here the bottom row is the sea, its
+        // voxels reaching 64 blocks over the surface at 64 (sea level 63).
+        let node = CubeNode::from_fn(CubeKey::new(7, 0, 0, 0), |x, y, _| {
+            voxel(if y == 0 && x < 8 {
+                WATER
+            } else if y == 0 {
+                STONE
+            } else {
+                AIR
+            })
+        });
+        let mut mesh = SectionMesh::default();
+        mesh_voxels(&node, AIR, Some(64), material, &mut mesh);
+        let water = quads(&mesh.translucent);
+        assert!(!water.is_empty());
+        let top = water
+            .iter()
+            .flat_map(|q| q.iter().map(|v| v.pos[1]))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(top, 64.0, "the sea's top is its surface, not the voxel's");
+        // The stone beside it keeps its whole voxel.
+        let stone_top = quads(&mesh.solid)
+            .iter()
+            .flat_map(|q| q.iter().map(|v| v.pos[1]))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(stone_top, 128.0);
+        // Water wholly above the surface (a lake in the hills) is left as it is.
+        let lake = CubeNode::from_fn(CubeKey::new(7, 0, 1, 0), |x, y, _| {
+            voxel(if y == 0 && x < 8 { WATER } else { AIR })
+        });
+        let mut mesh = SectionMesh::default();
+        mesh_voxels(&lake, AIR, Some(64), material, &mut mesh);
+        let top = quads(&mesh.translucent)
+            .iter()
+            .flat_map(|q| q.iter().map(|v| v.pos[1]))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(top, 128.0);
+    }
+
+    #[test]
+    fn a_cliff_wall_on_the_nodes_side_is_in_the_sun() {
+        // A cliff filling the node's east half and rising past its top: its
+        // columns are covered above the node. Its wall on the node's east side
+        // faces air the node does not hold, and stays lit as the wall facing
+        // west into the node's own open air is.
+        let mut mask = Box::new([0u64; 4]);
+        for z in 0..16 {
+            for x in 8..16 {
+                let bit = z << 4 | x;
+                mask[bit >> 6] |= 1 << (bit & 63);
+            }
+        }
+        let node = CubeNode::from_fn(CubeKey::new(0, 0, 0, 0), |x, _, _| {
+            voxel(if x >= 8 { STONE } else { AIR })
+        })
+        .with_covered(Some(mask));
+        let mesh = mesh(&node);
+        for plane in [8.0, 16.0] {
+            let wall = lights_at(&mesh, 0, plane);
+            assert!(!wall.is_empty(), "a wall at x = {plane}");
+            assert!(wall.iter().all(|w| w.0 == 240), "x = {plane}: {wall:?}");
+        }
     }
 
     #[test]

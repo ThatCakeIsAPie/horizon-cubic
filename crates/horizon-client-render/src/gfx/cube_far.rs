@@ -87,7 +87,9 @@ struct FrameUniform {
     cam_frac: [f32; 4],
     now: u32,
     nodes: u32,
-    pad: [u32; 2],
+    /// The sea's surface (sea level + 1): far water is drawn up to it.
+    water_top: i32,
+    pad: u32,
 }
 
 /// The state a [`CubeFar`] needs from the renderer to build its pipelines.
@@ -108,6 +110,8 @@ pub struct CubeFar {
     pool: PoolHandle,
     table: MaterialTable,
     air: u32,
+    /// The generator's sea level + 1 (`FrameUniform::water_top`).
+    water_top: i32,
     node_buffer: wgpu::Buffer,
     biomes: wgpu::Buffer,
     solid_args: wgpu::Buffer,
@@ -357,6 +361,7 @@ impl CubeFar {
             pool: backend.pool.clone(),
             table: MaterialTable::new(states),
             air,
+            water_top: backend.params.sea_level + 1,
             node_buffer,
             biomes,
             solid_args,
@@ -728,7 +733,8 @@ impl CubeFar {
             ],
             now: self.now_ms(),
             nodes: self.next_id,
-            pad: [0; 2],
+            water_top: self.water_top,
+            pad: 0,
         };
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));

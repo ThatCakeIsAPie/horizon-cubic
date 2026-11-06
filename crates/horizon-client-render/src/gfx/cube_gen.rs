@@ -492,12 +492,13 @@ pub fn node_class(p: &CubeGenParams, key: CubeKey, columns: &NodeColumns) -> Nod
         Class::Solid => NodeClass::Rock,
         Class::Empty => {
             // Water below the sea, air above it: uniform unless the sea level
-            // crosses the node.
+            // crosses the node. All open, a voxel is water when its bottom lies
+            // below the surface (`water_at_sea`).
             let s = f64::from(1u32 << key.level);
             let y = key.origin()[1] as f32;
             let sea = (p.sea_level + 1) as f32;
-            let low = (y + (0.5 * s) as f32) < sea;
-            let high = (y + (15.5 * s) as f32) < sea;
+            let low = y < sea;
+            let high = (y + (15.0 * s) as f32) < sea;
             if low == high {
                 NodeClass::Air
             } else {
@@ -519,8 +520,9 @@ pub fn fill_class(
     let origin_y = key.origin()[1] as f32;
     let state = |x: usize, y: usize, z: usize| match class {
         Class::Empty => {
-            let yc = origin_y + ((y as f64 + 0.5) * s) as f32;
-            if yc < (p.sea_level + 1) as f32 {
+            // All open: water wherever the voxel reaches below the surface.
+            let bottom = origin_y + ((y as f64) * s) as f32;
+            if bottom < (p.sea_level + 1) as f32 {
                 p.water
             } else {
                 p.air
@@ -630,6 +632,17 @@ fn hash_voxel(v: [i32; 3]) -> f32 {
     (h >> 8) as f32 / 16_777_216.0
 }
 
+/// Whether an open voxel whose centre lies at or above the sea's surface
+/// (`water_top`, the sea level + 1) is water all the same: it holds the
+/// surface (its bottom lies below it) and its column is open at the sea
+/// (`density_at_sea`, the density just under the surface, is not solid).
+/// Judged by its centre alone, every voxel of 128 blocks or more that held
+/// the surface was air, and from afar the sea showed its floor. The far
+/// renderer draws such water up to the surface only (`cube_far.wgsl`).
+fn water_at_sea(bottom: f32, water_top: f32, density_at_sea: impl FnOnce() -> f32) -> bool {
+    bottom < water_top && density_at_sea() <= 0.0
+}
+
 fn sign_of(v: f32) -> f32 {
     if v > 0.0 {
         1.0
@@ -672,13 +685,7 @@ fn reference_states(p: &CubeGenParams, key: CubeKey, columns: &NodeColumns) -> V
             };
             depth *= 0.2 * 17.0 / 64.0;
             let height = columns.height[col] * p.height_factor as f32 + p.height_offset as f32;
-            let mut run = 0u32;
-            let mut seen_air = false;
-            for jj in (0..16 + extra).rev() {
-                let ly = (f64::from(jj) + 0.5) * s;
-                let wy = f64::from(origin[1]) + ly;
-                let yc = origin[1] as f32 + ly as f32;
-                let pos = [wx, wy, wz];
+            let density_at = |pos: [f64; 3], yc: f32| {
                 let selector = noise_reference(p, SELECTOR, used[SELECTOR], pos).clamp(0.0, 1.0);
                 let low = noise_reference(p, LOW, used[LOW], pos);
                 let high = noise_reference(p, HIGH, used[HIGH], pos);
@@ -690,11 +697,26 @@ fn reference_states(p: &CubeGenParams, key: CubeKey, columns: &NodeColumns) -> V
                 };
                 let vol = columns.volatility[col] * below * p.height_variation_factor as f32
                     + p.height_variation_offset as f32;
-                let density = (mixed + depth) * vol + height - sign_of(vol) * yc;
+                (mixed + depth) * vol + height - sign_of(vol) * yc
+            };
+            let water_top = (p.sea_level + 1) as f32;
+            let mut run = 0u32;
+            let mut seen_air = false;
+            for jj in (0..16 + extra).rev() {
+                let ly = (f64::from(jj) + 0.5) * s;
+                let wy = f64::from(origin[1]) + ly;
+                let yc = origin[1] as f32 + ly as f32;
+                let density = density_at([wx, wy, wz], yc);
                 let block = if density <= 0.0 {
                     run = 0;
                     seen_air = true;
-                    if yc < (p.sea_level + 1) as f32 {
+                    let bottom = (f64::from(origin[1]) + f64::from(jj) * s) as f32;
+                    if yc < water_top {
+                        p.water
+                    } else if jj < 16 && water_at_sea(bottom, water_top, || {
+                        let ys = water_top - 0.5;
+                        density_at([wx, f64::from(ys), wz], ys)
+                    }) {
                         p.water
                     } else {
                         p.air
@@ -1737,6 +1759,10 @@ impl CubeSampler for GpuCubeSampler {
         self.descent.clone()
     }
 
+    fn sea_surface(&self) -> Option<i32> {
+        Some(self.params.sea_level + 1)
+    }
+
     fn fork(&self) -> Option<Box<dyn CubeSampler>> {
         let mut fork = Self::with(self.params.clone(), self.columns.clone(), self.gpu.clone());
         fork.backend = self.backend.clone();
@@ -1917,7 +1943,7 @@ mod tests {
     fn prepass_agrees_with_the_reference() {
         let p = params();
         let mut seen = [0; 3];
-        for level in [2u8, 3, 5] {
+        for level in [2u8, 3, 5, 8] {
             for y in -6..10 {
                 for (x, z) in [(0, 0), (3, -2), (78_125 >> (level - 2), 5)] {
                     let key = CubeKey::new(level, x, y, z);
@@ -1932,6 +1958,31 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|&n| n > 0), "{seen:?}");
+    }
+
+    #[test]
+    fn a_coarse_voxel_holding_the_sea_surface_is_sea() {
+        let p = params();
+        // Deep ocean: the ground far under the node, whose bottom row of
+        // 256-block voxels holds the sea's surface (64) below their centres.
+        let key = CubeKey::new(8, 0, 0, 0);
+        let sea = NodeColumns::flat(-600.0, 1.0, 0);
+        let node = cpu_reference_node(&p, key, &sea);
+        for z in 0..16 {
+            for x in 0..16 {
+                assert_eq!(node.get(x, 0, z).state.0, WATER, "({x}, 0, {z})");
+                assert_eq!(node.get(x, 1, z).state.0, AIR, "({x}, 1, {z})");
+            }
+        }
+        // The pre-pass, which settles it without the 3D noise, agrees.
+        let class = classify(&p, key, &sea);
+        if let Some(filled) = fill_class(&p, key, &sea, class) {
+            assert_eq!(states(&filled), states(&node));
+        }
+        assert_eq!(node_class(&p, key, &sea), NodeClass::Mixed, "not uniform air");
+        // Ground standing over the surface there keeps its voxel solid.
+        let land = cpu_reference_node(&p, key, &NodeColumns::flat(600.0, 1.0, 0));
+        assert!((0..16).all(|x| land.get(x, 0, 0).state.0 != WATER));
     }
 
     #[test]
@@ -1985,6 +2036,9 @@ mod tests {
             CubeKey::new(2, 78_125, 1, -77_000),
             CubeKey::new(4, -9_000, 0, 5_000),
             CubeKey::new(3, 0, 40, 0),
+            // Coarse voxels holding the sea's surface, over a coast.
+            CubeKey::new(7, 3, 0, -1),
+            CubeKey::new(8, 0, 0, 0),
         ];
         let cols: Vec<NodeColumns> = keys.iter().map(|&k| columns(k)).collect();
         let jobs: Vec<_> = keys.iter().copied().zip(cols.iter()).collect();

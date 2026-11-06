@@ -121,15 +121,32 @@ fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
     }
     let col = (p.z << 4u) | p.x;
     // A face takes the light of the cell in front of it, as in Minecraft: a cliff's wall
-    // is in the sun when the air beside it sees the sky, not only its top voxel. Past
-    // the node's edge (no light known there), it takes its own column's light at the
-    // node's top: open unless the column is covered above the node.
+    // is in the sun when the air beside it sees the sky, not only its top voxel. A top
+    // on the node's top takes its own column's light there: open unless the column is
+    // covered above the node.
     var front = (lit[col] >> 15u) & 1u;
     if inside {
         front = (lit[(u32(q.z) << 4u) | u32(q.x)] >> u32(q.y)) & 1u;
     } else if dir == 0u {
         // The underside at the node's bottom: shaded, as under an overhang.
         front = 0u;
+    } else if dir >= 2u {
+        // A wall on the node's side: its own column says nothing of the air in front
+        // (a cliff rising past the node has rock over it, and its walls went dark
+        // node by node). Open from the neighbour's top down to the cell in front where
+        // the neighbour is known (what covers it above that node is not), else open:
+        // a wall on a node's side mostly faces out, as a cliff's does.
+        front = 1u;
+        let neighbour = jobs[base + 4u + dir];
+        if neighbour != NONE {
+            let w = vec3<u32>(q & vec3<i32>(15));
+            for (var y = 15u; y > w.y; y--) {
+                if is_opaque(state_at(neighbour, w.x, y, w.z)) {
+                    front = 0u;
+                    break;
+                }
+            }
+        }
     }
     let shaded = 1u - front;
     var biome = 0u;

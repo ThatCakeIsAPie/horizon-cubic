@@ -17,7 +17,8 @@ struct Frame {
     cam_frac: vec4<f32>,
     now: u32,
     nodes: u32,
-    pad0: u32,
+    // The sea's surface (sea level + 1), in blocks.
+    water_top: i32,
     pad1: u32,
 }
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -85,7 +86,10 @@ fn cull_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let w = select(-(f32(code) + TILE_STEP), TILE_STEP, code == 0u);
     instances[node * 2u] = vec4<f32>(lo, w);
-    instances[node * 2u + 1u] = vec4<f32>(f32(1u << level), 0.0, 0.0, 0.0);
+    // The voxel size, and the sea's surface in node-local blocks (cube_far.wgsl
+    // draws water up to it), clamped where it is far outside the node anyway.
+    let water = clamp(frame.water_top - origin.y, -1, (16 << level) + 1);
+    instances[node * 2u + 1u] = vec4<f32>(f32(1u << level), f32(water), 0.0, 0.0);
     // The camera sits at the origin: a direction shows only when it can face it.
     // Down, Up, North, South, West, East.
     var front = array<bool, 6>(

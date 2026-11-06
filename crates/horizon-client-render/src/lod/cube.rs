@@ -378,6 +378,13 @@ pub trait CubeSampler: Send {
     fn surface(&self) -> bool {
         false
     }
+    /// The sea's surface (the sea level + 1) when the sampler fills a voxel
+    /// that holds it with water where the sea is open there: the CPU mesher
+    /// draws such water up to the surface only (the GPU's reads the
+    /// generator's own). `None` by default.
+    fn sea_surface(&self) -> Option<i32> {
+        None
+    }
     /// Cubes that changed since this was last asked (the producer drops the
     /// nodes it kept in memory over them). Nothing by default.
     fn changes(&mut self) -> Changes {
@@ -2117,6 +2124,22 @@ fn refocused(before: &Rule, now: &Rule, view: &FarView) -> bool {
     }
 }
 
+/// How far the arena's room for nodes may move before the budget follows it,
+/// as (lower, upper) fractions of the budget held: the bytes a node takes move
+/// with the plan (finer nodes, more empty ones), and a budget that followed
+/// every move asked for a plan of another size each time (`refocused`), which
+/// moved the bytes again: at Ultra, where the arena binds, the far terrain
+/// went back and forth between levels. The lower bound keeps the arena's
+/// room for the nodes a plan replaces mostly whole.
+const ARENA_CAP_BAND: (f64, f64) = (0.9, 1.25);
+
+/// Whether the arena's room for `fits` nodes leaves a held cap of `cap` as
+/// it is.
+fn arena_cap_holds(cap: usize, fits: usize) -> bool {
+    let (lo, hi) = ARENA_CAP_BAND;
+    (fits as f64) >= cap as f64 * lo && (fits as f64) <= cap as f64 * hi
+}
+
 /// The most surface tiles a plan holds.
 pub const TILE_BUDGET: usize = 3584;
 /// Surface tiles the renderer's pool holds (`Renderer::use_surface_tiles`):
@@ -2268,6 +2291,9 @@ pub struct CubeLod {
     pruned: usize,
     coarsened: f64,
     render: Option<crate::gfx::cube_far::FarStats>,
+    /// The most nodes the quad arena holds two plans of, held between
+    /// [`ARENA_CAP_BAND`]'s bounds ([`CubeLod::set_render_stats`]).
+    arena_cap: Option<usize>,
     /// The sampler has a GPU descent.
     has_descent: bool,
     /// What the descent was last asked for, and its run count then.
@@ -2405,6 +2431,7 @@ impl CubeLod {
             pruned: 0,
             coarsened: 1.0,
             render: None,
+            arena_cap: None,
             has_descent: false,
             descent_asked: None,
             descent_runs_asked: 0,
@@ -2417,6 +2444,17 @@ impl CubeLod {
     /// for [`CubeLod::stats`].
     pub fn set_render_stats(&mut self, stats: Option<crate::gfx::cube_far::FarStats>) {
         self.render = stats;
+        if let Some(r) = stats
+            && r.nodes >= 1024
+            && r.arena_bytes > 0
+        {
+            let per_node = (r.arena_bytes / r.nodes as u64).max(1);
+            let fits = (r.arena_capacity_bytes / 2 / per_node) as usize;
+            self.arena_cap = Some(match self.arena_cap {
+                Some(cap) if arena_cap_holds(cap, fits) => cap,
+                _ => fits,
+            });
+        }
     }
 
     /// The renderer's surface tile counters (`Renderer::surface_stats`).
@@ -2522,12 +2560,8 @@ impl CubeLod {
         let mut budget = self.budget;
         if self.gpu_path() {
             budget = budget.min(crate::gfx::cube_far::MAX_NODES as usize / 2);
-            if let Some(r) = self.render
-                && r.nodes >= 1024
-                && r.arena_bytes > 0
-            {
-                let per_node = (r.arena_bytes / r.nodes as u64).max(1);
-                budget = budget.min((r.arena_capacity_bytes / 2 / per_node) as usize);
+            if let Some(cap) = self.arena_cap {
+                budget = budget.min(cap);
             }
         }
         budget.max(COVER_NODES)
@@ -3871,7 +3905,8 @@ fn work(
                 .map(Product::Gpu),
                 None => node(&shared, sampler.as_mut(), key, air, &kind).map(|node| {
                     let mut mesh = SectionMesh::default();
-                    mesh::mesh_cube(&mut mesher, &node, air, &context, &mut mesh);
+                    let sea = sampler.sea_surface();
+                    mesh::mesh_cube(&mut mesher, &node, air, sea, &context, &mut mesh);
                     mesh.sort_solid();
                     Product::Mesh(mesh)
                 }),
@@ -4012,6 +4047,16 @@ fn node(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_arena_cap_holds_through_small_moves() {
+        // Within the band the held cap stays; past it the cap follows.
+        assert!(super::arena_cap_holds(100_000, 100_000));
+        assert!(super::arena_cap_holds(100_000, 91_000));
+        assert!(super::arena_cap_holds(100_000, 124_000));
+        assert!(!super::arena_cap_holds(100_000, 89_000));
+        assert!(!super::arena_cap_holds(100_000, 126_000));
+    }
+
     use super::*;
 
     const AIR: BlockStateId = BlockStateId(0);

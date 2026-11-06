@@ -17863,6 +17863,14 @@ impl Game<'_> {
                     horizontal: self.streaming.radius + 2,
                     vertical: shape.section_count() as i32,
                 };
+                // ...but only within the render distance: the near renderer draws a
+                // circle of columns (`streaming::in_view_distance`), and the lit ones
+                // past it, in the square the game holds, are drawn by nobody else.
+                let near_center = (
+                    (player.position.x.floor() as i32) >> 4,
+                    (player.position.z.floor() as i32) >> 4,
+                );
+                let near_radius = self.streaming.radius;
                 // The window sections a moved window left as placeholders until their column
                 // arrives (`remote_cubic_window`) are not held: the octree draws them.
                 let placeholders = self.remote.as_ref().map(|r| &r.cubic_placeholders);
@@ -17906,7 +17914,12 @@ impl Game<'_> {
                 cube_lod.surface_feedback(|key| renderer.surface_tile_info(key));
                 let meshes = horizon_client::spans::time("cube_lod_update", || {
                     cube_lod.update(camera, f64::from(lod_distance) * 16.0, &view, loaded, |p| {
-                        shape.has_section(p.y)
+                        horizon_client::streaming::in_view_distance(
+                            near_center,
+                            near_radius,
+                            p.x,
+                            p.z,
+                        ) && shape.has_section(p.y)
                             && world.chunks.get(&(p.x, p.z)).is_some_and(|c| c.lit)
                             && !placeholders.is_some_and(|set| {
                                 set.get(&(p.x, p.z)).is_some_and(|mask| {

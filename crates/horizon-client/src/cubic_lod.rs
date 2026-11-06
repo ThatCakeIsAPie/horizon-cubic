@@ -699,6 +699,10 @@ impl CubeSampler for CubicLodSampler {
         self.far.as_ref()?.descent()
     }
 
+    fn sea_surface(&self) -> Option<i32> {
+        self.far.as_ref()?.sea_surface()
+    }
+
     fn changes(&mut self) -> Changes {
         match &self.cache {
             Some(cache) => cache.changes_since(&mut self.cursor),

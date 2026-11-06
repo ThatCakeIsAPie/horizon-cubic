@@ -300,11 +300,12 @@ fn classify_node(key: vec3<i32>, level: u32) -> u32 {
     }
     if r.y <= 0.0 {
         // Water below the sea, air above it: uniform unless the sea level
-        // crosses the node (cube_gen's `node_class`).
+        // crosses the node (cube_gen's `node_class`). All open, a voxel is
+        // water when its bottom lies below the surface.
         let sea = tables.shape2.y;
         let fs = f32(s);
-        let below_low = (ylo + 0.5 * fs) < sea;
-        let below_high = (ylo + 15.5 * fs) < sea;
+        let below_low = ylo < sea;
+        let below_high = (ylo + 15.0 * fs) < sea;
         if below_low == below_high {
             return KIND_AIR;
         }

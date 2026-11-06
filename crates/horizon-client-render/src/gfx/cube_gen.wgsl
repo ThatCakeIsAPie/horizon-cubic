@@ -74,6 +74,22 @@ fn sign_of(v: f32) -> f32 {
     return select(select(0.0, -1.0, v < 0.0), 1.0, v > 0.0);
 }
 
+// The density at `local` blocks from the node origin, world height `yc`, in a column
+// of the given height, depth noise and volatility: solid above 0.
+fn density_at(node: u32, local: vec3<f32>, yc: f32, height: f32, depth: f32,
+    base_volatility: f32) -> f32 {
+    let selector = clamp(noise_value(node, 0u, local), 0.0, 1.0);
+    let low = noise_value(node, 1u, local);
+    let high = noise_value(node, 2u, local);
+    let mixed = low + selector * (high - low);
+    var vol_below = 1.0;
+    if height > yc {
+        vol_below = params.misc.x;
+    }
+    let vol = base_volatility * vol_below * params.height.z + params.height.w;
+    return (mixed + depth) * vol + height - sign_of(vol) * yc;
+}
+
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let node = wg.x;
@@ -104,7 +120,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     depth = depth * (0.2 * 17.0 / 64.0);
 
     let height = base_height * params.height.x + params.height.y;
-    let below_factor = params.misc.x;
 
     let extra = headers[node].extra.x;
     var jj = i32(15u + extra);
@@ -118,21 +133,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         let ly = (f32(jj) + 0.5) * s;
         let yc = f32(origin.y) + ly;
         let local = vec3<f32>(lx, ly, lz);
-        let selector = clamp(noise_value(node, 0u, local), 0.0, 1.0);
-        let low = noise_value(node, 1u, local);
-        let high = noise_value(node, 2u, local);
-        let mixed = low + selector * (high - low);
-        var vol_below = 1.0;
-        if height > yc {
-            vol_below = below_factor;
-        }
-        let vol = base_volatility * vol_below * params.height.z + params.height.w;
-        let density = (mixed + depth) * vol + height - sign_of(vol) * yc;
+        let density = density_at(node, local, yc, height, depth, base_volatility);
         let solid = density > 0.0;
         var block = params.ids.x;
         if !solid {
-            if yc < params.misc.z {
+            let water_top = params.misc.z;
+            if yc < water_top {
                 block = params.ids.w;
+            } else if jj < 16 && f32(origin.y) + f32(jj) * s < water_top {
+                // The voxel holding the sea's surface, its centre above it: water
+                // where the column is open at the sea (cube_gen.rs `water_at_sea`),
+                // drawn up to the sea's surface only (cube_far.wgsl).
+                let ys = water_top - 0.5;
+                let at_sea = vec3<f32>(lx, ys - f32(origin.y), lz);
+                if density_at(node, at_sea, ys, height, depth, base_volatility) <= 0.0 {
+                    block = params.ids.w;
+                }
             }
             run = 0u;
             seen_air = true;

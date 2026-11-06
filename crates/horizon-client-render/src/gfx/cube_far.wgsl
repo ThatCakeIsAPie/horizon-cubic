@@ -6,11 +6,26 @@
 // the culling pass into the indirect draw's first instance.
 @group(1) @binding(30) var<storage, read> cf_quads: array<vec2<u32>>;
 // Per node two vec4: camera-relative origin and the instance word (gfx/lod.rs
-// `instance`); then the voxel size in blocks.
+// `instance`); then the voxel size in blocks and the sea's surface in node-local
+// blocks.
 @group(1) @binding(31) var<storage, read> cf_instances: array<vec4<f32>>;
 @group(1) @binding(32) var<storage, read> cf_materials: array<u32>;
 // Per biome: grass, foliage, dry foliage and water colours (0xRRGGBB).
 @group(1) @binding(33) var<storage, read> cf_biomes: array<u32>;
+
+// Coarser far terrain is drawn a hair farther, by level (depth is reversed:
+// nearer is larger). A coarse node or tile stays until everything planned in
+// its place is in, so it stands over the finer nodes that came in for as long
+// as the rest takes (tens of seconds through a spyglass); their water and flat
+// ground lie in its very planes, and the two fought. The finer now win. 2e-5
+// of the distance a level: far over the depth buffer's precision, far under
+// anything that shows where the levels only meet.
+const CF_LEVEL_DEPTH: f32 = 2e-5;
+fn cf_by_level(drawn: TerrainOut, level: u32) -> TerrainOut {
+    var out = drawn;
+    out.clip.z *= 1.0 - CF_LEVEL_DEPTH * f32(level);
+    return out;
+}
 
 fn cf_shade(dir: u32) -> f32 {
     switch dir {
@@ -41,7 +56,8 @@ fn cf_shade(dir: u32) -> f32 {
     let state = q.y & 0x1ffffu;
     let biome = (q.y >> 17u) & 255u;
     let instance = cf_instances[node * 2u];
-    let scale = cf_instances[node * 2u + 1u].x;
+    let extent = cf_instances[node * 2u + 1u];
+    let scale = extent.x;
 
     let axis = dir >> 1u;
     let up = dir & 1u;
@@ -78,11 +94,22 @@ fn cf_shade(dir: u32) -> f32 {
     } else if axis == 2u {
         position = vec3<f32>(p, bv, av);
     }
+    // Water in a voxel that holds the sea's surface stops at the surface, not at the
+    // voxel's top (cube_gen.rs `water_at_sea`): a 2,048-block voxel of sea is
+    // drawn as sea, not as a 2,048-block slab of water.
+    let surface = extent.y;
+    let bottom = select(v0, f32(y) * scale, axis == 0u);
+    if ((cf_materials[state * 32u] >> 2u) & 3u) != 0u && bottom < surface
+        && position.y > surface {
+        position.y = surface;
+    }
     let uv = vec2<f32>(av - u0, v1 - bv);
 
     let f = cf_face(state, dir, overlay, biome);
     let light = vec2<u32>(select(240u, 64u, shaded == 1u), 0u);
-    return terrain_vertex(position, uv, f.layer, unorm8x4(f.color), light, instance.xyz, instance.w);
+    return cf_by_level(
+        terrain_vertex(position, uv, f.layer, unorm8x4(f.color), light, instance.xyz, instance.w),
+        countTrailingZeros(u32(scale)));
 }
 
 struct CfFace {

@@ -209,8 +209,8 @@ fn st_ground(base: u32, nx: i32, nz: i32, fallback: i32) -> i32 {
     let origin = vec3<f32>(bitcast<f32>(instance.x), 0.0, bitcast<f32>(instance.y));
     // A span under another is roofed over: the sky light of a covered face.
     let light = vec2<u32>(select(240u, 64u, span > 0u), 0u);
-    return terrain_vertex(corner[0], corner[1].xy, f.layer, unorm8x4(f.color), light, origin,
-        bitcast<f32>(instance.z));
+    return cf_by_level(terrain_vertex(corner[0], corner[1].xy, f.layer, unorm8x4(f.color), light,
+        origin, bitcast<f32>(instance.z)), level);
 }
 
 // The water over a column whose highest span lies below the sea, at the sea's
@@ -234,6 +234,6 @@ fn st_ground(base: u32, nx: i32, nz: i32, fallback: i32) -> i32 {
     let f = cf_face(st_frame.ids.x, 1u, 0u, biome);
     let instance = st_instances[slot];
     let origin = vec3<f32>(bitcast<f32>(instance.x), 0.0, bitcast<f32>(instance.y));
-    return terrain_vertex(corner[0], corner[1].xy, f.layer, unorm8x4(f.color),
-        vec2<u32>(240u, 0u), origin, bitcast<f32>(instance.z));
+    return cf_by_level(terrain_vertex(corner[0], corner[1].xy, f.layer, unorm8x4(f.color),
+        vec2<u32>(240u, 0u), origin, bitcast<f32>(instance.z)), level);
 }
