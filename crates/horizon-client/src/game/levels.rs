@@ -450,6 +450,26 @@ impl Game<'_> {
         Some(parked.streaming.lod_source())
     }
 
+    /// A far-terrain sampler of `dim`'s level when it is cubic (the cube
+    /// octree's, `cubic_lod`): the cube generator past vanilla's range, the
+    /// level's vanilla far terrain inside it.
+    pub(super) fn cubic_sampler_in(
+        &self,
+        dim: Dim,
+    ) -> Option<Box<dyn horizon_client::lod::cube::CubeSampler>> {
+        let (streaming, save) = if dim == self.dim {
+            (&self.streaming, &self.save)
+        } else {
+            let parked = self.levels.parked.get(&dim)?;
+            (&parked.streaming, &parked.save)
+        };
+        let level = save.cubic.get()?;
+        let vanilla = streaming.lod_source().sampler();
+        Some(Box::new(
+            level.lod_sampler(vanilla, self.pack.assets.registry),
+        ))
+    }
+
     /// Put `dim`'s level in place for a command whose source is there
     /// (`execute in`, `execute at` a player in another level), opening it if
     /// nobody is in it; returns the level to put back afterwards. Only a

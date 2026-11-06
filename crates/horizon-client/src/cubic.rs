@@ -124,6 +124,25 @@ impl CubicLevel {
         Ok(level)
     }
 
+    /// A far-terrain sampler of the level (`cubic_lod`), reading inside
+    /// vanilla's range from `vanilla`, the vanilla generator's.
+    pub fn lod_sampler(
+        &self,
+        vanilla: Box<dyn crate::streaming::LodSampler>,
+        registry: &BlockRegistry,
+    ) -> crate::cubic_lod::CubicLodSampler {
+        let id = |name: &str| registry.default_state(name).map_or(0, |s| s.0);
+        crate::cubic_lod::CubicLodSampler::new(
+            self.generator.clone(),
+            vanilla,
+            id("minecraft:air"),
+            id("minecraft:stone"),
+            id("minecraft:deepslate"),
+            self.deep_biome,
+            self.sky_biome,
+        )
+    }
+
     /// The window the level's chunks hold.
     pub fn window(&self) -> ColumnLayout {
         *self.window.lock().unwrap()
@@ -610,6 +629,14 @@ impl<G: ChunkGenerator> ChunkGenerator for CubicTerrain<G> {
     type Worker = G::Worker;
     fn worker(&self) -> G::Worker {
         self.inner.worker()
+    }
+    /// The vanilla generator's far terrain (vanilla's range of the cubic
+    /// far terrain, `cubic_lod`).
+    fn lod_sampler(self: Arc<Self>) -> Box<dyn crate::streaming::LodSampler> {
+        ChunkGenerator::lod_sampler(self.inner.clone())
+    }
+    fn lod_surface(&self, worker: &mut G::Worker, x: i32, z: i32) -> Option<crate::lod::Surface> {
+        self.inner.lod_surface(worker, x, z)
     }
     fn load(&self, x: i32, z: i32) -> Option<Chunk> {
         if !self.level.has_vanilla(x, z) {

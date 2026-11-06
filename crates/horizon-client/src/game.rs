@@ -2474,6 +2474,9 @@ struct Game<'a> {
     world_biomes_base: Option<Arc<Biomes>>,
     streaming: Streaming,
     lod: Option<horizon_client::lod::Lod>,
+    /// A cubic level's far terrain: the cube octree (docs/cubic-chunks.md),
+    /// in place of `lod`.
+    cube_lod: Option<horizon_client::lod::cube::CubeLod>,
     lod_source_attempted: bool,
     lod_observe: horizon_client::fast_hash::FxHashSet<(i32, i32)>,
     /// The server level far terrain keeps the chunks of.
@@ -17394,7 +17397,7 @@ impl Game<'_> {
     }
     /// Only enabled LOD worlds extend the renderer's range, never simulation.
     fn terrain_distance(&self) -> i32 {
-        if self.lod.is_some() {
+        if self.lod.is_some() || self.cube_lod.is_some() {
             self.streaming.radius.max(self.lod_distance() as i32)
         } else {
             self.streaming.radius
@@ -17407,6 +17410,7 @@ impl Game<'_> {
             remote.session.cancel_far_terrain();
         }
         self.lod = None;
+        self.cube_lod = None;
         self.lod_source_attempted = false;
         self.lod_observe.clear();
         self.lod_blue_map = None;
@@ -17414,6 +17418,7 @@ impl Game<'_> {
         self.lod_covered_at = None;
         if let Some(renderer) = &mut self.renderer {
             renderer.clear_lods();
+            renderer.clear_cube_lods();
         }
     }
     fn prepare_lod(&mut self) {
@@ -17443,6 +17448,24 @@ impl Game<'_> {
         self.lod_source_attempted = true;
         self.lod_level = None;
         let dim = self.dim;
+        // A cubic level's far terrain is the cube octree, sampled from the
+        // single-player server's generators (docs/cubic-chunks.md).
+        if self.world.shape.cubic {
+            let sampler = self.integrated.as_ref().and_then(|server| {
+                server
+                    .call(move |game| game.cubic_sampler_in(dim))
+                    .flatten()
+            });
+            if let Some(sampler) = sampler {
+                let air = self.res.facts().air;
+                self.cube_lod = Some(horizon_client::lod::cube::CubeLod::new(
+                    sampler,
+                    self.worker_context(),
+                    air,
+                ));
+            }
+            return;
+        }
         let source = match (&self.integrated, self.server_far_terrain(), &self.remote) {
             (Some(server), ..) => server.call(move |game| game.lod_source_in(dim)).flatten(),
             (None, Some(offer), Some(remote)) => {
@@ -17786,6 +17809,29 @@ impl Game<'_> {
                 // over frames rather than stall one.
                 horizon_client::spans::time("lod_upload", || {
                     renderer.upload_lods(std::time::Duration::from_millis(2))
+                });
+            }
+            if let (Some(cube_lod), Some(player)) = (&mut self.cube_lod, &self.player) {
+                let lod_distance =
+                    horizon_client::graphics::lod_distance_capped(far_distance, &renderer.info);
+                let camera = [player.position.x, player.position.y, player.position.z];
+                let world = &self.world;
+                let shape = world.shape;
+                // The window's cubes the game holds lit are drawn in full;
+                // the octree leaves them out.
+                let loaded = horizon_client::lod::cube::LoadedBox {
+                    horizontal: self.streaming.radius + 2,
+                    vertical: shape.section_count() as i32,
+                };
+                let meshes = horizon_client::spans::time("cube_lod_update", || {
+                    cube_lod.update(camera, f64::from(lod_distance) * 16.0, loaded, |p| {
+                        shape.has_section(p.y)
+                            && world.chunks.get(&(p.x, p.z)).is_some_and(|c| c.lit)
+                    })
+                });
+                renderer.queue_cube_lods(meshes, cube_lod.removed());
+                horizon_client::spans::time("cube_lod_upload", || {
+                    renderer.upload_cube_lods(std::time::Duration::from_millis(2))
                 });
             }
         }
@@ -19604,6 +19650,7 @@ impl<'a> Game<'a> {
             world,
             streaming,
             lod: None,
+            cube_lod: None,
             lod_source_attempted: false,
             far_beacons: HashMap::new(),
             lod_observe: Default::default(),
