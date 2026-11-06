@@ -138,6 +138,60 @@ impl OctaveNoise {
         self.factor * sum + self.offset
     }
 
+    /// The octave factor (see the module docs).
+    pub(super) fn factor(&self) -> f64 {
+        self.factor
+    }
+
+    pub(super) fn offset(&self) -> f64 {
+        self.offset
+    }
+
+    pub(super) fn freq(&self) -> [f64; 3] {
+        self.freq
+    }
+
+    /// `0.5^i / norm` per octave.
+    pub(super) fn weights(&self) -> &[f64] {
+        &self.weights
+    }
+
+    /// How many octaves `get3` / `get2` evaluate for `min_wavelength` (the
+    /// same rule as their loops: octave 0 always, then until the wavelength
+    /// drops below the minimum).
+    pub(super) fn active_octaves(&self, min_wavelength: f64, planar: bool) -> usize {
+        let fmax = if planar {
+            self.freq[0].abs().max(self.freq[2].abs())
+        } else {
+            self.freq.iter().fold(0.0_f64, |a, &b| a.max(b.abs()))
+        };
+        let mut scale = 1.0;
+        for i in 0..self.octaves.len() {
+            if i > 0 && min_wavelength > 0.0 && fmax > 0.0 && 1.0 / (fmax * scale) < min_wavelength
+            {
+                return i;
+            }
+            scale *= 2.0;
+        }
+        self.octaves.len()
+    }
+
+    /// The raw `PerlinNoise` value of octave `i` at a point (before the
+    /// weight), with the 2D noise's `y = 0` when `planar`.
+    pub(super) fn octave_value(&self, i: usize, x: f64, y: f64, z: f64, planar: bool) -> f64 {
+        let scale = 2.0_f64.powi(i as i32);
+        let py = if planar {
+            0.0
+        } else {
+            wrap(y * self.freq[1] * scale)
+        };
+        f64::from(self.octaves[i].get3(
+            wrap(x * self.freq[0] * scale),
+            py,
+            wrap(z * self.freq[2] * scale),
+        ))
+    }
+
     pub fn table(&self) -> NoiseTable {
         NoiseTable {
             factor: self.factor,
@@ -256,9 +310,31 @@ impl TerrainNoise {
         ]
     }
 
+    pub(super) fn selector(&self) -> &OctaveNoise {
+        &self.selector
+    }
+
+    pub(super) fn low(&self) -> &OctaveNoise {
+        &self.low
+    }
+
+    pub(super) fn high(&self) -> &OctaveNoise {
+        &self.high
+    }
+
+    pub(super) fn depth(&self) -> &OctaveNoise {
+        &self.depth
+    }
+
     /// The depth transform of a column.
     pub fn depth_term(&self, x: i32, z: i32, min_wavelength: f64) -> f64 {
-        let mut d = self.depth.get2(f64::from(x), f64::from(z), min_wavelength);
+        Self::depth_transform(self.depth.get2(f64::from(x), f64::from(z), min_wavelength))
+    }
+
+    /// The piecewise-linear transform from the raw depth noise to the term
+    /// added to `mix` (see the module docs).
+    pub fn depth_transform(raw: f64) -> f64 {
+        let mut d = raw;
         if d < 0.0 {
             d *= -0.3;
         }

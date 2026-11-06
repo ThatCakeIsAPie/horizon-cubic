@@ -118,3 +118,28 @@ impl CubeWorld for MapWorld {
         }
     }
 }
+
+/// Settings presets the bounds are checked against: CWG's defaults, a
+/// floating-islands world (no height factor, noise that dominates) and an
+/// amplified one (tall, rough terrain).
+pub fn bound_presets() -> Vec<(&'static str, super::CustomGeneratorSettings)> {
+    let defaults = super::CustomGeneratorSettings::defaults();
+    let mut islands = defaults.clone();
+    islands.height_factor = 0.0;
+    islands.height_offset = 100.0;
+    islands.low_noise_factor = 24.0;
+    islands.high_noise_factor = 24.0;
+    islands.selector_noise_factor = 3.0;
+    islands.selector_noise_offset = 0.5;
+    let mut amplified = defaults.clone();
+    amplified.height_factor = 160.0;
+    amplified.height_variation_factor = 200.0;
+    amplified.height_offset = 90.0;
+    amplified.low_noise_factor = 2.0;
+    amplified.high_noise_factor = 2.0;
+    vec![
+        ("defaults", defaults),
+        ("floating islands", islands),
+        ("amplified", amplified),
+    ]
+}

@@ -704,6 +704,30 @@ impl UserFunction {
             }
         }
     }
+
+    /// The smallest and largest value over the real interval `[y0, y1]`
+    /// (piecewise linear, so at the ends and the breakpoints inside).
+    pub fn range(&self, y0: i32, y1: i32) -> (f64, f64) {
+        let (a, b) = (f64::from(y0), f64::from(y1));
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        let mut see = |y: f64| {
+            let v = self.get(y);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        };
+        see(a);
+        see(b);
+        for p in &self.0 {
+            if p.y > a && p.y < b {
+                see(p.y);
+            }
+        }
+        if lo.is_nan() || hi.is_nan() {
+            return (f64::NEG_INFINITY, f64::INFINITY);
+        }
+        (lo, hi)
+    }
 }
 
 // ---------------------------------------------------------------------------
