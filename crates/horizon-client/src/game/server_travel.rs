@@ -452,6 +452,7 @@ impl Game<'_> {
                 || self.carts.iter().any(|c| c.id == *id)
         });
         let source = self.dim;
+        let back = self.here();
         let end = plan.is_none();
         // Coordinates scale by 8 between the Overworld and the Nether; an
         // End portal has fixed destinations.
@@ -505,8 +506,8 @@ impl Game<'_> {
             placed: false,
             left: Some(source),
         });
-        if let Err(e) = self.enter_level(Some(host), source) {
-            log::error!("could not reopen {}: {e}", source.id());
+        if let Err(e) = self.enter_level(Some(host), back) {
+            log::error!("could not reopen {}: {e}", back.id());
         }
     }
 
@@ -849,6 +850,7 @@ impl Game<'_> {
                 continue;
             };
             let source = self.dim;
+            let back = self.here();
             if t.dim != source {
                 drop_hook(host, t.conn);
             }
@@ -902,8 +904,8 @@ impl Game<'_> {
                 placed: true,
                 left: Some(source),
             });
-            if let Err(e) = self.enter_level(Some(host), source) {
-                log::error!("could not reopen {}: {e}", source.id());
+            if let Err(e) = self.enter_level(Some(host), back) {
+                log::error!("could not reopen {}: {e}", back.id());
             }
         }
     }

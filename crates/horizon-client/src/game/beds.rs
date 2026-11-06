@@ -47,10 +47,9 @@ impl Game<'_> {
     fn player_in_bed(&self, head: [i32; 3]) -> bool {
         self.sleeping == Some(head)
             || self.lan.as_ref().is_some_and(|h| {
-                h.hub
-                    .guests
-                    .iter()
-                    .any(|g| g.bed == Some(head) && g.dimension == self.dim.id())
+                h.hub.guests.iter().any(|g| {
+                    g.bed == Some(head) && g.dimension == self.dim.id() && g.shard == self.shard
+                })
             })
     }
 
@@ -96,7 +95,7 @@ impl Game<'_> {
         if self.player_beds.is_empty() {
             return Ok(());
         }
-        let back = self.dim;
+        let back = self.here();
         for (dim, head) in std::mem::take(&mut self.player_beds) {
             self.enter_level(None, dim)?;
             // A client holds no other levels (`enter_level`).

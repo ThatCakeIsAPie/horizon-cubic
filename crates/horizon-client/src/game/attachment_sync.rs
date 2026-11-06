@@ -90,7 +90,7 @@ impl Game<'_> {
             if !guest.reads_attachment_sync() {
                 continue;
             }
-            if guest.dimension != hub.config.dimension {
+            if guest.dimension != hub.config.dimension || guest.shard != hub.shard {
                 hub.attachment_snapshots.push(snapshot);
                 continue;
             }

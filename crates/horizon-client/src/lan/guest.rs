@@ -380,6 +380,9 @@ pub struct Guest {
     /// The level the player is in (`ServerPlayer.level().dimension()`): the
     /// hub's level passes only reach the players in theirs.
     pub dimension: String,
+    /// The vertical shard of that level the player is in, when the dimension is
+    /// cubic and the server holds several (`cubic_shards`): 0 is the primary.
+    pub shard: u16,
     /// The open block container, if any.
     pub menu: Option<super::menu::Menu>,
     pub next_window: i32,
@@ -554,6 +557,7 @@ impl Guest {
             hidden_commands: Vec::new(),
             flying_speed: 0.05,
             dimension: "minecraft:overworld".into(),
+            shard: 0,
             menu: None,
             next_window: 0,
             drag: None,

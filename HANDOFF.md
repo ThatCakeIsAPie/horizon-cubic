@@ -71,6 +71,19 @@ Lead commits on main:
 - batched GPU requests from the far workers;
 - the test-pass fixes.
 
+### Converting a vanilla world (`cubic/convert`)
+
+`crates/horizon-client/src/cubic_convert.rs` copies a vanilla world to a cubic Hybrid world and leaves
+the original alone. Design, what is and is not carried over, and the options are in
+`docs/cubic-chunks.md` ("Converting a world").
+- CLI: `horizon-client --game-dir DIR --convert-cubic "<world>" [--keep-bedrock]` writes
+  `saves/<world> (Cubic)`.
+- UI: Edit World › Convert to Cubic Chunks… (confirm, background run with a progress line, the copy is
+  selected in the list).
+- Record format: `cubic::vanilla_column_records` is the one place a vanilla column becomes cube records;
+  `finish_vanilla` and the converter both use it.
+- Tests: `cargo test -p horizon-client-lib --lib cubic_convert` (needs `HORIZON_TEST_RESOURCES`).
+
 ### How it was tested
 
 - **Test pass:** one full `cargo test` of horizon-core, -world, -protocol, -client-render,
@@ -88,7 +101,7 @@ Lead commits on main:
 
 ### Known gaps
 
-- **Single player only.** LAN guests share one window. Vertical shards are planned in `docs/cubic-v2-plan.md` ("Residency").
+- **Vertical shards (branch `cubic/shards`).** LAN guests are grouped into shards by their vertical ranges (`cubic_shards.rs`); see `docs/cubic-v2-plan.md`, "Residency", "As built". Not done: vehicles carried across shards, mod API calls (`native_*` by dimension name) reach the shard in place only, and no trial on a long-running dedicated server yet.
 - **No structures in Custom Cubic,** as in CubicWorldGen. The structure toggles are marked `*`.
 - **Not generated yet:** snow and ice layers, dungeons and Bryce pillars.
 - **Seen from inside solid rock in spectator,** the far terrain's rock shells around the loaded box show as walls.

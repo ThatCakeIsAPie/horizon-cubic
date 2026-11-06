@@ -395,6 +395,7 @@ impl Game<'_> {
             for g in host.hub.guests.iter().filter(|g| {
                 g.placed
                     && g.dimension == level
+                    && g.shard == self.shard
                     && g.game_mode != horizon_client::lan::guest::SPECTATOR
             }) {
                 let since = host.play.get(&g.conn).map_or(0, |p| rest(&p.stats));

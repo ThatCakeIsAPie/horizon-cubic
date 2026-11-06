@@ -57,6 +57,20 @@ pub use crate::cubic_gen::VANILLA_CUBES;
 /// holds the column's own data (structure starts and references, the
 /// surface heights).
 pub const MARKER_CUBE: i32 = -4;
+/// A shard's window, shared with the shard's terrain, whose worker threads
+/// load columns into it (`CubicTerrain::window`). The game thread moves it
+/// with the shard's world.
+pub type ShardWindow = Arc<Mutex<ColumnLayout>>;
+
+/// A new shard's window cell, holding `shape`'s column layout.
+pub fn shard_window(shape: LevelShape) -> ShardWindow {
+    Arc::new(Mutex::new(shape.column()))
+}
+
+/// What makes a shard's streaming: the level's terrain around the given
+/// window cell (`CubicLevel::new_shard_streaming`).
+pub type ShardMaker = Box<dyn Fn(ShardWindow) -> crate::streaming::Streaming + Send + Sync>;
+
 /// The window a new cubic world opens with: vanilla's surface in its
 /// middle (the default vertical distance's height; the first player
 /// resizes and recentres it, `follow_cubic_window`).
@@ -125,10 +139,9 @@ pub fn wanted_cubes(cube: i32, vertical: u8) -> (i32, i32) {
 /// the middle of the union when it is taller) and kept in the cubic range;
 /// `None` for no players.
 pub fn union_cubes(ranges: impl IntoIterator<Item = (i32, i32)>) -> Option<(i32, i32)> {
-    // TODO(shards): players whose windows do not overlap get shards of
-    // their own (docs/cubic-v2-plan.md, "Residency"); until then the level
-    // holds one window for all of them, and a union taller than the cap
-    // leaves the outermost players on its edge.
+    // Players whose ranges do not meet are in shards of their own
+    // (`cubic_shards`), so a union is of ranges that overlap; one taller than
+    // the cap is a chain of them, and the outermost players stay on its edge.
     let (lo, hi) = ranges
         .into_iter()
         .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))?;
@@ -250,14 +263,7 @@ impl CubeIo {
     }
 
     fn write_now(&self, pos: SectionPos, tag: &Arc<NamedTag>) {
-        let written = if is_uniform_record(tag) {
-            self.store
-                .write_uniform(pos, tag)
-                .or_else(|_| self.store.write(pos, tag))
-        } else {
-            self.store.write(pos, tag)
-        };
-        if let Err(e) = written {
+        if let Err(e) = store_record(&self.store, pos, tag) {
             log::warn!("Horizon: cube {pos:?} not saved: {e}");
         }
         let mut pending = self.pending.lock().unwrap();
@@ -282,6 +288,115 @@ impl CubeIo {
         drop(count);
         if let Err(e) = self.store.sync() {
             log::warn!("Horizon: cubes not synced: {e}");
+        }
+    }
+}
+
+/// Writes cube record `tag` at `pos`: in the store's uniform sidecar when it
+/// is one block state and nothing else, else in a region file.
+pub(crate) fn store_record(
+    store: &CubeStore,
+    pos: SectionPos,
+    tag: &NamedTag,
+) -> std::io::Result<()> {
+    if is_uniform_record(tag) {
+        store
+            .write_uniform(pos, tag)
+            .or_else(|_| store.write(pos, tag))
+    } else {
+        store.write(pos, tag)
+    }
+}
+
+/// One cube of a vanilla column, as `finish_vanilla` saves it.
+pub(crate) struct ColumnCube {
+    pub cy: i32,
+    /// `None` for a cube that needs no record (air with nothing in it; a
+    /// missing vanilla cube reads as air).
+    pub root: Option<NamedTag>,
+    pub block_ticks: Vec<SavedTick>,
+    pub fluid_ticks: Vec<SavedTick>,
+    pub has_entities: bool,
+}
+
+/// A finished vanilla column's cubes as records (`vanilla_column_records`).
+pub(crate) struct ColumnRecords {
+    pub cubes: Vec<ColumnCube>,
+    /// The column's surface heights, kept in its marker cube.
+    pub heights: Vec<i32>,
+}
+
+/// The records of a finished vanilla column (`-64..320`) in a Hybrid world:
+/// one per vanilla cube, `entities` (by cube, `split_by_cube`) in theirs, the
+/// marker cube with the column's structures and surface heights. The one
+/// definition of the record format: `finish_vanilla` and the world converter
+/// both save through it.
+pub(crate) fn vanilla_column_records(
+    registry: &BlockRegistry,
+    biomes: &Biomes,
+    tables: Option<&SaveTables>,
+    vanilla: &Chunk,
+    entities: &BTreeMap<i32, Vec<Tag>>,
+) -> ColumnRecords {
+    let ctx = Codec {
+        registry,
+        biomes,
+        tables,
+    };
+    let air = |v: u32| v == 0;
+    let heights: Vec<i32> = (0..256)
+        .map(|i| vanilla.world_surface(i & 15, i >> 4, air))
+        .collect();
+    let vanilla_base = vanilla.min_y() >> 4;
+    let mut cubes = Vec::new();
+    for (s, section) in vanilla.sections.iter().enumerate() {
+        let cy = vanilla_base + s as i32;
+        if !VANILLA_CUBES.contains(&cy) {
+            continue;
+        }
+        let (block_ticks, fluid_ticks) = cube_ticks(vanilla, cy);
+        let marker = cy == MARKER_CUBE;
+        let low = cy * 16;
+        // A missing vanilla cube reads as air: the air above the ground
+        // needs no record (the marker always has one).
+        let bare = !marker
+            && section.blocks.uniform() == Some(0)
+            && block_ticks.is_empty()
+            && fluid_ticks.is_empty()
+            && !entities.contains_key(&cy)
+            && !vanilla
+                .block_entities
+                .iter()
+                .any(|(p, _)| p.1 >= low && p.1 < low + 16);
+        let here = entities.get(&cy).map_or(&[][..], |e| &e[..]);
+        let root = (!bare).then(|| {
+            let mut root = ctx.encode(vanilla, s, marker, here);
+            if marker && let Tag::Compound(map) = &mut root.tag {
+                map.insert(SURFACE_KEY.into(), Tag::IntArray(heights.clone()));
+            }
+            root
+        });
+        cubes.push(ColumnCube {
+            cy,
+            root,
+            block_ticks,
+            fluid_ticks,
+            has_entities: !here.is_empty(),
+        });
+    }
+    ColumnRecords { cubes, heights }
+}
+
+/// Vanilla's bedrock floor (y -64..-60) as `deepslate`, so the world can go
+/// deeper.
+pub(crate) fn replace_bedrock(chunk: &mut Chunk, bedrock: u32, deepslate: u32) {
+    for y in chunk.min_y()..chunk.min_y() + 5 {
+        for z in 0..16 {
+            for x in 0..16 {
+                if chunk.get(x, y, z) == bedrock {
+                    chunk.set(x, y, z, deepslate);
+                }
+            }
         }
     }
 }
@@ -328,6 +443,15 @@ pub struct CubicLevel {
     /// Each column's vanilla surface heights, for the sky a window's top
     /// leaves open (`sky_cover`); `None` for a column without them.
     surfaces: Mutex<HashMap<(i32, i32), Option<Arc<Vec<i32>>>>>,
+    /// Held while a column's vanilla range is written (`finish_vanilla`): two
+    /// shards that both need a column generated write it once, and the second
+    /// reads what the first wrote instead of overwriting edits made since.
+    vanilla_write: Mutex<()>,
+    /// Makes the streaming of another shard (set where the level's terrain is
+    /// built).
+    shard_maker: std::sync::OnceLock<ShardMaker>,
+    /// The window cell of the primary shard's terrain.
+    primary_window: std::sync::OnceLock<ShardWindow>,
 }
 
 impl CubicLevel {
@@ -385,6 +509,9 @@ impl CubicLevel {
             ),
             ring: crate::cubic_prefetch::Ring::new(),
             surfaces: Mutex::default(),
+            vanilla_write: Mutex::new(()),
+            shard_maker: std::sync::OnceLock::new(),
+            primary_window: std::sync::OnceLock::new(),
         });
         level.ring.start(Arc::downgrade(&level));
         Ok(level)
@@ -467,17 +594,42 @@ impl CubicLevel {
         self.biomes.id(self.wg.columns.biome_name(id))
     }
 
-    /// The window the level's chunks hold.
+    /// The window of the shard in place (`Game::swap_level` and a slide set
+    /// it): what an entity save stands for (`save_entities`). A shard's
+    /// terrain loads into the window of its own (`CubicTerrain::window`).
     pub fn window(&self) -> ColumnLayout {
         *self.window.lock().unwrap()
     }
 
-    /// Moves the level's window: the columns loaded from now on hold
-    /// `window`. The caller saved the leaving cubes and their entities
-    /// (`save_leaving_entities`) first. What is known of the cubes that stay
-    /// (`clean`) stays.
+    /// Moves the window of the shard in place: the columns it loads from now
+    /// on hold `window`. The caller saved the leaving cubes and their
+    /// entities (`save_leaving_entities`) first. What is known of the cubes
+    /// that stay (`clean`) stays.
     pub fn set_window(&self, window: LevelShape) {
         *self.window.lock().unwrap() = window.column();
+    }
+
+    /// The window cell of the primary shard's terrain, which the game moves
+    /// with the primary's world.
+    pub fn primary_window(&self) -> Option<ShardWindow> {
+        self.primary_window.get().cloned()
+    }
+
+    /// Records the primary shard's window cell (where its terrain is built).
+    pub fn set_primary_window(&self, window: ShardWindow) {
+        let _ = self.primary_window.set(window);
+    }
+
+    /// Lets the level make the streaming of other shards (`new_shard_streaming`).
+    pub fn set_shard_maker(&self, maker: ShardMaker) {
+        let _ = self.shard_maker.set(maker);
+    }
+
+    /// The streaming of a new shard around `window`: the same terrain, saves,
+    /// generator and population as the level's others, loading into
+    /// its own window. `None` when the level cannot make one.
+    pub fn new_shard_streaming(&self, window: ShardWindow) -> Option<crate::streaming::Streaming> {
+        self.shard_maker.get().map(|make| make(window))
     }
 
     /// Forgets that cube `pos` was loaded as it is (it left the window and
@@ -487,14 +639,31 @@ impl CubicLevel {
         self.clean.lock().unwrap().remove(&pos);
     }
 
-    /// Aims the prefetch ring at the layers around the window of `columns`,
-    /// nearest to `centres` first (`cubic_prefetch`).
+    /// Aims the prefetch ring at the layers around `window` of `columns`
+    /// (the loaded columns of shard `shard`), nearest to `centres` first
+    /// (`cubic_prefetch`). Each shard has its own target; the ring holds all.
+    pub fn retarget_shard_ring(
+        &self,
+        shard: u16,
+        window: ColumnLayout,
+        centres: &[(i32, i32)],
+        columns: impl IntoIterator<Item = (i32, i32)>,
+    ) {
+        self.ring.retarget_shard(shard, window, centres, columns);
+    }
+
+    /// `retarget_shard_ring` for the primary shard and the window in place.
     pub fn retarget_ring(
         &self,
         centres: &[(i32, i32)],
         columns: impl IntoIterator<Item = (i32, i32)>,
     ) {
         self.ring.retarget(self.window(), centres, columns);
+    }
+
+    /// Drops shard `shard`'s ring target (the shard closed).
+    pub fn drop_ring_target(&self, shard: u16) {
+        self.ring.forget(shard);
     }
 
     /// Whether cube `pos` waits in the ring.
@@ -522,13 +691,15 @@ impl CubicLevel {
         if let Some(cache) = &self.lod_cache {
             cache.invalidate(pos);
         }
-        // A cube read before this write is older than its record.
-        self.ring.invalidate(pos);
         if self.is_marker(pos.y) {
             self.surfaces.lock().unwrap().remove(&(pos.x, pos.z));
         }
         let tag = Arc::new(tag);
         self.io.pending.lock().unwrap().insert(pos, tag.clone());
+        // A cube read before this write is older than its record. Dropped
+        // once the record can be read, so the ring (one for every shard) does
+        // not read the old one again in between.
+        self.ring.invalidate(pos);
         *self.io.queued.0.lock().unwrap() += 1;
         let sent = self
             .send
@@ -952,8 +1123,10 @@ impl CubicLevel {
             chunk.sky_covered = self.sky_cover(x, z, window);
             return chunk;
         }
+        // The column's own data lives in the marker cube. A window that does
+        // not hold it (another shard may) reads it: the same surface and
+        // structure data whichever shard loads the column.
         if surface.is_none()
-            && !self.is_vanilla(base)
             && let Some(root) = self.read(SectionPos::new(x, MARKER_CUBE, z))
         {
             surface = surface_heights(&root);
@@ -971,47 +1144,28 @@ impl CubicLevel {
     /// the generator's cubes.
     fn finish_vanilla(&self, mut vanilla: Chunk, window: ColumnLayout, ctx: &Codec) -> Chunk {
         let (x, z) = (vanilla.x, vanilla.z);
-        self.strip_bedrock(&mut vanilla);
-        // The column's surface, for sky light in windows below it.
-        let air = |v: u32| v == 0;
-        let mut heights = Vec::with_capacity(256);
-        for i in 0..256 {
-            heights.push(vanilla.world_surface(i & 15, i >> 4, air));
+        // Two shards can both need this column generated. The first writes
+        // its cubes; the second takes them from the store, so it does not write
+        // the generated cubes over edits made since.
+        let _write = self.vanilla_write.lock().unwrap();
+        if self.vanilla_done.lock().unwrap().contains(&(x, z)) {
+            return self.assemble(x, z, window, ctx);
         }
-        let vanilla_base = vanilla.min_y() >> 4;
+        self.strip_bedrock(&mut vanilla);
         // The column's entities by cube: each is saved in its cube's record.
         let entities = split_by_cube(std::mem::take(&mut vanilla.entities));
-        for (s, section) in vanilla.sections.iter().enumerate() {
-            let cy = vanilla_base + s as i32;
-            if !self.is_vanilla(cy) {
+        let records =
+            vanilla_column_records(self.registry, &self.biomes, ctx.tables, &vanilla, &entities);
+        let heights = records.heights;
+        let vanilla_base = vanilla.min_y() >> 4;
+        for cube in records.cubes {
+            let pos = SectionPos::new(x, cube.cy, z);
+            let section = &vanilla.sections[(cube.cy - vanilla_base) as usize];
+            self.note_clean(pos, section, &cube.block_ticks, &cube.fluid_ticks);
+            let Some(root) = cube.root else {
                 continue;
-            }
-            let pos = SectionPos::new(x, cy, z);
-            let (block_ticks, fluid_ticks) = cube_ticks(&vanilla, cy);
-            self.note_clean(pos, section, &block_ticks, &fluid_ticks);
-            // A missing vanilla cube reads as air: the air above the ground
-            // needs no record (the marker always has one).
-            let low = cy * 16;
-            if !self.is_marker(cy)
-                && section.blocks.uniform() == Some(0)
-                && block_ticks.is_empty()
-                && fluid_ticks.is_empty()
-                && !entities.contains_key(&cy)
-                && !vanilla
-                    .block_entities
-                    .iter()
-                    .any(|(p, _)| p.1 >= low && p.1 < low + 16)
-            {
-                continue;
-            }
-            let here = entities.get(&cy).map_or(&[][..], |e| &e[..]);
-            self.note_entities(pos, !here.is_empty());
-            let mut root = ctx.encode(&vanilla, s, self.is_marker(cy), here);
-            if self.is_marker(cy)
-                && let Tag::Compound(map) = &mut root.tag
-            {
-                map.insert(SURFACE_KEY.into(), Tag::IntArray(heights.clone()));
-            }
+            };
+            self.note_entities(pos, cube.has_entities);
             self.write_later(pos, root);
         }
         self.vanilla_done.lock().unwrap().insert((x, z));
@@ -1072,18 +1226,8 @@ impl CubicLevel {
     }
 
     fn strip_bedrock(&self, chunk: &mut Chunk) {
-        let (Some(bedrock), Some(deepslate)) = (self.bedrock, self.deepslate) else {
-            return;
-        };
-        // Vanilla's floor is y -64..-60.
-        for y in chunk.min_y()..chunk.min_y() + 5 {
-            for z in 0..16 {
-                for x in 0..16 {
-                    if chunk.get(x, y, z) == bedrock {
-                        chunk.set(x, y, z, deepslate);
-                    }
-                }
-            }
+        if let (Some(bedrock), Some(deepslate)) = (self.bedrock, self.deepslate) {
+            replace_bedrock(chunk, bedrock, deepslate);
         }
     }
 
@@ -1478,7 +1622,7 @@ fn entity_cube(entity: &Tag) -> Option<i32> {
 }
 
 /// A column's entities by the cube Y they are in.
-fn split_by_cube(entities: Vec<Tag>) -> BTreeMap<i32, Vec<Tag>> {
+pub(crate) fn split_by_cube(entities: Vec<Tag>) -> BTreeMap<i32, Vec<Tag>> {
     let mut cubes: BTreeMap<i32, Vec<Tag>> = BTreeMap::new();
     for entity in entities {
         match entity_cube(&entity) {
@@ -1506,7 +1650,7 @@ fn cube_ticks(chunk: &Chunk, cy: i32) -> (Vec<SavedTick>, Vec<SavedTick>) {
 
 /// Whether a cube record is one block state and one biome throughout with
 /// nothing else in it: what the store keeps in its uniform sidecar.
-fn is_uniform_record(root: &NamedTag) -> bool {
+pub(crate) fn is_uniform_record(root: &NamedTag) -> bool {
     let empty = |key: &str| match root.tag.get(key) {
         None => true,
         Some(Tag::List(list)) => list.is_empty(),
@@ -1597,9 +1741,15 @@ fn blocks_hash(section: &Section) -> u64 {
 pub struct CubicTerrain<G> {
     pub inner: Arc<Persistent<G>>,
     pub level: Arc<CubicLevel>,
+    /// The window of the shard this terrain loads columns into.
+    pub window: ShardWindow,
 }
 
 impl<G: ChunkGenerator> CubicTerrain<G> {
+    fn window(&self) -> ColumnLayout {
+        *self.window.lock().unwrap()
+    }
+
     fn codec(&self) -> Codec<'_> {
         let tables = self
             .inner
@@ -1616,7 +1766,7 @@ impl<G: ChunkGenerator> CubicTerrain<G> {
 
     /// A vanilla-range column (the proto's, or its blocks) as the window's.
     fn window_of(&self, vanilla: &Chunk) -> Chunk {
-        let window = self.level.window();
+        let window = self.window();
         let mut chunk = Chunk::with_layout(vanilla.x, vanilla.z, window);
         let base = window.min_y() >> 4;
         for s in 0..window.sections() {
@@ -1649,7 +1799,7 @@ impl<G: ChunkGenerator> ChunkGenerator for CubicTerrain<G> {
         self.inner.lod_surface(worker, x, z)
     }
     fn load(&self, x: i32, z: i32) -> Option<Chunk> {
-        let window = self.level.window();
+        let window = self.window();
         // A window that doesn't reach vanilla's range needs no vanilla
         // column: its cubes are saved ones and the generator's.
         let base = window.min_y() >> 4;
@@ -1689,7 +1839,7 @@ impl<G: ChunkGenerator> ChunkGenerator for CubicTerrain<G> {
     fn finish(&self, proto: Proto) -> Chunk {
         let vanilla = self.inner.finish(proto);
         self.level
-            .finish_vanilla(vanilla, self.level.window(), &self.codec())
+            .finish_vanilla(vanilla, self.window(), &self.codec())
     }
     fn is_decorated(&self, proto: &Proto) -> bool {
         self.inner.is_decorated(proto)
@@ -2340,6 +2490,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Two players at y 0 and y 20,000 are two shards over one level: each
+    /// column is made from the cubes of its own window, from the same store.
+    #[test]
+    fn two_windows_over_one_level_each_make_their_own_columns_from_the_same_cubes() {
+        let Some(f) = Fixture::new("shards") else {
+            return;
+        };
+        let level = f.level_of(CubicKind::Custom);
+        let near = LevelShape::cubic_window(LevelShape::OVERWORLD, -80, 19 * 16);
+        let far = LevelShape::cubic_window(LevelShape::OVERWORLD, 20_000 - 144, 19 * 16);
+        let (x, z) = (2, 5);
+        let ctx = f.codec();
+        // The upper shard builds a platform in cube 1250, and the store has it.
+        let platform = f.uniform("minecraft:stone");
+        let mut cube = Chunk::with_layout(x, z, ColumnLayout::window(1250 * 16, 16));
+        cube.sections[0] = platform;
+        assert!(level.save_cube(&cube, 1250));
+        level.flush();
+        let low = level.assemble(x, z, near.column(), &ctx);
+        let high = level.assemble(x, z, far.column(), &ctx);
+        assert_eq!((low.min_y(), high.min_y()), (-80, 20_000 - 144));
+        assert_eq!(low.sections.len(), 19);
+        assert_eq!(high.sections.len(), 19);
+        // Each holds the cubes of its window and no other: the platform is the
+        // upper column's alone, and the generator's terrain the lower's.
+        let stone = f.state("minecraft:stone");
+        let index = (1250 - (high.min_y() >> 4)) as usize;
+        assert_eq!(high.sections[index].blocks.uniform(), Some(stone));
+        assert!(
+            low.sections.iter().any(|s| !s.is_uniform(0)),
+            "terrain near the surface"
+        );
+        // The same cube, loaded by both layouts that hold it, is the same section.
+        let overlap = LevelShape::cubic_window(LevelShape::OVERWORLD, 1250 * 16, 3 * 16);
+        let again = level.assemble(x, z, overlap.column(), &ctx);
+        assert!(again.sections[0].same_as(&high.sections[index]));
+    }
+
+    /// The column's sky data is the level's: whichever window loads the column
+    /// is told the same covering, from the same surface.
+    #[test]
+    fn the_sky_over_a_column_is_one_answer_for_every_window() {
+        let Some(f) = Fixture::new("sky") else {
+            return;
+        };
+        let level = f.level_of(CubicKind::Custom);
+        let (x, z) = (-3, 8);
+        let under = LevelShape::cubic_window(LevelShape::OVERWORLD, -3000, 19 * 16);
+        let above = LevelShape::cubic_window(LevelShape::OVERWORLD, 20_000, 19 * 16);
+        let a = level.sky_cover(x, z, under.column());
+        let b = level.sky_cover(x, z, above.column());
+        assert!(a.is_some(), "a window deep under the surface is covered");
+        assert!(b.is_none(), "a window above it sees the sky");
+        // Asked again, in the other order and from a second view, the same.
+        assert_eq!(level.sky_cover(x, z, above.column()), b);
+        assert_eq!(level.sky_cover(x, z, under.column()), a);
+    }
+
+    /// An entity that leaves one shard's window is saved with its cube, and the
+    /// shard whose window holds that cube loads it.
+    #[test]
+    fn an_entity_leaving_one_shard_is_loaded_by_the_shard_that_holds_its_cube() {
+        let Some(f) = Fixture::new("carried") else {
+            return;
+        };
+        let level = f.level_of(CubicKind::Custom);
+        let (x, z) = (1, 1);
+        let lower = LevelShape::cubic_window(LevelShape::OVERWORLD, 0, 19 * 16);
+        let upper = LevelShape::cubic_window(LevelShape::OVERWORLD, 19 * 16, 19 * 16);
+        level.set_window(lower);
+        // The lower shard saves its entities, one in its top cube (18), and
+        // that cube leaves it as the shard closes.
+        let carried = mob(7, 18.0 * 16.0 + 4.5);
+        level.save_entities(x, z, vec![carried.clone(), mob(8, 20.5)]);
+        level.save_leaving_entities(x, z, 0..=18, vec![carried.clone(), mob(8, 20.5)]);
+        level.flush();
+        // The upper shard's window holds cube 19 and up: it does not have it...
+        let theirs = level.assemble(x, z, upper.column(), &f.codec());
+        assert!(theirs.entities.is_empty());
+        // ...until the entity walks (is saved) into cube 19, which the upper
+        // shard's column loads with it.
+        let over = mob(7, 19.0 * 16.0 + 0.5);
+        level.set_window(upper);
+        level.save_entities(x, z, vec![over.clone()]);
+        level.flush();
+        let theirs = level.assemble(x, z, upper.column(), &f.codec());
+        assert_eq!(theirs.entities, [over]);
+        // The lower window's column still holds what its own cubes saved.
+        let ours = level.assemble(x, z, lower.column(), &f.codec());
+        assert_eq!(ours.entities.len(), 2, "{:?}", ours.entities);
     }
 
     #[test]

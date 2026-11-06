@@ -7,6 +7,12 @@
 //! chunks by swapping it into place (`enter_level`), the way `as_guest` swaps a player
 //! in, so the tick code runs unchanged, one level at a time.
 //!
+//! A cubic Overworld may be several levels (vertical shards, docs/cubic-v2-plan.md,
+//! "Residency"): each is a `World`, `Streaming` and window of its own over the
+//! same cubes (`CubicLevel`), and a level is named by its dimension and shard
+//! (`LevelId`). The primary shard (0) is the one the dimension-keyed code
+//! finds.
+//!
 //! Shared by every level, as vanilla's derived levels share the
 //! Overworld's level data: the game time, the day time and the weather, the
 //! game rules, the scoreboard, the maps and the entities waiting to arrive
@@ -34,8 +40,55 @@ use std::{
 /// once no ticket holds them; the Overworld stays loaded).
 const IDLE_TICKS: u32 = 300;
 
+/// Server ticks a shard of the Overworld stays loaded with no player in it
+/// before it is saved and closed: long enough for the events of a player
+/// leaving to run in it, short enough to give its cubes back.
+const SHARD_IDLE_TICKS: u32 = 40;
+
+/// A level: a dimension and, in a cubic one, the vertical shard. Without a
+/// shard it means the shard in place when the dimension is the one in place,
+/// else the dimension's primary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct LevelId {
+    pub dim: Dim,
+    pub shard: Option<u16>,
+}
+
+impl From<Dim> for LevelId {
+    fn from(dim: Dim) -> Self {
+        Self { dim, shard: None }
+    }
+}
+
+impl LevelId {
+    /// The dimension's id.
+    pub(super) fn id(&self) -> &'static str {
+        self.dim.id()
+    }
+
+    /// The level a guest is in.
+    pub(super) fn of(g: &horizon_client::lan::guest::Guest) -> Self {
+        Self::shard(Dim::from_id(&g.dimension), g.shard)
+    }
+
+    /// Shard `shard` of `dim`.
+    pub(super) fn shard(dim: Dim, shard: u16) -> Self {
+        Self {
+            dim,
+            shard: Some(shard),
+        }
+    }
+}
+
 /// A level that is not in place: every per-level field of `Game`.
 pub(super) struct Parked {
+    /// The vertical shard of its dimension this level is.
+    shard: u16,
+    /// The shard's window cell (`None` for the primary's, which the cubic
+    /// level keeps).
+    shard_window: Option<horizon_client::cubic::ShardWindow>,
+    /// The shard's window sliding (`game/cubic.rs`).
+    slide: super::cubic::SlideState,
     world: World,
     streaming: Streaming,
     locator: Option<Arc<VanillaTerrain>>,
@@ -122,7 +175,7 @@ impl Default for Pass {
 /// The levels not in place, by dimension.
 #[derive(Default)]
 pub(super) struct Levels {
-    parked: HashMap<Dim, Parked>,
+    parked: HashMap<(Dim, u16), Parked>,
     /// The levels whose open the mods heard (`native_level_load`), each to
     /// be told closed once.
     heard_open: Vec<Dim>,
@@ -135,9 +188,67 @@ impl Levels {
         self.heard_open.clear();
     }
 
+    /// The key of `dim`'s primary level among the parked ones: its lowest shard.
+    fn primary_key(&self, dim: Dim) -> Option<(Dim, u16)> {
+        self.parked
+            .keys()
+            .filter(|k| k.0 == dim)
+            .min_by_key(|k| k.1)
+            .copied()
+    }
+
+    /// The shard `dim`'s level not in place is for a bare dimension: the primary's.
+    /// The shard a bare `dim` means among the parked levels: its primary.
+    pub(super) fn primary_shard_of(&self, dim: Dim) -> u16 {
+        self.primary_shard(dim)
+    }
+
+    fn primary_shard(&self, dim: Dim) -> u16 {
+        self.primary_key(dim).map_or(0, |k| k.1)
+    }
+
+    /// The primary shard of `dim`, counting the level in place (`here`).
+    pub(super) fn primary_shard_or(&self, dim: Dim, here_dim: Dim, here_shard: u16) -> u16 {
+        let parked = self.primary_key(dim).map(|k| k.1);
+        match (parked, here_dim == dim) {
+            (Some(p), true) => p.min(here_shard),
+            (Some(p), false) => p,
+            (None, true) => here_shard,
+            (None, false) => 0,
+        }
+    }
+
+    /// The world of shard `shard` of `dim`, when that level is parked.
+    pub(super) fn parked_shard_world(&self, dim: Dim, shard: u16) -> Option<&World> {
+        self.parked.get(&(dim, shard)).map(|level| &level.world)
+    }
+
+    /// Keeps a new shard's level with the others.
+    pub(super) fn insert_shard(&mut self, parked: Parked) {
+        self.parked.insert((Dim::Overworld, parked.shard), parked);
+    }
+
+    /// Drops the level of shard `shard` of `dim`.
+    pub(super) fn remove_shard(&mut self, dim: Dim, shard: u16) {
+        self.parked.remove(&(dim, shard));
+    }
+
+    /// The shards of `dim` that are parked, lowest first.
+    pub(super) fn parked_shards(&self, dim: Dim) -> Vec<u16> {
+        let mut shards: Vec<u16> = self
+            .parked
+            .keys()
+            .filter(|k| k.0 == dim)
+            .map(|k| k.1)
+            .collect();
+        shards.sort_unstable();
+        shards
+    }
+
     /// A parked level, without opening or loading it.
     pub(super) fn parked_world(&self, dim: Dim) -> Option<&World> {
-        self.parked.get(&dim).map(|level| &level.world)
+        let key = self.primary_key(dim)?;
+        self.parked.get(&key).map(|level| &level.world)
     }
 
     /// The worlds of the levels not in place.
@@ -147,17 +258,20 @@ impl Levels {
 
     /// The world of the level not in place, in `dim`, to change.
     pub(super) fn parked_world_mut(&mut self, dim: Dim) -> Option<&mut World> {
-        self.parked.get_mut(&dim).map(|level| &mut level.world)
+        let key = self.primary_key(dim)?;
+        self.parked.get_mut(&key).map(|level| &mut level.world)
     }
 
     /// The level not in place, in `dim`.
     pub(super) fn parked_mut(&mut self, dim: Dim) -> Option<&mut Parked> {
-        self.parked.get_mut(&dim)
+        let key = self.primary_key(dim)?;
+        self.parked.get_mut(&key)
     }
 
     /// The entities of a parked level, counted as `Game::entity_count` counts the one in place.
     pub(super) fn parked_entity_count(&self, dim: Dim) -> Option<usize> {
-        let l = self.parked.get(&dim)?;
+        let key = self.primary_key(dim)?;
+        let l = self.parked.get(&key)?;
         Some(
             l.mobs.iter().filter(|m| !m.removed).count()
                 + l.dropped.len()
@@ -178,13 +292,15 @@ impl Levels {
 
     /// The mobs of a parked level.
     pub(super) fn parked_mobs(&self, dim: Dim) -> Option<&[Mob]> {
-        self.parked.get(&dim).map(|level| level.mobs.as_slice())
+        let key = self.primary_key(dim)?;
+        self.parked.get(&key).map(|level| level.mobs.as_slice())
     }
 
     /// A parked level's loose entities, for `horizon-report`: items, experience orbs,
     /// projectiles, minecarts and boats.
     pub(super) fn parked_entity_counts(&self, dim: Dim) -> Option<[usize; 5]> {
-        self.parked.get(&dim).map(|l| {
+        let key = self.primary_key(dim)?;
+        self.parked.get(&key).map(|l| {
             [
                 l.dropped.as_slice().len(),
                 l.orbs.as_slice().len(),
@@ -203,8 +319,15 @@ impl Levels {
         }
     }
 
+    /// The dimensions with a level not in place, once each.
     pub(super) fn parked_dims(&self) -> Vec<Dim> {
-        self.parked.keys().copied().collect()
+        let mut dims: Vec<Dim> = Vec::new();
+        for (dim, _) in self.parked.keys() {
+            if !dims.contains(dim) {
+                dims.push(*dim);
+            }
+        }
+        dims
     }
 }
 
@@ -225,6 +348,55 @@ impl Game<'_> {
         Ok(self.new_parked(dim, streaming, save, locator))
     }
 
+    /// The Overworld's save and vanilla terrain, wherever its level is.
+    fn overworld_parts(
+        &self,
+    ) -> Option<(
+        Arc<horizon_client::save::SaveDir>,
+        Option<Arc<horizon_client::vanillagen::VanillaTerrain>>,
+    )> {
+        if self.dim == Dim::Overworld {
+            return Some((self.save.clone(), self.end.locator()));
+        }
+        let key = self.levels.primary_key(Dim::Overworld)?;
+        let p = self.levels.parked.get(&key)?;
+        Some((p.save.clone(), p.locator.clone()))
+    }
+
+    /// A new shard of the cubic Overworld around `shape`'s window, with its
+    /// own world and streaming over the primary's level (`CubicLevel`): the
+    /// same store, generator, population and saves. Empty until its players
+    /// and columns arrive.
+    pub(super) fn open_shard(
+        &self,
+        shard: u16,
+        shape: horizon_client::chunk::LevelShape,
+    ) -> Result<Parked> {
+        let dim = Dim::Overworld;
+        let (save, locator) = self.overworld_parts().ok_or("the Overworld is not open")?;
+        let level = save.cubic.get().cloned().ok_or("the level is not cubic")?;
+        let window = horizon_client::cubic::shard_window(shape);
+        let mut streaming = level
+            .new_shard_streaming(window.clone())
+            .ok_or("the level cannot make a shard")?;
+        super::world_loading::configure_streaming(
+            &mut streaming,
+            &save,
+            &self.options,
+            &self.settings,
+            dim,
+            self.level.seed,
+        );
+        // The level's forced chunks are the primary shard's.
+        streaming.forced.clear();
+        let mut parked = self.new_parked(dim, streaming, save, None);
+        parked.shard = shard;
+        parked.shard_window = Some(window);
+        parked.world.shape = shape;
+        parked.locator = locator;
+        Ok(parked)
+    }
+
     /// A level of `dim` over `streaming` and `save`, with nothing in it yet.
     fn new_parked(
         &self,
@@ -238,6 +410,9 @@ impl Game<'_> {
         world.shape = self.level_shapes.get(dim.id());
         world.fast_lava = dim == Dim::Nether;
         Parked {
+            shard: 0,
+            shard_window: None,
+            slide: Default::default(),
             world,
             streaming,
             locator,
@@ -295,6 +470,13 @@ impl Game<'_> {
         use std::mem::swap;
         swap(&mut self.world, &mut p.world);
         swap(&mut self.streaming, &mut p.streaming);
+        swap(&mut self.shard, &mut p.shard);
+        swap(&mut self.shard_window, &mut p.shard_window);
+        swap(&mut self.cubic_slide, &mut p.slide);
+        // `CubicLevel::save_entities` stands for the window of the level in place.
+        if let Some(level) = self.save.cubic.get() {
+            level.set_window(self.world.shape);
+        }
         let mut locator = self.end.locator();
         swap(&mut locator, &mut p.locator);
         self.end.set_locator(locator);
@@ -358,23 +540,55 @@ impl Game<'_> {
         self.pickups.clear();
     }
 
+    /// The level in place.
+    pub(super) fn here(&self) -> LevelId {
+        LevelId::shard(self.dim, self.shard)
+    }
+
     /// Put `target`'s level in place, opening it first if it is not loaded.
     /// The level that was in place is kept with the others; the shared
     /// clock and weather go with the swap. `host` is the hub when the caller
-    /// holds it (`self.lan` is taken during the network tick).
+    /// holds it (`self.lan` is taken during the network tick). A bare
+    /// dimension is the shard in place when it is the dimension in place, else
+    /// the dimension's primary.
     pub(super) fn enter_level(
         &mut self,
         mut host: Option<&mut LanHost>,
-        target: Dim,
+        target: impl Into<LevelId>,
     ) -> Result<()> {
         // A client holds no levels.
         if self.options.execution_role.is_client() {
             return Ok(());
         }
-        if target != self.dim {
-            let (mut p, opened) = match self.levels.parked.remove(&target) {
+        let target: LevelId = target.into();
+        let shard = target.shard.unwrap_or_else(|| {
+            if target.dim == self.dim {
+                self.shard
+            } else {
+                self.levels.primary_shard(target.dim)
+            }
+        });
+        let target = target.dim;
+        // A shard that closed since a player was told it: the dimension's primary.
+        let shard = if shard != 0
+            && !self.shard_exists(target, shard)
+            && !self.levels.parked.contains_key(&(target, shard))
+        {
+            log::warn!(
+                "Horizon: {} has no shard {shard}; using the primary",
+                target.id()
+            );
+            self.levels.primary_shard(target)
+        } else {
+            shard
+        };
+        if (target, shard) != (self.dim, self.shard) {
+            let (mut p, opened) = match self.levels.parked.remove(&(target, shard)) {
                 Some(p) => (p, false),
-                None => (self.open_level(target)?, true),
+                None if shard == 0 => (self.open_level(target)?, true),
+                None => {
+                    return Err(format!("{} has no shard {shard}", target.id()).into());
+                }
             };
             p.world.game_time = self.world.game_time;
             p.world.day_time = self.world.day_time;
@@ -396,7 +610,8 @@ impl Game<'_> {
                 std::mem::swap(states, &mut p.lan_states);
             }
             p.idle = 0;
-            let left = std::mem::replace(&mut self.dim, target);
+            // The swap put the level that was in place into `p`, with its shard.
+            let left = (std::mem::replace(&mut self.dim, target), p.shard);
             self.levels.parked.insert(left, p);
             if opened {
                 // The new streaming's radius and meshing options.
@@ -404,12 +619,14 @@ impl Game<'_> {
                 self.native_level_opened(target);
             }
         }
+        let shape = self.world.shape;
+        let (dim, shard) = (self.dim, self.shard);
         let host = match host {
             Some(h) => Some(h),
             None => self.lan.as_mut(),
         };
         if let Some(h) = host {
-            h.hub.set_dimension(target.id());
+            h.hub.set_level(dim.id(), shard, Some(shape));
         }
         Ok(())
     }
@@ -418,7 +635,10 @@ impl Game<'_> {
     /// moves with it from the level not in place to the level in place, so
     /// it is saved in the other level as it was.
     pub(super) fn move_entity_memory(&mut self, from: Dim, id: u32) {
-        let Some(p) = self.levels.parked.get_mut(&from) else {
+        let Some(key) = self.levels.primary_key(from) else {
+            return;
+        };
+        let Some(p) = self.levels.parked.get_mut(&key) else {
             return;
         };
         let uuid = p.persist.uuids.remove(&id);
@@ -440,7 +660,7 @@ impl Game<'_> {
         if dim == self.dim {
             return Some(self.streaming.lod_source());
         }
-        let parked = self.levels.parked.get(&dim)?;
+        let parked = self.levels.parked.get(&self.levels.primary_key(dim)?)?;
         Some(parked.streaming.lod_source())
     }
 
@@ -454,7 +674,7 @@ impl Game<'_> {
         let (streaming, save) = if dim == self.dim {
             (&self.streaming, &self.save)
         } else {
-            let parked = self.levels.parked.get(&dim)?;
+            let parked = self.levels.parked.get(&self.levels.primary_key(dim)?)?;
             (&parked.streaming, &parked.save)
         };
         let level = save.cubic.get()?;
@@ -466,11 +686,14 @@ impl Game<'_> {
     /// (`execute in`, `execute at` a player in another level), opening it if
     /// nobody is in it; returns the level to put back afterwards. Only a
     /// server holds other levels.
-    pub(super) fn enter_command_level(&mut self, dim: Dim) -> Option<Dim> {
-        if self.options.execution_role.is_client() || dim == self.dim {
+    pub(super) fn enter_command_level(&mut self, dim: impl Into<LevelId>) -> Option<LevelId> {
+        let dim: LevelId = dim.into();
+        if self.options.execution_role.is_client()
+            || (dim.dim == self.dim && dim.shard.is_none_or(|s| s == self.shard))
+        {
             return None;
         }
-        let back = self.dim;
+        let back = self.here();
         match self.enter_level(None, dim) {
             Ok(()) => Some(back),
             Err(e) => {
@@ -509,7 +732,7 @@ impl Game<'_> {
         let order = dims.clone();
         let n = dims.len();
         let mut result = Ok(());
-        for (k, dim) in dims.into_iter().enumerate() {
+        for (k, (dim, shard)) in dims.into_iter().enumerate() {
             // Each level's share of the tick (the first one also reads the network and runs the
             // tick's shared parts): `horizon-report`'s `level_*` spans.
             let _level_span = horizon_client::spans::guard(match dim {
@@ -517,7 +740,7 @@ impl Game<'_> {
                 Dim::Nether => "level_the_nether",
                 Dim::End => "level_the_end",
             });
-            if let Err(e) = self.enter_level(None, dim) {
+            if let Err(e) = self.enter_level(None, LevelId::shard(dim, shard)) {
                 result = Err(e);
                 break;
             }
@@ -527,7 +750,8 @@ impl Game<'_> {
                 running,
                 packets_drained: false,
             };
-            if observe_level {
+            let observe = observe_level && shard == 0;
+            if observe {
                 self.native_level_tick_pre(dim.id());
             }
             self.update_dedicated_streaming();
@@ -551,7 +775,7 @@ impl Game<'_> {
             if result.is_err() {
                 break;
             }
-            if observe_level {
+            if observe {
                 self.native_level_tick_post(dim.id());
             }
             self.publish_server_debug(dim);
@@ -559,16 +783,17 @@ impl Game<'_> {
             // server tick is in it when the tick ends (`addDuringTeleport`).
             if running == Some(true) {
                 let mut moved = false;
-                for &earlier in &order[..k] {
-                    if !self.arrival_chunks(earlier).is_empty()
-                        && self.enter_level(None, earlier).is_ok()
+                for &(earlier, earlier_shard) in &order[..k] {
+                    if earlier_shard == 0
+                        && !self.arrival_chunks(earlier).is_empty()
+                        && self.enter_level(None, LevelId::shard(earlier, 0)).is_ok()
                     {
                         self.land_portal_arrivals();
                         moved = true;
                     }
                 }
                 if moved {
-                    self.enter_level(None, dim)?;
+                    self.enter_level(None, LevelId::shard(dim, shard))?;
                 }
             }
         }
@@ -689,45 +914,65 @@ impl Game<'_> {
 
     /// The levels this server tick runs, in `MinecraftServer.levels` order
     /// (the Overworld, the Nether, the End): every level with a player in
-    /// it, forced chunks or a `/pregen` task, or the Overworld while idle.
-    pub(super) fn levels_to_tick(&self) -> Vec<Dim> {
+    /// it, forced chunks or a `/pregen` task, or the Overworld while idle. A
+    /// cubic Overworld's shards each run, in order, when they have players;
+    /// whatever else keeps the dimension active runs its primary shard.
+    pub(super) fn levels_to_tick(&self) -> Vec<(Dim, u16)> {
         let guests = self
             .lan
             .as_ref()
             .map_or(&[][..], |h| h.hub.guests.as_slice());
-        let mut dims: Vec<Dim> = [Dim::Overworld, Dim::Nether, Dim::End]
-            .into_iter()
-            .filter(|d| {
-                // `/forceload`ed chunks, or a native mod's tickets.
-                let held = |s: &Streaming| !s.forced.is_empty() || !s.mod_forced.is_empty();
-                let forced = if *d == self.dim {
-                    held(&self.streaming)
-                } else {
-                    self.levels
-                        .parked
-                        .get(d)
-                        .is_some_and(|p| held(&p.streaming))
-                };
-                guests.iter().any(|g| g.dimension == d.id())
-                    // A viewer count not yet told to 0 (`tick_mod_container_viewers`).
-                    || self.mod_container_viewers.keys().any(|(k, _)| *k == d.id())
-                    || self.player_bed_levels().any(|b| b == *d)
-                    || forced
-                    // A game test runs in its own level, players or not.
-                    || self.game_tests.has_tests_in(*d)
-                    || self.pregen_level() == Some(*d)
-                    // A pending portal arrival keeps its destination level
-                    // running so it can land and tick (the portal ticket).
-                    || !self.arrival_chunks(*d).is_empty()
-                    // A portal ticket keeps its dimension active
-                    // (`TicketType.shouldKeepDimensionActive`).
-                    || !self.portal_ticket_chunks(*d).is_empty()
-            })
-            .collect();
+        let mut dims: Vec<(Dim, u16)> = Vec::new();
+        for d in [Dim::Overworld, Dim::Nether, Dim::End] {
+            // `/forceload`ed chunks, or a native mod's tickets.
+            let held = |s: &Streaming| !s.forced.is_empty() || !s.mod_forced.is_empty();
+            let forced = if d == self.dim {
+                held(&self.streaming)
+            } else {
+                self.levels
+                    .primary_key(d)
+                    .and_then(|k| self.levels.parked.get(&k))
+                    .is_some_and(|p| held(&p.streaming))
+            };
+            let active = forced
+                // A viewer count not yet told to 0 (`tick_mod_container_viewers`).
+                || self.mod_container_viewers.keys().any(|(k, _)| *k == d.id())
+                || self.player_bed_levels().any(|b| b == d)
+                // A game test runs in its own level, players or not.
+                || self.game_tests.has_tests_in(d)
+                || self.pregen_level() == Some(d)
+                // A pending portal arrival keeps its destination level
+                // running so it can land and tick (the portal ticket).
+                || !self.arrival_chunks(d).is_empty()
+                // A portal ticket keeps its dimension active
+                // (`TicketType.shouldKeepDimensionActive`).
+                || !self.portal_ticket_chunks(d).is_empty();
+            let mut shards: Vec<u16> = guests
+                .iter()
+                .filter(|g| g.dimension == d.id())
+                .map(|g| g.shard)
+                .filter(|s| self.shard_exists(d, *s))
+                .collect();
+            if active {
+                shards.push(self.levels.primary_shard_or(d, self.dim, self.shard));
+            }
+            shards.sort_unstable();
+            shards.dedup();
+            dims.extend(shards.into_iter().map(|s| (d, s)));
+        }
         if dims.is_empty() {
-            dims.push(Dim::Overworld);
+            dims.push((
+                Dim::Overworld,
+                self.levels
+                    .primary_shard_or(Dim::Overworld, self.dim, self.shard),
+            ));
         }
         dims
+    }
+
+    /// Whether the level of shard `shard` of `dim` is open (in place or parked).
+    pub(super) fn shard_exists(&self, dim: Dim, shard: u16) -> bool {
+        (self.dim == dim && self.shard == shard) || self.levels.parked.contains_key(&(dim, shard))
     }
 
     /// The chunks holding a portal ticket in `dim`'s level (`placePortalTicket`).
@@ -736,8 +981,8 @@ impl Game<'_> {
             self.tickets.portal_chunks().collect()
         } else {
             self.levels
-                .parked
-                .get(&dim)
+                .primary_key(dim)
+                .and_then(|k| self.levels.parked.get(&k))
                 .map_or_else(Vec::new, |p| p.tickets.portal_chunks().collect())
         }
     }
@@ -751,26 +996,36 @@ impl Game<'_> {
             .levels
             .parked
             .keys()
-            .copied()
+            .map(|k| k.0)
             .filter(|d| self.vehicle_waits_in(*d))
             .collect();
         let mut closing = Vec::new();
-        for (dim, p) in &mut self.levels.parked {
-            if occupied.contains(dim) || waiting.contains(dim) {
+        let mut closing_shards = Vec::new();
+        for (key, p) in &mut self.levels.parked {
+            if occupied.contains(key) || waiting.contains(&key.0) {
                 p.idle = 0;
                 continue;
             }
             p.idle += 1;
-            if *dim != Dim::Overworld && p.idle >= IDLE_TICKS {
-                closing.push(*dim);
+            if key.0 != Dim::Overworld && p.idle >= IDLE_TICKS {
+                closing.push(*key);
+            } else if key.0 == Dim::Overworld && key.1 != 0 && p.idle >= SHARD_IDLE_TICKS {
+                // A shard of the Overworld nobody is in any more (the Overworld
+                // itself stays loaded): a leaving player's last events have run.
+                closing_shards.push(key.1);
+            }
+        }
+        for shard in closing_shards {
+            if let Err(e) = self.close_shard(shard) {
+                log::error!("Horizon: cubic shard {shard} did not close: {e}");
             }
         }
         if closing.is_empty() {
             return Ok(());
         }
-        let back = self.dim;
-        for dim in closing {
-            self.enter_level(None, dim)?;
+        let back = self.here();
+        for key in closing {
+            self.enter_level(None, LevelId::shard(key.0, key.1))?;
             // Its chunks leave with it: the mods hear before its last save.
             let chunks: Vec<_> = self.world.chunks.values().cloned().collect();
             self.native_chunks_changed(&chunks);
@@ -780,8 +1035,8 @@ impl Game<'_> {
                 self.entity_attachments.remove(uuid);
             }
             self.enter_level(None, back)?;
-            self.levels.parked.remove(&dim);
-            self.native_level_closed(dim);
+            self.levels.parked.remove(&key);
+            self.native_level_closed(key.0);
         }
         Ok(())
     }
@@ -823,10 +1078,11 @@ impl Game<'_> {
         if self.levels.parked.is_empty() {
             return Ok(());
         }
-        let back = self.dim;
-        let dims: Vec<Dim> = self.levels.parked.keys().copied().collect();
-        for dim in dims {
-            self.enter_level(None, dim)?;
+        let back = self.here();
+        let mut keys: Vec<(Dim, u16)> = self.levels.parked.keys().copied().collect();
+        keys.sort_by_key(|k| (k.1, k.0 as u8));
+        for (dim, shard) in keys {
+            self.enter_level(None, LevelId::shard(dim, shard))?;
             self.save_level(wait)?;
         }
         self.enter_level(None, back)

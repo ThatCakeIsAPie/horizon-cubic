@@ -291,7 +291,8 @@ impl Game<'_> {
         let Some(dim) = self.raiding.loaded else {
             return;
         };
-        if !self.raiding.raids.dirty || self.remote.is_some() {
+        // The raids file is the primary shard's.
+        if self.shard != 0 || !self.raiding.raids.dirty || self.remote.is_some() {
             return;
         }
         let tag = horizon_world::nbt::Tag::compound([
@@ -702,7 +703,7 @@ impl Game<'_> {
             .hub
             .guests
             .iter()
-            .map(|g| (g.conn, g.position, g.placed && g.dimension == dim))
+            .map(|g| (g.conn, g.position, host.hub.here(g) && g.dimension == dim))
             .collect();
         let neutral = horizon_client::settings::SOUND_SOURCES
             .iter()

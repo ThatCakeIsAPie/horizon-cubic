@@ -58,6 +58,11 @@ v2 keeps a window per World, but makes it as small and as cheap to move as per-c
   - Shards merge when their windows meet.
   - Shards never hold the same cube, so nothing is simulated twice. Entities leaving a window are saved with their cube, as at a window's edge today.
   - The server's map of levels goes from one World per dimension to a list of shards per dimension. A player belongs to one shard.
+  - **As built** (`cubic_shards.rs`, `game/cubic.rs`, `game/levels.rs`, `lan/hub.rs`):
+    - A shard is a `World`, `Streaming`, window cell (`CubicTerrain::window`) and `SlideState` of its own, parked in `Levels.parked` under `(Dim, shard)`. The level in place is `(Game.dim, Game.shard)`; `enter_level` takes a `LevelId` and a bare `Dim` means the shard in place, else the dimension's primary. `Guest.shard` and `Hub.shard` name a player's and the hub's.
+    - `cubic_shards::plan` groups players by their ranges: touching ranges (gap 0 or less) merge, a gap of two cubes or more splits, a gap of one keeps things as they are (the hysteresis). A chain taller than 99 cubes is cut between players. `settle` keeps only the moves that cannot put a cube in two shards.
+    - A merge saves everything the closing shard holds, then the survivor slides over its cubes (a jump) and the players move. A split shrinks the old shard first (a shrink is at once), then opens the new shard. A player that changes shard is sent the level like a dimension change (`Respawn`, window, columns, cubes); a vehicle it rides stays in the old shard.
+    - The `CubicLevel` is shared. Column data stays one answer: sky covering comes from its surface cache (`sky_cover`), the structure data and surface heights from the marker cube's record (a window without the marker reads it), generation of a column's vanilla range is written once (`vanilla_write`), and the prefetch ring has a target per shard. The saved window (`horizon_cubic.json`) is the primary shard's (shard 0, which also owns forced chunks, attachments and raids); shard 0 never closes.
 - **The wire** carries cubes, not whole columns, once a window has moved:
   - `horizon:cubic_window {min_y, height}` relays out the client's window in place.
   - `horizon:cubes {x, z, cubes: [(cy, section | uniform id, light)]}` sends only the entering layer.
