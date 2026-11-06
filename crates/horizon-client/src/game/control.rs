@@ -1491,6 +1491,38 @@ impl Game<'_> {
             .map_or((0, 0), |lod| lod.detail_progress());
         status["lod"]["detail_target_columns"] = wanted.into();
         status["lod"]["refined_target_columns"] = refined.into();
+        // A cubic level's far terrain (the octree): its progress, which the
+        // far-fill benchmark (tools/cubic_far_bench.py) times.
+        status["cube_lod"] = self
+            .cube_lod
+            .as_ref()
+            .map_or(serde_json::Value::Null, |lod| {
+                let s = lod.stats();
+                let now = std::time::Instant::now();
+                let ago = |t: Option<std::time::Instant>| {
+                    t.map(|t| now.saturating_duration_since(t).as_secs_f64())
+                };
+                json!({
+                    "planned": s.planned,
+                    "ready": s.ready,
+                    "pending": s.pending,
+                    "uniform_skipped": s.uniform_skipped,
+                    "gpu_generated": s.gpu_generated,
+                    "gpu_meshed": s.gpu_meshed,
+                    "arena_bytes": s.arena_bytes,
+                    "pool_bytes": s.pool_bytes,
+                    "complete": s.complete,
+                    "gpu_path": lod.on_gpu_path(),
+                    "plan_changed_ago_s": ago(s.plan_changed),
+                    "plan_complete_ago_s": ago(s.plan_complete),
+                    "fill_s": match (s.plan_changed, s.plan_complete) {
+                        (Some(changed), Some(complete)) if s.complete => {
+                            Some(complete.saturating_duration_since(changed).as_secs_f64())
+                        }
+                        _ => None,
+                    },
+                })
+            });
         status["pending_uploads"] = self.pending_uploads.len().into();
         status["destroying"] = json!(destroying);
         status["physical_keys"] = json!(physical_keys);
