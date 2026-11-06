@@ -71,6 +71,19 @@ Lead commits on main:
 - batched GPU requests from the far workers;
 - the test-pass fixes.
 
+### Converting a vanilla world (`cubic/convert`)
+
+`crates/horizon-client/src/cubic_convert.rs` copies a vanilla world to a cubic Hybrid world and leaves
+the original alone. Design, what is and is not carried over, and the options are in
+`docs/cubic-chunks.md` ("Converting a world").
+- CLI: `horizon-client --game-dir DIR --convert-cubic "<world>" [--keep-bedrock]` writes
+  `saves/<world> (Cubic)`.
+- UI: Edit World › Convert to Cubic Chunks… (confirm, background run with a progress line, the copy is
+  selected in the list).
+- Record format: `cubic::vanilla_column_records` is the one place a vanilla column becomes cube records;
+  `finish_vanilla` and the converter both use it.
+- Tests: `cargo test -p horizon-client-lib --lib cubic_convert` (needs `HORIZON_TEST_RESOURCES`).
+
 ### How it was tested
 
 - **Test pass:** one full `cargo test` of horizon-core, -world, -protocol, -client-render,
