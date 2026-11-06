@@ -159,6 +159,7 @@ mod arena;
 pub mod capture;
 pub mod compositor;
 pub(crate) mod core_lines;
+pub mod cube_gen;
 mod cull;
 mod end_sky;
 pub mod entity_skin;
