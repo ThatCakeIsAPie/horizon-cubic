@@ -142,6 +142,64 @@ impl ChunkTicks {
             ScheduledTick::drain_cmp,
         );
     }
+    /// Takes out the ticks at positions `predicate` holds for, queued or still
+    /// waiting to be unpacked, as they would be saved at `game_time`, in the
+    /// order [`Self::pack`] gives them.
+    pub fn take_if(
+        &mut self,
+        game_time: i64,
+        mut predicate: impl FnMut(BlockPos) -> bool,
+    ) -> Vec<SavedTick> {
+        let mut taken = Vec::new();
+        if let Some(pending) = &mut self.pending {
+            let mut i = 0;
+            while i < pending.len() {
+                if predicate(pending[i].pos) {
+                    let tick = pending.remove(i);
+                    self.positions.remove(&(tick.kind, tick.pos));
+                    taken.push(tick);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let mut queued: Vec<ScheduledTick> = self
+            .queue
+            .values
+            .iter()
+            .copied()
+            .filter(|t| predicate(t.pos))
+            .collect();
+        self.remove_if(|tick| queued.contains(&tick));
+        queued.sort_by_key(|t| t.sub_tick_order);
+        taken.extend(queued.into_iter().map(|t| t.saved(game_time)));
+        taken
+    }
+    /// Adds ticks saved relative to `game_time`: to the ones waiting to be
+    /// unpacked while the chunk has not started ticking, else scheduled now
+    /// (a tick of a type and position already scheduled is dropped).
+    pub fn add_saved(&mut self, ticks: Vec<SavedTick>, game_time: i64) {
+        if let Some(pending) = &mut self.pending {
+            for tick in ticks {
+                if self.positions.insert((tick.kind, tick.pos)) {
+                    pending.push(tick);
+                }
+            }
+            return;
+        }
+        let mut order = self
+            .queue
+            .values
+            .iter()
+            .map(|t| t.sub_tick_order)
+            .max()
+            .map_or(0, |o| o.wrapping_add(1));
+        for tick in ticks {
+            if self.schedule(tick.unpack(game_time, order)) {
+                order = order.wrapping_add(1);
+            }
+        }
+    }
     pub fn pack(&self, game_time: i64) -> Vec<SavedTick> {
         let mut saved = self.pending.clone().unwrap_or_default();
         let mut queued = self.queue.values.clone();
@@ -270,6 +328,65 @@ mod tests {
             .unwrap();
         assert_eq!(ran, [tick(0, 0, 0, 0, 0)]);
     }
+    #[test]
+    fn ticks_in_an_area_are_taken_out_and_put_back_relative_to_the_game_time() {
+        let mut level = level();
+        let pending = SavedTick {
+            kind: TickTypeId(3),
+            pos: BlockPos::new(0, 200, 0),
+            delay: 9,
+            priority: TickPriority::High,
+        };
+        // A saved tick outside the chunk it is added to is refused.
+        level
+            .add_chunk(ChunkPos::new(5, 5), ChunkTicks::from_saved(vec![pending]))
+            .unwrap_err();
+        let mut waiting = ChunkTicks::from_saved(vec![SavedTick {
+            pos: BlockPos::new(80, 200, 80),
+            ..pending
+        }]);
+        assert_eq!(waiting.count(), 1);
+        level
+            .add_chunk(ChunkPos::new(5, 5), waiting.clone())
+            .unwrap();
+        level.schedule(tick(0, 0, 100, 0, 1));
+        level.schedule(ScheduledTick {
+            pos: BlockPos::new(0, 4, 0),
+            ..tick(1, 0, 105, 0, 2)
+        });
+        let area = TickArea::new(BlockPos::new(-16, 64, -16), BlockPos::new(100, 255, 100));
+        let mut taken = level.take_area(area, 100);
+        taken.sort_by_key(|(chunk, _)| (chunk.x, chunk.z));
+        assert_eq!(taken.len(), 2);
+        // The queued tick in the area, 0 ticks from now; the waiting one keeps its delay.
+        assert_eq!(taken[0].1.len(), 1);
+        assert_eq!(
+            (taken[0].1[0].kind, taken[0].1[0].delay),
+            (TickTypeId(0), 0)
+        );
+        assert_eq!(
+            (taken[1].1[0].pos, taken[1].1[0].delay),
+            (BlockPos::new(80, 200, 80), 9)
+        );
+        // The tick below the area stays; nothing else does.
+        assert_eq!(level.count(), 1);
+        assert!(level.has_scheduled(BlockPos::new(0, 4, 0), TickTypeId(1)));
+        // Put back at a later time, they run `delay` ticks after it, in the chunk that is
+        // ticking (scheduled now) or the one waiting to unpack (kept for then).
+        level.add_saved(ChunkPos::new(0, 0), taken[0].1.clone(), 500);
+        assert!(level.has_scheduled(BlockPos::new(0, 64, 0), TickTypeId(0)));
+        level.add_saved(ChunkPos::new(5, 5), taken[1].1.clone(), 500);
+        assert_eq!(level.count(), 3);
+        waiting.add_saved(taken[1].1.clone(), 500);
+        assert_eq!(
+            waiting.count(),
+            1,
+            "a tick already waiting is not added twice"
+        );
+        waiting.unpack(500);
+        assert_eq!(waiting.poll().unwrap().trigger_tick, 509);
+    }
+
     #[test]
     fn collection_guards_and_membership_survive_area_mutation() {
         let mut level = level();
@@ -579,6 +696,41 @@ impl LevelTicks {
             (p.x, p.z)
         });
         keys
+    }
+    /// Takes the ticks inside `area` out of the chunks (queued or waiting to
+    /// be unpacked), as they would be saved at `game_time`, with the chunk
+    /// they were in.
+    pub fn take_area(&mut self, area: TickArea, game_time: i64) -> Vec<(ChunkPos, Vec<SavedTick>)> {
+        let mut out = Vec::new();
+        for key in self.chunks_in_area(area) {
+            let chunk = self.chunks.get_mut(&key).unwrap();
+            let old = chunk.peek();
+            let taken = chunk.take_if(game_time, |pos| area.contains(pos));
+            if chunk.peek() != old {
+                if let Some(tick) = chunk.peek() {
+                    self.deadlines.put(key, tick.trigger_tick);
+                } else {
+                    self.deadlines.remove(key);
+                }
+            }
+            if !taken.is_empty() {
+                out.push((ChunkPos::unpack(key), taken));
+            }
+        }
+        out
+    }
+    /// Adds ticks saved relative to `game_time` to chunk `pos` (see
+    /// [`ChunkTicks::add_saved`]); they are dropped when the chunk is not
+    /// here.
+    pub fn add_saved(&mut self, pos: ChunkPos, ticks: Vec<SavedTick>, game_time: i64) {
+        let key = pos.pack();
+        let Some(chunk) = self.chunks.get_mut(&key) else {
+            return;
+        };
+        chunk.add_saved(ticks, game_time);
+        if let Some(tick) = chunk.peek() {
+            self.deadlines.put(key, tick.trigger_tick);
+        }
     }
     pub fn clear_area(&mut self, area: TickArea) {
         for key in self.chunks_in_area(area) {
