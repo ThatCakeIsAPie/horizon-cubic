@@ -941,6 +941,11 @@ impl CubeLod {
         }
     }
 
+    /// Whether nodes take the GPU path now (`set_gpu_path`).
+    pub fn on_gpu_path(&self) -> bool {
+        self.shared.gpu_path.load(Ordering::Relaxed)
+    }
+
     /// The sampler's GPU generator, if it has one: the device the renderer's
     /// GPU mesher must run on (`gfx::cube_mesh`) to read its nodes.
     pub fn gpu_backend(&self) -> Option<&GpuBackend> {

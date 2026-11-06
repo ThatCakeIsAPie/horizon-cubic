@@ -417,7 +417,7 @@ fn preset_settings(value: &Value) -> Option<FlatSettings> {
     })
 }
 /// The ids of a registry in the prepared `registries.json`.
-fn registry_ids(root: &Path, registry: &str) -> BTreeSet<String> {
+pub(super) fn registry_ids(root: &Path, registry: &str) -> BTreeSet<String> {
     let Ok(text) = std::fs::read_to_string(root.join("registries.json")) else {
         return BTreeSet::new();
     };

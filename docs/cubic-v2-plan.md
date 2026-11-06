@@ -132,6 +132,13 @@ The owner suggested this, after Houdini's sparse solving for smoke and fire:
   - Otherwise subdivide.
 - Octaves the node's resolution skips are bounded by their amplitude alone.
 
+**The descent rule** (the owner's two checks). For each node, from the root down:
+1. **Uniform?** One sample plus `L`. If the node is proved all air or all solid, stop. Nothing is drawn, except a solid node's shell where it meets air.
+2. **The right size for its distance?** This is the plan's `DETAIL` × size test. It needs no noise, so it is free. If it passes, stop and hand the node to the visual engine: generate its 16³ voxels, mesh them, draw them.
+3. **Otherwise** subdivide into its 8 children and repeat.
+
+Each node costs one density sample, about a hundred arithmetic operations, so a GPU decides millions of nodes per frame. Only the surviving leaves pay for full generation.
+
 **Uses:**
 - **GPU far terrain.** The descent runs level by level as compute passes over a compacted list of undecided nodes. The descent stops at the level the distance plan wants. Work then scales with surface area in any world, islands and spaghetti included.
 - **CPU cubes.** One density sample, plus the 2D biome terms, decides whether a cube is uniform before the 75-sample lattice runs. Carvers still run where a cave walk reaches.

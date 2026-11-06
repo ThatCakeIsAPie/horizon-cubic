@@ -93,6 +93,10 @@ impl State {
         }
     }
 }
+/// The biomes of the prepared resources, for the Cubic Chunks screens' pickers.
+pub(super) fn biomes(root: &Path) -> Vec<Biome> {
+    load(root)
+}
 /// The biome registry of the prepared resources, by the name each is shown
 /// under: `Registry.listElements` sorted with a locale collator, which for
 /// these names is a case-insensitive order with the id breaking ties.
