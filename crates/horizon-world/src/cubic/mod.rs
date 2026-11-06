@@ -10,6 +10,7 @@
 
 use horizon_core::position::SectionPos;
 
+pub mod generator;
 pub mod heights;
 pub mod store;
 pub mod window;
