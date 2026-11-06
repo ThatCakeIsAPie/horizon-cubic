@@ -139,6 +139,31 @@ fn composed() -> Vec<(&'static str, Vec<&'static str>, String)> {
             crate::gfx::cube_far::shader_source(),
         ),
         (
+            "surface tiles",
+            vec!["terrain.wgsl", "cube_far.wgsl", "surface_draw.wgsl"],
+            crate::gfx::surface_tile::draw_shader_source(),
+        ),
+        (
+            "far terrain generation",
+            vec!["cwg_noise.wgsl", "cube_gen.wgsl"],
+            crate::gfx::cube_gen::SHADER.to_owned(),
+        ),
+        (
+            "far terrain descent",
+            vec!["cwg_noise.wgsl", "cube_descent.wgsl"],
+            crate::gfx::cube_descent::SHADER.to_owned(),
+        ),
+        (
+            "far terrain biomes",
+            vec!["cwg_noise.wgsl", "biome_gen.wgsl"],
+            crate::gfx::biome_gen::SHADER.to_owned(),
+        ),
+        (
+            "surface tile generation",
+            vec!["cwg_noise.wgsl", "surface_gen.wgsl"],
+            crate::gfx::surface_tile::GEN_SHADER.to_owned(),
+        ),
+        (
             "improved transparency world border",
             vec!["border.wgsl", "oit.wgsl", "oit_border.wgsl"],
             include_str!("../border.wgsl").to_owned()
