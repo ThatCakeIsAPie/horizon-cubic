@@ -1305,12 +1305,21 @@ impl Game<'_> {
         keys: &HashSet<(i32, i32)>,
         remove: bool,
     ) -> Vec<((i32, i32), Vec<Tag>)> {
+        self.entity_chunks_in(&EntityScope::columns(keys), remove)
+    }
+    /// [`Self::entity_chunks`] for a scope: columns, and perhaps only some of
+    /// their cubes (the entities of other cubes, and the unknown ones, stay).
+    pub(super) fn entity_chunks_in(
+        &mut self,
+        keys: &EntityScope<'_>,
+        remove: bool,
+    ) -> Vec<((i32, i32), Vec<Tag>)> {
         let mut out: HashMap<(i32, i32), Vec<Tag>> =
             keys.iter().map(|k| (*k, Vec::new())).collect();
         // Every kind in `entity_lists!` saves itself (`Entity::save_nbt`).
         self.save_every_entity(keys, &mut out);
         if let Some(d) = &self.dragon
-            && keys.contains(&chunk_of(d.position))
+            && keys.holds(d.position)
         {
             let raw = anon_raw(&self.persist, "minecraft:ender_dragon", d.position);
             let uuid = saved_uuid(&self.persist, d.id);
@@ -1324,7 +1333,7 @@ impl Game<'_> {
                 ));
         }
         for c in &self.crystals {
-            if keys.contains(&chunk_of(c.position)) {
+            if keys.holds(c.position) {
                 let raw = anon_raw(&self.persist, "minecraft:end_crystal", c.position);
                 let uuid = saved_uuid(&self.persist, c.id);
                 out.entry(chunk_of(c.position)).or_default().push(with_raw(
@@ -1335,7 +1344,7 @@ impl Game<'_> {
         }
         for s in &self.ominous_spawners {
             let at = Vec3::new(s.position[0], s.position[1], s.position[2]);
-            if keys.contains(&chunk_of(at)) {
+            if keys.holds(at) {
                 let tag = entity_nbt::ominous_item_spawner_to_nbt(
                     &s.item,
                     at,
@@ -1353,7 +1362,7 @@ impl Game<'_> {
                 (lo[1] + hi[1]) / 2.0,
                 (lo[2] + hi[2]) / 2.0,
             );
-            if keys.contains(&chunk_of(at)) {
+            if keys.holds(at) {
                 let uuid = self
                     .persist
                     .uuids
@@ -1365,7 +1374,7 @@ impl Game<'_> {
             }
         }
         for c in &self.cushions {
-            if keys.contains(&chunk_of(c.position)) {
+            if keys.holds(c.position) {
                 let uuid = self
                     .persist
                     .uuids
@@ -1378,7 +1387,7 @@ impl Game<'_> {
         }
         for p in &self.paintings {
             let at = painting_center(p);
-            if keys.contains(&chunk_of(at)) {
+            if keys.holds(at) {
                 let uuid = self
                     .persist
                     .uuids
@@ -1391,7 +1400,7 @@ impl Game<'_> {
         }
         for f in &self.fangs.list {
             let at = Vec3::new(f.pos[0], f.pos[1], f.pos[2]);
-            if keys.contains(&chunk_of(at)) {
+            if keys.holds(at) {
                 let uuid = self
                     .persist
                     .uuids
@@ -1404,7 +1413,7 @@ impl Game<'_> {
             }
         }
         for o in &self.others {
-            if keys.contains(&chunk_of(o.position)) {
+            if keys.holds(o.position) {
                 let uuid = self
                     .persist
                     .uuids
@@ -1415,7 +1424,7 @@ impl Game<'_> {
                 out.entry(chunk_of(o.position)).or_default().push(tag);
             }
         }
-        for key in keys {
+        for key in keys.iter().filter(|_| keys.cubes.is_none()) {
             let unknown = if remove {
                 self.persist.unknown.remove(key)
             } else {
@@ -1431,7 +1440,7 @@ impl Game<'_> {
             }
         }
         if remove {
-            let gone = |p: Vec3| keys.contains(&chunk_of(p));
+            let gone = |p: Vec3| keys.holds(p);
             let mut removed: Vec<u32> = Vec::new();
             let riding = self.riding;
             self.boats.retain(|b| {
@@ -1539,9 +1548,7 @@ impl Game<'_> {
             self.rockets.retain(|r| !gone(r.position));
             self.tridents.retain(|t| !gone(t.position));
             self.tnts.retain(|t| !gone(t.position));
-            self.persist
-                .anon
-                .retain(|_, (at, _)| !keys.contains(&chunk_of(*at)));
+            self.persist.anon.retain(|_, (at, _)| !keys.holds(*at));
             for id in removed {
                 self.forget_entity(id);
             }
@@ -1663,17 +1670,13 @@ impl Game<'_> {
 impl Game<'_> {
     /// `Entity::save_nbt` for a mob: a rider is saved inside its root vehicle,
     /// in the root's chunk; a boat's or cart's passengers inside the vehicle.
-    pub(super) fn save_mob(
-        &mut self,
-        i: usize,
-        keys: &HashSet<ChunkKey>,
-    ) -> Option<(ChunkKey, Tag)> {
+    pub(super) fn save_mob(&mut self, i: usize, keys: &EntityScope<'_>) -> Option<(ChunkKey, Tag)> {
         let m = &self.mobs[i];
         let saves = self.mob_root(i) == i
             && m.extra.mount.is_none_or(|v| {
                 self.boats.iter().all(|b| b.id != v) && self.carts.iter().all(|c| c.id != v)
             })
-            && keys.contains(&chunk_of(m.position))
+            && keys.holds(m.position)
             && m.alive()
             && !m.removed;
         saves.then(|| (chunk_of(self.mobs[i].position), self.mob_tree_nbt(i)))
@@ -1681,10 +1684,10 @@ impl Game<'_> {
     pub(super) fn save_item(
         &mut self,
         i: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         let at = self.dropped[i].position;
-        keys.contains(&chunk_of(at)).then(|| {
+        keys.holds(at).then(|| {
             let id = self.dropped[i].id;
             let uuid = self.uuid_for(id);
             let tag =
@@ -1692,13 +1695,9 @@ impl Game<'_> {
             (chunk_of(at), tag)
         })
     }
-    pub(super) fn save_orb(
-        &mut self,
-        i: usize,
-        keys: &HashSet<ChunkKey>,
-    ) -> Option<(ChunkKey, Tag)> {
+    pub(super) fn save_orb(&mut self, i: usize, keys: &EntityScope<'_>) -> Option<(ChunkKey, Tag)> {
         let o = &self.orbs[i];
-        keys.contains(&chunk_of(o.position)).then(|| {
+        keys.holds(o.position).then(|| {
             let raw = anon_raw(&self.persist, "minecraft:experience_orb", o.position);
             let uuid = saved_uuid(&self.persist, o.id);
             let tag = with_raw(
@@ -1711,10 +1710,10 @@ impl Game<'_> {
     pub(super) fn save_projectile(
         &mut self,
         i: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         let p = &self.creatures.projectiles[i];
-        if !keys.contains(&chunk_of(p.position)) || !entity_nbt::saved_with_chunk(p) {
+        if !keys.holds(p.position) || !entity_nbt::saved_with_chunk(p) {
             return None;
         }
         let owner = p.owner_uuid;
@@ -1741,10 +1740,10 @@ impl Game<'_> {
     pub(super) fn save_falling(
         &mut self,
         i: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         let f = &self.falling[i];
-        if !keys.contains(&chunk_of(f.position)) {
+        if !keys.holds(f.position) {
             return None;
         }
         let raw = match &f.saved {
@@ -1772,10 +1771,10 @@ impl Game<'_> {
     pub(super) fn save_rocket(
         &mut self,
         i: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         let (id, at) = (self.rockets[i].id, self.rockets[i].position);
-        keys.contains(&chunk_of(at)).then(|| {
+        keys.holds(at).then(|| {
             let uuid = self.uuid_for(id);
             let tag =
                 self.rockets[i].to_nbt(uuid, self.level.player_uuid, self.persist.raw.get(&id));
@@ -1785,22 +1784,18 @@ impl Game<'_> {
     pub(super) fn save_trident(
         &mut self,
         i: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         let (id, at) = (self.tridents[i].id, self.tridents[i].position);
-        keys.contains(&chunk_of(at)).then(|| {
+        keys.holds(at).then(|| {
             let uuid = self.uuid_for(id);
             let tag = self.tridents[i].to_nbt(uuid, self.persist.raw.get(&id));
             (chunk_of(at), tag)
         })
     }
-    pub(super) fn save_tnt(
-        &mut self,
-        i: usize,
-        keys: &HashSet<ChunkKey>,
-    ) -> Option<(ChunkKey, Tag)> {
+    pub(super) fn save_tnt(&mut self, i: usize, keys: &EntityScope<'_>) -> Option<(ChunkKey, Tag)> {
         let (id, at) = (self.tnts[i].id, self.tnts[i].position);
-        keys.contains(&chunk_of(at)).then(|| {
+        keys.holds(at).then(|| {
             let uuid = self.uuid_for(id);
             let t = &self.tnts[i];
             let tag = entity_nbt::tnt_to_nbt(
@@ -1820,11 +1815,11 @@ impl Game<'_> {
     pub(super) fn save_boat(
         &mut self,
         i: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         let b = &self.boats[i];
         let (id, at) = (b.id, b.position);
-        if !keys.contains(&chunk_of(at)) {
+        if !keys.holds(at) {
             return None;
         }
         let uuid = self.saved_uuid_or_random(id);
@@ -1845,10 +1840,10 @@ impl Game<'_> {
     pub(super) fn save_cart(
         &mut self,
         i: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         let (id, at) = (self.carts[i].id, self.carts[i].position);
-        if !keys.contains(&chunk_of(at)) {
+        if !keys.holds(at) {
             return None;
         }
         let uuid = self.saved_uuid_or_random(id);
@@ -1859,10 +1854,10 @@ impl Game<'_> {
     pub(super) fn save_armor_stand(
         &mut self,
         i: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         let a = &self.armor_stands[i];
-        keys.contains(&chunk_of(a.position)).then(|| {
+        keys.holds(a.position).then(|| {
             let uuid = self.saved_uuid_or_random(a.id);
             let tag = entity_nbt::armor_stand_to_nbt(a, uuid, self.persist.raw.get(&a.id));
             (chunk_of(a.position), tag)
@@ -1881,6 +1876,48 @@ impl Game<'_> {
 
 /// A chunk's key, as `chunk_of` gives it.
 pub(super) type ChunkKey = (i32, i32);
+
+/// The entities a save or an unload is for: those in some columns, and with
+/// `cubes` only those in cubes (`y >> 4`) of that range, as when a cubic
+/// level's window slides and its leaving layers go.
+pub(super) struct EntityScope<'a> {
+    columns: &'a HashSet<ChunkKey>,
+    cubes: Option<std::ops::RangeInclusive<i32>>,
+}
+
+impl<'a> EntityScope<'a> {
+    pub(super) fn columns(columns: &'a HashSet<ChunkKey>) -> Self {
+        Self {
+            columns,
+            cubes: None,
+        }
+    }
+    /// The entities of `columns` in cubes `cubes`.
+    pub(super) fn cubes(
+        columns: &'a HashSet<ChunkKey>,
+        cubes: std::ops::RangeInclusive<i32>,
+    ) -> Self {
+        Self {
+            columns,
+            cubes: Some(cubes),
+        }
+    }
+    /// Whether an entity at `p` is in scope.
+    pub(super) fn holds(&self, p: Vec3) -> bool {
+        self.columns.contains(&chunk_of(p))
+            && self
+                .cubes
+                .as_ref()
+                .is_none_or(|cubes| cubes.contains(&((p.y.floor() as i64 >> 4) as i32)))
+    }
+}
+
+impl std::ops::Deref for EntityScope<'_> {
+    type Target = HashSet<ChunkKey>;
+    fn deref(&self) -> &HashSet<ChunkKey> {
+        self.columns
+    }
+}
 
 /// The raw compound kept for an entity loaded at `at`, found by kind and position.
 fn anon_raw(persist: &EntityMemory, kind: &str, at: Vec3) -> Option<Tag> {
@@ -2224,6 +2261,81 @@ mod tests {
             );
             println!("{kind}: id {id}, UUID kept, attachments loaded and saved back");
         }
+    }
+
+    /// A cubic level's window sliding saves and removes the entities of the leaving cubes
+    /// only: the others stay in the world.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn a_slide_takes_only_the_entities_of_the_leaving_cubes() {
+        use super::super::{Audio, Game, Options, Progress, Settings, load_resources};
+        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+        let settings = Settings::default();
+        let loaded = load_resources(
+            root.clone(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            true,
+            &Progress::new(),
+            &mut |_, _| unreachable!("no menu handoff"),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut game = Game::new(
+            &loaded.resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&root),
+            None,
+        )
+        .unwrap();
+        let zombie = |y: f64, n: i32| {
+            Tag::compound([
+                ("id", Tag::String("minecraft:zombie".into())),
+                (
+                    "Pos",
+                    Tag::List([1.0, y, 3.0].map(|v| Tag::Double(v.to_bits())).to_vec()),
+                ),
+                ("UUID", Tag::IntArray(vec![n, 2 * n, 3 * n, 4 * n])),
+            ])
+        };
+        game.world
+            .loaded_entities
+            .push(((0, 0), vec![zombie(70.0, 1), zombie(200.0, 2)]));
+        game.spawn_loaded_entities();
+        let columns = HashSet::from([(0, 0)]);
+        // Cubes 8..=15 (y 128..=255) leave: the zombie at y 200 goes, the one at y 70 stays.
+        let taken = game.entity_chunks_in(&EntityScope::cubes(&columns, 8..=15), true);
+        let taken: Vec<&Tag> = taken.iter().flat_map(|(_, tags)| tags).collect();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(entity_nbt::uuid(taken[0]), Some([2, 4, 6, 8]));
+        let rest = game.entity_chunks(&columns, false);
+        let rest: Vec<&Tag> = rest.iter().flat_map(|(_, tags)| tags).collect();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(entity_nbt::uuid(rest[0]), Some([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn an_entity_scope_holds_a_column_and_perhaps_only_some_cubes() {
+        let columns = HashSet::from([(0, 0), (-1, 2)]);
+        let at = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+        let all = EntityScope::columns(&columns);
+        assert!(all.holds(at(1.0, 5_000_000.0, 1.0)));
+        assert!(all.holds(at(-3.0, 0.0, 40.0)));
+        assert!(!all.holds(at(20.0, 0.0, 1.0)));
+        let some = EntityScope::cubes(&columns, -2..=1);
+        assert!(some.holds(at(1.0, -32.0, 1.0)), "cube -2");
+        assert!(some.holds(at(1.0, 31.9, 1.0)), "cube 1");
+        assert!(!some.holds(at(1.0, 32.0, 1.0)), "cube 2");
+        assert!(!some.holds(at(1.0, -32.1, 1.0)), "cube -3");
+        assert!(!some.holds(at(20.0, 0.0, 1.0)), "another column");
     }
 
     #[test]

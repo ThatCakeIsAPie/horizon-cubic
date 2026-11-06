@@ -358,47 +358,6 @@ impl Game<'_> {
         self.pickups.clear();
     }
 
-    /// The level in place opened again from the save with its shape as
-    /// `level_shapes` now has it (a cubic level's new window), the clock,
-    /// weather and rules carried over; the old one is dropped. The caller
-    /// saves it first.
-    pub(super) fn reopen_level_in_place(&mut self) -> Result<()> {
-        let mut p = self.open_level(self.dim)?;
-        self.carry_into(&mut p);
-        Ok(())
-    }
-
-    /// The level in place made again over `streaming`, its saves and its
-    /// generator kept (a cubic level's moved window, `game/cubic.rs`): its
-    /// chunks and entities start over from the save.
-    pub(super) fn renew_level_in_place(
-        &mut self,
-        mut streaming: horizon_client::streaming::Streaming,
-    ) {
-        super::world_loading::configure_streaming(
-            &mut streaming,
-            &self.save,
-            &self.options,
-            &self.settings,
-            self.dim,
-            self.level.seed,
-        );
-        let mut p = self.new_parked(self.dim, streaming, self.save.clone(), self.end.locator());
-        self.carry_into(&mut p);
-    }
-
-    /// Swaps `p` into place with the clock, weather, rules and watched
-    /// blocks of the level it replaces, which is then dropped.
-    fn carry_into(&mut self, p: &mut Parked) {
-        p.world.game_time = self.world.game_time;
-        p.world.day_time = self.world.day_time;
-        p.world.weather = self.world.weather;
-        p.world.health_rules = self.world.health_rules;
-        p.world.watched = std::mem::take(&mut self.world.watched);
-        self.swap_level(p);
-        self.apply_settings();
-    }
-
     /// Put `target`'s level in place, opening it first if it is not loaded.
     /// The level that was in place is kept with the others; the shared
     /// clock and weather go with the swap. `host` is the hub when the caller

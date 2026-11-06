@@ -3126,6 +3126,8 @@ struct Game<'a> {
     integrated: Option<integrated::Integrated>,
     /// The shapes of the open world's levels, from its dimension types.
     level_shapes: horizon_client::chunk::LevelShapes,
+    /// A cubic level's window sliding on the server (`game/cubic.rs`).
+    cubic_slide: cubic::SlideState,
     /// This game is that server thread's (game/integrated.rs).
     serving: Option<integrated::Serving>,
     /// The open world is shared behind an invite code (game/friends.rs).
@@ -20039,6 +20041,7 @@ impl<'a> Game<'a> {
             lan: None,
             integrated: None,
             level_shapes: Default::default(),
+            cubic_slide: Default::default(),
             serving: None,
             world_options: None,
             options_to_world_options: false,

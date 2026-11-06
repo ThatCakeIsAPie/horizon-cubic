@@ -8,7 +8,7 @@
 //! no vtable. A new kind is one line in `entity_lists!` and one `impl Entity`.
 
 use super::commands::Target;
-use super::persist::ChunkKey;
+use super::persist::{ChunkKey, EntityScope};
 use super::{FallingBlock, Game};
 use super::{
     boats::Boat, fireworks::Rocket, minecarts::Minecart, tnt::PrimedTnt, trident::ThrownTrident,
@@ -26,7 +26,7 @@ use horizon_core::position::BlockPos;
 use horizon_world::nbt::Tag;
 use horizon_world::{level::data::PushReaction, piston_push};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// What `Entity.thunderHit` does to a kind: it sets the entity on fire and
 /// calls `hurtServer(lightning_bolt, 5)`, so a kind whose `hurtServer` does
@@ -82,7 +82,7 @@ pub(super) trait Entity: EntityRules {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)>;
     /// Loads a saved entity whose type id is `kind` as this kind and joins it to
     /// the world, or hands `tag` back when `kind` is not one this kind loads.
@@ -947,7 +947,7 @@ impl Game<'_> {
     /// Saves every entity of every kind that lies in `keys` into `out`, by chunk.
     pub(super) fn save_every_entity(
         &mut self,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
         out: &mut HashMap<ChunkKey, Vec<Tag>>,
     ) {
         // Saved by chunk in the order they joined, so a reload adds them in
@@ -984,7 +984,7 @@ impl Entity for Mob {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_mob(index, keys)
     }
@@ -1094,7 +1094,7 @@ impl Entity for ItemEntity {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_item(index, keys)
     }
@@ -1164,7 +1164,7 @@ impl Entity for ExperienceOrb {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_orb(index, keys)
     }
@@ -1229,7 +1229,7 @@ impl Entity for Boat {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_boat(index, keys)
     }
@@ -1300,7 +1300,7 @@ impl Entity for Minecart {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_cart(index, keys)
     }
@@ -1383,7 +1383,7 @@ impl Entity for ArmorStand {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_armor_stand(index, keys)
     }
@@ -1483,7 +1483,7 @@ impl Entity for PrimedTnt {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_tnt(index, keys)
     }
@@ -1552,7 +1552,7 @@ impl Entity for FallingBlock {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_falling(index, keys)
     }
@@ -1597,7 +1597,7 @@ impl Entity for Projectile {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_projectile(index, keys)
     }
@@ -1694,7 +1694,7 @@ impl Entity for Rocket {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_rocket(index, keys)
     }
@@ -1752,7 +1752,7 @@ impl Entity for ThrownTrident {
     fn save_nbt(
         game: &mut Game<'_>,
         index: usize,
-        keys: &HashSet<ChunkKey>,
+        keys: &EntityScope<'_>,
     ) -> Option<(ChunkKey, Tag)> {
         game.save_trident(index, keys)
     }

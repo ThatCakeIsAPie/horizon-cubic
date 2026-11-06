@@ -887,12 +887,6 @@ pub(super) fn make_streaming(
             });
             let context = pack.context_with(biomes.clone());
             let threads = res.threads();
-            // A moved window opens a new streaming over this same generator.
-            let weak = Arc::downgrade(&terrain);
-            let again = context.clone();
-            level.set_streaming_factory(Box::new(move || {
-                Some(Streaming::new(weak.upgrade()?, again.clone(), threads))
-            }));
             Streaming::new(terrain, context, threads)
         } else {
             Streaming::new(persistent, pack.context_with(biomes.clone()), res.threads())

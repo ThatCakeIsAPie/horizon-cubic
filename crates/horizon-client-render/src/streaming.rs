@@ -484,6 +484,9 @@ pub struct Streaming {
     /// `update`; and the columns whose light job it abandoned.
     shifted_dirty: Vec<(i32, i32, i32)>,
     shifted_light: Vec<(i32, i32)>,
+    /// The layout the level was last shifted to (`shift_layout`): a column or a light view
+    /// made for another one by a job that began before the shift is dropped.
+    layout: Option<crate::chunk::ColumnLayout>,
     /// The sequence each section's latest accepted mesh was dispatched at
     /// (`CompiledSectionMesh.compileTaskStartTimeNs`).
     compile_started: FxHashMap<(i32, i32, i32), u64>,
@@ -1082,6 +1085,7 @@ impl Streaming {
             meshing: Default::default(),
             shifted_dirty: Vec::new(),
             shifted_light: Vec::new(),
+            layout: None,
             compile_started: Default::default(),
             lit: Default::default(),
             meshed: Default::default(),
@@ -1153,6 +1157,7 @@ impl Streaming {
         new: crate::chunk::ColumnLayout,
     ) {
         let delta = (old.min_y() - new.min_y()) >> 4;
+        self.layout = Some(new);
         if delta == 0 && old.sections() == new.sections() {
             return;
         }
@@ -1166,6 +1171,9 @@ impl Streaming {
         self.shifted_light.extend(self.lighting.keys().copied());
         self.lighting.clear();
         self.light_snapshots.clear();
+        // Views of proto chunks were made for the old layout.
+        self.light_views.clear();
+        self.layout = Some(new);
     }
     /// A column received from a server, with the light it sent
     /// (`ClientPacketListener.handleLevelChunkWithLight`): nothing is
@@ -1330,6 +1338,22 @@ impl Streaming {
         }
         chunks
     }
+    /// Takes the `columns` out of a generating level as `update` unloads far ones, to be
+    /// loaded again by the generation scan (a cubic window that slid into vanilla's range
+    /// finds columns it never generated that range for). Returns the chunks they held: the
+    /// caller saves them and their entities.
+    pub fn unload_columns(
+        &mut self,
+        world: &mut World,
+        columns: &FxHashSet<(i32, i32)>,
+    ) -> Vec<Arc<Chunk>> {
+        for key in columns {
+            self.decorated.remove(key);
+            self.light_snapshots.remove(key);
+        }
+        self.generation_scan.invalidate();
+        self.forget_columns(world, columns)
+    }
     /// Queue a job for the column `at`, nearest first: its distance (`distance`)
     /// times four plus `bias`, which orders a column's jobs. A job without a
     /// column (a save, meshes to free) goes ahead of every other.
@@ -1434,6 +1458,11 @@ impl Streaming {
         self.generating.remove(&key);
         self.finishing.remove(&key);
         self.decorated.insert(key);
+        // A column a job made for the layout before a shift is made again for this one
+        // (what it saved of itself stays saved).
+        if self.layout.is_some_and(|layout| layout != chunk.layout()) {
+            return;
+        }
         // A column that finished after the player moved away is dropped
         // whole: its block entities and saved entities too, or they would
         // stay in the world (and the entities spawn again, duplicated, when
@@ -1531,6 +1560,7 @@ impl Streaming {
     fn receive_light_view(&mut self, x: i32, z: i32, proto: Proto, view: Option<Chunk>) {
         self.viewing.remove(&(x, z));
         self.protos.insert((x, z), Some(proto));
+        let view = view.filter(|v| self.layout.is_none_or(|layout| layout == v.layout()));
         if let Some(view) = view {
             self.light_views.insert((x, z), Arc::new(view));
         }
@@ -1566,6 +1596,11 @@ impl Streaming {
     }
     pub fn is_lit(&self, x: i32, z: i32) -> bool {
         self.lit.contains(&(x, z))
+    }
+    /// Whether a light job for column (`x`, `z`) is out: its light is about to change
+    /// (a cubic window that slid asks for its layers to be lit again).
+    pub fn is_relighting(&self, x: i32, z: i32) -> bool {
+        self.lighting.contains_key(&(x, z))
     }
     /// The non-air sections of a column that is a decorated proto chunk
     /// here (vanilla's INITIALIZE_LIGHT and on), if it is one: a level

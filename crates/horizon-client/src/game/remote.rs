@@ -524,6 +524,8 @@ pub(super) struct Remote {
     /// The cube far terrain draws those sections meanwhile (`remote_cubic_window`).
     pub(super) cubic_placeholders:
         horizon_client::fast_hash::FxHashMap<(i32, i32), horizon_client::section_mask::SectionMask>,
+    /// The vertical distance the server was last told (`send_cubic_view`).
+    pub(super) cubic_vertical_sent: Option<u8>,
     /// Decodes chunk packets as they arrive, off the frame.
     decoder: ChunkDecoder,
     /// Options.serverRenderDistance: the server's view distance from the
@@ -1095,6 +1097,7 @@ impl Game<'_> {
                 7,
             )),
             cubic_placeholders: Default::default(),
+            cubic_vertical_sent: None,
             decoder: ChunkDecoder::new(),
             view_distance: self.settings.render_distance,
             simulation_distance: self.settings.simulation_distance,
@@ -1865,6 +1868,7 @@ impl Game<'_> {
     /// already waited `BACKLOG_LIMIT`. A chunk packet still decoding holds
     /// back what follows it.
     pub(super) fn poll_remote(&mut self) -> Result<()> {
+        self.send_cubic_view();
         let Some(r) = self.remote.as_mut() else {
             return Ok(());
         };
@@ -2406,6 +2410,32 @@ impl Game<'_> {
             renderer.shift_layout(new);
         }
         self.apply_settings();
+    }
+
+    /// `horizon:cubic_view`: once the client is in a cubic level, and whenever the Vertical
+    /// Distance setting changes, the server is told how many cubes above and below the
+    /// player it wants loaded.
+    fn send_cubic_view(&mut self) {
+        if !self.world.shape.cubic {
+            return;
+        }
+        let wanted = self.settings.horizon.cubic_vertical.clamp(
+            horizon_client::graphics::CUBIC_VERTICAL_MIN,
+            horizon_client::graphics::CUBIC_VERTICAL_MAX,
+        ) as u8;
+        let Some(r) = self.remote.as_mut() else {
+            return;
+        };
+        if r.cubic_vertical_sent == Some(wanted) {
+            return;
+        }
+        r.cubic_vertical_sent = Some(wanted);
+        self.send(S::CustomPayload(
+            horizon_protocol::packets::configuration::CustomPayload {
+                channel: horizon_protocol::cubic::VIEW_CHANNEL.into(),
+                data: horizon_protocol::cubic::View { vertical: wanted }.encode(),
+            },
+        ));
     }
 
     /// `ClientChunkCache.Storage.inRange`: within the storage around the
@@ -3280,6 +3310,10 @@ impl Game<'_> {
                     Ok(window) => self.remote_cubic_window(window),
                     Err(e) => log::warn!("Horizon: a bad cubic window payload: {e}"),
                 }
+            }
+            // The cubes a cubic level's window slid over, for columns already here.
+            C::CustomPayload(p) if p.channel == horizon_protocol::cubic::CUBES_CHANNEL => {
+                self.remote_cubes(&p.data);
             }
             // The server's recipes its native mods asked to send.
             C::CustomPayload(p) if p.channel == horizon_client::lan::recipes::CONTENT_CHANNEL => {
