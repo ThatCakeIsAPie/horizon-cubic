@@ -275,19 +275,58 @@ The two numbers measure different things. Meridian's 1.5 s is a coarse picture o
 
 What we take from it:
 1. **Coarse first.** On a teleport, request a coarse whole-world layer first (a few hundred nodes at high levels), draw it, then refine nearest-first. `CubeLod::removed` already keeps a node drawn until everything over its place is delivered. What is missing is asking for the coarse ancestors before the fine leaves. The benchmark should then report two times: the first full-coverage picture, and complete.
-2. **A surface layer for the coarsest levels.** A 16³ node at level 15 has voxels 32,768 blocks tall, while all the terrain lies within a few hundred blocks. So the surface snaps to whole voxels, and the top face can be the stone below the surface. Above some level, nodes should be 2.5D tiles holding, per column, a height, a top block and water, taken from the 2D pre-pass's columns. That is 16 times less work per node, with no vertical snapping.
-3. **Filter colour at the coarse levels.** Average the column colours, as mipmaps do, so the far ground does not shimmer.
+2. **A height-map layer for the absolute coarsest levels** (branch `cubic/far-surface`). A 16³ node at level 15 has voxels 32,768 blocks tall, while all the terrain lies within a few hundred blocks. So the surface snaps to whole voxels, and the top face can be the stone below the surface.
+   - The owner's order: height-map tiles at the absolute coarsest levels, refining into 3D cube nodes, then finer nodes, then full blocks.
+   - **Exact heights, no fixed range.** The owner wants realistic mountains (a Minecraft Everest of about 9,000 blocks) visible from extremely far away. A tile column keeps its height in blocks.
+   - **Layered columns, for players' edge cases.** CubicWorldGen presets can make sky islands at any height, overhangs and arches; later generators may make ceilings. Each column holds up to K solid spans (top, bottom, top block; K = 4 to start), drawn as boxes. One height per column would draw a sky island as a pillar from the ground.
+   - **Complex places go 3D sooner.** A column with more spans than K merges its lowest ones and flags the tile as complex. The node-kind decision is per node (`node_kind(key, view, tile_info)`), so complex tiles become 3D cube nodes at a greater distance than simple ones.
+3. **No colour blending (owner's decision).** Meridian's shimmer from very high up is whole biomes side by side (desert, ocean, plains), which is true to the world. No one plays at y 5,000,000. So each tile column takes one colour sample: its top block.
 4. **Fog follows the far view.**
    - Fixed on 2026-11-06: cubic worlds never told the fog that far terrain was on (`FogInputs::distant_terrain` checked only the column LOD). Atmospheric fog therefore stopped at about 1,000 blocks, and from high up the ground faded into the sky.
    - Later: a horizon fade setting like Meridian's.
 5. **Choose detail by size on screen, not by distance alone.**
    - The plan splits a node while it is nearer than `DETAIL` (2.5) times its size, whatever the field of view. So a far voxel spans about 1/40 of its distance, about 25 pixels on a 1280-pixel, 70° view.
    - That is why the far view looks blocky, and why "complete" does not mean full detail.
-   - Voxy-class detail needs about 1–2 pixels per voxel. To get there:
+   - **The owner's ideal:** a block stays a block until it is smaller than a pixel on screen. Then it steps down to 2×2, then 4×4 when that is about a pixel, and so on, coarse first and refining up to that.
+     - At 1080p and 70°, a block is one pixel at about 770 blocks away, and a 16-block chunk at about 12,000.
+     - There is no point drawing single blocks so far away that whole chunks are a pixel.
+     - The Far Detail setting's top step is that switch point (about 1 px per voxel), and the default is as close to it as the hardware allows. A rough estimate is about 150,000 far nodes for a whole-world view at 1 px, against about 7,000 at today's `DETAIL`.
+   - To get there:
      - choose levels by projected voxel size, using the field of view and the resolution;
      - refine what is on screen first;
      - make the target a setting (like Meridian's Detail), and measure the fill time at each step.
-6. **The coarse levels alias.** From y = 5,000,000 the ground is a regular tile pattern. Each coarse voxel point-samples the noise at a spacing that lines up with the noise's period. The surface layer (2) with averaged colour (3) fixes this.
+6. **The coarse levels alias.** From y = 5,000,000 the ground is a regular tile pattern, which is wrong data rather than biomes. Each coarse voxel point-samples the noise at a spacing that lines up with the noise's period, so every node gets the same values. The height-map tiles sample each column at a hashed (jittered) offset inside the column, which breaks the alignment for free.
+
+### Far view: the owner's decisions and later work (2026-11-06)
+
+These came from the owner while reviewing the Meridian video. They are recorded here so they outlive any one session. Items marked *later* are not being built yet.
+
+1. **Detail by size on screen** is the rule everywhere, underground too (see 5 above).
+2. **Occlusion: generate behind, refine only when seen.** *Later.*
+   - Terrain hidden behind other terrain (behind a mountain, or beyond the rock walls of a cave) still gets a low-detail version, so turning or moving never shows a hole.
+   - It is not refined until the player can see it. Hi-Z or occlusion-query results from earlier frames feed the planner's priority: a hidden node keeps its coarse level, and a node that becomes visible goes to the front of the refine queue.
+   - This matters most underground, where most far terrain is behind rock.
+3. **Far views of the player's own builds, updated in the background.** *Later; the next job after the far-view rework.*
+   - Today only the finest far levels (0–1) read saved cubes. Coarser levels come from the generator, so a build you fly away from turns back into natural terrain.
+   - When a cube is edited, mark its far nodes dirty all the way up the levels. Rebuild them in the background at low priority, coalescing many edits (downsample from the cube, then from children). Upload only the changed nodes, so the player sees their build's LOD update while they build.
+   - The height-map tiles take player edits the same way: rebuild the affected columns' spans.
+4. **Structures fill in over time, in the background.** *Later; Custom Cubic has no structures yet.*
+   - Structureless terrain is generated first, as now.
+   - A low-priority CPU job runs structure placement (structure starts and piece layout, not full chunk generation) over the regions the far view covers, nearest and on-screen first.
+   - When it finds a structure, it regenerates the far nodes and tiles that the structure's bounding boxes touch, at their current levels, with the structure's blocks voxelized into them.
+   - Villages, temples and strongholds then appear in the far view over time, Meridian-style coarse-then-refine but for content. Hybrid's vanilla structures can use the same path.
+5. **The thin-feature flex: a 1-block-wide build visible from 50,000 blocks.** *Later, after 3; nice to have, not a priority.*
+   - When downsampling, player-built blocks win over natural ones in a mixed voxel.
+   - Features thinner than a pixel are drawn at a minimum width of one pixel, the way games draw distant power lines.
+6. **Huge underground caverns** (Skyrim's Blackreach, scaled up) are something players will build or generate.
+   - The screen-space rule and coarse-first must work with the camera deep in rock: the coverage layer is 3D nodes around the camera, not surface tiles.
+   - Occlusion (2) and **far block light** (glowstone, lava and shroomlight lighting distant cavern walls) are what caverns need most. Today far terrain is lit by sky light only, so a lit cavern looks black past the near area.
+7. **Other edge cases players will push:**
+   - sky islands at any height (layered tile columns);
+   - overhangs and arches;
+   - ceilings and stacked layers;
+   - extreme height settings: no height cap in tiles; the cube range is ±8.4 M blocks, the border ±30 M;
+   - very tall thin towers (5 above).
 
 ### Where the GPU far view stands
 
@@ -353,10 +392,27 @@ Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertica
    - Install to `E:\Horizon Cubic`.
    - Update `HANDOFF.md` and these docs.
    - Push to horizon-cubic.
+6. **Far-view rework (2026-11-06, in flight).** Steps 1–5 above are done.
+   1. `cubic/far-detail`:
+      - detail by size on screen (FOV and spyglass aware);
+      - a Far Detail setting (top step about 1 px per voxel);
+      - a coarse-first coverage layer;
+      - on-screen-first priority;
+      - the benchmark's two numbers, `cover_s` and `far_fill_s`;
+      - the per-node `node_kind` seam.
+   2. `cubic/far-surface`: layered height-map tiles on the GPU for the coarsest levels, with exact heights and jittered samples.
+   3. Lead: merge both, wire the tiles into the plan through `node_kind`, one test pass, benchmark at each Far Detail step, screenshots from y 300 to 5,000,000, install.
+   4. Then, in this order:
+      1. far views of the player's builds;
+      2. occlusion-driven refinement;
+      3. far block light;
+      4. structures in the far view, once Custom has structures;
+      5. the thin-feature flex.
+      See "Far view: the owner's decisions and later work".
 
 ## Cut or deferred, on purpose
 
-- CubicWorldGen's structure toggles: kept as fields, nothing generated, as in CubicWorldGen itself.
+- CubicWorldGen's structure toggles: kept as fields, nothing generated, as in CubicWorldGen itself. When structures arrive, the far view fills them in over time in the background (see "Far view: the owner's decisions and later work", item 4).
 - `mesaSurface`: simplified clay bands.
 - The replacer and cube-area editors in the Customize screen: CubicWorldGen never had them either. The JSON covers them.
 - Hybrid's vanilla band on the GPU, which needs the 26.3 router in WGSL.
