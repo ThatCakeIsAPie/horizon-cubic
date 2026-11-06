@@ -60,8 +60,10 @@ impl Game<'_> {
         }
         // The old window's level, saved above, goes.
         self.reopen_level_in_place()?;
-        // WIRE: tell the players (`Hub::cubic_window_changed`, cubic/wire).
-        let _ = &self.lan;
+        // The players' clients lay out the new window and get its chunks.
+        if let Some(h) = self.lan.as_mut() {
+            h.hub.cubic_window_changed(self.dim.id(), window);
+        }
         Ok(())
     }
 }
