@@ -251,6 +251,29 @@ impl<T> Resident<T> {
         }
         removed
     }
+    /// The level's column moved: section index `y` is now `y + delta` and counts from
+    /// `min_y` (`sections` of them). The sections still inside keep their values, bounds and
+    /// marks under their new keys; the others are removed and returned with their old keys.
+    /// Slots are made again (as `remove_columns` does): none is kept across the call.
+    pub fn rekey(&mut self, delta: i32, min_y: i32, sections: i32) -> Vec<(SectionKey, T)> {
+        self.min_y = min_y;
+        let items = std::mem::take(&mut self.items);
+        let bounds = std::mem::take(&mut self.bounds);
+        let marked = std::mem::take(&mut self.marked);
+        self.slots.clear();
+        self.columns.clear();
+        self.column_index.clear();
+        let mut removed = Vec::new();
+        for (((key, value), bounds), marked) in items.into_iter().zip(bounds).zip(marked) {
+            let y = key.1 + delta;
+            if (0..sections).contains(&y) {
+                self.insert_marked((key.0, y, key.2), value, bounds, marked);
+            } else {
+                removed.push((key, value));
+            }
+        }
+        removed
+    }
     pub fn remove(&mut self, key: SectionKey) -> Option<T> {
         let slot = self.slots.remove(&key)?;
         self.mark_slot(slot, false);
@@ -1015,5 +1038,37 @@ mod tests {
                 pct_saved
             );
         }
+    }
+
+    /// The column moving keeps the sections inside, marks and bounds with them, and returns
+    /// the others with their old keys.
+    #[test]
+    fn rekey_moves_sections_and_returns_those_outside() {
+        let mut r = Resident::default();
+        let bounds = Some([Vec3::ZERO, Vec3::new(16.0, 3.0, 16.0)]);
+        for y in [0, 1, 2, 5, 31] {
+            r.insert_marked((4, y, -3), y, bounds, y % 2 == 0);
+        }
+        r.insert((9, 3, 9), 100);
+        // Up by two sections: index y becomes y - 2.
+        let mut removed = r.rekey(-2, 32, 32);
+        removed.sort_unstable();
+        assert_eq!(removed, [((4, 0, -3), 0), ((4, 1, -3), 1)]);
+        assert_eq!(r.min_y(), 32);
+        assert_eq!(r.len(), 4);
+        for (old, value) in [(2, 2), (5, 5), (31, 31)] {
+            let key = (4, old - 2, -3);
+            assert_eq!(r.find(key), Some(&value));
+            assert_eq!(r.is_marked(key), value % 2 == 0);
+        }
+        assert_eq!(r.find((9, 1, 9)), Some(&100));
+        assert!(!r.contains((4, 2, -3)));
+        // Down by one: the top section falls out.
+        let removed = r.rekey(1, 16, 30);
+        assert_eq!(removed, [((4, 29, -3), 31)]);
+        assert_eq!(r.find((4, 1, -3)), Some(&2));
+        // Still removable and walkable through its column afterwards.
+        assert_eq!(r.remove((4, 1, -3)), Some(2));
+        assert_eq!(r.len(), 3);
     }
 }

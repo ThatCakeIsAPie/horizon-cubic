@@ -17823,10 +17823,19 @@ impl Game<'_> {
                     horizontal: self.streaming.radius + 2,
                     vertical: shape.section_count() as i32,
                 };
+                // The window sections a moved window left as placeholders until their column
+                // arrives (`remote_cubic_window`) are not held: the octree draws them.
+                let placeholders = self.remote.as_ref().map(|r| &r.cubic_placeholders);
                 let meshes = horizon_client::spans::time("cube_lod_update", || {
                     cube_lod.update(camera, f64::from(lod_distance) * 16.0, loaded, |p| {
                         shape.has_section(p.y)
                             && world.chunks.get(&(p.x, p.z)).is_some_and(|c| c.lit)
+                            && !placeholders.is_some_and(|set| {
+                                set.get(&(p.x, p.z)).is_some_and(|mask| {
+                                    usize::try_from(p.y - shape.min_section())
+                                        .is_ok_and(|i| mask.contains(i))
+                                })
+                            })
                     })
                 });
                 renderer.queue_cube_lods(meshes, cube_lod.removed());

@@ -633,6 +633,19 @@ impl Occlusion {
             generation: next_generation(),
         }
     }
+    /// The same connectivity for a level whose columns hold `sections` from `min_y`, with
+    /// the section at index `y` now at `y + delta` (those that fall outside are forgotten,
+    /// the new ones connect every face). The search starts over, as for any change.
+    pub fn relayout(&mut self, min_y: i32, sections: i32, delta: i32) {
+        let old = std::mem::replace(self, Self::new(min_y, sections));
+        for (&(x, z), column) in &old.columns.map {
+            for (y, &vis) in column.iter().enumerate() {
+                if vis != ALL_VISIBLE {
+                    self.set((x, y as i32 + delta, z), vis);
+                }
+            }
+        }
+    }
     pub fn set(&mut self, key: SectionKey, vis: u64) {
         if self.columns.set(key, vis) {
             self.changed(key, vis);

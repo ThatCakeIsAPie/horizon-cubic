@@ -300,7 +300,13 @@ impl Game<'_> {
         };
         let (x, z) = (p.x, p.z);
         // A column sent again while it is resident (a bulk edit): only what changed is lit and meshed again.
-        if self.world.chunks.contains_key(&(x, z)) {
+        // A column whose window sections were placeholders (`remote_cubic_window`) takes the new one
+        // keeping the sections that did not change, and only the rest remesh.
+        let placeholder = self
+            .remote
+            .as_mut()
+            .is_some_and(|r| r.cubic_placeholders.remove(&(x, z)).is_some());
+        if self.world.chunks.contains_key(&(x, z)) && !placeholder {
             horizon_client::spans::time("replace_remote", || {
                 self.streaming.replace_remote(&mut self.world, chunk)
             });

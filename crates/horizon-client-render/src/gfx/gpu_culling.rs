@@ -705,6 +705,20 @@ impl Records {
         self.add_to(page);
         self.mark(id);
     }
+    /// The section with `id` is now at index `y` (a level whose column moved).
+    pub fn rekey(&mut self, id: u32, y: i32) {
+        let Some(record) = self
+            .records
+            .get_mut(id as usize)
+            .filter(|r| r.page().is_some())
+        else {
+            return;
+        };
+        if record.key[1] != y {
+            record.key[1] = y;
+            self.mark(id);
+        }
+    }
     /// The section with `id` began to draw faded, or stopped (gfx.rs
     /// `SectionGpu::gpu_fading`): its record is `FADING` when `on`.
     pub fn set_fading(&mut self, id: u32, on: bool) {
@@ -798,6 +812,13 @@ impl Fades {
         }
         self.due.pop();
         Some(key)
+    }
+    /// The sections' keys changed (`map` gives the new one, `None`: the section went).
+    pub fn rekey(&mut self, map: impl Fn(SectionKey) -> Option<SectionKey>) {
+        self.due = std::mem::take(&mut self.due)
+            .into_iter()
+            .filter_map(|Reverse((end, key))| Some(Reverse((end, map(key)?))))
+            .collect();
     }
     /// Every end goes; `fade_ms` stays.
     pub fn clear(&mut self) {
