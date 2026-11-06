@@ -209,6 +209,7 @@ mod reuse;
 mod stars;
 pub mod submit;
 mod sunrise_fan;
+pub mod surface_tile;
 mod timing;
 pub mod translucency;
 pub(crate) mod upload;
@@ -1281,6 +1282,9 @@ pub struct Renderer {
     cube_pending: Option<lod::CubePending>,
     /// Far cube terrain meshed and drawn on the GPU (`cube_far`), once a GPU sampler asked.
     cube_far: Option<cube_far::CubeFar>,
+    /// `HORIZON_SURFACE_TILES_DEBUG`'s view of the surface tiles, drawn in place of
+    /// `cube_far` (temporary, until the planner hands tiles out).
+    surface_debug: Option<surface_tile::DebugTiles>,
     /// Far tiles' occlusion culling slots (`lod::Tile::cull_slot`): those
     /// free, and the next never used.
     lod_cull_free: Vec<u32>,
@@ -4679,6 +4683,7 @@ impl Renderer {
             lod_cubes: HashMap::new(),
             cube_pending: None,
             cube_far: None,
+            surface_debug: None,
             lod_cull_free: Vec::new(),
             lod_cull_next: 0,
             lod_cutout: Default::default(),
@@ -7709,6 +7714,11 @@ impl Renderer {
         {
             far.prepare(&mut encoder, camera, view.planes);
         }
+        if !frame.title
+            && let Some(debug) = &mut self.surface_debug
+        {
+            debug.frame(&mut encoder, camera, view.planes);
+        }
         let reachable = &self.occlusion;
         let cutout = &self.lod_cutout;
         // Sections fading out (`leave_section`) are past the render distance:
@@ -9847,7 +9857,10 @@ impl Renderer {
                 && let Some(far) = &self.cube_far
             {
                 pass.set_bind_group(0, &self.group, &[]);
-                far.draw(&mut pass, false);
+                match &self.surface_debug {
+                    Some(debug) => debug.tiles.draw(&mut pass, false),
+                    None => far.draw(&mut pass, false),
+                }
             }
             // `[displacement]`'s grid over the flat quads it took over, writing its depth.
             if let Some(n) = self
@@ -10308,7 +10321,10 @@ impl Renderer {
                 && let Some(far) = &self.cube_far
             {
                 pass.set_bind_group(0, &self.group, &[]);
-                far.draw(&mut pass, true);
+                match &self.surface_debug {
+                    Some(debug) => debug.tiles.draw(&mut pass, true),
+                    None => far.draw(&mut pass, true),
+                }
                 pass.set_bind_group(0, &self.group, &[]);
                 pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
             }
@@ -12417,6 +12433,17 @@ mod tests {
             } else if name == "cube_far.wgsl" {
                 // Appended to terrain.wgsl (gfx/cube_far.rs).
                 sources.push((path, crate::gfx::cube_far::shader_source()));
+            } else if name == "cwg_noise.wgsl" {
+                // The far terrain's shared noise: the compute shaders below start with it.
+                continue;
+            } else if matches!(
+                name,
+                "cube_gen.wgsl" | "cube_descent.wgsl" | "biome_gen.wgsl" | "surface_gen.wgsl"
+            ) {
+                sources.push((path, include_str!("gfx/cwg_noise.wgsl").to_owned() + &text));
+            } else if name == "surface_draw.wgsl" {
+                // Appended to terrain.wgsl and cube_far.wgsl (gfx/surface_tile.rs).
+                sources.push((path, crate::gfx::surface_tile::draw_shader_source()));
             } else if name == "oit_border.wgsl" {
                 let base = include_str!("border.wgsl").to_owned() + include_str!("oit.wgsl");
                 sources.push((path, base + &text));

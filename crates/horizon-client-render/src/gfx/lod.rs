@@ -448,6 +448,9 @@ impl Renderer {
                 && self.info.backend != wgpu::Backend::Dx12,
         };
         self.cube_far = cube_far::CubeFar::new(backend, states, air, &setup);
+        if let Some(far) = &self.cube_far {
+            self.surface_debug = super::surface_tile::DebugTiles::from_env(backend, far, &setup);
+        }
         self.cube_far.is_some()
     }
 

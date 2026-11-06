@@ -386,6 +386,17 @@ impl CubeFar {
         &self.device
     }
 
+    /// The material table (`cube_far.wgsl`'s `cf_materials`), for other
+    /// far-terrain draws that share it (`gfx::surface_tile`).
+    pub fn material_buffer(&self) -> &wgpu::Buffer {
+        self.mesher.materials()
+    }
+
+    /// The biome colour table (`cf_biomes`).
+    pub fn biome_buffer(&self) -> &wgpu::Buffer {
+        &self.biomes
+    }
+
     fn now_ms(&self) -> u32 {
         (self.epoch.elapsed().as_millis() as u32).min(NOT_SET - 1)
     }
