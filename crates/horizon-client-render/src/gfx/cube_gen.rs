@@ -99,6 +99,7 @@
 //! 3. Make the sampler with `GpuCubeSampler::new(device, queue, params,
 //!    columns)` (the renderer's device, or `with_own_device`) and hand it to
 //!    the cube LOD producer; `fork()` gives each worker a handle.
+use crate::gfx::cube_descent::GpuDescent;
 use crate::lod::cube::{CubeKey, CubeNode, CubeSampler, NodeClass, Resident, SIDE, VOLUME, Voxel};
 use bytemuck::Zeroable;
 use horizon_core::noise::wrap;
@@ -243,7 +244,7 @@ pub struct GpuHeader {
 }
 
 /// The weights and scales of a noise's kept octaves.
-fn octave_terms(noise: &NoiseDesc, depth: bool) -> Vec<([f64; 3], f32)> {
+pub(crate) fn octave_terms(noise: &NoiseDesc, depth: bool) -> Vec<([f64; 3], f32)> {
     let norm: f64 = (0..noise.octaves.len())
         .map(|i| 0.5f64.powi(i as i32))
         .sum();
@@ -299,7 +300,7 @@ impl GpuParams {
 
 /// How many octaves of noise `n` a node of `level` shows: those whose
 /// wavelength is at least a voxel (the first always).
-fn used_octaves(p: &CubeGenParams, n: usize, level: u8) -> usize {
+pub(crate) fn used_octaves(p: &CubeGenParams, n: usize, level: u8) -> usize {
     let noise = &p.noises[n];
     let kept = noise.octaves.len().min(MAX_OCTAVES);
     let f = noise.frequency;
@@ -315,7 +316,7 @@ fn used_octaves(p: &CubeGenParams, n: usize, level: u8) -> usize {
 }
 
 /// Voxel layers computed above a node, so its top layer sees the surface.
-fn extra_layers(p: &CubeGenParams, level: u8) -> u32 {
+pub(crate) fn extra_layers(p: &CubeGenParams, level: u8) -> u32 {
     ((p.filler_depth / f64::from(1u32 << level)).ceil() as u32).clamp(1, 4)
 }
 
@@ -1323,6 +1324,8 @@ pub struct GpuCubeSampler {
     columns: ColumnFn,
     gpu: Option<mpsc::Sender<Message>>,
     backend: Option<GpuBackend>,
+    /// The GPU descent (`gfx::cube_descent`), once `with_descent` made it.
+    descent: Option<Arc<GpuDescent>>,
     reply: mpsc::Sender<Vec<Option<Resident>>>,
     replies: mpsc::Receiver<Vec<Option<Resident>>>,
 }
@@ -1395,9 +1398,28 @@ impl GpuCubeSampler {
             columns,
             gpu,
             backend: None,
+            descent: None,
             reply,
             replies,
         }
+    }
+
+    /// Adds the GPU descent (`gfx::cube_descent`) on the sampler's device,
+    /// from the generator's density bound (`CustomCubicGenerator::gpu_terms`).
+    /// Without a GPU generator, or when the terms do not match the
+    /// parameters, the sampler is returned as it was. `CubeLod` uses the
+    /// descent when asked (`CubeLod::set_gpu_descent`).
+    pub fn with_descent(mut self, terms: &horizon_world::cubic::custom::GpuTerms) -> Self {
+        if let Some(backend) = &self.backend {
+            self.descent = GpuDescent::new(
+                backend.device.clone(),
+                backend.queue.clone(),
+                &self.params,
+                terms,
+            )
+            .map(Arc::new);
+        }
+        self
     }
 
     /// Whether requests go to the GPU.
@@ -1532,9 +1554,14 @@ impl CubeSampler for GpuCubeSampler {
         node_class(&self.params, key, &columns)
     }
 
+    fn descent(&self) -> Option<Arc<GpuDescent>> {
+        self.descent.clone()
+    }
+
     fn fork(&self) -> Option<Box<dyn CubeSampler>> {
         let mut fork = Self::with(self.params.clone(), self.columns.clone(), self.gpu.clone());
         fork.backend = self.backend.clone();
+        fork.descent = self.descent.clone();
         Some(Box::new(fork))
     }
 }

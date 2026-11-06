@@ -13,7 +13,10 @@
 use super::mesh::{self, Mesher};
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
-    gfx::cube_gen::{GpuBackend, slot_words},
+    gfx::{
+        cube_descent::{DescentRequest, GpuDescent},
+        cube_gen::{GpuBackend, MIN_LEVEL, slot_words},
+    },
     mesher::SectionMesh,
     streaming::WorkerContext,
 };
@@ -342,6 +345,13 @@ pub trait CubeSampler: Send {
     fn classify(&mut self, _key: CubeKey) -> NodeClass {
         NodeClass::Mixed
     }
+    /// The GPU descent behind this sampler (`gfx::cube_descent`), if it has
+    /// one: it proves whole subtrees of the octree uniform from the density
+    /// bound, in place of [`CubeSampler::classify`] node by node
+    /// ([`CubeLod::set_gpu_descent`]).
+    fn descent(&self) -> Option<Arc<GpuDescent>> {
+        None
+    }
     /// The GPU generator behind this sampler (its device, node pool and block
     /// states), if any: what lets [`CubeLod`] mesh and draw on the GPU.
     fn gpu(&self) -> Option<GpuBackend> {
@@ -465,6 +475,33 @@ pub enum NodeClass {
     Rock,
 }
 
+/// The nodes the plan starts from: those of the first level at least as wide
+/// as `max_distance` that the range around `camera` meets (at most 27).
+pub fn root_nodes(camera: [f64; 3], max_distance: f64) -> Vec<CubeKey> {
+    let top = (0..=MAX_CUBE_LEVEL)
+        .find(|&l| f64::from(16 << l) >= max_distance)
+        .unwrap_or(MAX_CUBE_LEVEL);
+    let size = f64::from(16 << top);
+    let span = |c: f64| {
+        (
+            ((c - max_distance) / size).floor() as i32,
+            ((c + max_distance) / size).floor() as i32,
+        )
+    };
+    let mut roots = Vec::new();
+    let (x0, x1) = span(camera[0]);
+    let (y0, y1) = span(camera[1]);
+    let (z0, z1) = span(camera[2]);
+    for x in x0..=x1 {
+        for y in y0..=y1 {
+            for z in z0..=z1 {
+                roots.push(CubeKey::new(top, x, y, z));
+            }
+        }
+    }
+    roots
+}
+
 /// [`plan_from`] with what is known of nodes' contents: a node `class` calls
 /// [`NodeClass::Air`] is left out with its whole subtree, one it calls
 /// [`NodeClass::Rock`] stays a leaf (nothing inside shows), unless it holds
@@ -490,27 +527,7 @@ pub fn plan_classified(
         }
     }
     let center = cube_of(camera);
-    let top = (0..=MAX_CUBE_LEVEL)
-        .find(|&l| f64::from(16 << l) >= max_distance)
-        .unwrap_or(MAX_CUBE_LEVEL);
-    let size = f64::from(16 << top);
-    let span = |c: f64| {
-        (
-            ((c - max_distance) / size).floor() as i32,
-            ((c + max_distance) / size).floor() as i32,
-        )
-    };
-    let mut stack = Vec::new();
-    let (x0, x1) = span(camera[0]);
-    let (y0, y1) = span(camera[1]);
-    let (z0, z1) = span(camera[2]);
-    for x in x0..=x1 {
-        for y in y0..=y1 {
-            for z in z0..=z1 {
-                stack.push(CubeKey::new(top, x, y, z));
-            }
-        }
-    }
+    let mut stack = root_nodes(camera, max_distance);
     let mut leaves = Vec::new();
     while let Some(node) = stack.pop() {
         if !in_world(node) {
@@ -645,6 +662,17 @@ pub struct CubeLodStats {
     /// Every planned node is drawn or known empty, and the GPU mesher has
     /// nothing waiting.
     pub complete: bool,
+    /// GPU descents run (`CubeLod::set_gpu_descent`), ever.
+    pub descent_runs: u64,
+    /// Nodes the last descent proved uniform (air, fluid or rock).
+    pub descent_uniform: usize,
+    /// Right-sized nodes the last descent found (the leaves of the GPU's
+    /// levels, before the loaded cubes and the classes are applied).
+    pub descent_leaves: usize,
+    /// Wall time of the last descent, with its readback, in milliseconds.
+    pub descent_ms: f32,
+    /// The last descent filled a list: its classes are partial (safe).
+    pub descent_overflow: bool,
     /// When the plan last changed.
     pub plan_changed: Option<Instant>,
     /// When the current plan last became complete; none while it is not.
@@ -759,8 +787,25 @@ impl Shared {
             stop: AtomicBool::new(false),
             cache: Mutex::default(),
             gpu_path: AtomicBool::new(false),
+            descent_on: AtomicBool::new(false),
+            descent: Mutex::default(),
+            descent_wake: Condvar::new(),
+            classes_dirty: AtomicBool::new(false),
         }
     }
+}
+
+/// The request the descent thread is to run next (the latest wins), and what
+/// the last run found.
+#[derive(Default)]
+struct DescentSlot {
+    request: Option<DescentRequest>,
+    busy: bool,
+    runs: u64,
+    uniform: usize,
+    leaves: usize,
+    millis: f32,
+    overflow: bool,
 }
 
 struct Shared {
@@ -772,6 +817,13 @@ struct Shared {
     cache: Mutex<Cache>,
     /// The workers make [`GpuNode`]s (`CubeLod::set_gpu_path`).
     gpu_path: AtomicBool,
+    /// Classes come from the GPU descent (`CubeLod::set_gpu_descent`), not
+    /// from the classifier thread.
+    descent_on: AtomicBool,
+    descent: Mutex<DescentSlot>,
+    descent_wake: Condvar,
+    /// The descent added classes the plan has not looked at yet.
+    classes_dirty: AtomicBool,
 }
 
 /// The far terrain of a cubic level, built in the background.
@@ -821,6 +873,10 @@ pub struct CubeLod {
     /// Nodes the planner left out as uniform, from the class cache.
     pruned: usize,
     render: Option<crate::gfx::cube_far::FarStats>,
+    /// The sampler has a GPU descent.
+    has_descent: bool,
+    /// What the descent was last asked for.
+    descent_asked: Option<(SectionPos, f64, LoadedBox)>,
 }
 
 impl CubeLod {
@@ -834,6 +890,7 @@ impl CubeLod {
         let backend = sampler.gpu();
         // One more fork classifies nodes for the planner, on a thread of its own.
         let classifier = backend.is_some().then(|| sampler.fork()).flatten();
+        let descent = sampler.descent();
         let mut samplers = Vec::new();
         while samplers.len() + 1 < wanted_threads
             && let Some(fork) = sampler.fork()
@@ -853,6 +910,16 @@ impl CubeLod {
             })
             .into_iter()
             .collect();
+        let has_descent = descent.is_some();
+        if let Some(descent) = descent {
+            let shared = shared.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name("Cube far descent".into())
+                    .spawn(move || descent_loop(&shared, &descent))
+                    .expect("spawn the cube descent thread"),
+            );
+        }
         threads.extend(samplers.into_iter().map(|sampler| {
             let (shared, tx, context) = (shared.clone(), tx.clone(), context.clone());
             let backend = backend.clone();
@@ -861,7 +928,9 @@ impl CubeLod {
                 .spawn(move || work(shared, tx, context, sampler, air, backend))
                 .expect("spawn a cube far terrain thread")
         }));
-        Self::assemble(shared, results, threads, backend, Some(context), air)
+        let mut lod = Self::assemble(shared, results, threads, backend, Some(context), air);
+        lod.has_descent = has_descent;
+        lod
     }
 
     fn assemble(
@@ -892,6 +961,8 @@ impl CubeLod {
             empty: FxHashSet::default(),
             pruned: 0,
             render: None,
+            has_descent: false,
+            descent_asked: None,
         }
     }
 
@@ -923,6 +994,13 @@ impl CubeLod {
             out.pool_bytes = render.pool_bytes;
         }
         out.complete = self.is_complete();
+        if let Ok(slot) = self.shared.descent.lock() {
+            out.descent_runs = slot.runs;
+            out.descent_uniform = slot.uniform;
+            out.descent_leaves = slot.leaves;
+            out.descent_ms = slot.millis;
+            out.descent_overflow = slot.overflow;
+        }
         out
     }
 
@@ -970,6 +1048,54 @@ impl CubeLod {
     /// Whether workers make [`GpuNode`]s.
     pub fn gpu_path(&self) -> bool {
         self.shared.gpu_path.load(Ordering::Relaxed)
+    }
+
+    /// Switches the planner's classes between the GPU descent (`on`, and the
+    /// sampler has one: `GpuCubeSampler::with_descent`) and the classifier
+    /// thread's 2D pre-pass. With the descent, each replan's camera cube sends
+    /// one request to the GPU, which walks the octree level by level, proves
+    /// whole subtrees uniform from the density bound and returns their keys;
+    /// the plan, hysteresis and loaded cubes stay the CPU's, and nodes the
+    /// descent has not classified yet count as mixed. The nodes a plan keeps
+    /// are those of the CPU plan minus the proven-uniform subtrees. Returns
+    /// whether it changed.
+    pub fn set_gpu_descent(&mut self, on: bool) -> bool {
+        let on = on && self.has_descent;
+        if self.shared.descent_on.swap(on, Ordering::Relaxed) == on {
+            return false;
+        }
+        self.planned = None;
+        self.descent_asked = None;
+        true
+    }
+
+    /// Whether the planner's classes come from the GPU descent.
+    pub fn gpu_descent(&self) -> bool {
+        self.shared.descent_on.load(Ordering::Relaxed)
+    }
+
+    /// Sends the descent its request for this camera, once per cube, and says
+    /// whether the plan should wait for the first answer.
+    fn ask_descent(&mut self, camera: [f64; 3], max_distance: f64, loaded: LoadedBox) -> bool {
+        let cube = cube_of(camera);
+        let asked = (cube, max_distance, loaded);
+        if self.descent_asked != Some(asked) {
+            self.descent_asked = Some(asked);
+            let mut slot = self.shared.descent.lock().unwrap();
+            slot.request = Some(DescentRequest {
+                camera,
+                max_distance,
+                // The plan's hysteresis splits a node up to `MERGE` times
+                // farther than the plain rule does.
+                split_scale: MERGE,
+                min_level: MIN_LEVEL,
+                loaded: Some(([cube.x, cube.y, cube.z], loaded)),
+            });
+            drop(slot);
+            self.shared.descent_wake.notify_one();
+        }
+        let slot = self.shared.descent.lock().unwrap();
+        slot.runs == 0 && (slot.request.is_some() || slot.busy)
     }
 
     /// The nodes finished for the GPU mesher since the last call (their slots
@@ -1035,13 +1161,21 @@ impl CubeLod {
         self.camera = camera;
         let now = Instant::now();
         let cube = cube_of(camera);
-        let stale = match self.planned {
-            Some((c, d, l, at)) => {
-                c != cube || d != max_distance || l != loaded || now - at >= REPLAN
-            }
-            None => true,
-        };
-        if stale {
+        // With the descent on, the first plan waits for its first answer: a
+        // plan of nothing but unclassified (mixed) nodes would queue the
+        // whole octree.
+        let waiting = self.shared.descent_on.load(Ordering::Relaxed)
+            && self.ask_descent(camera, max_distance, loaded)
+            && self.plan.is_empty();
+        let fresh = self.shared.classes_dirty.swap(false, Ordering::Relaxed);
+        let stale = fresh
+            || match self.planned {
+                Some((c, d, l, at)) => {
+                    c != cube || d != max_distance || l != loaded || now - at >= REPLAN
+                }
+                None => true,
+            };
+        if stale && !waiting {
             let shared = self.shared.clone();
             let class = move |key: CubeKey| classify_cached(&shared, key);
             let (next, pruned) =
@@ -1188,6 +1322,10 @@ impl Drop for CubeLod {
             let _classes = self.shared.classes.lock();
             self.shared.classes_wake.notify_all();
         }
+        {
+            let _descent = self.shared.descent.lock();
+            self.shared.descent_wake.notify_all();
+        }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -1205,12 +1343,55 @@ fn classify_cached(shared: &Shared, key: CubeKey) -> NodeClass {
     if let Some(&class) = classes.known.get(&key) {
         return class;
     }
+    if shared.descent_on.load(Ordering::Relaxed) {
+        // The descent fills the classes; nothing is asked of the classifier.
+        return NodeClass::Mixed;
+    }
     if classes.queued.insert(key) {
         classes.queue.push_back(key);
         drop(classes);
         shared.classes_wake.notify_one();
     }
     NodeClass::Mixed
+}
+
+/// Runs the GPU descent for each request (the latest wins) and files the
+/// nodes it proved uniform as classes.
+fn descent_loop(shared: &Shared, descent: &GpuDescent) {
+    loop {
+        let request = {
+            let mut slot = shared.descent.lock().unwrap();
+            loop {
+                if shared.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(request) = slot.request.take() {
+                    slot.busy = true;
+                    break request;
+                }
+                slot = shared.descent_wake.wait(slot).unwrap();
+            }
+        };
+        let found = descent.descend(&request);
+        if let Some(found) = &found {
+            let mut classes = shared.classes.lock().unwrap();
+            if classes.known.len() + found.uniform_count() > CLASS_NODES {
+                classes.known.clear();
+            }
+            classes.known.extend(found.uniform());
+        }
+        let mut slot = shared.descent.lock().unwrap();
+        slot.busy = false;
+        slot.runs += 1;
+        if let Some(found) = found {
+            slot.uniform = found.uniform_count();
+            slot.leaves = found.leaves.len();
+            slot.millis = found.elapsed.as_secs_f32() * 1000.0;
+            slot.overflow = found.overflow;
+        }
+        drop(slot);
+        shared.classes_dirty.store(true, Ordering::Relaxed);
+    }
 }
 
 fn classify_loop(shared: &Shared, sampler: &mut dyn CubeSampler) {
