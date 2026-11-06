@@ -46,8 +46,13 @@ pub struct WorldOptions {
     /// The folder of packs for the new world (vanilla's `mcworld-`
     /// temporary folder), made when Data Packs first opens.
     pub pack_dir: Option<std::path::PathBuf>,
-    /// Cubic Chunks: the Overworld has no height limit (docs/cubic-chunks.md).
-    pub cubic: bool,
+    /// Cubic Chunks: the Overworld has no height limit (docs/cubic-chunks.md),
+    /// generated as this world type; `None` is Off.
+    pub cubic: Option<crate::cubic_settings::CubicKind>,
+    /// The cubic generator's settings as JSON (`cubicgen.json`): CubicWorldGen's
+    /// for Custom Cubic and Hybrid, the layers for Flat Cubic. Empty is the
+    /// type's defaults.
+    pub cubic_json: String,
 }
 impl Default for WorldOptions {
     fn default() -> Self {
@@ -64,7 +69,8 @@ impl Default for WorldOptions {
             rules: crate::gamerules::GameRules::default(),
             data_packs: vec!["vanilla".into()],
             pack_dir: None,
-            cubic: false,
+            cubic: None,
+            cubic_json: String::new(),
         }
     }
 }
@@ -77,6 +83,7 @@ impl WorldOptions {
     ) -> Self {
         let generation = crate::save::WorldGen::read(dir).unwrap_or_default();
         let (pack_dir, data_packs) = crate::datapack::for_recreate(dir);
+        let cubic = crate::cubic_settings::load_world_generation(dir);
         Self {
             hardcore: level.hardcore,
             difficulty: DIFFICULTIES
@@ -94,7 +101,8 @@ impl WorldOptions {
             rules: crate::gamerules::GameRules::load_with_features(dir, &level.enabled_features),
             data_packs,
             pack_dir,
-            cubic: crate::cubic::is_cubic_world(dir),
+            cubic_json: cubic.as_ref().map(|c| c.1.clone()).unwrap_or_default(),
+            cubic: cubic.map(|c| c.0),
             ..Self::default()
         }
     }
@@ -176,6 +184,11 @@ impl WorldOptions {
             crate::save::WorldPreset::Flat | crate::save::WorldPreset::Debug
         )
     }
+    /// The cubic world type the world is made with: the chosen one, when the
+    /// world preset allows it.
+    pub fn cubic_kind(&self) -> Option<crate::cubic_settings::CubicKind> {
+        self.cubic.filter(|_| self.cubic_allowed())
+    }
     pub fn bonus_chest(&self) -> bool {
         !self.hardcore && self.bonus_chest
     }
@@ -202,6 +215,18 @@ impl WorldOptions {
     /// A press on one of the open tab's cycle buttons or switches.
     pub(super) fn press(&mut self, id: u8, creative: &mut bool) {
         self.cycle(id, creative, 1);
+    }
+    /// The Cubic Chunks button: Off, Custom Cubic, Hybrid, Flat Cubic. A
+    /// settings text of another kind starts over from the defaults, which
+    /// Custom Cubic and Hybrid share.
+    fn cycle_cubic(&mut self, step: i32) {
+        use crate::cubic_settings::CubicKind;
+        let before = self.cubic;
+        self.cubic = CubicKind::cycle(self.cubic, step);
+        let terrain = |kind: Option<CubicKind>| kind.is_some_and(CubicKind::has_terrain_settings);
+        if terrain(before) != terrain(self.cubic) || self.cubic.is_none() {
+            self.cubic_json.clear();
+        }
     }
     /// A step on one of the open tab's cycle buttons or switches (mouse wheel or keyboard).
     pub(super) fn cycle(&mut self, id: u8, creative: &mut bool, step: i32) {
@@ -236,7 +261,7 @@ impl WorldOptions {
             }
             27 => self.structures = !self.structures,
             28 => self.bonus_chest = !self.bonus_chest,
-            36 => self.cubic = !self.cubic,
+            36 => self.cycle_cubic(step),
             _ => {}
         }
     }
@@ -357,6 +382,11 @@ fn labelled(key: &str, value: String) -> String {
     )
     .plain()
 }
+/// The value of the Cubic Chunks button: Off or the world type's name.
+fn cubic_label(o: &WorldOptions) -> String {
+    o.cubic_kind()
+        .map_or_else(|| tr("options.off"), |kind| tr(kind.label()))
+}
 fn on_off(on: bool) -> String {
     tr(if on { "options.on" } else { "options.off" })
 }
@@ -449,14 +479,22 @@ pub(super) fn buttons(w: f32, h: f32, creative: bool, o: &WorldOptions) -> Vec<B
                 28,
             ),
             // Horizon's Cubic Chunks (docs/cubic-chunks.md): not for the
-            // flat and debug presets.
+            // flat and debug presets. The world type, and its Customize.
             b(
-                gx + 266.0,
+                gx,
                 gy + 121.0,
-                44.0,
-                on_off(o.cubic && o.cubic_allowed()),
+                150.0,
+                labelled("horizon.cubic.world", cubic_label(o)),
                 o.cubic_allowed(),
                 36,
+            ),
+            b(
+                gx + 160.0,
+                gy + 121.0,
+                150.0,
+                tr("selectWorld.customizeType"),
+                o.cubic_kind().is_some(),
+                37,
             ),
         ],
         // The More tab, as vanilla lays it out: Game Rules, Experiments
@@ -566,11 +604,11 @@ pub(super) fn button_narration(
             o.structures,
         ),
         28 => switch("selectWorld.bonusItems", None, o.bonus_chest()),
-        36 => switch(
-            "horizon.cubic.world",
-            Some("horizon.cubic.world.info"),
-            o.cubic && o.cubic_allowed(),
-        ),
+        36 => {
+            let next = crate::cubic_settings::CubicKind::cycle(o.cubic_kind(), 1)
+                .map_or_else(|| tr("options.off"), |kind| tr(kind.label()));
+            cycle(next).hint(tr("horizon.cubic.world.info"))
+        }
         _ => Narratable::button(b.label.clone(), rect, b.enabled),
     };
     // The World tab adds its type and Customize row before the seed box,
@@ -721,7 +759,6 @@ impl Title {
                 // SwitchGrid labels, centred on their switch rows.
                 label(batch, "selectWorld.mapFeatures", gx, gy + 78.0);
                 label(batch, "selectWorld.bonusItems", gx, gy + 102.0);
-                label(batch, "horizon.cubic.world", gx, gy + 126.0);
             }
             _ => {}
         }
@@ -810,7 +847,7 @@ impl Title {
             1 if over(gx + 266.0, gy + 73.0, 44.0) => {
                 Some(Text::translate("selectWorld.mapFeatures.info", &[]))
             }
-            1 if over(gx + 266.0, gy + 121.0, 44.0) => {
+            1 if over(gx, gy + 121.0, 150.0) => {
                 Some(Text::translate("horizon.cubic.world.info", &[]))
             }
             _ => None,

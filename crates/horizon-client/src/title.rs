@@ -18,6 +18,9 @@ use std::{
 mod buffet;
 mod confirm_experiments;
 mod create_world;
+mod cubic_customize;
+mod cubic_map;
+mod cubic_preview;
 mod experiments;
 mod flat;
 mod onboarding;
@@ -26,6 +29,7 @@ mod tests;
 pub mod world_management;
 pub use buffet::State as BuffetEditor;
 pub use create_world::{DIFFICULTIES, WorldOptions};
+pub use cubic_customize::State as CubicEditor;
 pub use flat::{FlatLayer, FlatSettings, State as FlatEditor};
 pub use onboarding::Onboarding;
 
@@ -357,6 +361,16 @@ pub enum Mode {
         focus: u8,
         options: WorldOptions,
         buffet: buffet::State,
+    },
+    /// Horizon's Customize screen of the Cubic Chunks world types, over the
+    /// fields Create New World keeps.
+    CreateCubic {
+        name: String,
+        seed: String,
+        creative: bool,
+        focus: u8,
+        options: WorldOptions,
+        cubic: Box<cubic_customize::State>,
     },
     /// AccessibilityOnboardingScreen: the first screen of a first launch.
     Onboarding(Onboarding),
@@ -728,6 +742,7 @@ impl Mode {
             Self::Create { .. } => "world_create",
             Self::CreateFlat { .. } => "world_create_flat",
             Self::CreateBuffet { .. } => "world_create_buffet",
+            Self::CreateCubic { .. } => "world_create_cubic",
             Self::Edit { .. } => "world_edit",
             Self::Backup { .. } => "world_backup",
             Self::BackupBeforeUpgrade { .. } => "world_backup_confirm",
@@ -960,6 +975,50 @@ impl Title {
             };
         }
     }
+    /// A press on the Cubic Chunks Customize screen: a footer button (`hit`),
+    /// or its boxes, rows and controls. The action it asks for, and whether
+    /// a control took the press.
+    fn cubic_click(&mut self, x: f32, y: f32, size: (f32, f32), hit: Option<u8>) -> (Action, bool) {
+        let Mode::CreateCubic { cubic, .. } = &mut self.mode else {
+            return (Action::None, false);
+        };
+        match hit {
+            Some(id) => match cubic_customize::press(cubic, id) {
+                cubic_customize::Exit::Apply => self.close_cubic(true),
+                cubic_customize::Exit::Cancel => self.close_cubic(false),
+                cubic_customize::Exit::Copy(text) => return (Action::CopyText(text), true),
+                cubic_customize::Exit::Stay => {}
+            },
+            None => return (Action::None, cubic_customize::click(cubic, (x, y), size)),
+        }
+        (Action::None, false)
+    }
+    /// Return to Create New World, keeping (`apply`) the world type's
+    /// settings or dropping them (the Customize screen's Done and Cancel).
+    fn close_cubic(&mut self, apply: bool) {
+        let mode = std::mem::replace(&mut self.mode, Mode::Main);
+        if let Mode::CreateCubic {
+            name,
+            seed,
+            creative,
+            focus,
+            mut options,
+            cubic,
+        } = mode
+        {
+            if apply {
+                options.cubic = Some(cubic.kind());
+                options.cubic_json = cubic.json();
+            }
+            self.mode = Mode::Create {
+                name,
+                seed,
+                creative,
+                focus,
+                options,
+            };
+        }
+    }
     /// Return to Create New World, keeping (`apply`) or dropping the layers.
     fn close_flat(&mut self, apply: bool) {
         let mode = std::mem::replace(&mut self.mode, Mode::Main);
@@ -1141,6 +1200,10 @@ impl Title {
             buffet::drag(buffet, cursor, size);
             return;
         }
+        if let Mode::CreateCubic { cubic, .. } = &mut self.mode {
+            cubic_customize::drag(cubic, cursor, (size.0.ceil(), size.1.ceil()));
+            return;
+        }
         if let Mode::Select { worlds, .. } = &self.mode {
             let (top, bottom, _, content) = self.world_list(worlds, size);
             let mut scroll = self.scroll.get();
@@ -1162,6 +1225,9 @@ impl Title {
         if let Mode::CreateBuffet { buffet, .. } = &mut self.mode {
             buffet::release(buffet);
         }
+        if let Mode::CreateCubic { cubic, .. } = &mut self.mode {
+            cubic_customize::release(cubic);
+        }
         self.scroll.get_mut().release();
     }
     /// Mouse wheel over the classic world and server lists, or cycle buttons. Returns true if a button was cycled.
@@ -1180,6 +1246,10 @@ impl Title {
         }
         if let Mode::CreateBuffet { buffet, .. } = &mut self.mode {
             buffet::wheel(buffet, delta, cursor, size);
+            return false;
+        }
+        if let Mode::CreateCubic { cubic, .. } = &mut self.mode {
+            cubic_customize::wheel(cubic, delta, cursor, (size.0.ceil(), size.1.ceil()));
             return false;
         }
         // CycleButton.mouseScrolled reads only the vertical wheel.
@@ -1912,6 +1982,7 @@ impl Title {
             } => create_world::buttons(w, h, *creative, options),
             Mode::CreateFlat { flat, .. } => flat::buttons(w, h, flat),
             Mode::CreateBuffet { buffet, .. } => buffet::buttons(w, h, buffet),
+            Mode::CreateCubic { cubic, .. } => cubic_customize::buttons(w, h, cubic),
             Mode::Edit { world, name, .. } => {
                 let x = (w / 2.0).floor() - 100.0;
                 let top = edit_top(h);
@@ -2282,6 +2353,13 @@ impl Title {
                 get(
                     "createWorld.customize.flat.title",
                     "Superflat Customization",
+                ),
+            ),
+            Mode::CreateCubic { .. } => ScreenInfo::new(
+                "create_world/cubic",
+                get(
+                    "horizon.cubic.customize.title",
+                    "Cubic Chunks Customization",
                 ),
             ),
             Mode::CreateBuffet { .. } => ScreenInfo::new(
@@ -2776,6 +2854,9 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             } => self.draw_create(atlas, batch, cursor, name, seed, *focus, options),
             Mode::CreateFlat { flat, .. } => flat::draw(self, atlas, items, batch, cursor, flat),
             Mode::CreateBuffet { buffet, .. } => buffet::draw(self, atlas, batch, cursor, buffet),
+            Mode::CreateCubic { cubic, .. } => {
+                cubic_customize::draw(self, atlas, batch, cursor, cubic);
+            }
             Mode::Edit { name, focused, .. } => {
                 crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
                 centered(
@@ -3502,6 +3583,11 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             self.drop_button_focus_for_field(hit);
             return (Action::None, hit.is_some());
         }
+        if matches!(self.mode, Mode::CreateCubic { .. }) {
+            let (action, hit_control) = self.cubic_click(x, y, (w, h), hit);
+            self.drop_button_focus_for_field(hit);
+            return (action, hit.is_some() || hit_control);
+        }
         let action = self.click_action(x, y, (w, h), hit);
         self.drop_button_focus_for_field(hit);
         // World list selection is silent; launching its selected entry sounds.
@@ -3517,6 +3603,9 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         }
     }
     fn click_action(&mut self, x: f32, y: f32, (w, h): (f32, f32), hit: Option<u8>) -> Action {
+        if matches!(self.mode, Mode::CreateCubic { .. }) {
+            return self.cubic_click(x, y, (w, h), hit).0;
+        }
         match (&mut self.mode, hit) {
             (Mode::Main, Some(1)) => {
                 // The title button is no longer part of the world-select screen.
@@ -3833,6 +3922,31 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 *self.rules.get_mut() = Some(RulesScreen::for_creation(&rules));
                 Action::None
             }
+            // Horizon's Customize screen of the Cubic Chunks world types.
+            (
+                Mode::Create {
+                    name,
+                    seed,
+                    creative,
+                    focus,
+                    options,
+                },
+                Some(37),
+            ) if options.cubic_kind().is_some() => {
+                let kind = options
+                    .cubic_kind()
+                    .unwrap_or(crate::cubic_settings::CubicKind::Custom);
+                let cubic = cubic_customize::State::new(&self.resources, kind, &options.cubic_json);
+                self.mode = Mode::CreateCubic {
+                    name: name.clone(),
+                    seed: seed.clone(),
+                    creative: *creative,
+                    focus: *focus,
+                    options: options.clone(),
+                    cubic: Box::new(cubic),
+                };
+                Action::None
+            }
             // CreateBuffetWorldScreen for the single-biome preset.
             (
                 Mode::Create {
@@ -3882,7 +3996,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                     creative, options, ..
                 },
                 Some(id),
-            ) if !matches!(id, 21 | 22 | 30 | 31) => {
+            ) if !matches!(id, 21 | 22 | 30 | 31 | 37) => {
                 options.press(id, creative);
                 Action::None
             }
@@ -4001,6 +4115,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             Mode::CreateBuffet { buffet, .. } if buffet.query_focused => {
                 Some(buffet::search_box(w))
             }
+            Mode::CreateCubic { cubic, .. } => cubic.focused_box((w, h)),
             _ => None,
         }
     }
@@ -4374,7 +4489,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
     pub fn focus_selects_row(&self) -> bool {
         matches!(
             self.mode,
-            Mode::CreateFlat { .. } | Mode::CreateBuffet { .. }
+            Mode::CreateFlat { .. } | Mode::CreateBuffet { .. } | Mode::CreateCubic { .. }
         )
     }
     /// The focus landed on the list row at `point`
@@ -4387,6 +4502,9 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         match &mut self.mode {
             Mode::CreateFlat { flat, .. } => return flat::focus_row(flat, point, size),
             Mode::CreateBuffet { buffet, .. } => return buffet::focus_row(buffet, point, size),
+            Mode::CreateCubic { cubic, .. } => {
+                return cubic_customize::focus_row(cubic, point, (size.0.ceil(), size.1.ceil()));
+            }
             _ => {}
         }
         let Mode::Select { worlds, .. } = &self.mode else {
@@ -4695,6 +4813,16 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 }
             }
             Mode::CreateBuffet { .. } => self.close_buffet(false),
+            // Escape closes the Presets or the picker first, then the screen.
+            Mode::CreateCubic { .. } => {
+                let closed = match &mut self.mode {
+                    Mode::CreateCubic { cubic, .. } => cubic.escape(),
+                    _ => false,
+                };
+                if !closed {
+                    self.close_cubic(false);
+                }
+            }
             Mode::Create { .. } => self.cancel_create(),
             // Screen.keyPressed: Escape closes the screen, which fades out.
             Mode::Onboarding(_) => self.onboarding_close(),
@@ -4767,6 +4895,8 @@ fn caret_field<'a>(
         Mode::CreateBuffet { buffet, .. } if buffet.query_focused => {
             Some((buffet::SEARCH, &mut buffet.query, 50))
         }
+        // The Cubic Chunks Customize screen's Presets JSON and picker search.
+        Mode::CreateCubic { cubic, .. } => cubic.focused_text(),
         _ => None,
     }
 }
