@@ -412,7 +412,7 @@ fn copy_tree(
         } else if kind.is_file() {
             std::fs::copy(&path, &target).map_err(|e| io_error(&path, e))?;
             *copied += 1;
-            if *copied % 64 == 0 || *copied == total {
+            if copied.is_multiple_of(64) || *copied == total {
                 progress(Progress::Copying {
                     files: *copied,
                     total,
@@ -503,8 +503,14 @@ fn convert_columns(
     let save = SaveDir::new(source.clone(), LevelShape::OVERWORLD);
     let _ = save.tables.set(Arc::new(SaveTables::new(&assets)));
     let (Some(bedrock), Some(deepslate)) = (
-        assets.registry.default_state("minecraft:bedrock").map(|s| s.0),
-        assets.registry.default_state("minecraft:deepslate").map(|s| s.0),
+        assets
+            .registry
+            .default_state("minecraft:bedrock")
+            .map(|s| s.0),
+        assets
+            .registry
+            .default_state("minecraft:deepslate")
+            .map(|s| s.0),
     ) else {
         return Err("the resources have no bedrock or deepslate".into());
     };
@@ -512,7 +518,9 @@ fn convert_columns(
     std::fs::create_dir_all(&level_dir).map_err(|e| io_error(&level_dir, e))?;
 
     let threads = match options.threads {
-        0 => std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 8),
+        0 => std::thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .clamp(1, 8),
         n => n,
     }
     .min(regions.len().max(1));
@@ -677,9 +685,10 @@ impl Job<'_> {
         if !self.keep_bedrock {
             let before = count_blocks(&chunk, self.bedrock);
             replace_bedrock(&mut chunk, self.bedrock, self.deepslate);
-            self.counts
-                .bedrock
-                .fetch_add(before - count_blocks(&chunk, self.bedrock), Ordering::Relaxed);
+            self.counts.bedrock.fetch_add(
+                before - count_blocks(&chunk, self.bedrock),
+                Ordering::Relaxed,
+            );
         }
         self.counts
             .block_entities
@@ -701,7 +710,8 @@ impl Job<'_> {
                 continue;
             };
             let pos = SectionPos::new(x, cube.cy, z);
-            store_record(store, pos, &root).map_err(|e| format!("cube {x} {} {z}: {e}", cube.cy))?;
+            store_record(store, pos, &root)
+                .map_err(|e| format!("cube {x} {} {z}: {e}", cube.cy))?;
             self.counts.cubes.fetch_add(1, Ordering::Relaxed);
             if crate::cubic::is_uniform_record(&root) {
                 self.counts.uniform.fetch_add(1, Ordering::Relaxed);
@@ -767,7 +777,10 @@ fn height_issue(world: &Path) -> Option<String> {
         let min_y = value["min_y"].as_i64().unwrap_or(-64);
         let height = value["height"].as_i64().unwrap_or(384);
         if (min_y, height) != (-64, 384) {
-            return refuse(&format!("the data pack {} sets {min_y} + {height}", pack.file_name().to_string_lossy()));
+            return refuse(&format!(
+                "the data pack {} sets {min_y} + {height}",
+                pack.file_name().to_string_lossy()
+            ));
         }
     }
     None

@@ -178,7 +178,7 @@ fn make_source(root: &Path, assets: &crate::assets::Assets, biomes: &Biomes) -> 
         (
             (x, z),
             NamedTag {
-                name: String::new().into(),
+                name: "".into(),
                 tag: Tag::compound([
                     ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
                     ("Position", Tag::IntArray(vec![x, z])),
@@ -303,10 +303,14 @@ fn a_vanilla_world_becomes_a_hybrid_cubic_world() {
             continue;
         }
         let copied = dst.join(name);
-        if is_overworld_chunk_data(Path::new(name)) {
+        if Path::new(name).ancestors().any(is_overworld_chunk_data) {
             assert!(!copied.exists(), "{name} was carried over");
         } else {
-            assert_eq!(&std::fs::read(&copied).unwrap(), bytes, "{name}");
+            assert_eq!(
+                &std::fs::read(&copied).unwrap_or_else(|e| panic!("{name}: {e}")),
+                bytes,
+                "{name}"
+            );
         }
     }
     assert!(!dst.join("session.lock").exists());
@@ -314,7 +318,11 @@ fn a_vanilla_world_becomes_a_hybrid_cubic_world() {
     // Open it as a cubic level and compare the blocks.
     let opened = open(&dst, &assets, &biomes);
     let (bedrock, deepslate) = (
-        assets.registry.default_state("minecraft:bedrock").unwrap().0,
+        assets
+            .registry
+            .default_state("minecraft:bedrock")
+            .unwrap()
+            .0,
         assets
             .registry
             .default_state("minecraft:deepslate")
@@ -393,7 +401,11 @@ fn bedrock_can_be_kept_and_the_wrong_worlds_are_refused() {
     let report = convert_with(&source.world, &dst, &options, |_| {}).expect("converts");
     assert_eq!(report.bedrock_replaced, 0);
     let opened = open(&dst, &assets, &biomes);
-    let bedrock = assets.registry.default_state("minecraft:bedrock").unwrap().0;
+    let bedrock = assets
+        .registry
+        .default_state("minecraft:bedrock")
+        .unwrap()
+        .0;
     let floor = opened.load_cube(SectionPos::new(0, -4, 0)).unwrap();
     assert_eq!(floor.section.get(index(0, 0, 0)), bedrock);
     drop(opened);

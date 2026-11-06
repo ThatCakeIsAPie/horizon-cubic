@@ -1620,14 +1620,10 @@ impl Title {
             let target = crate::cubic_convert::destination_for(&saves, &folder);
             let options = crate::cubic_convert::ConvertOptions::new(resources);
             let progress = send.clone();
-            let result = crate::cubic_convert::convert_with(
-                &saves.join(&folder),
-                &target,
-                &options,
-                |p| {
+            let result =
+                crate::cubic_convert::convert_with(&saves.join(&folder), &target, &options, |p| {
                     let _ = progress.send(ConvertUpdate::Progress(p));
-                },
-            );
+                });
             let done = result.map(|report| {
                 log::info!("Horizon: {}", crate::cubic_convert::summary(&report));
                 target

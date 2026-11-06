@@ -278,7 +278,11 @@ impl CubeIo {
 
 /// Writes cube record `tag` at `pos`: in the store's uniform sidecar when it
 /// is one block state and nothing else, else in a region file.
-pub(crate) fn store_record(store: &CubeStore, pos: SectionPos, tag: &NamedTag) -> std::io::Result<()> {
+pub(crate) fn store_record(
+    store: &CubeStore,
+    pos: SectionPos,
+    tag: &NamedTag,
+) -> std::io::Result<()> {
     if is_uniform_record(tag) {
         store
             .write_uniform(pos, tag)
@@ -1069,13 +1073,8 @@ impl CubicLevel {
         self.strip_bedrock(&mut vanilla);
         // The column's entities by cube: each is saved in its cube's record.
         let entities = split_by_cube(std::mem::take(&mut vanilla.entities));
-        let records = vanilla_column_records(
-            self.registry,
-            &self.biomes,
-            ctx.tables,
-            &vanilla,
-            &entities,
-        );
+        let records =
+            vanilla_column_records(self.registry, &self.biomes, ctx.tables, &vanilla, &entities);
         let heights = records.heights;
         let vanilla_base = vanilla.min_y() >> 4;
         for cube in records.cubes {
