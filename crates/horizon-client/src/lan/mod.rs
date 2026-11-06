@@ -150,6 +150,12 @@ pub const HORIZON_CLIENTS_ONLY: &str = "horizon-clients-only";
 pub const HORIZON_CLIENTS_ONLY_REASON: &str =
     "This server is for the Horizon client: playhorizon.dev";
 
+/// A vanilla client refused from a cubic world: the lang key a Horizon client translates, and
+/// the text a vanilla one shows (a component's `fallback`).
+pub const CUBIC_REFUSED_KEY: &str = "horizon.cubic.vanilla_refused";
+pub const CUBIC_REFUSED_FALLBACK: &str =
+    "This world has no height limit and needs the Horizon client: playhorizon.dev";
+
 /// How the server side of the network behaves: an integrated server's LAN
 /// uses the defaults, a dedicated server takes them from server.properties.
 #[derive(Clone)]
@@ -361,6 +367,9 @@ pub struct Shared {
     /// `DedicatedServer.setAcceptsTransfers`: whether a login by transfer from another server
     /// is accepted (`accepts-transfers`), live.
     accepts_transfers: AtomicBool,
+    /// A level of the world is cubic (docs/cubic-chunks.md): Horizon clients are told
+    /// while they configure and vanilla ones refused. Set by the hub.
+    cubic: AtomicBool,
     /// PlayerList.players in join order: profile id and name.
     online: Mutex<Vec<(u128, String)>>,
     next: AtomicU32,
@@ -379,6 +388,13 @@ pub struct Shared {
     turned_away: Mutex<(usize, Option<Instant>)>,
 }
 impl Shared {
+    /// Whether the world has a cubic level (`Hub::new`, `Hub::cubic_window_changed`).
+    pub fn cubic(&self) -> bool {
+        self.cubic.load(Ordering::SeqCst)
+    }
+    pub fn set_cubic(&self, on: bool) {
+        self.cubic.store(on, Ordering::SeqCst);
+    }
     /// The registries and tags a new connection is sent.
     pub fn sync(&self) -> Arc<data::SyncData> {
         self.sync.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -603,6 +619,7 @@ impl Lan {
             hide_online_players: AtomicBool::new(hide_online_players),
             enable_status: AtomicBool::new(enable_status),
             accepts_transfers: AtomicBool::new(config.accepts_transfers),
+            cubic: AtomicBool::new(false),
             online: Mutex::new(Vec::new()),
             next: AtomicU32::new(1),
             stop: AtomicBool::new(false),

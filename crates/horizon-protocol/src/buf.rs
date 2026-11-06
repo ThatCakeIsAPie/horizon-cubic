@@ -418,14 +418,74 @@ impl Codec<[f64; 3]> for Vec3d {
         }
     }
 }
-/// BlockPos.STREAM_CODEC: x (26 bits), z (26 bits), y (12 bits) in one long.
+static WIDE_POSITIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Turn the wide block position wire on or off for the whole process. Vanilla packs a
+/// `BlockPos` into one long with 12 bits of Y; a cubic level reaches y = +-8.4 million, so
+/// with this on, every `Pos` is three `i32`s (x, y, z) and a block entity's Y an `i32`.
+/// Both ends of a connection must agree; the integrated server and its window share the
+/// process, a LAN guest turns it on from the `horizon:cubic` payload.
+pub fn set_wide_positions(on: bool) {
+    WIDE_POSITIONS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+/// Whether block positions are on the wire as three `i32`s (see [`set_wide_positions`]).
+pub fn wide_positions() -> bool {
+    WIDE_POSITIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+static WIDE_HOLDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Wide positions are on for as long as this lives (and while any other hold does):
+/// a server with a cubic level holds one, and so does a client told of it. The last
+/// hold dropped turns them off again, so a world closing cannot turn off one
+/// that opened after it.
+pub struct WideHold(());
+/// Turn wide positions on until the returned hold (and every other) is dropped.
+pub fn hold_wide_positions() -> WideHold {
+    WIDE_HOLDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    set_wide_positions(true);
+    WideHold(())
+}
+impl Drop for WideHold {
+    fn drop(&mut self) {
+        if WIDE_HOLDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            set_wide_positions(false);
+        }
+    }
+}
+/// BlockPos.STREAM_CODEC: x (26 bits), z (26 bits), y (12 bits) in one long; three `i32`s
+/// when [`wide_positions`] is on.
 pub struct Pos;
 impl Codec<[i32; 3]> for Pos {
     fn read(r: &mut Reader) -> Result<[i32; 3]> {
+        if wide_positions() {
+            return Ok([r.i32()?, r.i32()?, r.i32()?]);
+        }
         Ok(unpack_block_pos(r.i64()?))
     }
     fn write(v: &[i32; 3], w: &mut Writer) {
-        w.i64(pack_block_pos(*v))
+        if wide_positions() {
+            for c in v {
+                w.i32(*c);
+            }
+        } else {
+            w.i64(pack_block_pos(*v))
+        }
+    }
+}
+/// A block entity's Y in `ClientboundLevelChunkPacketData`: a short, or an int when wide.
+pub struct BlockEntityY;
+impl Codec<i32> for BlockEntityY {
+    fn read(r: &mut Reader) -> Result<i32> {
+        if wide_positions() {
+            r.i32()
+        } else {
+            Ok(i32::from(r.i16()?))
+        }
+    }
+    fn write(v: &i32, w: &mut Writer) {
+        if wide_positions() {
+            w.i32(*v);
+        } else {
+            w.i16(*v as i16);
+        }
     }
 }
 pub fn pack_block_pos(p: [i32; 3]) -> i64 {

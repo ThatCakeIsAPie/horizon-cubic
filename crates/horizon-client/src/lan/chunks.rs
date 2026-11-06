@@ -712,6 +712,10 @@ impl ChunkEncoder {
         // The heightmaps depend on the level's height.
         self.heights.get_mut().unwrap().clear();
     }
+    /// The block Y of the first section the encoder puts on the wire.
+    pub fn window_min_y(&self) -> i32 {
+        self.column.section_y(self.sections.start)
+    }
     pub fn entity_type(&self, state: u32) -> Option<i32> {
         self.entity_types
             .get(state as usize)
@@ -1113,7 +1117,7 @@ impl ChunkEncoder {
                 }
                 entity_infos.push(BlockEntityInfo {
                     packed_xz: ((x << 4) | z) as i8,
-                    y: wy as i16,
+                    y: wy,
                     kind,
                     // BlockEntityInfo.create: an empty update tag is not sent.
                     tag: entity
@@ -1134,7 +1138,7 @@ impl ChunkEncoder {
             let at = |e: &BlockEntityInfo| {
                 let pos = (
                     chunk.x * 16 + i32::from(e.packed_xz as u8 >> 4),
-                    i32::from(e.y),
+                    e.y,
                     chunk.z * 16 + i32::from(e.packed_xz as u8 & 15),
                 );
                 order.iter().position(|p| *p == pos).unwrap_or(usize::MAX)
@@ -1144,7 +1148,7 @@ impl ChunkEncoder {
         java_hash_order(&mut entity_infos, |e| {
             (
                 chunk.x * 16 + i32::from(e.packed_xz as u8 >> 4),
-                i32::from(e.y),
+                e.y,
                 chunk.z * 16 + i32::from(e.packed_xz as u8 & 15),
             )
         });
@@ -1559,12 +1563,7 @@ mod tests {
                 .iter()
                 .map(|e| {
                     let xz = e.packed_xz as u8;
-                    (
-                        i32::from(xz >> 4),
-                        i32::from(e.y),
-                        i32::from(xz & 15),
-                        e.kind,
-                    )
+                    (i32::from(xz >> 4), e.y, i32::from(xz & 15), e.kind)
                 })
                 .collect::<Vec<_>>()
         };
@@ -1614,7 +1613,7 @@ mod tests {
             HashMap::from([((1, MIN_Y + 2, 3), BlockEntity::Mod(Box::new(machine)))]);
         let infos = encoder.encode(&chunk, &block_entities).chunk.block_entities;
         assert_eq!(infos.len(), 1, "the casing has no block entity");
-        assert_eq!((infos[0].kind, infos[0].y), (49, (MIN_Y + 2) as i16));
+        assert_eq!((infos[0].kind, infos[0].y), (49, MIN_Y + 2));
         let mut expected = Compound::new();
         expected.insert("active".into(), Tag::Byte(1));
         expected.insert("x".into(), Tag::Int(1));
@@ -2227,6 +2226,21 @@ mod tests {
         let per_section = vanilla.chunk.buffer.len() / SECTIONS;
         assert!(tall.chunk.buffer.len() > per_section * 131);
         assert_eq!(tall.light.sky.len(), 132);
+    }
+
+    #[test]
+    fn a_cubic_window_is_encoded_by_its_own_height_and_y() {
+        let shape = LevelShape::cubic_window(LevelShape::OVERWORLD, 1_000_000, 512);
+        let mut chunk = Chunk::with_layout(0, 0, shape.column());
+        chunk.set(3, 1_000_020, 4, 1);
+        let mut encoder = encoder();
+        encoder.set_dimension(shape);
+        let packet = encoder.encode(&chunk, &HashMap::new());
+        assert!(packet.light.sky.len() >= 32);
+        let sections = packet.chunk.sections(32, 16, 7).unwrap();
+        assert_eq!(sections.len(), 32);
+        // The stone is in the window's second section, 1_000_020 - 1_000_000 up.
+        assert_eq!((sections[0].non_empty, sections[1].non_empty), (0, 1));
     }
 
     #[test]

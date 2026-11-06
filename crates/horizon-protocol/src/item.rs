@@ -4,7 +4,7 @@
 use crate::{
     Result,
     adapter::ids,
-    buf::{Codec, Reader, Writer, pack_block_pos, unpack_block_pos},
+    buf::{Codec, Pos, Reader, Writer},
 };
 use horizon_world::nbt::Tag;
 use std::sync::Arc;
@@ -471,7 +471,7 @@ impl Component {
             FIREWORK_EXPLOSION => Self::FireworkExplosion(FireworkExplosion::read(r)?),
             LODESTONE_TRACKER => {
                 let target = if r.bool()? {
-                    Some((r.string(32767)?, unpack_block_pos(r.i64()?)))
+                    Some((r.string(32767)?, Pos::read(r)?))
                 } else {
                     None
                 };
@@ -666,7 +666,7 @@ impl Component {
                 w.bool(target.is_some());
                 if let Some((dimension, pos)) = target {
                     w.string(dimension);
-                    w.i64(pack_block_pos(*pos));
+                    Pos::write(pos, w);
                 }
                 w.bool(*tracked);
             }

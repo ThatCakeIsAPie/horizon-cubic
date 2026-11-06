@@ -265,6 +265,9 @@ fn take_tracking(
 }
 
 pub struct Hub {
+    /// Wide block positions are on while a level is cubic (`cubic_window_changed`,
+    /// `HubConfig::levels`); dropped with the hub, when the world closes.
+    wide: Option<horizon_protocol::buf::WideHold>,
     /// Clicks on and closings of native mods' menus, for the game.
     pub native_menu_events: Vec<super::menu::NativeMenuEvent>,
     /// Kicks waiting for the game thread to notify native mods.
@@ -626,7 +629,11 @@ impl Hub {
         let clock_ids = (0..sync.dynamic.len("minecraft:world_clock") as i32).collect();
         let mut encoder = encoder;
         encoder.set_dimension(config.levels.get(&config.dimension));
+        let wide =
+            levels_are_cubic(&config.levels).then(horizon_protocol::buf::hold_wide_positions);
+        lan.shared.set_cubic(wide.is_some());
         Self {
+            wide,
             lan,
             config,
             encoder,
@@ -1222,6 +1229,9 @@ impl Hub {
             online_mode: self.lan.shared.config.online.is_some(),
             enforces_secure_chat: self.enforces_secure_chat(),
         }));
+        // A cubic level's window, before any of its chunks.
+        self.send_cubic_window(i);
+        let g = &self.guests[i];
         g.send(&C::ChangeDifficulty(play::ChangeDifficulty {
             difficulty: ctx.difficulty,
             locked: ctx.difficulty_locked,
@@ -4284,6 +4294,8 @@ impl Hub {
             spawn: info,
             keep: 0,
         }));
+        self.send_cubic_window(i);
+        let g = &mut self.guests[i];
         // ClientPacketListener.handleRespawn without KEEP_ENTITY_DATA: the client's new player
         // starts with wasSprinting false. (A level change keeps it: the new player sprints on, or
         // says STOP.)
@@ -4358,6 +4370,56 @@ impl Hub {
             .set_dimension(self.config.levels.get(dimension));
     }
 
+    /// The shape of the level the hub names, when it is cubic.
+    fn cubic_shape(&self) -> Option<crate::chunk::LevelShape> {
+        Some(self.config.levels.get(&self.config.dimension)).filter(|s| s.cubic)
+    }
+
+    /// `horizon:cubic_window` for player `i`, when the level it is in is
+    /// cubic: sent after the Login or Respawn packet and before the level's
+    /// chunks, so the client lays its level out for the window first.
+    fn send_cubic_window(&self, i: usize) {
+        if let Some(shape) = self.cubic_shape() {
+            send_window(&self.guests[i], shape);
+        }
+    }
+
+    /// The server swapped level `dimension` for one with a new window
+    /// (`shape`, `LevelShape::cubic_window`). Every player in that level is
+    /// told the window, then sent the level's chunks again, nearest first, as
+    /// after a join: what was sent of the level is forgotten (the client drops
+    /// its chunks on the window payload, so no ForgetLevelChunk is sent). The
+    /// hub's encoder and levels follow. Entities stay tracked. Call it after
+    /// the new `World` is the one `TickCtx` carries, before the next
+    /// `update_chunks`.
+    pub fn cubic_window_changed(&mut self, dimension: &str, shape: crate::chunk::LevelShape) {
+        debug_assert!(shape.cubic);
+        *self.config.levels.get_mut(dimension) = shape;
+        if self.wide.is_none() {
+            self.wide = Some(horizon_protocol::buf::hold_wide_positions());
+            self.lan.shared.set_cubic(true);
+        }
+        // Sections offered under the old window and bulk changes of its columns.
+        super::handoff::forget_all();
+        if self.config.dimension != dimension {
+            return;
+        }
+        self.encoder.set_dimension(shape);
+        for g in self.guests.iter_mut().filter(|g| g.dimension == dimension) {
+            send_window(g, shape);
+            g.sent_chunks.clear();
+            g.far_sent_chunks.clear();
+            g.chunk_queue.clear();
+            g.far_queue.clear();
+            // Both ends forget the view: the next update requeues it around the
+            // player and sends the centre again.
+            g.center = None;
+            g.center_sent = None;
+            // Batches in flight were of the old window; their acknowledgements
+            // still come and pace the new ones.
+        }
+    }
+
     /// ServerPlayer.teleport(TeleportTransition) into the level the hub now
     /// names (`set_dimension`): ClientboundRespawnPacket keeping all data,
     /// then vanilla's packet order. Nothing tracked in the old level is
@@ -4401,6 +4463,8 @@ impl Hub {
             // ClientboundRespawnPacket.KEEP_ALL_DATA.
             keep: 3,
         }));
+        self.send_cubic_window(i);
+        let g = &mut self.guests[i];
         g.send(&C::ChangeDifficulty(play::ChangeDifficulty {
             difficulty: ctx.difficulty,
             locked: ctx.difficulty_locked,
@@ -4531,6 +4595,27 @@ fn send_recipe_content(g: &Guest) {
             },
         ));
     }
+}
+
+/// Whether any of the world's levels is cubic.
+fn levels_are_cubic(levels: &crate::chunk::LevelShapes) -> bool {
+    [levels.overworld, levels.nether, levels.end]
+        .iter()
+        .any(|s| s.cubic)
+}
+
+/// `horizon:cubic_window` for one player.
+fn send_window(g: &Guest, shape: crate::chunk::LevelShape) {
+    g.send(&C::CustomPayload(
+        horizon_protocol::packets::configuration::CustomPayload {
+            channel: horizon_protocol::cubic::WINDOW_CHANNEL.into(),
+            data: horizon_protocol::cubic::Window {
+                min_y: shape.min_y,
+                height: shape.height,
+            }
+            .encode(),
+        },
+    ));
 }
 
 fn raw(id: i32, payload: Vec<u8>) -> C {
@@ -4847,6 +4932,151 @@ mod tests {
             vec![([0, 63, 0], STONE as i32)],
             "one block under a box that sits across a block"
         );
+    }
+
+    /// What a player was sent, in order: `Login`, a cubic window as (min_y, height), or a
+    /// chunk column's position.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Login,
+        Window(i32, i32),
+        Chunk(i32, i32),
+    }
+
+    fn seen(rx: &std::sync::mpsc::Receiver<crate::lan::Out>) -> Vec<Seen> {
+        let mut out = Vec::new();
+        let mut one = |body: &[u8]| {
+            let mut r = horizon_protocol::buf::Reader::new(body);
+            let id = r.varint().unwrap();
+            match C::decode(id, r.rest()) {
+                Ok(C::Login(_)) => out.push(Seen::Login),
+                Ok(C::LevelChunkWithLight(p)) => out.push(Seen::Chunk(p.x, p.z)),
+                Ok(C::CustomPayload(p)) if p.channel == horizon_protocol::cubic::WINDOW_CHANNEL => {
+                    let w = horizon_protocol::cubic::Window::decode(&p.data).unwrap();
+                    out.push(Seen::Window(w.min_y, w.height));
+                }
+                _ => {}
+            }
+        };
+        while let Ok(o) = rx.try_recv() {
+            match o {
+                crate::lan::Out::Packet(b) => one(&b),
+                crate::lan::Out::Packets(bs) => bs.iter().for_each(|b| one(b)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A lit cubic world of the window's shape, with the columns around the origin.
+    fn cubic_world(shape: crate::chunk::LevelShape) -> World {
+        let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        world.shape = shape;
+        for cz in -3..=3 {
+            for cx in -3..=3 {
+                let mut chunk = crate::chunk::Chunk::with_layout(cx, cz, shape.column());
+                chunk.lit = true;
+                world.chunks.insert((cx, cz), std::sync::Arc::new(chunk));
+            }
+        }
+        world
+    }
+
+    /// A player in a cubic level is told its window after the Login packet and before any
+    /// chunk; when the server moves the window it is told the new one and sent every chunk
+    /// again, nearest first.
+    #[test]
+    fn a_cubic_levels_window_comes_before_its_chunks_and_again_when_it_moves() {
+        use crate::chunk::LevelShape;
+        let (mut hub, rx) = hub_with_a_guest();
+        let first = LevelShape::cubic_window(LevelShape::OVERWORLD, 1_000_000, 512);
+        let second = LevelShape::cubic_window(LevelShape::OVERWORLD, 1_000_256, 512);
+        hub.cubic_window_changed("minecraft:overworld", first);
+        assert!(hub.lan.shared.cubic() && horizon_protocol::buf::wide_positions());
+        // The window of the (already placed) guest at that change; then a fresh placement.
+        assert_eq!(seen(&rx), vec![Seen::Window(1_000_000, 512)]);
+        let mut world = cubic_world(first);
+        let border = crate::worldborder::WorldBorder::default();
+        let mut next = 100;
+        let mut ctx = TickCtx {
+            world: &mut world,
+            entities: &[],
+            next_entity: &mut next,
+            spawn: [0.5, 1_000_100.0, 0.5],
+            difficulty: 2,
+            difficulty_locked: false,
+            clock_rate: 1.0,
+            tick_rate: 20.0,
+            tick_frozen: false,
+            tick_steps: Default::default(),
+            collision: None,
+            border: &border,
+            streaming: None,
+        };
+        hub.guests[0].position = [0.5, 1_000_100.0, 0.5];
+        hub.place_new_player(1, &mut ctx);
+        let mut stream = seen(&rx);
+        for _ in 0..40 {
+            hub.ticks += 1;
+            hub.update_chunks(&ctx);
+            stream.extend(seen(&rx));
+            hub.guests[0].unacknowledged = 0;
+        }
+        assert_eq!(
+            &stream[..2],
+            [Seen::Login, Seen::Window(1_000_000, 512)],
+            "the window follows Login"
+        );
+        let chunks: Vec<_> = stream
+            .iter()
+            .filter_map(|s| match s {
+                Seen::Chunk(x, z) => Some((*x, *z)),
+                _ => None,
+            })
+            .collect();
+        assert!(chunks.len() > 20, "the view is sent: {}", chunks.len());
+        assert_eq!(chunks[0], (0, 0), "nearest first");
+        assert!(
+            !stream[2..].iter().any(|s| matches!(s, Seen::Window(..))),
+            "one window, before the chunks"
+        );
+        // The server swaps the level for one with a new window.
+        let mut moved = cubic_world(second);
+        let ctx = TickCtx {
+            world: &mut moved,
+            entities: &[],
+            next_entity: &mut next,
+            spawn: [0.5, 1_000_100.0, 0.5],
+            difficulty: 2,
+            difficulty_locked: false,
+            clock_rate: 1.0,
+            tick_rate: 20.0,
+            tick_frozen: false,
+            tick_steps: Default::default(),
+            collision: None,
+            border: &border,
+            streaming: None,
+        };
+        hub.cubic_window_changed("minecraft:overworld", second);
+        let mut again = seen(&rx);
+        assert_eq!(again, vec![Seen::Window(1_000_256, 512)]);
+        for _ in 0..40 {
+            hub.ticks += 1;
+            hub.update_chunks(&ctx);
+            again.extend(seen(&rx));
+            hub.guests[0].unacknowledged = 0;
+        }
+        let resent: Vec<_> = again
+            .iter()
+            .filter_map(|s| match s {
+                Seen::Chunk(x, z) => Some((*x, *z)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resent, chunks, "every chunk again, in the same order");
+        // The encoder follows the new window: its sections start at the new floor.
+        assert_eq!(hub.encoder.window_min_y(), 1_000_256);
+        horizon_protocol::buf::set_wide_positions(false);
     }
 
     /// The tabs the guest was sent in `ClientboundSelectAdvancementsTabPacket`s, in order.

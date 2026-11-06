@@ -49,6 +49,19 @@ impl ChunkFormat {
     pub(super) fn in_column(self, column: ColumnLayout) -> Self {
         Self { column, ..self }
     }
+    /// Decodes a cubic level's window (`horizon:cubic_window`): `shape`'s sections, from its
+    /// `min_y`, into chunks of its column. A new format, so columns decoded under the old one
+    /// are decoded again.
+    pub(super) fn with_window(&self, shape: horizon_client::chunk::LevelShape) -> Self {
+        Self {
+            column: shape.column(),
+            min_y: shape.min_y,
+            sections: shape.section_count(),
+            has_skylight: shape.sky_light,
+            biome_map: self.biome_map.clone(),
+            biome_bits: self.biome_bits,
+        }
+    }
     /// The column decoded chunks hold.
     pub(super) fn layout(&self) -> ColumnLayout {
         self.column
@@ -300,7 +313,7 @@ impl Game<'_> {
         for info in &p.chunk.block_entities {
             let pos = (
                 x * 16 + i32::from(info.packed_xz as u8 >> 4),
-                i32::from(info.y),
+                info.y,
                 z * 16 + i32::from(info.packed_xz as u8 & 15),
             );
             let state = self.world.block(pos.0, pos.1, pos.2);
@@ -441,6 +454,56 @@ mod tests {
             }
         }
         assert!(matches!(decoder.next(), Next::Decoding));
+    }
+
+    /// A cubic level's window far from the origin: the packet's 32 sections are the
+    /// chunk's, from the window's `min_y`, and the light layers line up with them.
+    #[test]
+    fn a_window_far_from_the_origin_decodes_by_its_own_height() {
+        use horizon_client::chunk::LevelShape;
+        let shape = LevelShape::cubic_window(LevelShape::OVERWORLD, 1_000_000, 512);
+        let overworld = DimensionType::vanilla("minecraft:overworld");
+        let format = ChunkFormat::new(&overworld, vec![0, 7, 9], 2).with_window(shape);
+        assert_eq!(format.layout(), shape.column());
+        let mut sections = Vec::new();
+        for i in 0..32 {
+            sections.push(Wire {
+                non_empty: if i == 1 { 1 } else { 0 },
+                fluids: 0,
+                states: if i == 1 {
+                    let mut states = [0; 4096];
+                    states[(5 * 16 + 4) * 16 + 3] = 7;
+                    Paletted::from_values(&states, Wiring::Blocks, 16)
+                } else {
+                    Paletted::from_values(&[0; 4096], Wiring::Blocks, 16)
+                },
+                biomes: Paletted::from_values(&[1; 64], Wiring::Biomes, 2),
+            });
+        }
+        let none = LightData {
+            sky_mask: Vec::new(),
+            block_mask: Vec::new(),
+            empty_sky_mask: Vec::new(),
+            empty_block_mask: Vec::new(),
+            sky: Vec::new(),
+            block: Vec::new(),
+        };
+        let p = play::LevelChunkWithLight {
+            x: 2,
+            z: -3,
+            chunk: ChunkData {
+                heightmaps: Vec::new(),
+                buffer: ChunkData::from_sections(&sections),
+                block_entities: Vec::new(),
+            },
+            light: none,
+        };
+        let chunk = format.column(&p).unwrap();
+        assert_eq!((chunk.min_y(), chunk.sections.len()), (1_000_000, 32));
+        // Section 1 starts at 1_000_016: y 5 of it is 1_000_021.
+        assert_eq!(chunk.get(3, 1_000_021, 4), 7);
+        assert_eq!(chunk.get(3, 1_000_020, 4), 0);
+        assert_eq!(chunk.biome(0, 1_000_511, 0), 7);
     }
 
     /// `LevelChunk.replaceBiomes`: the packet's containers go to the
