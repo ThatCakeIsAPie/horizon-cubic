@@ -2181,9 +2181,10 @@ pub(super) fn wheel(state: &mut State, delta: f32, cursor: (f32, f32), size: (f3
     }
 }
 
-/// The focus landed on a picker row (the controller): it is chosen.
+/// The focus landed on a row of a single-choice picker (the controller): it is
+/// chosen. A multi-choice row toggles only on a press, never on focus.
 pub(super) fn focus_row(state: &mut State, cursor: (f32, f32), size: (f32, f32)) -> bool {
-    matches!(state.overlay, Overlay::Picker(_)) && picker_click(state, cursor, size)
+    matches!(&state.overlay, Overlay::Picker(p) if !p.multi) && picker_click(state, cursor, size)
 }
 
 // ---------------------------------------------------------------------------
