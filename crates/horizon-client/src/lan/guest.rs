@@ -82,6 +82,17 @@ pub struct SentEffect {
 /// ServerGamePacketListenerImpl.CLIENT_LOADED_TIMEOUT_TIME.
 pub const CLIENT_LOADED_TIMEOUT: u8 = 60;
 
+/// The cubes of one column a client has to be sent (`Guest::cube_queue`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CubesDue {
+    pub column: (i32, i32),
+    /// Cube Ys, in the order they are sent.
+    pub cubes: Vec<i32>,
+    /// The hub tick they were queued at: a column whose light is not settled by
+    /// `CUBES_WAIT` ticks later is sent as it is.
+    pub since: u64,
+}
+
 pub struct Guest {
     pub conn: u32,
     /// The client's address (IP bans, `list`).
@@ -238,6 +249,13 @@ pub struct Guest {
     pub chunk_queue: Vec<(i32, i32)>,
     /// The far ring's chunks still to send, past the view distance (`lan::far`), closest first.
     pub far_queue: Vec<(i32, i32)>,
+    /// A cubic level: the vertical view distance in cubes this client asked for
+    /// (`horizon:cubic_view`), which sets the height of the window around it.
+    pub vertical: u8,
+    /// A cubic level's cubes the client holds columns for and has not been sent: the cubes
+    /// that entered when the window slid (`Hub::cubic_window_changed`), nearest column first
+    /// when sent.
+    pub cube_queue: Vec<CubesDue>,
     /// PlayerChunkSender: batches sent but not yet acknowledged, how many
     /// may be (1 until the client's first acknowledgement, then 10), the
     /// rate the client asks for and the chunks the next batch may hold.
@@ -477,6 +495,8 @@ impl Guest {
             far_sent_chunks: Default::default(),
             chunk_queue: Vec::new(),
             far_queue: Vec::new(),
+            vertical: crate::cubic::DEFAULT_VERTICAL,
+            cube_queue: Vec::new(),
             unacknowledged: 0,
             max_unacknowledged: 1,
             chunks_per_tick: 9.0,
