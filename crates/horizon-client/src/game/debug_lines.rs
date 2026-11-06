@@ -50,7 +50,10 @@ impl Game<'_> {
         for path in paths {
             match path {
                 "biome" => self.debug_biome_line(d),
-                "chunk_render_stats" => self.debug_chunk_render_line(d),
+                "chunk_render_stats" => {
+                    self.debug_chunk_render_line(d);
+                    self.debug_cubic_lines(d);
+                }
                 "chunk_source_stats" => self.debug_chunk_source_lines(d, server.as_ref()),
                 "day_count" => {
                     if self.player.is_some() {
@@ -262,6 +265,46 @@ impl Game<'_> {
             self.streaming.pending(),
             0
         ));
+    }
+
+    /// Horizon's own lines in a cubic level, under the render stats: the
+    /// player's cube, the window of cubes loaded and the vertical distance,
+    /// then the far terrain's progress (nodes drawn of planned, still to do,
+    /// left out as uniform, and whether they take the GPU path).
+    fn debug_cubic_lines(&self, d: &mut Displayer) {
+        let shape = self.world.shape;
+        if !shape.cubic {
+            return;
+        }
+        let cube = self
+            .player
+            .as_ref()
+            .map_or(0, |p| (p.position.y.floor() as i32) >> 4);
+        d.line(format!(
+            "Cubic: cube {cube} in {}..={} (V {})",
+            shape.min_y >> 4,
+            (shape.min_y + shape.height - 1) >> 4,
+            self.settings.horizon.cubic_vertical
+        ));
+        if let Some(lod) = self.cube_lod.as_ref() {
+            let s = lod.stats();
+            let done = match (s.complete, s.plan_changed, s.plan_complete) {
+                (true, Some(changed), Some(complete)) => format!(
+                    " done in {:.1}s",
+                    complete.saturating_duration_since(changed).as_secs_f32()
+                ),
+                _ => String::new(),
+            };
+            d.line(format!(
+                "Far: {}/{} p: {} u: {} {} {}MB{done}",
+                s.ready,
+                s.planned,
+                s.pending,
+                s.uniform_skipped,
+                if lod.on_gpu_path() { "GPU" } else { "CPU" },
+                (s.arena_bytes + s.pool_bytes) >> 20,
+            ));
+        }
     }
 
     /// `LevelExtractor.entityStatistics`: the mobs drawn last frame of the
