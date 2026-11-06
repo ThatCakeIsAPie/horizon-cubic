@@ -1,9 +1,12 @@
 //! Far meshes share the terrain arenas and passes, with their actual bounds
 //! rather than the 16³ boxes used by the near-section residency walk.
-use super::{Frustum, Renderer, SectionGpu};
+use super::{Frustum, Renderer, SectionGpu, cube_far, cube_gen::GpuBackend};
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
-    lod::{MAX_LEVEL, TileKey, cube::CubeKey},
+    lod::{
+        MAX_LEVEL, TileKey,
+        cube::{CubeKey, GpuBatch},
+    },
     mesher::SectionMesh,
 };
 use glam::{DVec3, Vec3};
@@ -411,6 +414,56 @@ impl Renderer {
         }
     }
 
+    /// Whether far cube terrain can be meshed and drawn on the GPU here: the
+    /// device runs compute shaders and draws indirect with a first instance.
+    pub fn gpu_far_available(&self) -> bool {
+        self.multi_draw
+            && self.adapter.get_downlevel_capabilities().flags.contains(
+                wgpu::DownlevelFlags::COMPUTE_SHADERS | wgpu::DownlevelFlags::VERTEX_STORAGE,
+            )
+            && self.device.limits().max_storage_buffers_per_shader_stage >= 6
+    }
+
+    /// Makes the GPU far terrain ready for nodes of `backend`'s pool, which
+    /// must be on this renderer's device. `states` the registry's block state
+    /// count, `air` its air state. False if it cannot run (stay on the CPU).
+    pub fn use_gpu_cube_lods(&mut self, backend: &GpuBackend, states: usize, air: u32) -> bool {
+        if self.cube_far.is_some() {
+            return self
+                .cube_far
+                .as_ref()
+                .is_some_and(|far| *far.device() == backend.device);
+        }
+        if !self.gpu_far_available() || backend.device != self.device {
+            return false;
+        }
+        let setup = cube_far::DrawSetup {
+            bindings: &self.terrain_layout,
+            format: self.frame_format,
+            sprite_constants: self.terrain_sprites,
+            counts: self
+                .device
+                .features()
+                .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
+                && self.info.backend != wgpu::Backend::Dx12,
+        };
+        self.cube_far = cube_far::CubeFar::new(backend, states, air, &setup);
+        self.cube_far.is_some()
+    }
+
+    /// Queues the nodes `CubeLod::take_gpu_nodes` returned for meshing.
+    pub fn queue_gpu_cube_lods(&mut self, batch: GpuBatch) {
+        if let Some(far) = &mut self.cube_far {
+            far.set_materials(&batch.materials, batch.biomes.as_deref());
+            far.queue(batch.nodes, Vec::new());
+        }
+    }
+
+    /// The GPU far terrain's counters, if it runs.
+    pub fn cube_far_stats(&self) -> Option<cube_far::FarStats> {
+        self.cube_far.as_ref().map(|far| far.stats())
+    }
+
     pub fn remove_cube_lod(&mut self, key: CubeKey) {
         if let Some(tile) = self.lod_cubes.remove(&key) {
             self.lod_cull_free.push(tile.cull_slot);
@@ -421,6 +474,9 @@ impl Renderer {
     /// Drops every cube tile and what waits to upload.
     pub fn clear_cube_lods(&mut self) {
         self.cube_pending = None;
+        if let Some(far) = &mut self.cube_far {
+            far.clear();
+        }
         for (_, tile) in std::mem::take(&mut self.lod_cubes) {
             self.lod_cull_free.push(tile.cull_slot);
             self.release_tile(tile);
@@ -437,6 +493,9 @@ impl Renderer {
         if meshes.is_empty() && removed.is_empty() {
             return;
         }
+        if let Some(far) = &mut self.cube_far {
+            far.queue(Vec::new(), removed.clone());
+        }
         self.cube_pending
             .get_or_insert_default()
             .add(meshes, removed);
@@ -447,6 +506,9 @@ impl Renderer {
     /// for `FADE` and go: nothing opens a hole while the new ones come in.
     pub fn upload_cube_lods(&mut self, budget: Duration) {
         let start = Instant::now();
+        if let Some(far) = &mut self.cube_far {
+            far.upload();
+        }
         let faded: Vec<_> = self
             .lod_cubes
             .iter()

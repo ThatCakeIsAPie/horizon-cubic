@@ -24,8 +24,9 @@ pub(super) struct EdgeColumn<'a> {
     pub unknown: bool,
 }
 
-#[derive(Clone, Copy)]
-enum Tint {
+/// How a far face is tinted: the biome colour it takes, or a constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tint {
     None,
     Grass,
     Foliage,
@@ -33,17 +34,145 @@ enum Tint {
     Water,
     Constant(u32),
 }
-#[derive(Clone, Copy)]
-struct Style {
-    layer: u16,
-    tint: Tint,
-    translucent: bool,
+/// One textured face of a far voxel: a block face may draw two (grass's side
+/// is its dirt, then the tinted overlay).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Style {
+    /// Sprite layer, `OPAQUE_LAYER` set for opaque leaves and faces over opaque texels.
+    pub layer: u16,
+    pub tint: Tint,
+    pub translucent: bool,
 }
-#[derive(Clone, Copy)]
-struct Styles {
-    faces: [Option<Style>; 2],
-    fluid: u8,
-    opaque: bool,
+/// How a block state looks from one direction, and how it hides what lies
+/// behind it. The one lookup the CPU mesher (`Mesher::material`) and the GPU
+/// material table (`gfx::cube_mesh`) share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Styles {
+    pub faces: [Option<Style>; 2],
+    /// 0 none, 1 water, 2 lava.
+    pub fluid: u8,
+    pub opaque: bool,
+}
+/// The directional shade of a face.
+pub(crate) fn direction_shade(direction: Direction) -> f32 {
+    match direction {
+        Direction::Up => 1.0,
+        Direction::Down => 0.5,
+        Direction::North | Direction::South => 0.8,
+        Direction::West | Direction::East => 0.6,
+    }
+}
+/// The 0xRRGGBB a tint gives at block column `at` in `biome`.
+pub(crate) fn tint_rgb(context: &WorkerContext, tint: Tint, biome: u16, at: [i32; 2]) -> u32 {
+    let info = context.biomes.get(biome);
+    match tint {
+        Tint::None => 0xffffff,
+        Tint::Grass => context
+            .biomes
+            .grass(biome, f64::from(at[0]), f64::from(at[1])),
+        Tint::Foliage => info.foliage,
+        Tint::Dry => info.dry_foliage,
+        Tint::Water => info.water,
+        Tint::Constant(color) => color,
+    }
+}
+/// The style of `state`'s `direction` faces, from the registry and the block models.
+pub(crate) fn far_style(
+    context: &WorkerContext,
+    state: BlockStateId,
+    direction: Direction,
+) -> Styles {
+    let assets = &context.assets;
+    let name = assets.registry.state(state).map_or("", |s| s.name.as_str());
+    let fluid = match name {
+        "minecraft:water" | "minecraft:bubble_column" => 1,
+        "minecraft:lava" => 2,
+        _ => 0,
+    };
+    if fluid != 0 {
+        let sprite = if fluid == 1 {
+            "block/water_still"
+        } else {
+            "block/lava_still"
+        };
+        let render = &context.render;
+        let layer = render
+            .sprite_layers
+            .get(sprite)
+            .or_else(|| render.sprite_layers.get(&format!("minecraft:{sprite}")))
+            .copied()
+            .unwrap_or(0) as u16;
+        return Styles {
+            faces: [
+                Some(Style {
+                    layer,
+                    tint: if fluid == 1 { Tint::Water } else { Tint::None },
+                    translucent: fluid == 1,
+                }),
+                None,
+            ],
+            fluid,
+            opaque: fluid == 2,
+        };
+    }
+    let leaves = name.ends_with("_leaves");
+    let tint = match name.strip_prefix("minecraft:").unwrap_or(name) {
+        "spruce_leaves" => Tint::Constant(0x61_9961),
+        "birch_leaves" => Tint::Constant(0x80_A755),
+        // Cherry (and other pre-coloured) leaves: the texture is
+        // already pink; biome foliage tint turns a grove yellow (#4688).
+        "cherry_leaves" | "azalea_leaves" | "flowering_azalea_leaves" | "pale_oak_leaves" => {
+            Tint::None
+        }
+        "leaf_litter" => Tint::Dry,
+        _ if leaves => Tint::Foliage,
+        _ => Tint::Grass,
+    };
+    let models = context
+        .render
+        .model_catalog
+        .collect(state, BlockPos::new(0, 0, 0))
+        .ok();
+    let opaque = leaves
+        || models
+            .iter()
+            .flatten()
+            .flat_map(|(_, model)| &model.faces)
+            .any(|face| !face.translucent);
+    let mut matching = models
+        .iter()
+        .flatten()
+        .flat_map(|(_, model)| &model.faces)
+        .filter(|face| face.quad.facing == direction);
+    let mut faces = [None; 2];
+    for slot in &mut faces {
+        let Some(face) = matching.next() else { break };
+        *slot = Some(Style {
+            // As the mesher marks them: opaque leaves and faces over opaque texels skip
+            // the cutout and draw in the opaque pass.
+            layer: face.layer as u16
+                | if leaves || face.opaque {
+                    OPAQUE_LAYER
+                } else {
+                    0
+                },
+            tint: if face.quad.tint_index >= 0 {
+                tint
+            } else {
+                Tint::None
+            },
+            translucent: face.translucent && !leaves,
+        });
+        // Grass's tinted side overlay must follow its untinted base.
+        if name != "minecraft:grass_block" || matches!(direction, Direction::Up | Direction::Down) {
+            break;
+        }
+    }
+    Styles {
+        opaque,
+        faces,
+        fluid,
+    }
 }
 #[derive(Clone, Copy)]
 struct Paint {
@@ -95,127 +224,12 @@ impl Mesher {
         let styles = *self
             .styles
             .entry((span.state, direction as u8))
-            .or_insert_with(|| {
-                let assets = &context.assets;
-                let name = assets
-                    .registry
-                    .state(span.state)
-                    .map_or("", |s| s.name.as_str());
-                let fluid = match name {
-                    "minecraft:water" | "minecraft:bubble_column" => 1,
-                    "minecraft:lava" => 2,
-                    _ => 0,
-                };
-                if fluid != 0 {
-                    let sprite = if fluid == 1 {
-                        "block/water_still"
-                    } else {
-                        "block/lava_still"
-                    };
-                    let render = &context.render;
-                    let layer = render
-                        .sprite_layers
-                        .get(sprite)
-                        .or_else(|| render.sprite_layers.get(&format!("minecraft:{sprite}")))
-                        .copied()
-                        .unwrap_or(0) as u16;
-                    return Styles {
-                        faces: [
-                            Some(Style {
-                                layer,
-                                tint: if fluid == 1 { Tint::Water } else { Tint::None },
-                                translucent: fluid == 1,
-                            }),
-                            None,
-                        ],
-                        fluid,
-                        opaque: fluid == 2,
-                    };
-                }
-                let leaves = name.ends_with("_leaves");
-                let tint = match name.strip_prefix("minecraft:").unwrap_or(name) {
-                    "spruce_leaves" => Tint::Constant(0x61_9961),
-                    "birch_leaves" => Tint::Constant(0x80_A755),
-                    // Cherry (and other pre-coloured) leaves: the texture is
-                    // already pink; biome foliage tint turns a grove yellow (#4688).
-                    "cherry_leaves"
-                    | "azalea_leaves"
-                    | "flowering_azalea_leaves"
-                    | "pale_oak_leaves" => Tint::None,
-                    "leaf_litter" => Tint::Dry,
-                    _ if leaves => Tint::Foliage,
-                    _ => Tint::Grass,
-                };
-                let models = context
-                    .render
-                    .model_catalog
-                    .collect(span.state, BlockPos::new(0, 0, 0))
-                    .ok();
-                let opaque = leaves
-                    || models
-                        .iter()
-                        .flatten()
-                        .flat_map(|(_, model)| &model.faces)
-                        .any(|face| !face.translucent);
-                let mut matching = models
-                    .iter()
-                    .flatten()
-                    .flat_map(|(_, model)| &model.faces)
-                    .filter(|face| face.quad.facing == direction);
-                let mut faces = [None; 2];
-                for slot in &mut faces {
-                    let Some(face) = matching.next() else { break };
-                    *slot = Some(Style {
-                        // As the mesher marks them: opaque leaves and faces over opaque
-                        // texels skip the cutout and draw in the opaque pass.
-                        layer: face.layer as u16
-                            | if leaves || face.opaque {
-                                OPAQUE_LAYER
-                            } else {
-                                0
-                            },
-                        tint: if face.quad.tint_index >= 0 {
-                            tint
-                        } else {
-                            Tint::None
-                        },
-                        translucent: face.translucent && !leaves,
-                    });
-                    // Grass's tinted side overlay must follow its untinted base.
-                    if name != "minecraft:grass_block"
-                        || matches!(direction, Direction::Up | Direction::Down)
-                    {
-                        break;
-                    }
-                }
-                Styles {
-                    opaque,
-                    faces,
-                    fluid,
-                }
-            });
-        let biome = context.biomes.get(span.biome);
-        let shade = match direction {
-            Direction::Up => 1.0,
-            Direction::Down => 0.5,
-            Direction::North | Direction::South => 0.8,
-            Direction::West | Direction::East => 0.6,
-        };
+            .or_insert_with(|| far_style(context, span.state, direction));
+        let shade = direction_shade(direction);
         Material {
             faces: styles.faces.map(|face| {
                 face.map(|face| {
-                    let rgb = match face.tint {
-                        Tint::None => 0xffffff,
-                        Tint::Grass => {
-                            context
-                                .biomes
-                                .grass(span.biome, f64::from(at[0]), f64::from(at[1]))
-                        }
-                        Tint::Foliage => biome.foliage,
-                        Tint::Dry => biome.dry_foliage,
-                        Tint::Water => biome.water,
-                        Tint::Constant(color) => color,
-                    };
+                    let rgb = tint_rgb(context, face.tint, span.biome, at);
                     let channel = |shift: u32| (((rgb >> shift) & 255u32) as f32 * shade) as u32;
                     Paint {
                         layer: face.layer,

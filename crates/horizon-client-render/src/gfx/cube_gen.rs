@@ -99,13 +99,13 @@
 //! 3. Make the sampler with `GpuCubeSampler::new(device, queue, params,
 //!    columns)` (the renderer's device, or `with_own_device`) and hand it to
 //!    the cube LOD producer; `fork()` gives each worker a handle.
-use crate::lod::cube::{CubeKey, CubeNode, CubeSampler, SIDE, VOLUME, Voxel};
+use crate::lod::cube::{CubeKey, CubeNode, CubeSampler, NodeClass, Resident, SIDE, VOLUME, Voxel};
 use bytemuck::Zeroable;
 use horizon_core::noise::wrap;
 use horizon_world::registry::BlockStateId;
 use std::{
     borrow::Cow,
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
@@ -474,6 +474,30 @@ fn rock_block(p: &CubeGenParams, key: CubeKey, x: usize, jj: i32, z: usize) -> u
     }
 }
 
+/// What the 2D pre-pass says of the whole node, for the planner
+/// (`CubeSampler::classify`): uniform air or water draws nothing, uniform rock
+/// is a closed shell, the rest needs sampling.
+pub fn node_class(p: &CubeGenParams, key: CubeKey, columns: &NodeColumns) -> NodeClass {
+    match classify(p, key, columns) {
+        Class::Mixed => NodeClass::Mixed,
+        Class::Solid => NodeClass::Rock,
+        Class::Empty => {
+            // Water below the sea, air above it: uniform unless the sea level
+            // crosses the node.
+            let s = f64::from(1u32 << key.level);
+            let y = key.origin()[1] as f32;
+            let sea = (p.sea_level + 1) as f32;
+            let low = (y + (0.5 * s) as f32) < sea;
+            let high = (y + (15.5 * s) as f32) < sea;
+            if low == high {
+                NodeClass::Air
+            } else {
+                NodeClass::Mixed
+            }
+        }
+    }
+}
+
 /// The node of a classified key, filled on the CPU (`None` for
 /// [`Class::Mixed`]).
 pub fn fill_class(
@@ -728,25 +752,22 @@ pub const SLOT_BYTES: u64 = (SLOT_WORDS * 4) as u64;
 /// be submitted before the slot is freed and regenerated.
 pub struct NodePool {
     buffer: wgpu::Buffer,
-    free: Vec<u32>,
+    free: Arc<Mutex<Vec<u32>>>,
     capacity: u32,
 }
 
-impl NodePool {
-    fn new(device: &wgpu::Device, capacity: u32) -> Self {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Cube node pool"),
-            size: SLOT_BYTES * u64::from(capacity),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        Self {
-            buffer,
-            free: (0..capacity).rev().collect(),
-            capacity,
-        }
-    }
-    /// The storage buffer holding every slot.
+/// A shared view of a [`NodePool`]: the buffer and the free list. The GPU
+/// mesher (`gfx::cube_mesh`) and the renderer hold one to read slots, upload
+/// CPU-sampled nodes into slots and free slots, while the generator thread
+/// allocates from the same list.
+#[derive(Clone)]
+pub struct PoolHandle {
+    buffer: wgpu::Buffer,
+    free: Arc<Mutex<Vec<u32>>>,
+    capacity: u32,
+}
+
+impl PoolHandle {
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
     }
@@ -754,16 +775,95 @@ impl NodePool {
         self.capacity
     }
     pub fn free_slots(&self) -> usize {
-        self.free.len()
+        self.free.lock().unwrap().len()
     }
     /// A free slot, or `None` when the pool is full.
-    pub fn alloc(&mut self) -> Option<u32> {
-        self.free.pop()
+    pub fn alloc(&self) -> Option<u32> {
+        self.free.lock().unwrap().pop()
     }
     /// Returns `slot` to the pool.
-    pub fn free(&mut self, slot: u32) {
-        debug_assert!(slot < self.capacity && !self.free.contains(&slot));
-        self.free.push(slot);
+    pub fn free(&self, slot: u32) {
+        let mut free = self.free.lock().unwrap();
+        debug_assert!(slot < self.capacity && !free.contains(&slot));
+        free.push(slot);
+    }
+    /// Writes a node's [`SLOT_WORDS`] words into `slot` (queue order: later
+    /// submissions see it).
+    pub fn write(&self, queue: &wgpu::Queue, slot: u32, words: &[u32]) {
+        debug_assert_eq!(words.len(), SLOT_WORDS);
+        queue.write_buffer(
+            &self.buffer,
+            SLOT_BYTES * u64::from(slot),
+            bytemuck::cast_slice(words),
+        );
+    }
+}
+
+/// A node's slot words (the layout above): states, then the biome of each
+/// column (taken from the column's highest voxel that is not `air`, else its
+/// lowest: a CPU node holds a biome per voxel, a slot one per column).
+pub fn slot_words(node: &CubeNode, air: u32) -> Vec<u32> {
+    let mut words = vec![0u32; SLOT_WORDS];
+    for i in 0..VOLUME {
+        words[i] = node.at(i).state.0;
+    }
+    for z in 0..SIDE {
+        for x in 0..SIDE {
+            let biome = (0..SIDE)
+                .rev()
+                .map(|y| node.get(x, y, z))
+                .find(|v| v.state.0 != air)
+                .unwrap_or_else(|| node.get(x, 0, z))
+                .biome;
+            words[SLOT_STATES + (z << 4 | x)] = u32::from(biome);
+        }
+    }
+    words
+}
+
+impl NodePool {
+    fn new(device: &wgpu::Device, capacity: u32) -> Self {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cube node pool"),
+            size: SLOT_BYTES * u64::from(capacity),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            buffer,
+            free: Arc::new(Mutex::new((0..capacity).rev().collect())),
+            capacity,
+        }
+    }
+    /// The storage buffer holding every slot.
+    pub fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+    /// A handle other threads and the mesher keep.
+    pub fn handle(&self) -> PoolHandle {
+        PoolHandle {
+            buffer: self.buffer.clone(),
+            free: self.free.clone(),
+            capacity: self.capacity,
+        }
+    }
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+    pub fn free_slots(&self) -> usize {
+        self.free.lock().unwrap().len()
+    }
+    /// A free slot, or `None` when the pool is full.
+    pub fn alloc(&self) -> Option<u32> {
+        self.free.lock().unwrap().pop()
+    }
+    /// Returns `slot` to the pool.
+    pub fn free(&self, slot: u32) {
+        let mut free = self.free.lock().unwrap();
+        debug_assert!(slot < self.capacity && !free.contains(&slot));
+        free.push(slot);
     }
 }
 
@@ -1109,6 +1209,56 @@ impl CubeGen {
         out
     }
 
+    /// The jobs through the 3D pass only (chunks of at most [`MAX_BATCH`],
+    /// fewer when the pool is short), in order. A job with `slot[i]` set
+    /// stays in the pool and answers [`Resident::Slot`] (its slot is the
+    /// caller's to free); the others are read back and freed, as
+    /// [`CubeGen::generate_mixed`] does. `None` for a chunk that failed.
+    pub fn generate_resident(
+        &mut self,
+        jobs: &[(CubeKey, &NodeColumns)],
+        slot: &[bool],
+    ) -> Vec<Option<Resident>> {
+        debug_assert_eq!(jobs.len(), slot.len());
+        let mut out = Vec::with_capacity(jobs.len());
+        let mut at = 0;
+        while at < jobs.len() {
+            let size = (jobs.len() - at)
+                .min(MAX_BATCH)
+                .min(self.pool.free_slots().max(1));
+            let chunk = &jobs[at..at + size];
+            let keep = &slot[at..at + size];
+            match self.generate_to_pool(chunk) {
+                None => out.extend(chunk.iter().map(|_| None)),
+                Some(slots) => {
+                    let wanted: Vec<usize> = (0..size).filter(|&i| !keep[i]).collect();
+                    let read: Vec<u32> = wanted.iter().map(|&i| slots[i]).collect();
+                    let words = self.read_back(&read);
+                    for &s in &read {
+                        self.pool.free(s);
+                    }
+                    for i in 0..size {
+                        out.push(if keep[i] {
+                            Some(Resident::Slot(slots[i]))
+                        } else {
+                            let w = wanted.iter().position(|&j| j == i).unwrap();
+                            words.as_ref().map(|words| {
+                                let base = w * SLOT_WORDS;
+                                Resident::Node(build_node(
+                                    chunk[i].0,
+                                    &words[base..base + SLOT_STATES],
+                                    chunk[i].1,
+                                ))
+                            })
+                        });
+                    }
+                }
+            }
+            at += size;
+        }
+        out
+    }
+
     /// Any number of nodes: the 2D pre-pass settles what it can on the CPU
     /// (uniform air, water or rock, with no 3D noise run), and the rest go to
     /// the GPU in as few dispatches as the buffers allow. `Vec` in job order.
@@ -1147,7 +1297,21 @@ pub fn request_own_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 /// Jobs from one caller (the 3D pass only: the pre-pass ran on the caller).
 struct Message {
     jobs: Vec<(CubeKey, NodeColumns)>,
-    reply: mpsc::Sender<Vec<Option<CubeNode>>>,
+    /// Whether the nodes stay in the pool ([`Resident::Slot`]) or are read back.
+    slots: bool,
+    reply: mpsc::Sender<Vec<Option<Resident>>>,
+}
+
+/// What a sampler on the GPU gives the GPU mesher: the device it generates on,
+/// the pool its nodes stay in, and the block states it can write.
+#[derive(Clone)]
+pub struct GpuBackend {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub pool: PoolHandle,
+    /// Every block state id the generator writes (air, rock, water, and each
+    /// biome's top and filler).
+    pub states: Vec<u32>,
 }
 
 /// A [`CubeSampler`] generating levels [`MIN_LEVEL`] and up on the GPU. Every
@@ -1158,13 +1322,16 @@ pub struct GpuCubeSampler {
     params: Arc<CubeGenParams>,
     columns: ColumnFn,
     gpu: Option<mpsc::Sender<Message>>,
-    reply: mpsc::Sender<Vec<Option<CubeNode>>>,
-    replies: mpsc::Receiver<Vec<Option<CubeNode>>>,
+    backend: Option<GpuBackend>,
+    reply: mpsc::Sender<Vec<Option<Resident>>>,
+    replies: mpsc::Receiver<Vec<Option<Resident>>>,
 }
 
 impl GpuCubeSampler {
     /// A sampler on `device`/`queue`; without compute shaders there, it
     /// generates on the CPU ([`cpu_reference_node`]) in the calling threads.
+    /// Give it the renderer's device for [`GpuCubeSampler::backend`] to be
+    /// usable by the renderer's mesher (`gfx::cube_mesh`).
     pub fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,
@@ -1172,16 +1339,36 @@ impl GpuCubeSampler {
         columns: ColumnFn,
     ) -> Self {
         let params = Arc::new(params);
-        let gpu =
-            CubeGen::new(device, queue, params.clone(), DEFAULT_POOL_SLOTS).map(|generator| {
-                let (tx, rx) = mpsc::channel::<Message>();
-                std::thread::Builder::new()
-                    .name("cube-gen-gpu".into())
-                    .spawn(move || gpu_thread(generator, rx))
-                    .expect("spawn the cube generation thread");
-                tx
+        let mut backend = None;
+        let gpu = CubeGen::new(
+            device.clone(),
+            queue.clone(),
+            params.clone(),
+            DEFAULT_POOL_SLOTS,
+        )
+        .map(|generator| {
+            let mut states = vec![params.air, params.stone, params.deepslate, params.water];
+            for b in &params.biomes {
+                states.extend([b.top, b.filler]);
+            }
+            states.sort_unstable();
+            states.dedup();
+            backend = Some(GpuBackend {
+                device,
+                queue,
+                pool: generator.pool.handle(),
+                states,
             });
-        Self::with(params, columns, gpu)
+            let (tx, rx) = mpsc::channel::<Message>();
+            std::thread::Builder::new()
+                .name("cube-gen-gpu".into())
+                .spawn(move || gpu_thread(generator, rx))
+                .expect("spawn the cube generation thread");
+            tx
+        });
+        let mut sampler = Self::with(params, columns, gpu);
+        sampler.backend = backend;
+        sampler
     }
 
     /// A sampler on a device of its own, or on the CPU if there is none.
@@ -1207,6 +1394,7 @@ impl GpuCubeSampler {
             params,
             columns,
             gpu,
+            backend: None,
             reply,
             replies,
         }
@@ -1217,24 +1405,43 @@ impl GpuCubeSampler {
         self.gpu.is_some()
     }
 
+    /// The device, pool and block states of the GPU generator, if it runs.
+    pub fn backend(&self) -> Option<&GpuBackend> {
+        self.backend.as_ref()
+    }
+
     /// The nodes at `keys` in one request: columns and the 2D pre-pass run
     /// here, in the caller, and every node left goes to the GPU thread in one
     /// message, which batches it with whatever else is queued into as few
     /// dispatches as the pool and buffers allow. Levels below [`MIN_LEVEL`]
     /// and failures are `None`.
     pub fn request(&mut self, keys: &[CubeKey]) -> Vec<Option<CubeNode>> {
-        let mut out: Vec<Option<CubeNode>> = vec![None; keys.len()];
+        self.request_resident(keys, false)
+            .into_iter()
+            .map(|r| match r {
+                Some(Resident::Node(node)) => Some(node),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// As [`GpuCubeSampler::request`], but with `slots` the nodes the 3D pass
+    /// made stay in the GPU pool and answer [`Resident::Slot`], never read
+    /// back; the caller owns the slot until it frees it (`PoolHandle::free`).
+    /// Nodes the pre-pass settled are [`Resident::Node`] (uniform, no slot).
+    pub fn request_resident(&mut self, keys: &[CubeKey], slots: bool) -> Vec<Option<Resident>> {
+        let mut out: Vec<Option<Resident>> = (0..keys.len()).map(|_| None).collect();
         let mut jobs = Vec::new();
-        let mut slots = Vec::new();
+        let mut places = Vec::new();
         for (i, &key) in keys.iter().enumerate() {
             if key.level < MIN_LEVEL {
                 continue;
             }
             let columns = (self.columns)(key);
             match prepass_node(&self.params, key, &columns) {
-                Some(node) => out[i] = Some(node),
+                Some(node) => out[i] = Some(Resident::Node(node)),
                 None => {
-                    slots.push(i);
+                    places.push(i);
                     jobs.push((key, columns));
                 }
             }
@@ -1242,14 +1449,21 @@ impl GpuCubeSampler {
         if jobs.is_empty() {
             return out;
         }
-        let nodes = match &self.gpu {
+        let nodes: Vec<Option<Resident>> = match &self.gpu {
             None => jobs
                 .iter()
-                .map(|(key, columns)| Some(cpu_reference_node(&self.params, *key, columns)))
+                .map(|(key, columns)| {
+                    Some(Resident::Node(cpu_reference_node(
+                        &self.params,
+                        *key,
+                        columns,
+                    )))
+                })
                 .collect(),
             Some(gpu) => {
                 let sent = gpu.send(Message {
                     jobs,
+                    slots,
                     reply: self.reply.clone(),
                 });
                 if sent.is_err() {
@@ -1258,7 +1472,7 @@ impl GpuCubeSampler {
                 self.replies.recv().unwrap_or_default()
             }
         };
-        for (i, node) in slots.into_iter().zip(nodes) {
+        for (i, node) in places.into_iter().zip(nodes) {
             out[i] = node;
         }
         out
@@ -1284,7 +1498,11 @@ fn gpu_thread(mut generator: CubeGen, messages: mpsc::Receiver<Message>) {
             .iter()
             .flat_map(|m| m.jobs.iter().map(|(k, c)| (*k, c)))
             .collect();
-        let mut results = generator.generate_mixed(&jobs).into_iter();
+        let slot: Vec<bool> = batch
+            .iter()
+            .flat_map(|m| std::iter::repeat_n(m.slots, m.jobs.len()))
+            .collect();
+        let mut results = generator.generate_resident(&jobs, &slot).into_iter();
         drop(jobs);
         for message in batch {
             let part: Vec<_> = results.by_ref().take(message.jobs.len()).collect();
@@ -1298,12 +1516,26 @@ impl CubeSampler for GpuCubeSampler {
         self.request(&[key]).pop().flatten()
     }
 
+    fn resident(&mut self, key: CubeKey) -> Option<Resident> {
+        self.request_resident(&[key], true).pop().flatten()
+    }
+
+    fn gpu(&self) -> Option<GpuBackend> {
+        self.backend.clone()
+    }
+
+    fn classify(&mut self, key: CubeKey) -> NodeClass {
+        if key.level < MIN_LEVEL {
+            return NodeClass::Mixed;
+        }
+        let columns = (self.columns)(key);
+        node_class(&self.params, key, &columns)
+    }
+
     fn fork(&self) -> Option<Box<dyn CubeSampler>> {
-        Some(Box::new(Self::with(
-            self.params.clone(),
-            self.columns.clone(),
-            self.gpu.clone(),
-        )))
+        let mut fork = Self::with(self.params.clone(), self.columns.clone(), self.gpu.clone());
+        fork.backend = self.backend.clone();
+        Some(Box::new(fork))
     }
 }
 

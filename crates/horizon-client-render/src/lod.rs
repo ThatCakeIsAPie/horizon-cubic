@@ -11,7 +11,7 @@ pub mod bake;
 pub mod cache;
 pub mod cube;
 pub mod cube_cache;
-mod mesh;
+pub(crate) mod mesh;
 use horizon_world::registry::BlockStateId;
 use std::{
     collections::VecDeque,
