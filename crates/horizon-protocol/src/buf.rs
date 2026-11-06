@@ -427,25 +427,45 @@ static WIDE_POSITIONS: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 pub fn set_wide_positions(on: bool) {
     WIDE_POSITIONS.store(on, std::sync::atomic::Ordering::SeqCst);
 }
-/// Whether block positions are on the wire as three `i32`s (see [`set_wide_positions`]).
+/// Whether block positions are on the wire as three `i32`s (see [`set_wide_positions`]),
+/// for the process or, with a [`WideHold::here`], for this thread alone.
 pub fn wide_positions() -> bool {
-    WIDE_POSITIONS.load(std::sync::atomic::Ordering::SeqCst)
+    WIDE_HERE.with(|holds| holds.get() > 0)
+        || WIDE_POSITIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+thread_local! {
+    /// Holds of wide positions for the current thread alone (`WideHold::here`).
+    static WIDE_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 static WIDE_HOLDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Wide positions are on for as long as this lives (and while any other hold does):
 /// a server with a cubic level holds one, and so does a client told of it. The last
 /// hold dropped turns them off again, so a world closing cannot turn off one
 /// that opened after it.
-pub struct WideHold(());
+pub struct WideHold {
+    /// Held for the thread that took it alone (tests: their encoding runs on
+    /// that thread, and other tests' byte comparisons stay vanilla's).
+    here: bool,
+}
 /// Turn wide positions on until the returned hold (and every other) is dropped.
 pub fn hold_wide_positions() -> WideHold {
     WIDE_HOLDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     set_wide_positions(true);
-    WideHold(())
+    WideHold { here: false }
+}
+impl WideHold {
+    /// Wide positions on for the current thread alone until the hold is
+    /// dropped (on that thread).
+    pub fn here() -> Self {
+        WIDE_HERE.with(|holds| holds.set(holds.get() + 1));
+        WideHold { here: true }
+    }
 }
 impl Drop for WideHold {
     fn drop(&mut self) {
-        if WIDE_HOLDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        if self.here {
+            WIDE_HERE.with(|holds| holds.set(holds.get().saturating_sub(1)));
+        } else if WIDE_HOLDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
             set_wide_positions(false);
         }
     }

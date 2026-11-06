@@ -517,6 +517,20 @@ fn entity_type(
     Some(id)
 }
 
+/// A cubic server's hold of wide block positions: the process's; in this
+/// crate's tests the test thread's alone, so a cubic hub test can't change
+/// the bytes another test compares.
+fn hold_wide() -> horizon_protocol::buf::WideHold {
+    #[cfg(test)]
+    {
+        horizon_protocol::buf::WideHold::here()
+    }
+    #[cfg(not(test))]
+    {
+        horizon_protocol::buf::hold_wide_positions()
+    }
+}
+
 /// ChunkTrackingView.contains: the chunks a player at (cx, cz) with view
 /// distance `r` is sent (isWithinDistance with the neighbours' buffer).
 fn tracked(cx: i32, cz: i32, r: i32, x: i32, z: i32) -> bool {
@@ -629,8 +643,7 @@ impl Hub {
         let clock_ids = (0..sync.dynamic.len("minecraft:world_clock") as i32).collect();
         let mut encoder = encoder;
         encoder.set_dimension(config.levels.get(&config.dimension));
-        let wide =
-            levels_are_cubic(&config.levels).then(horizon_protocol::buf::hold_wide_positions);
+        let wide = levels_are_cubic(&config.levels).then(hold_wide);
         lan.shared.set_cubic(wide.is_some());
         Self {
             wide,
@@ -4396,10 +4409,13 @@ impl Hub {
         debug_assert!(shape.cubic);
         *self.config.levels.get_mut(dimension) = shape;
         if self.wide.is_none() {
-            self.wide = Some(horizon_protocol::buf::hold_wide_positions());
+            self.wide = Some(hold_wide());
             self.lan.shared.set_cubic(true);
         }
         // Sections offered under the old window and bulk changes of its columns.
+        // The handoff is the process's (single player's server and window): in
+        // this crate's tests, other tests use it at the same time.
+        #[cfg(not(test))]
         super::handoff::forget_all();
         if self.config.dimension != dimension {
             return;
