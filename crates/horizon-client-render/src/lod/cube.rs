@@ -126,13 +126,21 @@ enum Voxels {
 pub struct CubeNode {
     pub key: CubeKey,
     voxels: Voxels,
+    /// Columns (`z << 4 | x`) whose sky is blocked above the node: a set bit
+    /// means something solid stands over the node there (an island, the
+    /// vanilla terrain). `None`: all open. See [`CubeNode::column_covered`].
+    covered: Option<Box<CoverMask>>,
 }
+
+/// One bit per column of a node, `z << 4 | x`.
+pub type CoverMask = [u64; 4];
 
 impl CubeNode {
     pub fn uniform(key: CubeKey, voxel: Voxel) -> Self {
         Self {
             key,
             voxels: Voxels::Uniform(voxel),
+            covered: None,
         }
     }
     /// Voxels from `f(x, y, z)` (each 0..16); a node whose voxels all agree
@@ -144,6 +152,10 @@ impl CubeNode {
         }
         Self::dense(key, dense)
     }
+    /// A node of exactly these voxels (`y << 8 | z << 4 | x`).
+    pub fn from_dense(key: CubeKey, dense: Box<[Voxel; VOLUME]>) -> Self {
+        Self::dense(key, dense)
+    }
     fn dense(key: CubeKey, dense: Box<[Voxel; VOLUME]>) -> Self {
         let first = dense[0];
         if dense.iter().all(|&v| v == first) {
@@ -152,8 +164,24 @@ impl CubeNode {
             Self {
                 key,
                 voxels: Voxels::Dense(dense),
+                covered: None,
             }
         }
+    }
+    /// The node with its covered columns set (an empty mask is none).
+    pub fn with_covered(mut self, covered: Option<Box<CoverMask>>) -> Self {
+        self.covered = covered.filter(|mask| mask.iter().any(|&w| w != 0));
+        self
+    }
+    pub fn covered_mask(&self) -> Option<&CoverMask> {
+        self.covered.as_deref()
+    }
+    /// Whether the sky over the node is blocked at column (`x`, `z`).
+    pub fn column_covered(&self, x: usize, z: usize) -> bool {
+        let bit = z << 4 | x;
+        self.covered
+            .as_ref()
+            .is_some_and(|mask| mask[bit >> 6] >> (bit & 63) & 1 == 1)
     }
     pub fn index(x: usize, y: usize, z: usize) -> usize {
         y << 8 | z << 4 | x
@@ -200,7 +228,7 @@ pub fn downsample(
     if let Some(first) = children[0].as_uniform()
         && children.iter().all(|c| c.as_uniform() == Some(first))
     {
-        return CubeNode::uniform(key, first);
+        return CubeNode::uniform(key, first).with_covered(merged_cover(&children));
     }
     let mut dense = Box::new(
         [Voxel {
@@ -221,7 +249,32 @@ pub fn downsample(
             }
         }
     }
-    CubeNode::dense(key, dense)
+    CubeNode::dense(key, dense).with_covered(merged_cover(&children))
+}
+
+/// The parent's covered columns: what covers the upper four children, a
+/// parent column being covered when two of the four child columns under it
+/// are.
+fn merged_cover(children: &[&CubeNode; 8]) -> Option<Box<CoverMask>> {
+    if children[4..].iter().all(|c| c.covered.is_none()) {
+        return None;
+    }
+    let mut mask = Box::new([0u64; 4]);
+    for pz in 0..SIDE {
+        for px in 0..SIDE {
+            let child = children[4 | (px >> 3) | ((pz >> 3) << 1)];
+            let (cx, cz) = ((px & 7) * 2, (pz & 7) * 2);
+            let covered = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .into_iter()
+                .filter(|&(dx, dz)| child.column_covered(cx + dx, cz + dz))
+                .count();
+            if covered >= 2 {
+                let bit = pz << 4 | px;
+                mask[bit >> 6] |= 1 << (bit & 63);
+            }
+        }
+    }
+    Some(mask)
 }
 
 /// `eight` is in `x | z << 1 | y << 2` order: the top four are the upper layer.
@@ -277,12 +330,31 @@ pub trait CubeSampler: Send {
     /// An independent sampler for another thread, if this one can have one.
     /// Without it the producer runs a single worker.
     fn fork(&self) -> Option<Box<dyn CubeSampler>>;
+    /// Cubes that changed since this was last asked (the producer drops the
+    /// nodes it kept in memory over them). Nothing by default.
+    fn changes(&mut self) -> Changes {
+        Changes::None
+    }
+}
+
+/// What a [`CubeSampler`] reports as changed (see `CubeLodCache::invalidate`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Changes {
+    None,
+    /// These cubes were saved again.
+    Cubes(Vec<SectionPos>),
+    /// So many that the list was lost: forget every node.
+    All,
 }
 
 // ---------------------------------------------------------------- the plan
 
 /// The nodes subdivide while closer than this many times their size.
 pub const DETAIL: f64 = 2.5;
+/// A node the previous plan had split merges back only when farther than
+/// `DETAIL * MERGE` times its size, so the camera moving a little back and
+/// forth across a boundary does not flip nodes between levels.
+pub const MERGE: f64 = 1.25;
 /// Nodes this level or finer ask `is_loaded` about each cube they hold; coarser
 /// ones that meet the loaded box simply subdivide.
 const PROBE_LEVEL: u8 = 2;
@@ -313,6 +385,30 @@ pub fn plan(
     loaded: LoadedBox,
     is_loaded: &dyn Fn(SectionPos) -> bool,
 ) -> Vec<CubeKey> {
+    plan_from(camera, max_distance, loaded, is_loaded, &[])
+}
+
+/// [`plan`] with hysteresis: a node that `previous` (the last plan) split
+/// stays split until the camera is [`MERGE`] times farther than the distance
+/// that splits it. The invariants of `plan` hold for any `previous`.
+pub fn plan_from(
+    camera: [f64; 3],
+    max_distance: f64,
+    loaded: LoadedBox,
+    is_loaded: &dyn Fn(SectionPos) -> bool,
+    previous: &[CubeKey],
+) -> Vec<CubeKey> {
+    // The nodes holding a leaf of the last plan: the ones it split.
+    let mut was_split = FxHashSet::<CubeKey>::default();
+    for &leaf in previous {
+        let mut up = leaf;
+        while up.level < MAX_CUBE_LEVEL {
+            up = up.parent();
+            if !was_split.insert(up) {
+                break;
+            }
+        }
+    }
     let center = cube_of(camera);
     let top = (0..=MAX_CUBE_LEVEL)
         .find(|&l| f64::from(16 << l) >= max_distance)
@@ -346,7 +442,16 @@ pub fn plan(
         match loaded_state(node, center, loaded, is_loaded) {
             Loaded::All => continue,
             Loaded::Some => {}
-            Loaded::None if node.level > 0 && distance < DETAIL * f64::from(node.size()) => {}
+            Loaded::None
+                if node.level > 0
+                    && distance
+                        < DETAIL
+                            * f64::from(node.size())
+                            * if was_split.contains(&node) {
+                                MERGE
+                            } else {
+                                1.0
+                            } => {}
             Loaded::None => {
                 leaves.push((distance, node));
                 continue;
@@ -439,6 +544,11 @@ struct Cache {
 }
 
 impl Cache {
+    /// Drops the nodes holding any of `cubes`.
+    fn forget(&mut self, cubes: &[SectionPos]) {
+        self.nodes
+            .retain(|key, _| !cubes.iter().any(|&c| key.contains_cube(c)));
+    }
     fn get(&mut self, key: CubeKey) -> Option<Arc<CubeNode>> {
         self.tick += 1;
         let tick = self.tick;
@@ -576,7 +686,8 @@ impl CubeLod {
             None => true,
         };
         if stale {
-            self.plan = plan(camera, max_distance, loaded, &is_loaded);
+            let next = plan_from(camera, max_distance, loaded, &is_loaded, &self.plan);
+            self.plan = next;
             self.wanted = self.plan.iter().copied().collect();
             self.planned = Some((cube, max_distance, loaded, now));
             self.failed
@@ -735,6 +846,11 @@ fn work(
                 queue = shared.wake.wait(queue).unwrap();
             }
         };
+        match sampler.changes() {
+            Changes::None => {}
+            Changes::Cubes(cubes) => shared.cache.lock().unwrap().forget(&cubes),
+            Changes::All => shared.cache.lock().unwrap().nodes.clear(),
+        }
         let mesh = node(&shared, sampler.as_mut(), key, air, &kind).map(|node| {
             let mut mesh = SectionMesh::default();
             mesh::mesh_cube(&mut mesher, &node, air, &context, &mut mesh);
@@ -1126,6 +1242,114 @@ mod tests {
         let pb: FxHashSet<_> = plan(b, 1500.0, BOX, &near(b)).into_iter().collect();
         let changed = pa.symmetric_difference(&pb).count();
         assert!(changed * 4 < pa.len(), "{changed} of {}", pa.len());
+    }
+
+    fn assert_disjoint(leaves: &[CubeKey]) {
+        let set: FxHashSet<CubeKey> = leaves.iter().copied().collect();
+        assert_eq!(set.len(), leaves.len(), "no node twice");
+        for &leaf in leaves {
+            let mut up = leaf;
+            while up.level < MAX_CUBE_LEVEL {
+                up = up.parent();
+                assert!(!set.contains(&up), "{leaf:?} inside {up:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_node_merges_back_only_well_past_the_distance_that_split_it() {
+        let nowhere = |_: SectionPos| false;
+        let node = key(3, 0, 0, 0);
+        let children = node.children().to_vec();
+        // 340 blocks away: past 2.5 x 128 = 320 (a fresh plan keeps the node
+        // whole) and inside 1.25 times that (a plan that had it split keeps
+        // it split).
+        let camera = [-340.0, 64.0, 64.0];
+        let fresh = plan_from(camera, 2000.0, BOX, &nowhere, &[]);
+        assert!(fresh.contains(&node));
+        let kept = plan_from(camera, 2000.0, BOX, &nowhere, &children);
+        assert_disjoint(&kept);
+        assert!(!kept.contains(&node));
+        assert!(children.iter().all(|c| kept.contains(c)), "{kept:?}");
+        // 500 blocks away it merges, and nothing of its children stays.
+        let away = [-500.0, 64.0, 64.0];
+        let merged = plan_from(away, 2000.0, BOX, &nowhere, &children);
+        assert_disjoint(&merged);
+        assert!(merged.contains(&node));
+        assert!(!merged.iter().any(|l| node.contains(*l) && *l != node));
+        // Closer than the split distance, a plan that never split it does.
+        let close = [-300.0, 64.0, 64.0];
+        let split = plan_from(close, 2000.0, BOX, &nowhere, &[node]);
+        assert!(!split.contains(&node));
+    }
+
+    #[test]
+    fn a_camera_moving_a_little_back_and_forth_changes_no_node() {
+        // Both in the same cube, so the loaded box is the same.
+        let a = [1000.5, 64.5, 1000.5];
+        let b = [1003.5, 64.5, 1000.5];
+        let max = 1500.0;
+        // Leaves near enough to both cameras not to be cut by the range.
+        let settled = |leaves: &[CubeKey]| -> FxHashSet<CubeKey> {
+            leaves
+                .iter()
+                .copied()
+                .filter(|l| l.distance(a) < max - 10.0 && l.distance(b) < max - 10.0)
+                .collect()
+        };
+        let mut previous = plan_from(a, max, BOX, &near(a), &[]);
+        let mut seen = Vec::new();
+        for step in 0..6 {
+            let camera = if step % 2 == 0 { b } else { a };
+            previous = plan_from(camera, max, BOX, &near(camera), &previous);
+            assert_disjoint(&previous);
+            seen.push(settled(&previous));
+        }
+        assert!(!seen[0].is_empty());
+        for later in &seen[1..] {
+            assert_eq!(*later, seen[0], "the plan flipped on a 3 block move");
+        }
+    }
+
+    #[test]
+    fn a_parent_column_is_covered_when_two_of_the_four_columns_over_it_are() {
+        let cover = |columns: &[(usize, usize)]| {
+            let mut mask = Box::new([0u64; 4]);
+            for &(x, z) in columns {
+                let bit = z << 4 | x;
+                mask[bit >> 6] |= 1 << (bit & 63);
+            }
+            Some(mask)
+        };
+        let mut children = children_of(|_, _, _, _| STONE);
+        assert!(!down(&children).column_covered(0, 0));
+        // Child 4 is the upper one at x = z = 0: parent column (0, 0) holds
+        // its columns (0..2, 0..2), parent column (1, 0) the ones at x 2..4.
+        children[4] = children[4]
+            .clone()
+            .with_covered(cover(&[(0, 0), (1, 0), (2, 0)]));
+        // A lower child's cover is under the node: it counts for nothing.
+        children[0] = children[0]
+            .clone()
+            .with_covered(cover(&[(4, 4), (5, 4), (4, 5), (5, 5)]));
+        let parent = down(&children);
+        assert!(parent.column_covered(0, 0), "two of four");
+        assert!(!parent.column_covered(1, 0), "one of four");
+        assert!(!parent.column_covered(2, 2), "the lower child's");
+        assert_eq!(parent.as_uniform(), Some(voxel(STONE)));
+    }
+
+    #[test]
+    fn forgetting_cubes_drops_the_kept_nodes_over_them() {
+        let mut cache = Cache::default();
+        let kept = [key(0, 0, 0, 0), key(1, 5, 5, 5), key(2, -1, 0, 0)];
+        let dropped = [key(1, 0, 0, 0), key(3, 0, 0, 0), key(0, 1, 1, 1)];
+        for k in kept.iter().chain(&dropped) {
+            cache.insert(Arc::new(CubeNode::uniform(*k, voxel(STONE))));
+        }
+        cache.forget(&[SectionPos::new(1, 1, 1)]);
+        assert!(kept.iter().all(|k| cache.nodes.contains_key(k)));
+        assert!(dropped.iter().all(|k| !cache.nodes.contains_key(k)));
     }
 
     // ---- producer
