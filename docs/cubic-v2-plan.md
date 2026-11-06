@@ -146,6 +146,8 @@ The owner's end goal is the look of Voxy on Java: full blocks out to the horizon
 
 v2 lays the ground for this. v3 finishes it with the far-terrain path running on the GPU end to end:
 1. **Generate on the GPU** (`gfx/cube_gen`, v2). A node's 16³ voxels are written into a slot of a GPU-resident node pool. Reading them back to the CPU is optional, and only v2's CPU mesher uses it.
+   - **In huge batches.** Far terrain is only noise, so a ring of the plan, possibly thousands of nodes and on the order of 1024 × 1024 chunks at the coarse levels, goes out in one dispatch rather than one node at a time.
+   - **A 2D pre-pass bounds the surface.** Per voxel column it computes the depth noise and the biome height and volatility once. From the noise amplitude it derives the Y range where the surface can be. Nodes outside that range are uniform without any 3D noise, so the cost scales with surface area, not volume.
 2. **Biomes on the GPU.**
    - Port 26.3's climate sampler (six normal noises) to WGSL.
    - Flatten the biome parameter tree into a buffer.
