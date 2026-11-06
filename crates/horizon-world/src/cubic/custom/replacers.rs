@@ -771,3 +771,211 @@ impl Gradient {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Conservative analysis for the bounds (`bounds.rs`)
+// ---------------------------------------------------------------------------
+
+/// What is known about a box of blocks, for [`Replacers::possible_blocks`].
+pub struct BoxFacts<'a> {
+    /// Bounds of the (interpolated) density of every block in the box.
+    pub dmin: f64,
+    pub dmax: f64,
+    /// An upper bound of `|dy|`, the vertical gradient the replacers see.
+    pub dy: f64,
+    /// The block Y range of the box (inclusive).
+    pub y0: i32,
+    pub y1: i32,
+    /// The biomes of the box's columns; `None` when unknown (any biome).
+    pub biomes: Option<&'a [std::rc::Rc<ResolvedBiome>]>,
+}
+
+fn add(out: &mut Vec<u32>, b: u32) {
+    if !out.contains(&b) {
+        out.push(b);
+    }
+}
+
+impl Surface {
+    /// Every block `apply` can return that is not `prev`.
+    fn outputs(&self, f: &BoxFacts, out: &mut Vec<u32>) -> bool {
+        for b in [self.gravel, self.sandstone, self.red_sandstone, self.air] {
+            add(out, b);
+        }
+        for b in [self.override_top, self.override_filler]
+            .into_iter()
+            .flatten()
+        {
+            add(out, b);
+        }
+        for (_, b) in self.top_thresholds.iter().chain(&self.filler_thresholds) {
+            if let Some(b) = b {
+                add(out, *b);
+            }
+        }
+        let Some(biomes) = f.biomes else {
+            return false;
+        };
+        for b in biomes {
+            add(out, b.top);
+            add(out, b.filler);
+        }
+        true
+    }
+}
+
+impl Replacers {
+    /// Every block this chain can produce for the blocks of a box, starting
+    /// from air; `None` when it cannot tell (any block). A one-element result
+    /// proves the box uniform. The analysis is a superset: it follows every
+    /// branch the facts allow.
+    ///
+    /// Per kind (`prev` is each block that may reach the replacer):
+    /// * `densityRange`: filtered-out blocks stay; the in-range block when the
+    ///   whole density range is strictly inside `(min, max)`, the
+    ///   out-of-range block when it is wholly outside, both otherwise.
+    /// * `mainSurface`, `depthBasedSurface`: only act where
+    ///   `0 <= density <= maxSurfaceDepth * |dy|` (with the gradient bound);
+    ///   there every block they can place (and the biomes' top / filler) is
+    ///   possible.
+    /// * `mesaSurface`: unknown (any block) wherever it can act.
+    /// * `noiseBasedSurfaceDecoration`: acts only on its Y band and within
+    ///   `|dy|` of its threshold.
+    /// * `randomYGradient`: the probability function is evaluated at the ends
+    ///   of the box's Y range and at its breakpoints: all `>= 1` places the
+    ///   block, all `<= 0` leaves it, anything between makes both possible.
+    ///
+    /// A replacer whose Y range only partly covers the box, or whose biome
+    /// filter matches only some of the box's biomes, keeps the old blocks as
+    /// well.
+    pub fn possible_blocks(&self, f: &BoxFacts) -> Option<Vec<u32>> {
+        let mut cur = vec![self.air];
+        for (i, r) in self.list.iter().enumerate() {
+            let (may_biome, all_biome) = match f.biomes {
+                Some(b) => (
+                    b.iter().any(|b| b.replacer_applies(i)),
+                    b.iter().all(|b| b.replacer_applies(i)),
+                ),
+                None => (true, false),
+            };
+            if !may_biome || matches!(r.kind, Kind::Noop) {
+                continue;
+            }
+            // Decorations check their own Y band.
+            let (may_y, all_y) = if matches!(r.kind, Kind::Decoration(_)) {
+                (true, true)
+            } else {
+                (
+                    f.y1 >= r.min_y && f.y0 <= r.max_y,
+                    f.y0 >= r.min_y && f.y1 <= r.max_y,
+                )
+            };
+            if !may_y {
+                continue;
+            }
+            let mut next = Vec::new();
+            for &p in &cur {
+                if !self.apply_set(
+                    &r.kind,
+                    p,
+                    f,
+                    (f.y0.max(r.min_y), f.y1.min(r.max_y)),
+                    &mut next,
+                ) {
+                    return None;
+                }
+            }
+            if !(all_biome && all_y) {
+                for &p in &cur {
+                    add(&mut next, p);
+                }
+            }
+            if next.len() > 24 {
+                return None;
+            }
+            cur = next;
+        }
+        Some(cur)
+    }
+
+    /// Adds every block `kind` can turn `prev` into to `out`; false when
+    /// that is unknown.
+    fn apply_set(
+        &self,
+        kind: &Kind,
+        prev: u32,
+        f: &BoxFacts,
+        ey: (i32, i32),
+        out: &mut Vec<u32>,
+    ) -> bool {
+        match kind {
+            Kind::Noop => add(out, prev),
+            Kind::Density(d) => {
+                if d.filter.contains(&prev) != d.include {
+                    add(out, prev);
+                    return true;
+                }
+                let inside = f.dmin > d.min && f.dmax < d.max;
+                let outside = f.dmax <= d.min || f.dmin >= d.max;
+                if !outside {
+                    add(out, d.in_range.unwrap_or(prev));
+                }
+                if !inside {
+                    add(out, d.out_of_range.unwrap_or(prev));
+                }
+            }
+            Kind::Surface(s) => {
+                add(out, prev);
+                // `density > max_depth * |dy| || density < 0` leaves `prev`.
+                // (Written as `quiet` so that a NaN counts as "may act".)
+                let quiet = f.dmax < 0.0 || f.dmin > s.max_depth.max(0.0) * f.dy;
+                if prev != s.air && !quiet && !s.outputs(f, out) {
+                    return false;
+                }
+            }
+            Kind::Mesa(m) => {
+                add(out, prev);
+                let quiet = f.dmax < 0.0 || f.dmin > f.dy.max(m.mesa_depth.max(0.0) * f.dy);
+                if !quiet {
+                    return false;
+                }
+            }
+            Kind::Decoration(d) => {
+                add(out, prev);
+                if let Some(ground) = d.ground
+                    && f.y1 >= d.min_y
+                    && f.y0 < d.max_y
+                    && f.dmax > d.threshold
+                    && f.dmin - f.dy <= d.threshold
+                {
+                    add(out, ground);
+                }
+                if let Some(feature) = d.feature
+                    && f.y1 > d.min_y
+                    && f.y0 <= d.max_y
+                    && f.dmin <= d.threshold
+                    && f.dmax + f.dy > d.threshold
+                {
+                    add(out, feature);
+                }
+            }
+            Kind::Gradient(g) => {
+                if g.filter.contains(&prev) != g.include {
+                    add(out, prev);
+                    return true;
+                }
+                // `ey` is the box's Y range intersected with the replacer's.
+                let (pmin, pmax) = g.function.range(ey.0, ey.1);
+                if pmin >= 1.0 {
+                    add(out, g.block);
+                } else if pmax <= 0.0 {
+                    add(out, prev);
+                } else {
+                    add(out, prev);
+                    add(out, g.block);
+                }
+            }
+        }
+        true
+    }
+}

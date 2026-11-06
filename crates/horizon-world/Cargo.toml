@@ -35,5 +35,9 @@ path = "examples/probe/main.rs"
 name = "cwg_probe"
 path = "examples/cwg_probe/main.rs"
 
+[[example]]
+name = "bounds_probe"
+path = "examples/bounds_probe/main.rs"
+
 [lints]
 workspace = true

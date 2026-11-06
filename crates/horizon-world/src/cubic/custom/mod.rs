@@ -23,6 +23,12 @@
 //!   carvers or population, for the far terrain; `resolution_blocks > 1`
 //!   skips noise octaves finer than that. [`CustomCubicGenerator::surface_y`]
 //!   finds the terrain surface for spawn searches.
+//! * [`bounds`]: conservative 3D bounds on the density.
+//!   [`CustomCubicGenerator::generate`] returns a provably uniform cube
+//!   without sampling the lattice; [`CustomCubicGenerator::classify_box`],
+//!   [`CustomCubicGenerator::uniform_block`] and
+//!   [`CustomCubicGenerator::classify_node`] expose the test to the far
+//!   terrain, and [`CustomCubicGenerator::gpu_terms`] the per-octave terms.
 //! * [`CustomCubicGenerator::noise_tables`] exposes the octave tables for a
 //!   GPU twin (see [`density`]).
 //! * `cubeAreas` delegate whole cubes (generation and population) to nested
@@ -47,6 +53,7 @@ use horizon_core::position::SectionPos;
 use crate::registry::BlockRegistry;
 
 pub mod biomes;
+pub mod bounds;
 pub mod carvers;
 pub mod density;
 pub mod flat;
@@ -58,11 +65,13 @@ pub mod settings;
 pub mod testing;
 
 pub use biomes::{BiomeColumns, FixedBiome};
+pub use bounds::{BoxClass, DensityBound, GpuTerms, NodeClass};
 pub use density::{NoiseTable, OctaveTable};
 pub use populate::CubeWorld;
 pub use settings::{CustomGeneratorSettings, FlatGeneratorSettings};
 
 use biomes::{BiomeBlend, BiomeResolver, SURFACE_BLOCKS};
+use bounds::{Analyzer, Query};
 use density::{Lattice, TerrainNoise, cell_at};
 use replacers::{BlockCtx, Replacers, resolve_block};
 use settings::{BlockStateDesc, IntAabb, ReplacerConfig};
@@ -70,6 +79,7 @@ use settings::{BlockStateDesc, IntAabb, ReplacerConfig};
 struct Terrain {
     sizes: [i32; 3],
     noise: TerrainNoise,
+    bound: DensityBound,
     blend: BiomeBlend,
     replacers: Replacers,
     carvers: carvers::Carvers,
@@ -128,6 +138,7 @@ impl CustomCubicGenerator {
                 .map_err(|e| format!("cubeAreas[{i}]: {e}"))?;
             areas.push((a.area, g));
         }
+        let noise = TerrainNoise::new(seed, settings);
         Ok(Self {
             kind: Kind::Terrain(Box::new(Terrain {
                 sizes: [
@@ -135,7 +146,8 @@ impl CustomCubicGenerator {
                     settings.noise_sample_size_y,
                     settings.noise_sample_size_z,
                 ],
-                noise: TerrainNoise::new(seed, settings),
+                bound: DensityBound::new(&noise),
+                noise,
                 blend,
                 replacers: Replacers::new(seed, &settings.replacers, registry)?,
                 carvers: carvers::Carvers::new(seed, settings, registry)?,
@@ -182,6 +194,40 @@ impl CustomCubicGenerator {
         }
     }
 
+    /// The cube as the density lattice and the replacers make it, before the
+    /// carvers and without the uniform early-out: what [`Self::uniform_block`]
+    /// must agree with. For tests and probes.
+    #[doc(hidden)]
+    pub fn base_cube(&self, cube: SectionPos, out: &mut [u32; 4096]) {
+        if let Some(g) = self.area(cube) {
+            return g.base_cube(cube, out);
+        }
+        match &self.kind {
+            Kind::Flat(f) => {
+                f.generate(cube, out);
+            }
+            Kind::Terrain(t) => t.base(cube, out),
+        }
+    }
+
+    /// [`Self::generate`] without the uniform early-out (the lattice, then
+    /// the carvers), for timing and comparison.
+    #[doc(hidden)]
+    pub fn generate_lattice(&self, cube: SectionPos, out: &mut [u32; 4096]) {
+        if let Some(g) = self.area(cube) {
+            return g.generate_lattice(cube, out);
+        }
+        match &self.kind {
+            Kind::Flat(f) => {
+                f.generate(cube, out);
+            }
+            Kind::Terrain(t) => {
+                t.base(cube, out);
+                t.carvers.carve(cube, out);
+            }
+        }
+    }
+
     /// Adds ores, lakes and springs for `cube` (and calls the vegetation
     /// hook). The 2 x 2 x 2 cubes from `cube` up must be readable and
     /// writable in `world`.
@@ -221,6 +267,90 @@ impl CustomCubicGenerator {
         match &self.kind {
             Kind::Flat(f) => f.surface_y().filter(|&s| s <= from_y),
             Kind::Terrain(t) => t.surface_y(x, z, from_y),
+        }
+    }
+
+    /// Whether a box of blocks touches a `cubeAreas` entry (their blocks come
+    /// from other settings, so the bounds do not apply).
+    fn touches_area(&self, min: [i32; 3], max: [i32; 3]) -> bool {
+        self.areas.iter().any(|(a, _)| {
+            a.min_x <= max[0] >> 4
+                && a.max_x >= min[0] >> 4
+                && a.min_y <= max[1] >> 4
+                && a.max_y >= min[1] >> 4
+                && a.min_z <= max[2] >> 4
+                && a.max_z >= min[2] >> 4
+        })
+    }
+
+    /// The terrain, when the bounds apply to the box of blocks `min..=max`
+    /// (a terrain generator whose `cubeAreas` do not touch it).
+    fn bounded(&self, min: [i32; 3], max: [i32; 3]) -> Option<&Terrain> {
+        match &self.kind {
+            Kind::Terrain(t) if !self.touches_area(min, max) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Classifies the blocks `min..=max` (inclusive) by density alone, as the
+    /// lattice generator would make them: [`BoxClass::Air`] when no block's
+    /// density is above 0, [`BoxClass::Solid`] when all are. The answer is
+    /// conservative: [`BoxClass::Mixed`] means "not proven". Air at or below
+    /// the sea level is water, so use [`Self::uniform_block`] to know the
+    /// block. Flat Cubic and boxes touching a `cubeAreas` entry are `Mixed`.
+    pub fn classify_box(&self, min: [i32; 3], max: [i32; 3]) -> BoxClass {
+        self.bounded(min, max)
+            .map_or(BoxClass::Mixed, |t| t.classify_box(min, max))
+    }
+
+    /// The one block that all of `min..=max` is after density and replacers
+    /// (no carvers, no population), when the bounds prove it; `None` if not.
+    pub fn uniform_block(&self, min: [i32; 3], max: [i32; 3]) -> Option<u32> {
+        self.bounded(min, max)?.uniform_block(min, max)
+    }
+
+    /// Classifies a node of the far-terrain octree: the cube-aligned box of
+    /// side `16 << level` blocks whose minimum corner is `(x, y, z) * side`
+    /// (and its far faces, where voxel corners are sampled). Noise octaves
+    /// with a wavelength below `min_wavelength` blocks are skipped as in
+    /// [`Self::block_at`]; they are bounded by amplitude, so the answer holds
+    /// for the truncated density and for the full one.
+    pub fn classify_node(
+        &self,
+        level: u32,
+        x: i32,
+        y: i32,
+        z: i32,
+        min_wavelength: f64,
+    ) -> NodeClass {
+        let side = 16_i64 << level.min(24);
+        let at = |v: i32| -> i32 { (i64::from(v) * side).clamp(-(1 << 30), 1 << 30) as i32 };
+        let min = [at(x), at(y), at(z)];
+        let max = min.map(|v| (i64::from(v) + side).min(i64::from(i32::MAX)) as i32);
+        let Some(t) = self.bounded(min, max) else {
+            return NodeClass {
+                class: BoxClass::Mixed,
+                block: None,
+            };
+        };
+        t.analyzer().node(&Query::exact(min, max, min_wavelength))
+    }
+
+    /// The bound's per-octave terms and shape, as plain data for a GPU twin
+    /// of the descent (see [`bounds`]); `None` for Flat Cubic.
+    pub fn gpu_terms(&self) -> Option<GpuTerms> {
+        match &self.kind {
+            Kind::Terrain(t) => Some(t.bound.gpu_terms()),
+            Kind::Flat(_) => None,
+        }
+    }
+
+    /// The density's change bound `L(r)` for one column (see
+    /// [`DensityBound::l`]); `None` for Flat Cubic.
+    pub fn density_bound(&self) -> Option<&DensityBound> {
+        match &self.kind {
+            Kind::Terrain(t) => Some(&t.bound),
+            Kind::Flat(_) => None,
         }
     }
 
@@ -274,7 +404,41 @@ impl CustomCubicGenerator {
 }
 
 impl Terrain {
+    fn analyzer(&self) -> Analyzer<'_> {
+        Analyzer {
+            noise: &self.noise,
+            blend: &self.blend,
+            replacers: &self.replacers,
+            bound: &self.bound,
+            sizes: self.sizes,
+        }
+    }
+
+    fn classify_box(&self, min: [i32; 3], max: [i32; 3]) -> BoxClass {
+        self.analyzer()
+            .classify(&Query::lattice(self.sizes, min, max))
+    }
+
+    fn uniform_block(&self, min: [i32; 3], max: [i32; 3]) -> Option<u32> {
+        self.analyzer()
+            .uniform_block(&Query::lattice(self.sizes, min, max))
+    }
+
     fn generate(&self, cube: SectionPos, out: &mut [u32; 4096]) {
+        let min = [cube.x * 16, cube.y * 16, cube.z * 16];
+        if let Some(block) = self.uniform_block(min, min.map(|v| v + 15)) {
+            // Proven uniform before the carvers: no lattice. The carvers
+            // still run over it (their walks may reach the cube).
+            out.fill(block);
+        } else {
+            self.base(cube, out);
+        }
+        self.carvers.carve(cube, out);
+    }
+
+    /// The cube's blocks from the density lattice and the replacers, before
+    /// the carvers.
+    fn base(&self, cube: SectionPos, out: &mut [u32; 4096]) {
         let lattice = Lattice::for_cube(
             &self.noise,
             &self.blend,
@@ -296,10 +460,26 @@ impl Terrain {
             };
             out[ly << 8 | lz << 4 | lx] = self.replacers.block(&ctx);
         });
-        self.carvers.carve(cube, out);
     }
 
     fn block_at(&self, x: i32, y: i32, z: i32, resolution: i32) -> u32 {
+        // One bound over the points the answer is computed from, instead of
+        // eight (lattice cell) or four (finite differences) densities.
+        let q = if resolution <= 1 {
+            Query::lattice(self.sizes, [x, y, z], [x, y, z])
+        } else {
+            let h = resolution.min(8);
+            Query {
+                blocks: ([x, y, z], [x, y, z]),
+                samples: ([x, y, z], [x + h, y + h, z + h]),
+                dy_edge: f64::from(h),
+                min_wavelength: f64::from(resolution),
+                column: None,
+            }
+        };
+        if let Some(block) = self.analyzer().uniform_block(&q) {
+            return block;
+        }
         let (density, dx, dy, dz) = if resolution <= 1 {
             cell_at(&self.noise, &self.blend, self.sizes, x, y, z)
         } else {
@@ -347,8 +527,19 @@ impl Terrain {
             }
         } else {
             let limit = from_y - 4096;
+            let an = self.analyzer();
+            // Samples at `y`, `y - 8`, ...; the bound skips runs of them that
+            // cannot hold a solid block (the same blocks, fewer samples).
+            let empty = |hi: i32, n: i32| {
+                an.density_range(&Query::column(x, z, hi - 8 * (n - 1), hi, col))
+                    .is_some_and(|r| r.max <= 0.0)
+            };
             while y > limit && !solid(y) {
-                y -= 8;
+                let mut hop = 1;
+                while hop < 512 && empty(y, hop * 2) {
+                    hop *= 2;
+                }
+                y -= 8 * hop;
             }
             if y <= limit {
                 return None;
@@ -368,5 +559,7 @@ impl Terrain {
     }
 }
 
+#[cfg(test)]
+mod bounds_tests;
 #[cfg(test)]
 mod tests;

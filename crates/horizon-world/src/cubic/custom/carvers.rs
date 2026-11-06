@@ -109,6 +109,84 @@ impl Cache {
     }
 }
 
+/// Which origin cubes of 8 x 8 x 8 have a walk (the activity draw only
+/// depends on the origin), so that a cube does not draw for all of its
+/// 17 x 17 x 17 origins every time.
+#[derive(Default)]
+struct ActiveOrigins {
+    shards: [Mutex<HashMap<[i32; 3], Arc<[[i32; 3]]>>>; SHARDS],
+}
+
+const REGION: i32 = 8;
+
+impl ActiveOrigins {
+    fn region(
+        &self,
+        key: [i32; 3],
+        seeds: &OriginSeeds,
+        rarity: i32,
+        y_ok: &impl Fn(i32) -> bool,
+    ) -> Arc<[[i32; 3]]> {
+        let h = (key[0].wrapping_mul(73856093)
+            ^ key[1].wrapping_mul(19349663)
+            ^ key[2].wrapping_mul(83492791)) as u32 as usize;
+        let shard = &self.shards[h % SHARDS];
+        if let Some(v) = shard.lock().unwrap().get(&key) {
+            return v.clone();
+        }
+        let mut list = Vec::new();
+        for z in 0..REGION {
+            for y in 0..REGION {
+                for x in 0..REGION {
+                    let o = [
+                        key[0] * REGION + x,
+                        key[1] * REGION + y,
+                        key[2] * REGION + z,
+                    ];
+                    if y_ok(o[1]) && seeds.random(o).int(rarity) == 0 {
+                        list.push(o);
+                    }
+                }
+            }
+        }
+        let v: Arc<[[i32; 3]]> = list.into();
+        let mut map = shard.lock().unwrap();
+        if map.len() >= SHARD_LIMIT {
+            map.clear();
+        }
+        map.insert(key, v.clone());
+        v
+    }
+
+    /// The origins within `RANGE` cubes of `cube` whose activity draw hits,
+    /// in CWG's loop order (`z`, then `y`, then `x`).
+    fn near(
+        &self,
+        cube: SectionPos,
+        seeds: &OriginSeeds,
+        rarity: i32,
+        y_ok: impl Fn(i32) -> bool,
+    ) -> Vec<[i32; 3]> {
+        let lo = [cube.x - RANGE, cube.y - RANGE, cube.z - RANGE];
+        let hi = [cube.x + RANGE, cube.y + RANGE, cube.z + RANGE];
+        let mut out = Vec::new();
+        for rz in lo[2].div_euclid(REGION)..=hi[2].div_euclid(REGION) {
+            for ry in lo[1].div_euclid(REGION)..=hi[1].div_euclid(REGION) {
+                for rx in lo[0].div_euclid(REGION)..=hi[0].div_euclid(REGION) {
+                    let list = self.region([rx, ry, rz], seeds, rarity, &y_ok);
+                    out.extend(
+                        list.iter()
+                            .copied()
+                            .filter(|o| (0..3).all(|i| o[i] >= lo[i] && o[i] <= hi[i])),
+                    );
+                }
+            }
+        }
+        out.sort_unstable_by_key(|o| (o[2], o[1], o[0]));
+        out
+    }
+}
+
 /// `MapGenBase`-style origin seeds.
 #[derive(Clone, Copy)]
 struct OriginSeeds {
@@ -146,6 +224,7 @@ struct CaveCarver {
     grass: u32,
     seeds: OriginSeeds,
     cache: Cache,
+    active: ActiveOrigins,
 }
 
 struct RavineCarver {
@@ -156,6 +235,7 @@ struct RavineCarver {
     water: u32,
     seeds: OriginSeeds,
     cache: Cache,
+    active: ActiveOrigins,
 }
 
 /// All carvers of a generator.
@@ -195,6 +275,7 @@ impl Carvers {
                 grass,
                 seeds: OriginSeeds::new(world_seed, 0x6361_7665 + i as i64),
                 cache: Cache::default(),
+                active: ActiveOrigins::default(),
                 cfg: cfg.clone(),
             });
         }
@@ -211,6 +292,7 @@ impl Carvers {
                 water,
                 seeds: OriginSeeds::new(world_seed, 0x7261_7669),
                 cache: Cache::default(),
+                active: ActiveOrigins::default(),
             })
         } else {
             None
@@ -482,27 +564,21 @@ impl CaveCarver {
 
     fn carve(&self, cube: SectionPos, out: &mut [u32; 4096], lava: &[u32]) {
         let c = centre(cube);
-        for oz in cube.z - RANGE..=cube.z + RANGE {
-            for oy in cube.y - RANGE..=cube.y + RANGE {
-                if oy < self.cfg.cave_min_height || oy > self.cfg.cave_max_height {
-                    continue;
-                }
-                for ox in cube.x - RANGE..=cube.x + RANGE {
-                    let o = [ox, oy, oz];
-                    // Cheap activity test before touching the cache.
-                    if self.seeds.random(o).int(self.cfg.cave_rarity) != 0 {
-                        continue;
-                    }
-                    let Some(w) = self.cache.get(o, || self.walks(o)) else {
-                        continue;
-                    };
-                    if !w.may_reach(c) {
-                        continue;
-                    }
-                    for s in &w.spheres {
-                        self.carve_sphere(cube, out, s, lava);
-                    }
-                }
+        let (min, max) = (self.cfg.cave_min_height, self.cfg.cave_max_height);
+        let origins = self
+            .active
+            .near(cube, &self.seeds, self.cfg.cave_rarity, |y| {
+                y >= min && y <= max
+            });
+        for o in origins {
+            let Some(w) = self.cache.get(o, || self.walks(o)) else {
+                continue;
+            };
+            if !w.may_reach(c) {
+                continue;
+            }
+            for s in &w.spheres {
+                self.carve_sphere(cube, out, s, lava);
             }
         }
     }
@@ -633,23 +709,19 @@ impl RavineCarver {
 
     fn carve(&self, cube: SectionPos, out: &mut [u32; 4096]) {
         let c = centre(cube);
-        for oz in cube.z - RANGE..=cube.z + RANGE {
-            for oy in (cube.y - RANGE..=cube.y + RANGE).filter(|&oy| oy <= self.max_cube_y) {
-                for ox in cube.x - RANGE..=cube.x + RANGE {
-                    let o = [ox, oy, oz];
-                    if self.seeds.random(o).int(RAVINE_RARITY) != 0 {
-                        continue;
-                    }
-                    let Some(w) = self.cache.get(o, || self.walk(o)) else {
-                        continue;
-                    };
-                    if !w.may_reach(c) {
-                        continue;
-                    }
-                    for s in &w.spheres {
-                        self.carve_sphere(cube, out, s, &w);
-                    }
-                }
+        let max = self.max_cube_y;
+        let origins = self
+            .active
+            .near(cube, &self.seeds, RAVINE_RARITY, |y| y <= max);
+        for o in origins {
+            let Some(w) = self.cache.get(o, || self.walk(o)) else {
+                continue;
+            };
+            if !w.may_reach(c) {
+                continue;
+            }
+            for s in &w.spheres {
+                self.carve_sphere(cube, out, s, &w);
             }
         }
     }
