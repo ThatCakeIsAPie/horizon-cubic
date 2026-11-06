@@ -100,9 +100,14 @@ this machine's driver. clippy `-D warnings` and fmt are clean.
 
 ### Known gaps
 
-- **A window slide relights every column.** The entering layers (and the ones beside them) are lit
-  by the whole-column light job (`dirty_light`), and the cubes wait for it before they are sent.
-  A finer, per-layer relight is later work.
+- **A window slide lights only what it changes.** `Streaming::relight_slide` (`light::relight_entering`)
+  lights the entering layers in the slide's own call (a one-block cube is a single `Light` value), then
+  spreads light, increase only, from the entering cubes into the kept layer beside them and on where it
+  increases. Leaving cubes take no work: kept cubes beside them keep the light they gave (a whole relight
+  would drop it). Kept sections whose light changed go to every player holding the column as vanilla light
+  updates (`Hub::cubic_light_changed`); the entering cubes go out with their light, no longer waiting for a
+  column job. Only a jump (more than `SLIDE_RELIGHT_MAX` entering layers) and columns not lit yet use
+  `dirty_light`.
 - **Single player only.**
   - The window follows the first player. LAN guests at other heights get that player's window.
   - A dedicated server has not been tried.

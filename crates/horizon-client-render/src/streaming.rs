@@ -2272,6 +2272,98 @@ impl Streaming {
             }
         }
     }
+    /// Light for the cubes a cubic level's window slid over (`cubes`, cube
+    /// Ys, in the layout `World::relayout` has just given the world), from
+    /// what the slide changed alone instead of every column whole
+    /// (`light::relight_entering`): the entering sections are lit now, in
+    /// this call, and the kept cubes beside them get the light that spreads
+    /// into them. Meshes of those and of the cubes beside are queued.
+    ///
+    /// Columns not lit yet are lit whole, as is every column when the slide
+    /// is a jump (more than `SLIDE_RELIGHT_MAX` layers entered: all of it is
+    /// new, and the workers light it better). Returns, per column, the kept
+    /// sections whose light changed, for the players who hold them to be
+    /// sent (nothing changed in an entering section needs sending: it is
+    /// sent with its cube).
+    pub fn relight_slide(
+        &mut self,
+        world: &mut World,
+        cubes: &[i32],
+    ) -> FxHashMap<(i32, i32), SectionMask> {
+        let layout = world.layout();
+        let first = layout.min_y() >> 4;
+        let entering: Vec<usize> = cubes
+            .iter()
+            .filter_map(|&cy| usize::try_from(cy - first).ok())
+            .filter(|&s| s < layout.sections())
+            .collect();
+        let (mut lit, mut unlit) = (Vec::new(), Vec::new());
+        for (&key, chunk) in &world.chunks {
+            if chunk.lit && entering.len() <= SLIDE_RELIGHT_MAX {
+                lit.push(key);
+            } else {
+                unlit.push(key);
+            }
+        }
+        world.dirty_light.extend(unlit);
+        if lit.is_empty() || entering.is_empty() {
+            return FxHashMap::default();
+        }
+        let started = std::time::Instant::now();
+        let mut changed = LightChanges::default();
+        crate::light::relight_entering(
+            &mut world.chunks,
+            &self.light_tables,
+            self.sky_light,
+            &lit,
+            &entering,
+            &mut changed,
+        );
+        // Sections of one value share one allocation, as the light jobs leave them.
+        let mut runs: Vec<std::ops::RangeInclusive<usize>> = Vec::new();
+        for &s in &entering {
+            match runs.last_mut() {
+                Some(run) if *run.end() + 1 == s => *run = *run.start()..=s,
+                _ => runs.push(s..=s),
+            }
+        }
+        for key in &lit {
+            if let Some(chunk) = world.chunks.get_mut(key) {
+                let chunk = Arc::make_mut(chunk);
+                for run in &runs {
+                    crate::chunk::share_uniform(&mut chunk.sections[run.clone()]);
+                }
+            }
+        }
+        // The meshes: the entering sections and the sections beside them, which
+        // face them and read their light, and every section a change reaches.
+        let sections = layout.sections();
+        for &(x, z) in &lit {
+            for &s in &entering {
+                for s in s.saturating_sub(1)..=(s + 1).min(sections - 1) {
+                    world.dirty_sections.insert((x, s as i32, z));
+                }
+            }
+        }
+        changed.dirty_sections(|section| {
+            world.dirty_sections.insert(section);
+        });
+        Self::relight_beside_unlit(world, &changed);
+        let mut kept: FxHashMap<(i32, i32), SectionMask> = FxHashMap::default();
+        for (x, sy, z) in changed.sections() {
+            if !entering.contains(&(sy as usize)) {
+                kept.entry((x, z)).or_default().insert(sy as usize);
+            }
+        }
+        log::debug!(
+            "Horizon: window slide lit {} columns x {} layers in {:?} ({} kept sections changed)",
+            lit.len(),
+            entering.len(),
+            started.elapsed(),
+            kept.values().map(|m| m.len()).sum::<usize>()
+        );
+        kept
+    }
     /// Hands a big batch of edits (a `/fill` arriving block by block) to the
     /// workers: the columns they touch and their neighbours get full light
     /// jobs, as `World::edit_runs` does, instead of relighting every changed
@@ -3169,6 +3261,10 @@ fn same_values(
 /// The most changed blocks one frame relights itself (`Streaming::relight_edits`): a 16^3
 /// section's worth. Past it, the columns are lit again whole on the workers.
 const INLINE_RELIGHT_MAX: usize = 4096;
+
+/// The most layers a window slide lights in place (`Streaming::relight_slide`):
+/// a slide moves each end by a few layers; more is a jump, lit whole.
+const SLIDE_RELIGHT_MAX: usize = 4;
 
 /// Splits edits at `positions` into the columns to light again whole and the
 /// edits to relight in place. An edited column is lit whole with its

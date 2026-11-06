@@ -4483,6 +4483,46 @@ impl Hub {
         }
     }
 
+    /// The kept sections a slide of level `dimension`'s window changed the
+    /// light of (`Streaming::relight_slide`: the light that spreads out of the
+    /// entering cubes into the cubes beside them), sent as vanilla's light
+    /// update to every player that holds the column, not only to those at
+    /// the edge of what they track as `broadcast_light_changes` does: no
+    /// block of theirs carries these changes. That is cheaper than sending
+    /// the sections again with `horizon:cubes`, which carries their blocks
+    /// too, and the light changes only next to the entering layers. Call it
+    /// after `cubic_window_changed`, so the encoder holds the new window.
+    pub fn cubic_light_changed(
+        &mut self,
+        dimension: &str,
+        world: &World,
+        changes: &crate::fast_hash::FxHashMap<(i32, i32), crate::section_mask::SectionMask>,
+    ) {
+        if changes.is_empty() || self.config.dimension != dimension {
+            return;
+        }
+        let mut columns: Vec<_> = changes.iter().map(|(&c, &m)| (c, m)).collect();
+        columns.sort_unstable_by_key(|&(column, _)| column);
+        for ((x, z), sections) in columns {
+            let Some(chunk) = world.chunks.get(&(x, z)) else {
+                continue;
+            };
+            let viewers: Vec<usize> = (0..self.guests.len())
+                .filter(|&i| {
+                    let g = &self.guests[i];
+                    self.here(g) && g.sent_chunks.contains(&(x, z))
+                })
+                .collect();
+            if viewers.is_empty() {
+                continue;
+            }
+            let body = self.encoder.light_update(chunk, sections);
+            for &i in &viewers {
+                self.guests[i].sender.send(body.clone());
+            }
+        }
+    }
+
     /// The level took `columns` out to load them again (a cubic window that slid
     /// into vanilla's range found them without their vanilla generation): every
     /// player that holds one forgets it and is sent it again, whole, when the
@@ -4514,7 +4554,8 @@ impl Hub {
 
     /// The cubes the window slid over, sent to player `i`: its queued columns
     /// nearest first, a column once its light has settled (or
-    /// `CUBES_WAIT` ticks after it was queued), as many as the batch quota the
+    /// `CUBES_WAIT` ticks after it was queued: a slide's entering cubes are lit
+    /// when it is made, so only a jump or a column not lit yet waits), as many as the batch quota the
     /// client's acknowledgements pace allows after the chunks the tick sent.
     /// One batch: `ChunkBatchStart`, a `horizon:cubes` payload or more for
     /// each column, `ChunkBatchFinished` counting the columns.

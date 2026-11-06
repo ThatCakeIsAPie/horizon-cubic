@@ -121,7 +121,8 @@ impl Game<'_> {
     ///    entities, block entities and ticks join the world as a loaded
     ///    column's do.
     /// 5. The streaming shifts its per-section state.
-    /// 6. Every column is lit again (the coarse tool: `dirty_light`).
+    /// 6. The entering cubes are lit, and the light that spreads out of them
+    ///    into the kept cubes beside them (not every column whole).
     /// 7. The hub tells the players and queues the entering cubes for them.
     fn slide_cubic_window(
         &mut self,
@@ -236,13 +237,17 @@ impl Game<'_> {
         self.random_tick_sections.clear();
         self.portals.sections.clear();
 
-        // 6. Light: the entering layers and the ones beside them, as a whole
-        // column's light job does it.
-        self.world.dirty_light.extend(columns.iter().copied());
+        // 6. Light: the entering layers, and what spreads out of them into the
+        // kept cubes beside them (`Streaming::relight_slide`), not every
+        // column whole.
+        let kept_light = self.streaming.relight_slide(&mut self.world, &entering);
 
-        // 7. The players.
+        // 7. The players: the window, the kept sections whose light changed
+        // (the entering cubes are lit now, and go out with their light).
         if let Some(h) = self.lan.as_mut() {
             h.hub.cubic_window_changed(self.dim.id(), new_shape);
+            h.hub
+                .cubic_light_changed(self.dim.id(), &self.world, &kept_light);
         }
         self.aim_ring(viewers);
         Ok(())
