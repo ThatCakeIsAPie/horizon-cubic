@@ -50,6 +50,7 @@ def main():
     ap.add_argument('--hop', type=int, default=5_000_000, help='blocks between teleports')
     ap.add_argument('--y', type=int, default=300, help='height to look from')
     ap.add_argument('--timeout', type=float, default=180.0, help='seconds a fill may take')
+    ap.add_argument('--trace', action='store_true', help='print the cube_lod counters every second while waiting')
     ap.add_argument('--width', type=int, default=1280)
     ap.add_argument('--height', type=int, default=720)
     args = ap.parse_args()
@@ -90,6 +91,8 @@ def main():
             if s.get('fps') is not None:
                 fps.append(float(s['fps']))
             last = lod
+            if args.trace and int((time.monotonic() - since) * 10) % 10 == 0:
+                print(f'  t={time.monotonic() - since:5.1f} ' + ' '.join(f'{k}={v}' for k, v in lod.items() if not isinstance(v, (dict, list))), flush=True)
             # Complete, and the plan changed after the teleport: this is the new view's fill.
             changed_ago = lod.get('plan_changed_ago_s')
             complete_ago = lod.get('plan_complete_ago_s')
