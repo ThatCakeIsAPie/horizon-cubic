@@ -257,6 +257,7 @@ The owner downloaded the video and we went through it frame by frame. What it sh
 - **On joining and after each teleport,** chat prints "Preparing distant terrain data…" and then "Distant terrain ready (1.5 s)". After that the whole world is on screen. From y = 1,000,000 and 2,000,000 it is a flat plane out to the border's edge.
 - **That first picture is coarse.** The whole-world option's tooltip says coarse terrain appears first and is refined progressively. After a teleport to the ground, its F3 shows about 670 builds waiting, done at about 15 builds/s. Full detail therefore arrives over tens of seconds, and trees appear on distant hills seconds after the land.
 - **From high up, the ground is a point-sampled colour field.** It shimmers like static, and the End's islands make moiré rings. Colour is not averaged at the coarse levels.
+- **Detail follows screen size.** At 2:43–2:50 he is in the End at y ≈ 2,000,000 and looks through the spyglass. The far islands first show as fine static. Within about a second, the bands under the spyglass sharpen into block shapes, one stretch at a time. Zooming in narrows the field of view, which makes each voxel bigger on screen, so the nodes in view get refined.
 - **Its F3** shows:
   - a native Rust part, about 180 MB off-heap;
   - 235–430 MB of GPU terrain buffers;
@@ -279,6 +280,14 @@ What we take from it:
 4. **Fog follows the far view.**
    - Fixed on 2026-11-06: cubic worlds never told the fog that far terrain was on (`FogInputs::distant_terrain` checked only the column LOD). Atmospheric fog therefore stopped at about 1,000 blocks, and from high up the ground faded into the sky.
    - Later: a horizon fade setting like Meridian's.
+5. **Choose detail by size on screen, not by distance alone.**
+   - The plan splits a node while it is nearer than `DETAIL` (2.5) times its size, whatever the field of view. So a far voxel spans about 1/40 of its distance, about 25 pixels on a 1280-pixel, 70° view.
+   - That is why the far view looks blocky, and why "complete" does not mean full detail.
+   - Voxy-class detail needs about 1–2 pixels per voxel. To get there:
+     - choose levels by projected voxel size, using the field of view and the resolution;
+     - refine what is on screen first;
+     - make the target a setting (like Meridian's Detail), and measure the fill time at each step.
+6. **The coarse levels alias.** From y = 5,000,000 the ground is a regular tile pattern. Each coarse voxel point-samples the noise at a spacing that lines up with the noise's period. The surface layer (2) with averaged colour (3) fixes this.
 
 ### Where the GPU far view stands
 
