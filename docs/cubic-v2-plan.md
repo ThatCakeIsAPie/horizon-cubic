@@ -394,6 +394,26 @@ Points 1 and 5 above are built (`lod/cube.rs`):
 - **Dark walls fixed.** Both far meshers lit a face by whether its own voxel saw the sky, so only a column's top voxel was in the sun, and tall cliffs and pillars drew near-black. A face now takes the light of the cell in front of it, as in Minecraft. The tall world's pillars now draw with lit stone walls (`D:\ClaudeData\far-detail-runs\light\tall_cmp.png`).
 - **Not run:** `SURFACE_LEVEL` 10/14, the per-step sweep with tiles at Low/Normal/Extreme, and true 1 px.
 
+### The owner's first play test of the rework (2026-11-06, evening)
+
+The owner's verdict: "Not perfect yet, but WOW, this is insanity!" These are the issues the owner reported, what caused each one, and the fix.
+
+1. **Water vanished at middle distances.** The generator made a voxel water only when its centre lay below the sea's surface (sea level + 1). From 128-block voxels up (level 7), the centre of the voxel holding the surface lies above it, so that voxel was air and the sea showed its floor. The tiles (level 12 up) and fine cubes kept their water, so the sea disappeared only in a ring between them.
+   - **Fix (`cube_gen` `water_at_sea`):** an open voxel holding the surface is water when the column is open just under the surface (one more density sample, in that row only). The pre-pass and the GPU descent treat an all-open voxel as water when its bottom lies below the surface.
+   - **Drawing:** both meshers draw water in such a voxel up to the surface only (`cube_far.wgsl` takes the surface from the cull pass; the CPU mesher from `CubeSampler::sea_surface`), never as a slab 2,048 blocks deep.
+2. **A gap followed the player between far and near terrain.** The near renderer draws a circle of columns (`streaming::in_view_distance`). The octree left out every lit cube in the square the game holds, render distance + 2. The ring in between was drawn by neither.
+   - **Fix:** the octree leaves out only lit cubes within the circle.
+3. **Dark stripes on far cliffs** (the face-light change had caused them). A wall on a node's side took its own column's sky light at the node's top. A cliff that rises past the node has rock over it there, so its walls went dark one node at a time.
+   - **Fix:** a wall on a node's side looks into the neighbour node where it is known (open from that node's top down to the cell in front), and is lit where it is not.
+4. **Z-fighting through the spyglass at y 10,000.** A coarse tile or node stays drawn until everything planned in its place is in, which can take tens of seconds when zoomed. Meanwhile the finer nodes that are already in are drawn in the same place: same depth push, water and flat ground in the very same planes.
+   - **Fix (`cube_far.wgsl` `cf_by_level`):** coarser far terrain is pushed back by 2e-5 of its distance per level, so the finer node wins.
+5. **Ultra went back and forth between levels.** Where the quad arena binds the budget (Ultra), the budget followed the bytes per node every frame. The bytes move with the plan, and a budget change of over 10% asks for a new plan (`refocused`). The new plan moved the bytes again.
+   - **Fix:** the arena's cap holds until the room moves outside 0.9–1.25 of it (`ARENA_CAP_BAND`).
+6. **The spyglass refines slowly.** This is fill rate. At y 10,000 the zoomed plan wants about 90,000 new nodes, and the GPU makes 2,600–3,500 a second. The fill-rate loops (Order of work 6.5) are the lever.
+7. **Chunks flashed in.** Vanilla's chunk fade-in mixes a new section toward the fog colour, so a flash of sky showed where a chunk came in.
+   - **Change (the owner's request):** solid terrain dithers in, as far terrain fades. Translucent faces draw whole from the start, as far water already does.
+   - Not changed: the Metal opaque pass, which cannot discard, still mixes toward the fog colour, and so does the opt-in visibility buffer.
+
 ### Where the GPU far view stands
 
 Done: generate, mesh and draw (stages 1, 3 and most of 4) run on the GPU for a cubic level's far nodes; the CPU only chooses which nodes exist.
@@ -477,6 +497,7 @@ Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertica
    2. `cubic/far-surface`: layered height-map tiles on the GPU for the coarsest levels, with exact heights and jittered samples.
    3. Lead: merge both, wire the tiles into the plan through `node_kind`, one test pass, benchmark at each Far Detail step, screenshots from y 300 to 5,000,000, install. Done, except benchmarking every step: only High and Ultra were run with tiles.
    4. Still to measure: `SURFACE_LEVEL` 10/14, Low/Normal/Extreme with tiles, true 1 px. Then find why Ultra is slower with tiles; the first suspect is tile draw compaction.
+      The owner's first play test is fixed: mid-distance water, the gap at the render distance, dark cliff stripes, spyglass z-fighting, Ultra's swings, and the chunk fade-in dithered. See "The owner's first play test of the rework".
    5. Then, in this order:
       1. far views of the player's builds;
       2. occlusion-driven refinement;

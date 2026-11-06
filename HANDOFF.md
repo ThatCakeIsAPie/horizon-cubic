@@ -130,6 +130,16 @@ Tested:
 - **One full test pass:** every target passed except one tile-agent test with a threshold too strict for coarse columns. It was fixed and rerun.
 - **Measured at High with tiles:** a teleport is covered in 0.18 s and complete in 19 s, at 120 fps, with a 48 ms longest frame. The spyglass refines what it looks at. Caverns at y −2,000 show no holes.
 
+The owner's first play test, fixed: the plan's "The owner's first play test of the rework" lists each issue with its cause. In short:
+- sea water in coarse voxels;
+- the gap at the render distance's edge;
+- dark stripes on far cliffs;
+- z-fighting where coarse terrain waits over finer;
+- Ultra's plan swinging with the arena estimate;
+- the chunk fade-in, now dithered.
+
+`tools/cubic_far_check.py` gained `--spyglass-at Y:PITCH` and `--watch S` (plan swings while the camera is still).
+
 ### Known gaps
 
 - **Far view, not measured yet:**
@@ -137,6 +147,7 @@ Tested:
   - Low/Normal/Extreme with tiles;
   - true 1 px.
 - **Ultra is slower with tiles than without** (72 s against 48 s to complete, 103 fps against 120). The first suspect is tile draw compaction.
+- **The spyglass refines at the fill rate** (2,600–3,500 nodes/s). At y 10,000 a zoom wants about 90,000 new nodes, so it takes tens of seconds. The fill-rate work is the lever.
 - **Far terrain doesn't show the player's builds** beyond the disk cache's limits; see the plan.
 - **Vertical shards (branch `cubic/shards`).** LAN guests are grouped into shards by their vertical ranges (`cubic_shards.rs`); see `docs/cubic-v2-plan.md`, "Residency", "As built". Not done: vehicles carried across shards, mod API calls (`native_*` by dimension name) reach the shard in place only, and no trial on a long-running dedicated server yet.
 - **No structures in Custom Cubic,** as in CubicWorldGen. The structure toggles are marked `*`.

@@ -9,8 +9,11 @@ Each check launches a cubic world offscreen at Whole World (as tools/cubic_far_b
 its own HORIZON_HOME and control socket in --out) and prints `status`'s `cube_lod` counters:
 - `--hitch`: teleports 5,000,000 blocks twice and prints the frame-time summary of the 4 s after each
   (`horizon-ctl stats`: the longest frame is the teleport's hitch), then waits for the fill.
-- `--spyglass`: at y 300 facing the horizon, screenshots before and while looking through a spyglass
-  (the far nodes in view refine: `planned` grows), and after letting go.
+- `--spyglass`: at y 300 facing the horizon (or `--spyglass-at Y:PITCH`), screenshots before and while
+  looking through a spyglass (the far nodes in view refine: `planned` grows), and after letting go.
+- `--watch S`: after the views, holds still for S seconds and samples the plan four times a second:
+  how often it changed and how far `planned` and `budget` moved (a still camera's plan should not
+  swing between sizes).
 - `--cavern`: spectator at y -2,000 inside rock (screenshots four ways), then inside an open space: a
   natural one if a 96-block box around holds one, else a room carved with /fill. Prints the counters
   (no holes, complete) and the log's errors.
@@ -44,6 +47,8 @@ def main():
     ap.add_argument('--x', type=int, default=5_000_000, help='where the checks teleport to')
     ap.add_argument('--hitch', action='store_true')
     ap.add_argument('--spyglass', action='store_true')
+    ap.add_argument('--spyglass-at', default='300:2', help='Y:PITCH the spyglass looks from')
+    ap.add_argument('--watch', type=float, default=0.0, help='seconds to watch a still plan for swings')
     ap.add_argument('--cavern', action='store_true')
     ap.add_argument('--views', nargs='*', default=[], help='Y:PITCH views to screenshot after each fill')
     ap.add_argument('--tall', action='store_true', help='raise the terrain to peaks of thousands of blocks')
@@ -162,6 +167,24 @@ def main():
             settle(f'view y {y:.0f}, pitch {pitch:.0f}', time.monotonic())
             time.sleep(1)
             ctl_run('screenshot', scratch / f'view_y{y:.0f}_p{pitch:.0f}.png')
+        if args.watch > 0:
+            # A still camera: count the plans made and how far their sizes move.
+            planned, budgets, changes, last = [], [], 0, None
+            end = time.monotonic() + args.watch
+            while time.monotonic() < end:
+                lod = status().get('cube_lod') or {}
+                ago = lod.get('plan_changed_ago_s')
+                if ago is not None and last is not None and ago + 0.05 < last:
+                    changes += 1
+                last = ago
+                if lod.get('planned') is not None:
+                    planned.append(lod['planned'])
+                if lod.get('budget') is not None:
+                    budgets.append(lod['budget'])
+                time.sleep(0.25)
+            print(f'watch {args.watch:.0f} s: {changes} new plans, planned {min(planned, default=None)}..'
+                  f'{max(planned, default=None)}, budget {min(budgets, default=None)}..{max(budgets, default=None)}',
+                  flush=True)
         if args.hitch:
             for i in range(2):
                 ctl_run('stats', 'reset')
@@ -176,9 +199,10 @@ def main():
                     print(f'teleport {i + 1}: no stats', flush=True)
                 settle(f'teleport {i + 1}', time.monotonic(), moved=False)
         if args.spyglass:
-            ctl_run('tp', args.x, 300, 0)
-            ctl_run('look', 0, 2)
-            settle('y 300, horizon', time.monotonic())
+            spy_y, spy_pitch = (float(v) for v in args.spyglass_at.split(':'))
+            ctl_run('tp', args.x, spy_y, 0)
+            ctl_run('look', 0, spy_pitch)
+            settle(f'y {spy_y:.0f}, pitch {spy_pitch:.0f}', time.monotonic())
             time.sleep(1)
             ctl_run('screenshot', scratch / 'spyglass_before.png')
             # Spectators cannot use items: creative, flying where it is.
