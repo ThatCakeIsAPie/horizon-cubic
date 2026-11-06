@@ -1,9 +1,27 @@
-//! A cubic level's window on the server (docs/cubic-chunks.md, "v1
+//! A cubic level's windows on the server (docs/cubic-chunks.md, "v1
 //! architecture", and docs/cubic-v2-plan.md, "Residency"): the level's chunks
 //! hold a window of cubes around its players, `2V + 3` cubes tall (V is the
 //! vertical distance the players asked for, `horizon:cubic_view`), and the
 //! window slides by whole cube layers, in place, when a player's cube is two
 //! or more from its centre, or when V changes.
+//!
+//! **Shards.** Players whose wanted ranges overlap share a window; a player
+//! far above or below the others has a shard of its own: another `World`
+//! with its own window and streaming over the same `CubicLevel` (the cubes on
+//! disk, the generator and the population are shared; the windows are
+//! disjoint, so no cube is loaded or simulated twice). `cubic_shards::plan`
+//! says who shares, `cubic_shards::settle` keeps that to the moves that can be
+//! made now, and this module carries it out each server tick
+//! (`follow_cubic_window`): shards that meet merge (the one that closes saves
+//! all it holds, the other slides over it), a player that left the others'
+//! range splits into a new shard (the old one shrinks first), and a player
+//! that changes shard gets the level again like a dimension change (`Respawn`,
+//! the new window, its columns and cubes). The saved window
+//! (`horizon_cubic.json`) is the primary shard's, the one a world opens with
+//! (shard 0, which also owns the level's forced chunks, attachments and
+//! raids). The columns' sky tops and the marker cube's structure data are
+//! the `CubicLevel`'s, read from the store by whichever shard loads the
+//! column.
 //!
 //! A slide never reloads the level. The cubes that enter come from the
 //! prefetch ring (`cubic_prefetch`: the next two layers beyond the window,
@@ -12,9 +30,11 @@
 //! windows hold stay as they are (`World::relayout`). The hub then tells the
 //! players the window and sends them only the entering cubes
 //! (`Hub::cubic_window_changed`).
+use super::levels::LevelId;
 use super::persist::EntityScope;
 use super::{Dim, Game};
 use horizon_client::cubic::{self, LoadedCube};
+use horizon_client::cubic_shards::{self, Existing, Group, Member, Range};
 use horizon_client::fast_hash::FxHashSet;
 use horizon_core::position::{BlockPos, ChunkPos, SectionPos};
 use horizon_core::ticks::TickArea;
@@ -27,7 +47,7 @@ const RING_WAIT: u32 = 20;
 /// Ticks between aiming the ring again at the columns the level holds.
 const RETARGET_EVERY: u32 = 20;
 
-/// What the server remembers of the window between ticks.
+/// What the server remembers of a shard's window between ticks.
 #[derive(Default)]
 pub(super) struct SlideState {
     /// Ticks a due slide has waited for the ring.
@@ -38,16 +58,43 @@ pub(super) struct SlideState {
 
 /// A player in the cubic level: its cube, its vertical distance and column.
 struct Viewer {
+    conn: u32,
     cube: i32,
     vertical: u8,
     column: (i32, i32),
+    shard: u16,
 }
 
 impl Game<'_> {
-    /// The cubic level of the server's players: when the cubes they want
-    /// loaded (the union of their ranges, `cubic::union_cubes`) call for
-    /// another window, it slides there (`slide_cubic_window`); the ring is
-    /// kept aimed at the layers beyond the window meanwhile.
+    /// The Overworld's shards and the windows (cubes) they hold now.
+    fn overworld_shards(&self) -> Vec<Existing> {
+        let mut shards: Vec<Existing> = self
+            .levels
+            .parked_shards(Dim::Overworld)
+            .into_iter()
+            .filter_map(|id| {
+                let world = self.levels.parked_shard_world(Dim::Overworld, id)?;
+                Some(Existing {
+                    id,
+                    window: cubic::window_cube_range(world.shape),
+                })
+            })
+            .collect();
+        if self.dim == Dim::Overworld {
+            shards.push(Existing {
+                id: self.shard,
+                window: cubic::window_cube_range(self.world.shape),
+            });
+        }
+        shards.sort_by_key(|s| s.id);
+        shards
+    }
+
+    /// The cubic level's shards follow their players: each player is in the
+    /// shard whose window covers it (`cubic_shards::plan`), shards merge and
+    /// split, and each shard's window slides towards the cubes its players
+    /// want loaded (`step_shard`); the ring is kept aimed at the layers beyond
+    /// each window meanwhile.
     pub(super) fn follow_cubic_window(&mut self) -> horizon_client::Result<()> {
         if self.options.execution_role.is_client() || !self.level_shapes.overworld.cubic {
             return Ok(());
@@ -58,58 +105,189 @@ impl Game<'_> {
                 .iter()
                 .filter(|g| g.placed && g.dimension == Dim::Overworld.id())
                 .map(|g| Viewer {
+                    conn: g.conn,
                     cube: (g.position[1].floor() as i32) >> 4,
                     vertical: g.vertical,
                     column: g.chunk(),
+                    shard: g.shard,
                 })
                 .collect()
         });
-        // TODO(shards): the union of every player's range is one window for the
-        // level; vertical shards (docs/cubic-v2-plan.md) give players whose
-        // ranges do not meet windows of their own.
-        let Some(wanted) = cubic::union_cubes(
-            viewers
+        let existing = self.overworld_shards();
+        let members: Vec<Member> = viewers
+            .iter()
+            .map(|v| Member {
+                key: v.conn,
+                cube: v.cube,
+                range: cubic::wanted_cubes(v.cube, v.vertical),
+                shard: v.shard,
+            })
+            .collect();
+        let planned = cubic_shards::plan(&members, &existing);
+        let groups = cubic_shards::settle(planned.groups, &members, &existing);
+        let back = self.here();
+        let result = self.carry_out_shards(&groups, &viewers, existing);
+        let restored = self.enter_level(None, back);
+        result.and(restored)
+    }
+
+    /// Carries out the groups: in order, the merges (the shard that closes is
+    /// saved whole, its survivor slides over it), every other existing shard
+    /// sliding towards its window, the new shards, the players moving to
+    /// their shard, and the shards left without players closing.
+    fn carry_out_shards(
+        &mut self,
+        groups: &[Group],
+        viewers: &[Viewer],
+        existing: Vec<Existing>,
+    ) -> horizon_client::Result<()> {
+        let mut windows: HashMap<u16, Range> = existing.iter().map(|e| (e.id, e.window)).collect();
+        let viewer = |conn: u32| viewers.iter().find(|v| v.conn == conn);
+        // The shard each player ends in.
+        let mut target: HashMap<u32, u16> = viewers.iter().map(|v| (v.conn, v.shard)).collect();
+
+        // 1. Merges: the shards that join another save everything they hold
+        // and close; their players are moved below.
+        for g in groups {
+            for &gone in &g.absorbed {
+                self.close_shard(gone)?;
+                windows.remove(&gone);
+            }
+        }
+        // 2. Every shard that stays slides towards its window.
+        for g in groups.iter().filter(|g| g.shard.is_some()) {
+            let shard = g.shard.unwrap_or_default();
+            let incoming = g
+                .members
                 .iter()
-                .map(|v| cubic::wanted_cubes(v.cube, v.vertical)),
-        ) else {
-            return Ok(());
-        };
-        let due = cubic::needs_new_window(self.level_shapes.overworld, wanted);
+                .any(|k| viewer(*k).is_some_and(|v| v.shard != shard));
+            let cubes: Vec<i32> = g
+                .members
+                .iter()
+                .filter_map(|k| viewer(*k).map(|v| v.cube))
+                .collect();
+            let keep = (
+                cubes.iter().copied().min().unwrap_or(g.window.0),
+                cubes.iter().copied().max().unwrap_or(g.window.1),
+            );
+            let others: Vec<Range> = windows
+                .iter()
+                .filter(|(id, _)| **id != shard)
+                .map(|(_, w)| *w)
+                .collect();
+            let here: Vec<&Viewer> = viewers.iter().filter(|v| v.shard == shard).collect();
+            let now = self.step_shard(shard, g.window, keep, &here, &others, incoming)?;
+            windows.insert(shard, now);
+            for &k in &g.members {
+                // Players move once the window holds their cube.
+                let cube = viewer(k).map_or(keep.0, |v| v.cube);
+                if (now.0..=now.1).contains(&cube) {
+                    target.insert(k, shard);
+                }
+            }
+        }
+        // 3. New shards.
+        for g in groups.iter().filter(|g| g.shard.is_none()) {
+            let cubes: Vec<i32> = g
+                .members
+                .iter()
+                .filter_map(|k| viewer(*k).map(|v| v.cube))
+                .collect();
+            let keep = (
+                cubes.iter().copied().min().unwrap_or(g.window.0),
+                cubes.iter().copied().max().unwrap_or(g.window.1),
+            );
+            let others: Vec<Range> = windows.values().copied().collect();
+            let Some(window) = cubic_shards::clip_window(g.window, &others, keep) else {
+                continue;
+            };
+            let id = (1..)
+                .find(|id| !windows.contains_key(id) && !self.shard_exists(Dim::Overworld, *id))
+                .unwrap_or(1);
+            match self.create_shard(id, window) {
+                Ok(()) => {
+                    windows.insert(id, window);
+                    for &k in &g.members {
+                        target.insert(k, id);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Horizon: no cubic shard for the players above or below: {e}")
+                }
+            }
+        }
+        // 4. Players change shard.
+        for v in viewers {
+            if let Some(&to) = target.get(&v.conn)
+                && to != v.shard
+            {
+                self.move_guest_to_shard(v.conn, to);
+            }
+        }
+        // 5. A shard without players closes (the primary stays).
+        let occupied: HashSet<u16> = target.values().copied().collect();
+        let empty: Vec<u16> = windows
+            .keys()
+            .copied()
+            .filter(|id| *id != cubic_shards::PRIMARY && !occupied.contains(id))
+            .collect();
+        for id in empty {
+            self.close_shard(id)?;
+        }
+        Ok(())
+    }
+
+    /// One shard's step towards `wanted` (the cubes its players want loaded):
+    /// it slides when due, else the ring is kept aimed. `keep` is the cubes
+    /// (first, last) its players are in and `others` the other shards' windows,
+    /// which the new window must not meet. With `force` the window goes to
+    /// `wanted` at once (players are moving in). Returns the window it holds
+    /// after.
+    fn step_shard(
+        &mut self,
+        shard: u16,
+        wanted: Range,
+        keep: Range,
+        viewers: &[&Viewer],
+        others: &[Range],
+        force: bool,
+    ) -> horizon_client::Result<Range> {
+        self.enter_level(None, LevelId::shard(Dim::Overworld, shard))?;
+        let due = force || cubic::needs_new_window(self.world.shape, wanted);
         self.cubic_slide.since_retarget += 1;
         if !due {
             self.cubic_slide.waiting = 0;
-            if self.cubic_slide.since_retarget < RETARGET_EVERY {
-                return Ok(());
+            if self.cubic_slide.since_retarget >= RETARGET_EVERY {
+                self.aim_ring(viewers);
             }
+            return Ok(cubic::window_cube_range(self.world.shape));
         }
-        let back = self.dim;
-        self.enter_level(None, Dim::Overworld)?;
-        let result = if due {
-            self.slide_cubic_window(wanted, &viewers)
-        } else {
-            self.aim_ring(&viewers);
-            Ok(())
-        };
-        self.enter_level(None, back)?;
-        result
+        self.slide_cubic_window(wanted, keep, viewers, others, force)?;
+        Ok(cubic::window_cube_range(self.world.shape))
     }
 
-    /// Aims the level's prefetch ring at the layers beyond the window of the
-    /// columns it holds, nearest the players first.
-    fn aim_ring(&mut self, viewers: &[Viewer]) {
+    /// Aims the level in place's prefetch ring at the layers beyond the window
+    /// of the columns it holds, nearest the players first.
+    fn aim_ring(&mut self, viewers: &[&Viewer]) {
         self.cubic_slide.since_retarget = 0;
         let Some(level) = self.save.cubic.get() else {
             return;
         };
         let centres: Vec<(i32, i32)> = viewers.iter().map(|v| v.column).collect();
-        level.retarget_ring(&centres, self.world.chunks.keys().copied());
+        level.retarget_shard_ring(
+            self.shard,
+            self.world.shape.column(),
+            &centres,
+            self.world.chunks.keys().copied(),
+        );
     }
 
     /// Slides the level in place towards the cubes `wanted`: at most
     /// `cubic::RING` layers at each end per slide, unless a player is outside
-    /// the window or the two do not overlap, which is a jump. It waits (up to
-    /// `RING_WAIT` ticks) until the ring has the entering cubes of every
-    /// loaded column. In order:
+    /// the window or the two do not overlap, which is a jump (and `force`
+    /// is one). The window shrinks at once, keeps off `others` and holds the
+    /// cubes `keep`. It waits (up to `RING_WAIT` ticks) until the ring has
+    /// the entering cubes of every loaded column. In order:
     ///
     /// 1. Columns that would enter vanilla's range without having been
     ///    generated there are taken out, to load again the normal way.
@@ -126,8 +304,11 @@ impl Game<'_> {
     /// 7. The hub tells the players and queues the entering cubes for them.
     fn slide_cubic_window(
         &mut self,
-        wanted: (i32, i32),
-        viewers: &[Viewer],
+        wanted: Range,
+        keep: Range,
+        viewers: &[&Viewer],
+        others: &[Range],
+        force: bool,
     ) -> horizon_client::Result<()> {
         let Some(level) = self.save.cubic.get().cloned() else {
             return Ok(());
@@ -135,10 +316,14 @@ impl Game<'_> {
         let old_shape = self.world.shape;
         let have = cubic::window_cube_range(old_shape);
         let inside = viewers.iter().all(|v| (have.0..=have.1).contains(&v.cube));
-        let next = if inside {
-            cubic::next_window(have, wanted)
-        } else {
+        let next = if force || (wanted.0 >= have.0 && wanted.1 <= have.1) || !inside {
             wanted
+        } else {
+            cubic::next_window(have, wanted)
+        };
+        // Not into another shard's cubes, and never off the players'.
+        let Some(next) = cubic_shards::clip_window(next, others, keep) else {
+            return Ok(());
         };
         if next == have {
             return Ok(());
@@ -166,7 +351,7 @@ impl Game<'_> {
                 .iter()
                 .all(|&cy| level.is_prefetched(SectionPos::new(x, cy, z)))
         });
-        if !ready && inside && !jump && self.cubic_slide.waiting < RING_WAIT {
+        if !ready && inside && !jump && !force && self.cubic_slide.waiting < RING_WAIT {
             // The margin keeps the players in loaded cubes meanwhile.
             self.cubic_slide.waiting += 1;
             self.aim_ring(viewers);
@@ -174,7 +359,8 @@ impl Game<'_> {
         }
         self.cubic_slide.waiting = 0;
         log::info!(
-            "Horizon: cubic window {}..={} -> {}..={} ({} entering, {} columns)",
+            "Horizon: cubic window (shard {}) {}..={} -> {}..={} ({} entering, {} columns)",
+            self.shard,
             have.0,
             have.1,
             next.0,
@@ -198,10 +384,13 @@ impl Game<'_> {
 
         // 3. The window moves.
         let new_shape = cubic::window_of_cubes(old_shape, next);
-        level.set_window(new_shape);
-        *self.level_shapes.get_mut(self.dim.id()) = new_shape;
-        if let Err(e) = cubic::save_window(&self.world_root, new_shape.min_y, new_shape.height) {
-            log::warn!("Horizon: the cubic window was not recorded: {e}");
+        self.set_shard_window(&level, new_shape);
+        if self.shard == cubic_shards::PRIMARY {
+            *self.level_shapes.get_mut(self.dim.id()) = new_shape;
+            if let Err(e) = cubic::save_window(&self.world_root, new_shape.min_y, new_shape.height)
+            {
+                log::warn!("Horizon: the cubic window was not recorded: {e}");
+            }
         }
 
         // 4. The entering sections, from the ring.
@@ -251,6 +440,98 @@ impl Game<'_> {
         }
         self.aim_ring(viewers);
         Ok(())
+    }
+
+    /// Moves the window of the shard in place (the world's shape, the cell its
+    /// terrain loads into and the level's window for entity saves).
+    fn set_shard_window(
+        &mut self,
+        level: &Arc<cubic::CubicLevel>,
+        shape: horizon_client::chunk::LevelShape,
+    ) {
+        level.set_window(shape);
+        let cell = self.shard_window.clone().or_else(|| level.primary_window());
+        if let Some(cell) = cell {
+            *cell.lock().unwrap() = shape.column();
+        }
+    }
+
+    /// Opens shard `id` of the Overworld around `window` (cubes), with no
+    /// players yet.
+    fn create_shard(&mut self, id: u16, window: Range) -> horizon_client::Result<()> {
+        let shape = cubic::window_of_cubes(self.level_shapes.overworld, window);
+        let parked = self.open_shard(id, shape)?;
+        self.levels.insert_shard(parked);
+        log::info!(
+            "Horizon: cubic shard {id} opened at cubes {}..={}",
+            window.0,
+            window.1
+        );
+        Ok(())
+    }
+
+    /// Saves everything shard `id` holds (blocks, entities, block entities and
+    /// ticks go to the cubes' records) and closes it. The primary never closes.
+    fn close_shard(&mut self, id: u16) -> horizon_client::Result<()> {
+        if id == cubic_shards::PRIMARY || !self.shard_exists(Dim::Overworld, id) {
+            return Ok(());
+        }
+        let back = if self.dim == Dim::Overworld && self.shard == id {
+            LevelId::shard(Dim::Overworld, cubic_shards::PRIMARY)
+        } else {
+            self.here()
+        };
+        self.enter_level(None, LevelId::shard(Dim::Overworld, id))?;
+        let chunks: Vec<_> = self.world.chunks.values().cloned().collect();
+        self.native_chunks_changed(&chunks);
+        self.save_level(true)?;
+        for uuid in self.persist.uuids.values() {
+            self.entity_attachments.remove(uuid);
+        }
+        if let Some(level) = self.save.cubic.get().cloned() {
+            let (first, last) = cubic::window_cube_range(self.world.shape);
+            for &(x, z) in self.world.chunks.keys() {
+                for cy in first..=last {
+                    level.release_cube(SectionPos::new(x, cy, z));
+                }
+            }
+            level.drop_ring_target(id);
+        }
+        self.enter_level(None, back)?;
+        self.levels.remove_shard(Dim::Overworld, id);
+        if let Some(h) = self.lan.as_mut() {
+            h.hub.forget_level(Dim::Overworld.id(), id);
+        }
+        log::info!("Horizon: cubic shard {id} closed");
+        Ok(())
+    }
+
+    /// Player `conn` goes to shard `to`: the level changes under it as for a
+    /// dimension change (`Respawn` keeping its data, the new window, then its
+    /// columns and cubes), at the same place. A vehicle it rides stays behind
+    /// in its shard (saved with its cube when that leaves its window).
+    fn move_guest_to_shard(&mut self, conn: u32, to: u16) {
+        let Some(mut host) = self.lan.take() else {
+            return;
+        };
+        let back = self.here();
+        if let Some(i) = host.hub.guests.iter().position(|g| g.conn == conn)
+            && self
+                .enter_level(Some(&mut host), LevelId::shard(Dim::Overworld, to))
+                .is_ok()
+        {
+            let g = &mut host.hub.guests[i];
+            g.vehicle = None;
+            let (at, yaw, pitch) = (g.position, g.yaw, g.pitch);
+            let cooldown = host.play.get(&conn).map_or(0, |p| p.portal.cooldown);
+            let ctx = self.server_ctx();
+            host.hub
+                .change_level(i, at, yaw, Some(pitch), false, cooldown, &ctx);
+        }
+        if let Err(e) = self.enter_level(Some(&mut host), back) {
+            log::error!("could not reopen the level in place: {e}");
+        }
+        self.lan = Some(host);
     }
 
     /// Saves the cubes of `leaving` (ranges of cube Ys) in `columns`, which

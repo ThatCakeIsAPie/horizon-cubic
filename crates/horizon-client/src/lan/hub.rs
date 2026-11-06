@@ -343,7 +343,7 @@ pub struct Hub {
     stepping: u32,
     weather: (bool, f32, f32),
     /// The clock and weather last sent in the levels not in place, by
-    /// dimension (`set_dimension` swaps them with the fields above).
+    /// level key (`set_level` swaps them with the fields above).
     level_sync: std::collections::HashMap<String, LevelSync>,
     /// Operators and their permission levels (dedicated servers).
     pub ops: std::collections::HashMap<u128, u8>,
@@ -363,10 +363,14 @@ pub struct Hub {
     pub admin_feedback_to_ops: bool,
     chat_type: i32,
     dimension_type: i32,
+    /// The vertical shard of a cubic dimension that is in place with
+    /// `config.dimension` (`set_level`): 0, the primary, unless the server
+    /// holds several (docs/cubic-v2-plan.md, "Residency").
+    pub shard: u16,
     clock_ids: Vec<i32>,
     item_ids: std::collections::HashMap<Arc<str>, i32>,
     entity_types: std::collections::HashMap<String, i32>,
-    /// Each level's tracked entities, by dimension.
+    /// Each level's tracked entities, by level key (`level_key`).
     entities: std::collections::HashMap<String, Entities>,
     /// Each level's entities that joined it after its tracking pass, as they
     /// were then, and the server tick they were noted in (`note_joined`).
@@ -681,6 +685,7 @@ impl Hub {
             level_sync: Default::default(),
             chat_type,
             dimension_type,
+            shard: 0,
             clock_ids,
             item_ids: Default::default(),
             entity_types: Default::default(),
@@ -844,9 +849,26 @@ impl Hub {
         self.config.simulation_distance = distance;
         self.broadcast(&C::SetSimulationDistance(play::Distance { distance }));
     }
-    /// Whether a guest is placed in the level in place (`config.dimension`).
+    /// Whether a guest is placed in the level in place (`config.dimension`
+    /// and, in a cubic dimension, its shard).
     pub fn here(&self, g: &Guest) -> bool {
-        g.placed && g.dimension == self.config.dimension
+        g.placed && self.is_in_place(g)
+    }
+    /// Whether a guest's level, placed or not, is the one in place.
+    fn is_in_place(&self, g: &Guest) -> bool {
+        g.dimension == self.config.dimension && g.shard == self.shard
+    }
+    /// The name of the level in place for the hub's per-level tables: the
+    /// dimension, and `#n` after it for the shards after the primary.
+    fn level_key(&self) -> String {
+        Self::key_of(&self.config.dimension, self.shard)
+    }
+    fn key_of(dimension: &str, shard: u16) -> String {
+        if shard == 0 {
+            dimension.to_owned()
+        } else {
+            format!("{dimension}#{shard}")
+        }
     }
     /// `PlayerList.broadcastAll(packet, dimension)`: the players in the
     /// level in place.
@@ -1192,6 +1214,7 @@ impl Hub {
         guest.position = ctx.spawn;
         guest.previous_position = ctx.spawn;
         guest.dimension = self.config.dimension.clone();
+        guest.shard = self.shard;
         self.guests.push(guest);
         conn
     }
@@ -1937,11 +1960,7 @@ impl Hub {
                 self.ticking = (ctx.tick_rate, ctx.tick_frozen);
                 self.stepping = ctx.tick_steps.revision;
             }
-            if !self
-                .guests
-                .iter()
-                .any(|g| g.dimension == self.config.dimension)
-            {
+            if !self.guests.iter().any(|g| self.is_in_place(g)) {
                 let _ = ctx.world.block_log.take();
                 let _ = ctx.world.light_log.take();
                 if let Some(far) = self.far.as_mut() {
@@ -2846,7 +2865,7 @@ impl Hub {
     /// Whether an entity is tracked by the current dimension's level.
     pub fn tracks(&self, id: i32) -> bool {
         self.entities
-            .get(&self.config.dimension)
+            .get(&self.level_key())
             .is_some_and(|l| l.tracks(id))
     }
 
@@ -2861,10 +2880,8 @@ impl Hub {
         if joined.is_empty() {
             return;
         }
-        self.fresh_joined
-            .entry(self.config.dimension.clone())
-            .or_default()
-            .extend(joined);
+        let key = self.level_key();
+        self.fresh_joined.entry(key).or_default().extend(joined);
     }
 
     /// `ChunkMap.addEntity` for late arrivals, before their sounds are sent.
@@ -2873,7 +2890,8 @@ impl Hub {
         if entities.is_empty() {
             return;
         }
-        let dimension = &self.config.dimension;
+        let key = self.level_key();
+        let (dimension, shard) = (self.config.dimension.clone(), self.shard);
         let mut outs: Vec<Vec<Vec<u8>>> = self
             .guests
             .iter()
@@ -2883,7 +2901,7 @@ impl Hub {
         let mut viewers: Vec<Viewer> = self
             .guests
             .iter_mut()
-            .filter(|g| g.placed && g.dimension == *dimension)
+            .filter(|g| g.placed && g.dimension == dimension && g.shard == shard)
             .zip(outs.iter_mut())
             .map(|(g, out)| Viewer {
                 entity_id: g.entity_id,
@@ -2898,7 +2916,7 @@ impl Hub {
                 gone: None,
             })
             .collect();
-        let level = self.entities.entry(dimension.clone()).or_default();
+        let level = self.entities.entry(key).or_default();
         level.range_percent = Some(self.entity_range_percent);
         let (types, sync) = (&mut self.entity_types, &self.sync);
         level.pair_after_tick(entities, &self.riding, &mut viewers, |kind| {
@@ -2961,20 +2979,18 @@ impl Hub {
         all.extend(guest_states);
         let mut entities: Vec<&EntityState> = all.iter().chain(ctx.entities).collect();
         // ChunkMap.tick: the level's entities, once for all its players.
-        let mut level = self
-            .entities
-            .remove(&self.config.dimension)
-            .unwrap_or_default();
-        let mut joined = noted_last_tick(self.joined.remove(&self.config.dimension), self.ticks);
-        if let Some(fresh) = self.fresh_joined.remove(&self.config.dimension) {
+        let key = self.level_key();
+        let mut level = self.entities.remove(&key).unwrap_or_default();
+        let mut joined = noted_last_tick(self.joined.remove(&key), self.ticks);
+        if let Some(fresh) = self.fresh_joined.remove(&key) {
             joined.extend(fresh);
         }
         let joined = level.joined_states(&entities, joined);
         Entities::starting_from(&mut entities, &joined);
         level.synced.clone_from(&self.synced);
         let mut outs = std::mem::take(&mut self.entity_out);
-        let dimension = &self.config.dimension;
-        let here = |g: &Guest| g.placed && g.dimension == *dimension;
+        let (dimension, shard) = (self.config.dimension.clone(), self.shard);
+        let here = |g: &Guest| g.placed && g.dimension == dimension && g.shard == shard;
         outs.resize_with(self.guests.iter().filter(|g| here(g)).count(), Vec::new);
         // The prediction's replay excuses a client that may still have an entity that left it.
         let recording = self.recording();
@@ -3029,7 +3045,7 @@ impl Hub {
         }
         self.entity_gone = gone;
         self.entity_out = outs;
-        self.entities.insert(self.config.dimension.clone(), level);
+        self.entities.insert(key, level);
     }
 
     /// ServerPlayer.stopSleepInBed: the wake-up animation goes to the player
@@ -4278,6 +4294,7 @@ impl Hub {
         let g = &mut self.guests[i];
         // PlayerList.respawn: into the level in place (the respawn level).
         g.dimension = self.config.dimension.clone();
+        g.shard = self.shard;
         // restartClientLoadTimerAfterRespawn: the client loads a whole new level before it
         // reports it loaded.
         g.load_timeout = super::guest::CLIENT_LOADED_TIMEOUT;
@@ -4365,9 +4382,26 @@ impl Hub {
     }
 
     /// The level the players are in: the server holds one at a time, and the
-    /// hub's packets name it.
-    pub fn set_dimension(&mut self, dimension: &str) {
-        if self.config.dimension == dimension {
+    /// hub's packets name it. A cubic dimension's `shard` is part of it, and
+    /// `shape` the window its world holds (the hub's level shape for the
+    /// dimension, which the encoder and the cube sends read).
+    pub fn set_level(
+        &mut self,
+        dimension: &str,
+        shard: u16,
+        shape: Option<crate::chunk::LevelShape>,
+    ) {
+        let mut reshaped = false;
+        if let Some(shape) = shape.filter(|s| s.cubic) {
+            let slot = self.config.levels.get_mut(dimension);
+            reshaped = *slot != shape;
+            *slot = shape;
+        }
+        if self.config.dimension == dimension && self.shard == shard {
+            if reshaped {
+                self.encoder
+                    .set_dimension(self.config.levels.get(dimension));
+            }
             return;
         }
         // What this level's players were told stays with it.
@@ -4376,18 +4410,34 @@ impl Hub {
             last_rate: self.last_rate,
             weather: self.weather,
         };
-        let entering = self.level_sync.remove(dimension).unwrap_or_default();
-        self.level_sync
-            .insert(std::mem::take(&mut self.config.dimension), leaving);
+        let key = Self::key_of(dimension, shard);
+        let entering = self.level_sync.remove(&key).unwrap_or_default();
+        self.level_sync.insert(self.level_key(), leaving);
         (self.last_clock, self.last_rate, self.weather) =
             (entering.last_clock, entering.last_rate, entering.weather);
         self.config.dimension = dimension.to_owned();
+        self.shard = shard;
         self.dimension_type = self
             .sync
             .id("minecraft:dimension_type", dimension)
             .unwrap_or(0);
         self.encoder
             .set_dimension(self.config.levels.get(dimension));
+    }
+
+    /// A shard of a cubic dimension closed: what the hub kept for its level
+    /// goes with it.
+    pub fn forget_level(&mut self, dimension: &str, shard: u16) {
+        let key = Self::key_of(dimension, shard);
+        self.level_sync.remove(&key);
+        self.entities.remove(&key);
+        self.joined.remove(&key);
+        self.fresh_joined.remove(&key);
+    }
+
+    /// `set_level` for the primary shard.
+    pub fn set_dimension(&mut self, dimension: &str) {
+        self.set_level(dimension, 0, None);
     }
 
     /// The shape of the level the hub names, when it is cubic.
@@ -4436,10 +4486,15 @@ impl Hub {
             return;
         }
         self.encoder.set_dimension(shape);
+        let shard = self.shard;
         let have = crate::cubic::window_cube_range(old);
         let now = crate::cubic::window_cube_range(shape);
         let ticks = self.ticks;
-        for g in self.guests.iter_mut().filter(|g| g.dimension == dimension) {
+        for g in self
+            .guests
+            .iter_mut()
+            .filter(|g| g.dimension == dimension && g.shard == shard)
+        {
             send_window(g, shape);
             if !slid {
                 g.sent_chunks.clear();
@@ -4535,7 +4590,12 @@ impl Hub {
         if self.config.dimension != dimension {
             return;
         }
-        for g in self.guests.iter_mut().filter(|g| g.dimension == dimension) {
+        let shard = self.shard;
+        for g in self
+            .guests
+            .iter_mut()
+            .filter(|g| g.dimension == dimension && g.shard == shard)
+        {
             let mut forgotten = false;
             for &(x, z) in columns {
                 if g.sent_chunks.remove(&(x, z)) {
@@ -4661,6 +4721,7 @@ impl Hub {
         self.close_container_for(i);
         let g = &mut self.guests[i];
         g.dimension = self.config.dimension.clone();
+        g.shard = self.shard;
         // The load timer is not restarted: vanilla resets the client's loaded state on death and
         // respawn only, and covers a level change with its separate `isChangingDimension` term.
         g.tracker.clear();
@@ -5327,6 +5388,121 @@ mod tests {
         assert_eq!(sent, held, "a payload for every column the player holds");
         // The encoder follows the new window: its sections start at the new floor.
         assert_eq!(hub.encoder.window_min_y(), 1_000_256);
+        horizon_protocol::buf::set_wide_positions(false);
+    }
+
+    /// Two players of one cubic dimension, 20,000 blocks apart in height, are in two
+    /// vertical shards: each is sent its own shard's window, columns and entering cubes,
+    /// and nothing of the other's.
+    #[test]
+    fn each_player_of_a_cubic_dimension_is_sent_only_its_shards_window_and_cubes() {
+        use crate::chunk::LevelShape;
+        let overworld = "minecraft:overworld";
+        let (mut hub, rx_low) = hub_with_a_guest();
+        let (tx, rx_high) = std::sync::mpsc::channel();
+        let mut carol = Guest::new(
+            crate::lan::Joined {
+                conn: 2,
+                uuid: 2,
+                name: "Carol".into(),
+                properties: Vec::new(),
+                info: horizon_protocol::packets::configuration::ClientInformation::new(8),
+                brand: "vanilla".into(),
+                sender: crate::lan::PlayerSender::new(tx, std::sync::Arc::default()),
+                latency: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
+                address: "127.0.0.1:25566".parse().unwrap(),
+                expected: false,
+            },
+            2,
+            [0.5, 20_000.0, 0.5],
+            8,
+        );
+        carol.placed = true;
+        carol.dimension = overworld.into();
+        carol.shard = 1;
+        hub.guests.push(carol);
+        hub.guests[0].position = [0.5, 100.0, 0.5];
+        let low = LevelShape::cubic_window(LevelShape::OVERWORLD, 0, 304);
+        let high = LevelShape::cubic_window(LevelShape::OVERWORLD, 19_856, 304);
+        let border = crate::worldborder::WorldBorder::default();
+        let mut next = 100;
+
+        // The primary shard is in place: only Bob is in it.
+        hub.set_level(overworld, 0, Some(low));
+        hub.cubic_window_changed(overworld, low);
+        assert_eq!(seen(&rx_low), vec![Seen::Window(0, 304)]);
+        assert!(seen(&rx_high).is_empty(), "Carol is in another shard");
+        let mut world = cubic_world(low);
+        let mut ctx = cubic_ctx(&mut world, &mut next, &border, 100.0);
+        hub.place_new_player(1, &mut ctx);
+        let mut bob = seen(&rx_low);
+        for _ in 0..40 {
+            hub.ticks += 1;
+            hub.update_chunks(&ctx);
+            bob.extend(seen(&rx_low));
+            hub.guests[0].unacknowledged = 0;
+        }
+        assert!(bob.iter().any(|s| matches!(s, Seen::Chunk(..))));
+        assert!(
+            seen(&rx_high).is_empty(),
+            "nothing of Bob's level reaches Carol"
+        );
+
+        // The upper shard in place: Carol's window, login and chunks; Bob hears none of it.
+        hub.set_level(overworld, 1, Some(high));
+        hub.cubic_window_changed(overworld, high);
+        assert_eq!(seen(&rx_high), vec![Seen::Window(19_856, 304)]);
+        let mut up = cubic_world(high);
+        let mut ctx = cubic_ctx(&mut up, &mut next, &border, 20_000.0);
+        hub.guests[1].position = [0.5, 20_000.0, 0.5];
+        hub.place_new_player(2, &mut ctx);
+        let mut carol_stream = seen(&rx_high);
+        for _ in 0..40 {
+            hub.ticks += 1;
+            hub.update_chunks(&ctx);
+            carol_stream.extend(seen(&rx_high));
+            hub.guests[1].unacknowledged = 0;
+        }
+        assert!(carol_stream.iter().any(|s| matches!(s, Seen::Chunk(..))));
+        assert!(
+            seen(&rx_low).is_empty(),
+            "Bob is sent nothing of the other shard"
+        );
+
+        // The upper shard slides up a layer: Carol is told and sent the entering cube of
+        // each column she holds; Bob, in the primary shard, is sent nothing.
+        let up_one = LevelShape::cubic_window(LevelShape::OVERWORLD, 19_872, 304);
+        let mut slid = cubic_world(up_one);
+        let ctx = cubic_ctx(&mut slid, &mut next, &border, 20_000.0);
+        hub.cubic_window_changed(overworld, up_one);
+        let mut after = seen(&rx_high);
+        assert_eq!(after, vec![Seen::Window(19_872, 304)]);
+        for _ in 0..40 {
+            hub.ticks += 1;
+            hub.update_chunks(&ctx);
+            after.extend(seen(&rx_high));
+            hub.guests[1].unacknowledged = 0;
+        }
+        let entering = 19_872 / 16 + 18;
+        let cubes: Vec<_> = after
+            .iter()
+            .filter_map(|s| match s {
+                Seen::Cubes(_, _, cys) => Some(cys.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!cubes.is_empty());
+        assert!(cubes.iter().all(|cys| *cys == [entering]), "{cubes:?}");
+        assert!(
+            seen(&rx_low).is_empty(),
+            "a slide of the other shard reaches nobody in Bob's"
+        );
+        // Back in Bob's shard, a slide of the primary reaches Bob and not Carol.
+        hub.set_level(overworld, 0, Some(low));
+        let down = LevelShape::cubic_window(LevelShape::OVERWORLD, 16, 304);
+        hub.cubic_window_changed(overworld, down);
+        assert_eq!(seen(&rx_low), vec![Seen::Window(16, 304)]);
+        assert!(seen(&rx_high).is_empty());
         horizon_protocol::buf::set_wide_positions(false);
     }
 

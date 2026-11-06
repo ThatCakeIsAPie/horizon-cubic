@@ -187,6 +187,7 @@ mod launch_api;
 mod leads;
 mod level_particles;
 mod levels;
+use levels::LevelId;
 mod lightning;
 mod llamas;
 mod locator_bar;
@@ -2863,6 +2864,12 @@ struct Game<'a> {
     /// `SleepStatus`'s active and sleeping players at the last announcement.
     sleep_seen: (i64, i64),
     dim: Dim,
+    /// The vertical shard of `dim` in place (0, the primary, unless a cubic
+    /// Overworld holds several, game/levels.rs).
+    shard: u16,
+    /// The window cell of the shard in place, when it is not the primary (the
+    /// cubic level keeps the primary's).
+    shard_window: Option<horizon_client::cubic::ShardWindow>,
     world_root: PathBuf,
     /// The world's data packs' content tables, when it has packs (`None`
     /// keeps `Resources.rest`'s own in use).
@@ -16045,8 +16052,12 @@ impl Game<'_> {
     }
     /// Save the level in place: its changed chunks, its entities and its raids.
     fn save_level(&mut self, wait: bool) -> Result<()> {
-        self.save.save_attachments(&self.world.attachments)?;
-        self.save.save_forced_chunks(&self.streaming.forced)?;
+        // The level's own files are the primary shard's; another shard of a
+        // cubic Overworld saves its cubes and entities only.
+        if self.shard == 0 {
+            self.save.save_attachments(&self.world.attachments)?;
+            self.save.save_forced_chunks(&self.streaming.forced)?;
+        }
         self.streaming.save(&mut self.world, wait);
         let keys: Vec<_> = self.world.modified.drain().collect();
         let chunks = self.with_entities(keys.iter().filter_map(|k| self.world.chunks.get(k)));
@@ -19912,6 +19923,8 @@ impl<'a> Game<'a> {
             player_beds: Vec::new(),
             sleep_seen: (0, 0),
             dim: Dim::Overworld,
+            shard: 0,
+            shard_window: None,
             world_root: PathBuf::new(),
             world_flat: false,
             world_debug: false,

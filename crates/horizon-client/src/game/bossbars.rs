@@ -522,7 +522,7 @@ impl Game<'_> {
                     ints: horizon_client::lan::playerdata::uuid_ints(g.uuid),
                     at: g.position,
                     alive: !g.dead,
-                    here: g.dimension == self.dim.id(),
+                    here: g.dimension == self.dim.id() && g.shard == self.shard,
                     local: false,
                     conn: Some(g.conn),
                     view_chunks: g.view_distance,

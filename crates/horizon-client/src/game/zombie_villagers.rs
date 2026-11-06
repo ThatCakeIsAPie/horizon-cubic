@@ -184,7 +184,8 @@ impl Game<'_> {
             Target::Player => Some(Target::Player),
             Target::Guest(conn) => {
                 let g = self.lan.as_ref()?.hub.guest(conn)?;
-                (g.dimension == self.dim.id()).then_some(Target::Guest(conn))
+                (g.dimension == self.dim.id() && g.shard == self.shard)
+                    .then_some(Target::Guest(conn))
             }
             _ => None,
         }

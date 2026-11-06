@@ -181,18 +181,15 @@ impl Game<'_> {
             _ => return None,
         };
         let mut host = self.lan.take()?;
-        let back = self.dim;
-        let theirs = host
-            .hub
-            .guest(conn)
-            .map(|g| super::super::Dim::from_id(&g.dimension));
-        if let Some(dim) = theirs.filter(|d| *d != back)
-            && let Err(e) = self.enter_level(Some(&mut host), dim)
+        let back = self.here();
+        let theirs = host.hub.guest(conn).map(super::super::LevelId::of);
+        if let Some(level) = theirs.filter(|l| *l != back)
+            && let Err(e) = self.enter_level(Some(&mut host), level)
         {
-            log::error!("could not open {}: {e}", dim.id());
+            log::error!("could not open {}: {e}", level.id());
         }
-        let Some(swap) = self.enter_guest(&mut host, conn, back) else {
-            if self.dim != back
+        let Some(swap) = self.enter_guest(&mut host, conn, back.dim) else {
+            if self.here() != back
                 && let Err(e) = self.enter_level(Some(&mut host), back)
             {
                 log::error!("could not reopen {}: {e}", back.id());
@@ -218,7 +215,7 @@ impl Game<'_> {
                 }),
             );
         }
-        if self.dim != back
+        if self.here() != back
             && let Err(e) = self.enter_level(Some(&mut host), back)
         {
             log::error!("could not reopen {}: {e}", back.id());
