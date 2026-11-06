@@ -295,8 +295,16 @@ impl Game<'_> {
                 ),
                 _ => String::new(),
             };
+            // The pixels a far voxel reaches (more than the setting's when the
+            // budget binds), and the coarse layer while it holds the rest back.
+            let detail = if s.limited {
+                format!(" {:.1}px max", s.voxel_px)
+            } else {
+                format!(" {}px", s.target_px)
+            };
+            let covering = if s.covering { " covering" } else { "" };
             d.line(format!(
-                "Far: {}/{} p: {} u: {} {} {}MB{done}",
+                "Far: {}/{} p: {} u: {} {} {}MB{detail}{covering}{done}",
                 s.ready,
                 s.planned,
                 s.pending,

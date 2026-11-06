@@ -5,8 +5,8 @@
 //!
 //! 1. **Proved all air or all solid?** Stop. Nothing is drawn, except a solid
 //!    node's closed shell.
-//! 2. **The right size for its distance?** (`DETAIL` times its size, the
-//!    plan's test.) Stop and hand the node to the visual engine, which
+//! 2. **The right size for its distance?** (the request's `detail` times
+//!    its size: the plan's test for nodes out of view.) Stop and hand the node to the visual engine, which
 //!    generates its 16^3 voxels (`cube_gen`), meshes and draws them.
 //! 3. **Otherwise** subdivide into its 8 children.
 //!
@@ -79,9 +79,8 @@
 //! The distance and hysteresis rule is `plan_classified`'s: the camera is
 //! passed as integer part and fraction (a block coordinate beyond 2^24 loses
 //! no precision), the gap per axis is computed as `f32(lo - cam_i) - cam_f`,
-//! and the node splits while the distance is below
-//! `DETAIL * scale * size` (`scale` is 1, or `MERGE` to cover a plan that
-//! has hysteresis). Nodes outside the world or farther than the maximum
+//! and the node splits while the distance is below `detail * size` (the
+//! plan's factor, times `MERGE` to cover a plan that has hysteresis). Nodes outside the world or farther than the maximum
 //! distance are dropped, as in the plan.
 //!
 //! # Leaves and the generator
@@ -104,7 +103,7 @@
 use crate::gfx::cube_gen::{
     CubeGenParams, GpuParams, MAX_OCTAVES, extra_layers, octave_terms, used_octaves,
 };
-use crate::lod::cube::{CubeKey, DETAIL, LoadedBox, NodeClass, WORLD_BORDER, root_nodes};
+use crate::lod::cube::{CubeKey, LoadedBox, NodeClass, WORLD_BORDER, root_nodes};
 use bytemuck::Zeroable;
 use horizon_world::cubic::custom::GpuTerms;
 use std::{
@@ -284,8 +283,10 @@ fn build_tables(p: &CubeGenParams, t: &GpuTerms) -> Option<(Box<GpuTables>, Vec<
 pub struct DescentRequest {
     pub camera: [f64; 3],
     pub max_distance: f64,
-    /// 1 for the plan's own rule; `MERGE` covers a plan with hysteresis.
-    pub split_scale: f64,
+    /// A node splits while nearer than this many times its size: the plan's
+    /// factor (`lod::cube::Rule`), times `MERGE` to cover a plan with
+    /// hysteresis.
+    pub detail: f64,
     /// The finest level the GPU path serves (`cube_gen::MIN_LEVEL`): a node
     /// of this level that should split is reported as [`KIND_FINE`].
     pub min_level: u8,
@@ -518,7 +519,7 @@ impl GpuDescent {
         }
         f.cam_f[3] = request.max_distance as f32;
         f.rule = [
-            (DETAIL * request.split_scale) as f32,
+            request.detail as f32,
             if classify_only { 1.0 } else { 0.0 },
             0.0,
             0.0,
@@ -631,7 +632,8 @@ impl GpuDescent {
         let request = DescentRequest {
             camera: [0.0; 3],
             max_distance: 0.0,
-            split_scale: 1.0,
+            // Classifying only: no node splits.
+            detail: 1.0,
             min_level: 0,
             loaded: None,
         };
@@ -708,7 +710,7 @@ mod tests {
     use super::*;
     use crate::fast_hash::{FxHashMap, FxHashSet};
     use crate::gfx::cube_gen::{BiomeBlocks, NoiseDesc, OctaveDesc};
-    use crate::lod::cube::{LoadedBox, plan_classified};
+    use crate::lod::cube::{DETAIL, LoadedBox, Rule, plan_classified};
     use horizon_core::noise::wrap;
     use horizon_world::cubic::custom::testing::{bound_presets, default_registry};
     use horizon_world::cubic::custom::{BoxClass, CustomCubicGenerator, FixedBiome};
@@ -940,7 +942,7 @@ mod tests {
             let request = DescentRequest {
                 camera,
                 max_distance,
-                split_scale: 1.0,
+                detail: DETAIL,
                 min_level: 2,
                 loaded: Some((camera.map(|v| (v / 16.0).floor() as i32), none)),
             };
@@ -948,7 +950,16 @@ mod tests {
             assert!(!found.overflow);
             let classes: FxHashMap<CubeKey, NodeClass> = found.uniform().collect();
             let class = |k: CubeKey| classes.get(&k).copied().unwrap_or(NodeClass::Mixed);
-            let (plan, _) = plan_classified(camera, max_distance, none, &|_| false, &[], &class);
+            let plan = plan_classified(
+                camera,
+                max_distance,
+                &Rule::distance(DETAIL),
+                none,
+                &|_| false,
+                &[],
+                &class,
+            )
+            .leaves;
             // Plan leaves of the GPU's levels, and the coarser ones standing
             // for the plan's levels 0 and 1.
             let gpu: FxHashSet<CubeKey> = found.leaves.iter().chain(&found.rock).copied().collect();
@@ -989,7 +1000,7 @@ mod tests {
                 .descend(&DescentRequest {
                     camera: [40.0, 80.0, -40.0],
                     max_distance: 16_384.0,
-                    split_scale: 1.0,
+                    detail: DETAIL,
                     min_level: 2,
                     loaded: None,
                 })

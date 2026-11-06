@@ -334,6 +334,67 @@ impl FarDetail {
     }
 }
 
+/// How finely a cubic level's far terrain is drawn (`cubicFarDetail`): the most
+/// pixels a far voxel may span on screen before its node splits
+/// (`lod::cube::FarView::target_px`). The top step is the switch point the owner
+/// asked for: a block stays a block until it is about a pixel, then 2x2 blocks,
+/// and so on. Coarser steps are for weaker hardware. The node budget
+/// (`lod::cube::NODE_BUDGET`) caps every step.
+///
+/// Ultra is the default: measured on a 4-core i7 and a GTX 1070 Ti at 720 pixels
+/// (docs/cubic-v2-plan.md), it fills the budget (about 2.5 pixels per voxel)
+/// with the frame rate unchanged, covers a teleport in 0.2 s and completes in
+/// about 48 s; Extreme reaches no further within the budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CubicFarDetail {
+    Low,
+    Normal,
+    High,
+    #[default]
+    Ultra,
+    Extreme,
+}
+impl CubicFarDetail {
+    pub const ALL: [CubicFarDetail; 5] = [
+        CubicFarDetail::Low,
+        CubicFarDetail::Normal,
+        CubicFarDetail::High,
+        CubicFarDetail::Ultra,
+        CubicFarDetail::Extreme,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            CubicFarDetail::Low => "low",
+            CubicFarDetail::Normal => "normal",
+            CubicFarDetail::High => "high",
+            CubicFarDetail::Ultra => "ultra",
+            CubicFarDetail::Extreme => "extreme",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            CubicFarDetail::Low => "Low",
+            CubicFarDetail::Normal => "Normal",
+            CubicFarDetail::High => "High",
+            CubicFarDetail::Ultra => "Ultra",
+            CubicFarDetail::Extreme => "Extreme",
+        }
+    }
+    /// The most pixels a far voxel spans before its node splits.
+    pub fn target_px(self) -> f64 {
+        match self {
+            CubicFarDetail::Low => 16.0,
+            CubicFarDetail::Normal => 8.0,
+            CubicFarDetail::High => 4.0,
+            CubicFarDetail::Ultra => 2.0,
+            CubicFarDetail::Extreme => 1.0,
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.name() == s)
+    }
+}
+
 /// Frame generation: a frame made between each two real ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FrameGeneration {
@@ -675,6 +736,8 @@ pub struct Graphics {
     pub gpu_far: bool,
     /// How finely far terrain is drawn; Full unless the player picks Reduced.
     pub far_detail: FarDetail,
+    /// Cubic levels: how big a far voxel may be on screen (`cubicFarDetail`).
+    pub cubic_far_detail: CubicFarDetail,
     /// Far terrain from servers' BlueMap web maps; no server has one unless
     /// the player names it (`blueMap:` lines) or turns on auto-detect.
     pub blue_map: crate::bluemap::Settings,
@@ -795,6 +858,7 @@ impl Default for Graphics {
             cubic_vertical: CUBIC_VERTICAL_DEFAULT,
             gpu_far: true,
             far_detail: FarDetail::Full,
+            cubic_far_detail: CubicFarDetail::default(),
             blue_map: crate::bluemap::Settings::default(),
             cave_culling: true,
             gpu_culling: false,
@@ -899,6 +963,11 @@ impl Graphics {
                     }
                 }
                 "farDetail" => g.far_detail = FarDetail::parse(value),
+                "cubicFarDetail" => {
+                    if let Some(detail) = CubicFarDetail::parse(value) {
+                        g.cubic_far_detail = detail;
+                    }
+                }
                 "blueMapRadius" => {
                     if let Some(radius) = crate::bluemap::Settings::parse_radius(value) {
                         g.blue_map.radius = radius;
@@ -1004,7 +1073,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\ncubicVertical:{}\ngpuFarTerrain:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\ncubicVertical:{}\ngpuFarTerrain:{}\ncubicFarDetail:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -1061,6 +1130,7 @@ impl Graphics {
             bool_text(self.gpu_culling),
             self.cubic_vertical,
             if self.gpu_far { "auto" } else { "off" },
+            self.cubic_far_detail.name(),
         );
         text += &self.blue_map.serialize();
         text
@@ -1229,6 +1299,7 @@ mod tests {
             cubic_vertical: 13,
             gpu_far: false,
             far_detail: FarDetail::Reduced,
+            cubic_far_detail: CubicFarDetail::Extreme,
             blue_map: crate::bluemap::Settings {
                 radius: 40,
                 auto_detect: true,

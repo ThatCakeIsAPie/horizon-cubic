@@ -40,13 +40,14 @@ use std::{borrow::Cow, collections::VecDeque, time::Instant};
 
 /// Words per node in the node table.
 pub const NODE_WORDS: usize = 32;
-/// Nodes the table holds.
-pub const MAX_NODES: u32 = 32_768;
+/// Nodes the table holds: a plan of `lod::cube::NODE_BUDGET` nodes and the nodes it
+/// replaces while it comes in (about 350 bytes of buffers each).
+pub const MAX_NODES: u32 = 1 << 18;
 /// Fade time in milliseconds (`lod::FADE`).
 const FADE_MS: u32 = 600;
 const NOT_SET: u32 = u32::MAX;
-/// The arena is at most this many quads (128 MiB).
-const MAX_ARENA_QUADS: u32 = 16 << 20;
+/// The arena is at most this many quads (256 MiB), or what the device binds.
+const MAX_ARENA_QUADS: u32 = 32 << 20;
 
 /// Counters for `CubeLodStats` and the overlay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

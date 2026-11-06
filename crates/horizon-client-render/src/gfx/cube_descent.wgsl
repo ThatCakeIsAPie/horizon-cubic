@@ -23,7 +23,7 @@ struct Frame {
     // Camera: fraction of each coordinate; w is the maximum distance.
     cam_f: vec4<f32>,
     // x: the factor of a node's size the camera must be nearer than to split
-    // (DETAIL times the hysteresis scale); y: 1 = classify the list only.
+    // (the plan's factor, times the hysteresis scale); y: 1 = classify the list only.
     rule: vec4<f32>,
     // World border, lowest y, highest y, the level that is not split further
     // (such a node is handed over as "fine").

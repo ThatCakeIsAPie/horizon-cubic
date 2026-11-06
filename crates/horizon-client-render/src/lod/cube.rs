@@ -8,8 +8,13 @@
 //! (`mesh::mesh_cube`), so no crack opens between neighbours of different
 //! levels, and drawn through the far-tile pipeline.
 //!
-//! [`plan`] chooses the nodes (pure, no threads); [`CubeLod`] samples and
-//! meshes them in the background.
+//! [`plan_classified`] chooses the nodes (pure, no threads): a node splits
+//! while its voxels would span more than the Cubic Far Detail setting's pixels
+//! on screen ([`FarView`], [`Rule`]), within a node budget. [`CubeLod`] plans
+//! on a thread of its own, asks for a coarse coverage layer first after a big
+//! change, queues the rest by direction (the view's first) and distance, and
+//! samples and meshes the nodes in the background. [`node_kind`] is where far
+//! nodes will become 2D height-map tiles.
 use super::mesh::{self, Mesher};
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
@@ -394,15 +399,227 @@ pub enum Changes {
 
 // ---------------------------------------------------------------- the plan
 
-/// The nodes subdivide while closer than this many times their size.
+/// The distance rule the plan used before detail followed the screen, kept
+/// as the tests' reference ([`Rule::distance`]): a node splits while nearer
+/// than this many times its size. A far voxel then spans about 1/40 of its
+/// distance, 13 pixels on a 720-pixel, 70 degree view.
 pub const DETAIL: f64 = 2.5;
-/// A node the previous plan had split merges back only when farther than
-/// `DETAIL * MERGE` times its size, so the camera moving a little back and
-/// forth across a boundary does not flip nodes between levels.
+/// A node the previous plan had split merges back only when its voxels are
+/// this many times smaller on screen than the size that splits it (it is
+/// this many times farther), so the camera moving a little back and forth
+/// across a boundary does not flip nodes between levels.
 pub const MERGE: f64 = 1.25;
 /// Nodes this level or finer ask `is_loaded` about each cube they hold; coarser
 /// ones that meet the loaded box simply subdivide.
 const PROBE_LEVEL: u8 = 2;
+/// A view whose detail in view is less than this many times the unzoomed
+/// one's is planned as unzoomed: a bow's draw or a sprint's wider view does
+/// not make the plan depend on where the camera looks.
+const ZOOMED: f64 = 1.5;
+
+/// What the player sees, for choosing detail by size on screen
+/// ([`CubeLod::update`]).
+///
+/// A node splits while one of its voxels, `1 << level` blocks wide, would
+/// span more than `target_px` pixels at the node's nearest point:
+/// `voxel / distance * height_px / (2 * tan(fov_y / 2)) > target_px`. A
+/// narrower field of view (the spyglass) makes every voxel bigger on screen,
+/// so the nodes in view refine; nodes out of view keep the unzoomed rule.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FarView {
+    /// The direction the camera looks (a unit vector).
+    pub forward: [f64; 3],
+    /// The vertical field of view drawn now, in radians: the spyglass, zoom
+    /// and dynamic field of view included.
+    pub fov_y: f64,
+    /// The vertical field of view without any zoom (the FOV option), in
+    /// radians: what nodes out of view are planned for.
+    pub base_fov_y: f64,
+    /// The viewport's width over its height.
+    pub aspect: f64,
+    /// The viewport's height in pixels.
+    pub height_px: f64,
+    /// The most pixels a voxel may span, at its node's nearest point, before
+    /// the node splits (the Cubic Far Detail setting).
+    pub target_px: f64,
+}
+
+impl FarView {
+    /// A 70 degree, 16:9 view 720 pixels tall looking along +Z, aiming for
+    /// `target_px` (the benchmark's window).
+    pub fn standard(target_px: f64) -> Self {
+        Self {
+            forward: [0.0, 0.0, 1.0],
+            fov_y: 70f64.to_radians(),
+            base_fov_y: 70f64.to_radians(),
+            aspect: 16.0 / 9.0,
+            height_px: 720.0,
+            target_px,
+        }
+    }
+    /// The same view looking along `forward` with a field of view of
+    /// `fov_y` radians (a zoom: the base stays).
+    pub fn looking(self, forward: [f64; 3], fov_y: f64) -> Self {
+        Self {
+            forward,
+            fov_y,
+            ..self
+        }
+    }
+    fn fov(fov: f64) -> f64 {
+        if fov.is_finite() {
+            fov.clamp(0.1f64.to_radians(), 179f64.to_radians())
+        } else {
+            70f64.to_radians()
+        }
+    }
+    /// Pixels a block spans per block of distance with this vertical field of
+    /// view: a voxel `w` blocks wide `d` blocks away spans `w / d * focal`.
+    pub fn focal_px(&self, fov_y: f64) -> f64 {
+        let height = if self.height_px.is_finite() {
+            self.height_px.max(1.0)
+        } else {
+            720.0
+        };
+        height / (2.0 * (Self::fov(fov_y) / 2.0).tan())
+    }
+    /// Half the angle across the screen's diagonal.
+    pub fn half_diagonal(&self) -> f64 {
+        let aspect = if self.aspect.is_finite() && self.aspect > 0.0 {
+            self.aspect
+        } else {
+            16.0 / 9.0
+        };
+        ((Self::fov(self.fov_y) / 2.0).tan() * (1.0 + aspect * aspect).sqrt()).atan()
+    }
+    /// How far a zoomed view may turn before the plan is redone: the plan's
+    /// cone of finer nodes is this much wider than the screen.
+    pub fn turn_margin(&self) -> f64 {
+        (Self::fov(self.fov_y) * 0.25).max(0.5f64.to_radians())
+    }
+    /// The plan's rule for this view, with at most `budget` leaves.
+    pub fn rule(&self, budget: usize) -> Rule {
+        let target = if self.target_px.is_finite() {
+            self.target_px.max(0.05)
+        } else {
+            8.0
+        };
+        // Out of view, the wider of the two fields of view: a sprint's or a
+        // speed effect's wider view never asks for more than in view.
+        let base = Self::fov(self.base_fov_y).max(Self::fov(self.fov_y));
+        let out_of_view = self.focal_px(base) / (16.0 * target);
+        let in_view = self.focal_px(self.fov_y) / (16.0 * target);
+        if in_view < out_of_view * ZOOMED {
+            return Rule {
+                in_view: out_of_view,
+                out_of_view,
+                cone: None,
+                budget,
+            };
+        }
+        Rule {
+            in_view,
+            out_of_view,
+            cone: Some(Cone::new(
+                self.forward,
+                self.half_diagonal() + self.turn_margin(),
+            )),
+            budget,
+        }
+    }
+}
+
+/// How finely a plan goes ([`plan_classified`]): a node splits while it is
+/// nearer than `factor` times its size, `factor` being `in_view` for nodes
+/// the cone meets and `out_of_view` for the rest (with [`FarView::rule`],
+/// the voxel's size on screen against the target), and while the plan has
+/// fewer than `budget` leaves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rule {
+    pub in_view: f64,
+    pub out_of_view: f64,
+    /// Where `in_view` applies; `None` when the two are the same.
+    pub cone: Option<Cone>,
+    /// The most leaves a plan has. Past it, the nodes whose voxels are
+    /// smallest on screen (the farthest for their size) stay whole: the plan
+    /// coarsens from the far end rather than failing. Splits around the
+    /// loaded cubes are made whatever the budget.
+    pub budget: usize,
+}
+
+impl Rule {
+    /// The distance rule, the same everywhere and unbounded.
+    pub const fn distance(detail: f64) -> Self {
+        Self {
+            in_view: detail,
+            out_of_view: detail,
+            cone: None,
+            budget: usize::MAX,
+        }
+    }
+    /// The rule with voxels `times` bigger on screen, and at most `budget`
+    /// leaves (the coverage layer's).
+    pub fn coarser(&self, times: f64, budget: usize) -> Self {
+        Self {
+            in_view: self.in_view / times,
+            out_of_view: self.out_of_view / times,
+            cone: self.cone,
+            budget,
+        }
+    }
+    /// The factor for `node` seen from `camera`.
+    pub fn factor(&self, camera: [f64; 3], node: CubeKey) -> f64 {
+        match &self.cone {
+            Some(cone) if cone.meets(camera, node) => self.in_view,
+            _ => self.out_of_view,
+        }
+    }
+}
+
+/// A cone of directions from the camera: the view, widened.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cone {
+    axis: [f64; 3],
+    half: f64,
+}
+
+impl Cone {
+    /// Directions within `half` radians of `axis`.
+    pub fn new(axis: [f64; 3], half: f64) -> Self {
+        let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        let axis = if len > 1e-9 && len.is_finite() {
+            axis.map(|v| v / len)
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        Self {
+            axis,
+            half: if half.is_finite() {
+                half.clamp(0.0, std::f64::consts::PI)
+            } else {
+                std::f64::consts::PI
+            },
+        }
+    }
+    /// Whether any of `node` may lie inside the cone seen from `camera`:
+    /// the node is taken as the sphere around it, whose own angular radius
+    /// widens the cone, so a node straddling the edge counts in.
+    pub fn meets(&self, camera: [f64; 3], node: CubeKey) -> bool {
+        let size = f64::from(node.size());
+        let o = node.origin();
+        let d = [0, 1, 2].map(|a| f64::from(o[a]) + size / 2.0 - camera[a]);
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let radius = size * 0.866_025_403_784_438_6;
+        if len <= radius {
+            return true;
+        }
+        let reach = self.half + (radius / len).asin();
+        if reach >= std::f64::consts::PI {
+            return true;
+        }
+        (d[0] * self.axis[0] + d[1] * self.axis[1] + d[2] * self.axis[2]) / len >= reach.cos()
+    }
+}
 
 /// The box of cubes around the camera's cube that the game may have loaded:
 /// `horizontal` cubes each way in X and Z, `vertical` in Y. `is_loaded` is
@@ -443,10 +660,16 @@ pub fn plan_from(
     is_loaded: &dyn Fn(SectionPos) -> bool,
     previous: &[CubeKey],
 ) -> Vec<CubeKey> {
-    plan_classified(camera, max_distance, loaded, is_loaded, previous, &|_| {
-        NodeClass::Mixed
-    })
-    .0
+    plan_classified(
+        camera,
+        max_distance,
+        &Rule::distance(DETAIL),
+        loaded,
+        is_loaded,
+        previous,
+        &|_| NodeClass::Mixed,
+    )
+    .leaves
 }
 
 /// Vanilla's world border, in blocks each way from the origin.
@@ -511,19 +734,76 @@ pub fn root_nodes(camera: [f64; 3], max_distance: f64) -> Vec<CubeKey> {
     roots
 }
 
-/// [`plan_from`] with what is known of nodes' contents: a node `class` calls
-/// [`NodeClass::Air`] is left out with its whole subtree, one it calls
-/// [`NodeClass::Rock`] stays a leaf (nothing inside shows), unless it holds
-/// loaded cubes. Also returns how many nodes were left out as air.
+/// What [`plan_classified`] chose.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Plan {
+    /// The leaves: non-overlapping, nearest first.
+    pub leaves: Vec<CubeKey>,
+    /// Nodes left out as uniform air or fluid, with their whole subtrees.
+    pub pruned: usize,
+    /// The budget kept some nodes whole that the rule would have split.
+    pub limited: bool,
+    /// How many times its target the first node the budget kept whole was
+    /// (its voxels' size on screen over the target; 1 when the budget did
+    /// not bind): the plan reaches about `target * coarsened`.
+    pub coarsened: f64,
+}
+
+/// A node the plan may split, by how far over the target its voxels are.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    /// It meets the loaded cubes: it splits whatever the budget.
+    forced: bool,
+    ratio: f64,
+    distance: f64,
+    key: CubeKey,
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for Candidate {}
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.forced
+            .cmp(&other.forced)
+            .then(self.ratio.total_cmp(&other.ratio))
+            .then(other.key.cmp(&self.key))
+    }
+}
+
+/// What becomes of a node the plan reaches.
+enum Fate {
+    /// Outside the world or the range, or all loaded: nothing.
+    Out,
+    /// Uniform air or fluid: left out with its subtree.
+    Pruned,
+    Leaf(f64, CubeKey),
+    Split(Candidate),
+}
+
+/// The plan with what is known of nodes' contents and how fine it goes: a
+/// node `class` calls [`NodeClass::Air`] is left out with its whole subtree,
+/// one it calls [`NodeClass::Rock`] stays a leaf (nothing inside shows),
+/// unless it holds loaded cubes. A node splits by `rule` (with hysteresis:
+/// one `previous` split splits while its ratio is above `1 / MERGE`), the
+/// nodes furthest over their target first, until `rule.budget` leaves.
 pub fn plan_classified(
     camera: [f64; 3],
     max_distance: f64,
+    rule: &Rule,
     loaded: LoadedBox,
     is_loaded: &dyn Fn(SectionPos) -> bool,
     previous: &[CubeKey],
     class: &dyn Fn(CubeKey) -> NodeClass,
-) -> (Vec<CubeKey>, usize) {
-    let mut pruned = 0;
+) -> Plan {
     // The nodes holding a leaf of the last plan: the ones it split.
     let mut was_split = FxHashSet::<CubeKey>::default();
     for &leaf in previous {
@@ -536,52 +816,99 @@ pub fn plan_classified(
         }
     }
     let center = cube_of(camera);
-    let mut stack = root_nodes(camera, max_distance);
-    let mut leaves = Vec::new();
-    while let Some(node) = stack.pop() {
+    let fate = |node: CubeKey| -> Fate {
         if !in_world(node) {
-            continue;
+            return Fate::Out;
         }
         let distance = node.distance(camera);
         if distance > max_distance {
+            return Fate::Out;
+        }
+        match loaded_state(node, center, loaded, is_loaded) {
+            Loaded::All => Fate::Out,
+            Loaded::Some => Fate::Split(Candidate {
+                forced: true,
+                ratio: f64::INFINITY,
+                distance,
+                key: node,
+            }),
+            Loaded::None => match class(node) {
+                NodeClass::Air => Fate::Pruned,
+                NodeClass::Rock => Fate::Leaf(distance, node),
+                NodeClass::Mixed if node.level == 0 => Fate::Leaf(distance, node),
+                NodeClass::Mixed => {
+                    let merge = if was_split.contains(&node) {
+                        MERGE
+                    } else {
+                        1.0
+                    };
+                    let ratio =
+                        rule.factor(camera, node) * f64::from(node.size()) * merge / distance;
+                    if ratio > 1.0 {
+                        Fate::Split(Candidate {
+                            forced: false,
+                            ratio,
+                            distance,
+                            key: node,
+                        })
+                    } else {
+                        Fate::Leaf(distance, node)
+                    }
+                }
+            },
+        }
+    };
+    let mut out = Plan {
+        coarsened: 1.0,
+        ..Plan::default()
+    };
+    let mut leaves: Vec<(f64, CubeKey)> = Vec::new();
+    let mut heap = std::collections::BinaryHeap::new();
+    // Leaves and candidates so far: what the plan holds if nothing more splits.
+    let mut count = 0usize;
+    let take = |f: Fate,
+                leaves: &mut Vec<(f64, CubeKey)>,
+                heap: &mut std::collections::BinaryHeap<Candidate>,
+                pruned: &mut usize| match f {
+        Fate::Out => {}
+        Fate::Pruned => *pruned += 1,
+        Fate::Leaf(distance, key) => leaves.push((distance, key)),
+        Fate::Split(c) => heap.push(c),
+    };
+    for root in root_nodes(camera, max_distance) {
+        let f = fate(root);
+        if matches!(f, Fate::Leaf(..) | Fate::Split(_)) {
+            count += 1;
+        }
+        take(f, &mut leaves, &mut heap, &mut out.pruned);
+    }
+    let mut full = false;
+    while let Some(c) = heap.pop() {
+        if !c.forced && full {
+            leaves.push((c.distance, c.key));
             continue;
         }
-        let state = loaded_state(node, center, loaded, is_loaded);
-        if matches!(state, Loaded::None) {
-            match class(node) {
-                NodeClass::Air => {
-                    pruned += 1;
-                    continue;
-                }
-                NodeClass::Rock => {
-                    leaves.push((distance, node));
-                    continue;
-                }
-                NodeClass::Mixed => {}
-            }
+        let fates = c.key.children().map(&fate);
+        let added = fates
+            .iter()
+            .filter(|f| matches!(f, Fate::Leaf(..) | Fate::Split(_)))
+            .count();
+        if !c.forced && count - 1 + added > rule.budget {
+            // Every node left is at most this far over its target.
+            full = true;
+            out.limited = true;
+            out.coarsened = c.ratio;
+            leaves.push((c.distance, c.key));
+            continue;
         }
-        match state {
-            Loaded::All => continue,
-            Loaded::Some => {}
-            Loaded::None
-                if node.level > 0
-                    && distance
-                        < DETAIL
-                            * f64::from(node.size())
-                            * if was_split.contains(&node) {
-                                MERGE
-                            } else {
-                                1.0
-                            } => {}
-            Loaded::None => {
-                leaves.push((distance, node));
-                continue;
-            }
+        count = count - 1 + added;
+        for f in fates {
+            take(f, &mut leaves, &mut heap, &mut out.pruned);
         }
-        stack.extend(node.children());
     }
     leaves.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    (leaves.into_iter().map(|(_, node)| node).collect(), pruned)
+    out.leaves = leaves.into_iter().map(|(_, node)| node).collect();
+    out
 }
 
 enum Loaded {
@@ -635,6 +962,64 @@ fn loaded_state(
     }
 }
 
+// ------------------------------------------------------------- node kinds
+
+/// From this level up, a node will be drawn as a 2D height-map tile rather
+/// than a 16^3 cube node, once the tiles exist (branch `cubic/far-surface`):
+/// a quadtree over X and Z covering all Y, holding per column a few solid
+/// spans, a top block and water. A level-12 node is 65,536 blocks wide with
+/// voxels 4,096 blocks tall: nearly all terrain lies inside one or two of
+/// them, so a cube node snaps the surface to whole voxels.
+pub const SURFACE_LEVEL: u8 = 12;
+/// A tile flagged complex (some columns have more solid spans than a tile
+/// holds: floating islands, overhangs, a cavern's ceiling) turns into cube
+/// nodes this many levels sooner, coming from the coarse end.
+pub const COMPLEX_LIFT: u8 = 3;
+
+/// How a far node is drawn ([`node_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeKind {
+    /// A 2D height-map tile over the node's X and Z (all Y).
+    Tile,
+    /// A 16^3 cube node.
+    Cube,
+}
+
+/// What the tile module knows of the tile over a node's X and Z.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TileInfo {
+    /// Some column has more solid spans than the tile holds.
+    pub complex: bool,
+}
+
+/// How the node at `key` is drawn: the one place this is decided. Until the
+/// tile module lands nothing knows of tiles (`tile` is always `None`), so
+/// every node is a cube node.
+///
+/// Where it plugs in: the planner asks this for each node it reaches, and a
+/// `Tile` stands for the whole column of nodes of its level over its X and Z
+/// (the plan stops splitting it in Y); the producer routes a `Tile` leaf to
+/// the tile generator. `view` is for a screen-size threshold later (a tile
+/// stays a tile while its height steps are below a pixel).
+pub fn node_kind(key: CubeKey, view: Option<&FarView>, tile: Option<TileInfo>) -> NodeKind {
+    let _ = view;
+    match tile {
+        None => NodeKind::Cube,
+        Some(info) => {
+            let from = if info.complex {
+                SURFACE_LEVEL.saturating_add(COMPLEX_LIFT)
+            } else {
+                SURFACE_LEVEL
+            };
+            if key.level >= from {
+                NodeKind::Tile
+            } else {
+                NodeKind::Cube
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- producer
 
 /// Nodes kept after sampling, so a node meshed again (or the parent of
@@ -645,6 +1030,44 @@ const CACHE_NODES: usize = 1024;
 const REPLAN: Duration = Duration::from_millis(250);
 /// How long a node whose sampling failed waits before it is asked again.
 const RETRY: Duration = Duration::from_secs(1);
+/// The plan is redone when the view's detail changes by more than this ratio
+/// either way: the spyglass in and out.
+const REFOCUS: f64 = 1.25;
+/// The coverage layer is the plan for voxels this many times bigger on
+/// screen...
+pub const COVER_SCALE: f64 = 8.0;
+/// ...with at most this many nodes.
+pub const COVER_NODES: usize = 768;
+/// A plan with more than one in this many of its nodes undrawn (nothing
+/// delivered over their place: a teleport, joining) asks for the coverage
+/// layer first.
+const COVER_HOLES: usize = 4;
+/// The longest the coverage layer holds the rest of the plan back.
+const COVER_WAIT: Duration = Duration::from_millis(1500);
+/// The most nodes a plan holds unless [`CubeLod::set_budget`] says
+/// otherwise; the GPU's node table and arena may lower it
+/// ([`CubeLod::budget`]).
+pub const NODE_BUDGET: usize = 120_000;
+/// The environment variable that replaces [`NODE_BUDGET`] (a number of nodes),
+/// for benchmarks (`tools/cubic_far_bench.py --budget`).
+pub const BUDGET_VAR: &str = "HORIZON_FAR_NODES";
+/// After a jump (a move farther than [`JUMP`]) the plan waits this long at
+/// most for the GPU descent's classes of the new place: without them every
+/// node there counts as mixed and the plan asks for the sky too.
+const DESCENT_WAIT: Duration = Duration::from_millis(300);
+const JUMP: f64 = 4096.0;
+/// The queue takes its sectors in a new order when the view turned this far
+/// (radians).
+const TURN: f64 = 0.087;
+/// Above this many nodes, the passes over the whole plan (releasing nodes,
+/// looking for holes) run at most every [`SCAN_EVERY`].
+const SLOW_SCAN: usize = 8192;
+const SCAN_EVERY: Duration = Duration::from_millis(200);
+/// The most nodes [`CubeLod::removed`] lets go at a time. The GPU renderer
+/// fades each out and frees it with a buffer write of its own (about a
+/// microsecond each), so a whole plan let go at once after a teleport cost
+/// over 200 ms in one frame at 120,000 nodes.
+pub const RELEASE_BATCH: usize = 4096;
 
 /// Progress of the far terrain, for the overlay and benchmarks
 /// (`CubeLod::stats`).
@@ -686,6 +1109,26 @@ pub struct CubeLodStats {
     pub plan_changed: Option<Instant>,
     /// When the current plan last became complete; none while it is not.
     pub plan_complete: Option<Instant>,
+    /// When every part of the plan's footprint last had a delivered node
+    /// drawn over it (no holes, the coverage layer counting); none while some
+    /// part has nothing.
+    pub plan_covered: Option<Instant>,
+    /// Planned nodes with nothing drawn over their place yet.
+    pub holes: usize,
+    /// Coverage nodes the last big change asked for first.
+    pub cover_nodes: usize,
+    /// The coverage layer is holding the rest of the plan back.
+    pub covering: bool,
+    /// The most leaves the plan may have now.
+    pub budget: usize,
+    /// The budget kept the plan coarser than its target.
+    pub limited: bool,
+    /// The target in pixels per voxel the plan was made for, and the size it
+    /// reaches (bigger when the budget binds).
+    pub target_px: f32,
+    pub voxel_px: f32,
+    /// The planner's time for the last plan, in milliseconds.
+    pub plan_ms: f32,
 }
 
 /// What a worker made of a node: a CPU mesh, or (the GPU path) a node for the
@@ -734,11 +1177,131 @@ pub struct GpuBatch {
     pub biomes: Option<Vec<u32>>,
 }
 
-#[derive(Default)]
+// ---------------------------------------------------------------- sectors
+
+/// The queue sorts the plan by direction from the camera: 16 azimuths in
+/// each of three bands (down, level, up), plus sector 0 for the nodes around
+/// the camera, which are in view whichever way it looks. Turning the camera
+/// only reorders the sectors ([`sector_order`]): no node is sorted again.
+const AZIMUTHS: usize = 16;
+const SECTORS: usize = 1 + 3 * AZIMUTHS;
+
+/// The sector of `node` seen from `camera`.
+fn sector(camera: [f64; 3], node: CubeKey) -> u8 {
+    let size = f64::from(node.size());
+    let o = node.origin();
+    let d = [0, 1, 2].map(|a| f64::from(o[a]) + size / 2.0 - camera[a]);
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if len <= size {
+        return 0;
+    }
+    let band = if d[1] < -0.5 * len {
+        0
+    } else if d[1] > 0.5 * len {
+        2
+    } else {
+        1
+    };
+    let turn = (d[2].atan2(d[0]) + std::f64::consts::PI) / std::f64::consts::TAU;
+    let azimuth = ((turn * AZIMUTHS as f64) as usize).min(AZIMUTHS - 1);
+    (1 + band * AZIMUTHS + azimuth) as u8
+}
+
+/// The middle direction of sector `s` (not 0).
+fn sector_axis(s: usize) -> [f64; 3] {
+    let (band, azimuth) = ((s - 1) / AZIMUTHS, (s - 1) % AZIMUTHS);
+    let angle =
+        (azimuth as f64 + 0.5) / AZIMUTHS as f64 * std::f64::consts::TAU - std::f64::consts::PI;
+    let y = [-0.8, 0.0, 0.8][band];
+    let h = (1.0f64 - y * y).sqrt();
+    [h * angle.cos(), y, h * angle.sin()]
+}
+
+/// The sectors in the order the queue takes them for a camera looking along
+/// `forward`: around the camera first, then by angle from the view's centre.
+fn sector_order(forward: [f64; 3]) -> Vec<u8> {
+    let mut by_angle: Vec<(f64, u8)> = (1..SECTORS)
+        .map(|s| {
+            let a = sector_axis(s);
+            (
+                -(a[0] * forward[0] + a[1] * forward[1] + a[2] * forward[2]),
+                s as u8,
+            )
+        })
+        .collect();
+    by_angle.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    std::iter::once(0)
+        .chain(by_angle.into_iter().map(|(_, s)| s))
+        .collect()
+}
+
+fn angle_between(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let la = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+    let lb = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
+    if la * lb <= 0.0 || !(la * lb).is_finite() {
+        return 0.0;
+    }
+    (dot / (la * lb)).clamp(-1.0, 1.0).acos()
+}
+
+/// The jobs, in the order the workers take them.
 struct Queue {
-    /// Waiting, nearest first.
-    jobs: VecDeque<CubeKey>,
+    /// Taken first, in order: the coverage layer, then holes, new nodes and
+    /// retries.
+    first: VecDeque<CubeKey>,
+    /// The rest of the plan by sector, nearest first in each.
+    sectors: Vec<VecDeque<CubeKey>>,
+    /// The order the sectors are taken in: the ones the camera faces first.
+    order: Vec<u8>,
+    /// Queued keys the plan dropped since: skipped when taken.
+    dropped: FxHashSet<CubeKey>,
     running: FxHashSet<CubeKey>,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Self {
+            first: VecDeque::new(),
+            sectors: (0..SECTORS).map(|_| VecDeque::new()).collect(),
+            order: (0..SECTORS as u8).collect(),
+            dropped: FxHashSet::default(),
+            running: FxHashSet::default(),
+        }
+    }
+}
+
+impl Queue {
+    fn clear(&mut self) {
+        self.first.clear();
+        for s in &mut self.sectors {
+            s.clear();
+        }
+        self.dropped.clear();
+    }
+    /// The next job.
+    fn pop(&mut self) -> Option<CubeKey> {
+        loop {
+            let mut next = self.first.pop_front();
+            if next.is_none() {
+                for &s in &self.order {
+                    if let Some(key) = self.sectors[usize::from(s)].pop_front() {
+                        next = Some(key);
+                        break;
+                    }
+                }
+            }
+            let key = next?;
+            if self.dropped.remove(&key) || self.running.contains(&key) {
+                continue;
+            }
+            return Some(key);
+        }
+    }
+    #[cfg(test)]
+    fn drain(&mut self) -> Vec<CubeKey> {
+        std::iter::from_fn(|| self.pop()).collect()
+    }
 }
 
 #[derive(Default)]
@@ -800,6 +1363,8 @@ impl Shared {
             descent: Mutex::default(),
             descent_wake: Condvar::new(),
             classes_dirty: AtomicBool::new(false),
+            planner: Mutex::default(),
+            planner_wake: Condvar::new(),
         }
     }
 }
@@ -833,6 +1398,260 @@ struct Shared {
     descent_wake: Condvar,
     /// The descent added classes the plan has not looked at yet.
     classes_dirty: AtomicBool,
+    /// The planner thread's job and answer (one at a time).
+    planner: Mutex<PlanSlot>,
+    planner_wake: Condvar,
+}
+
+// ---------------------------------------------------------------- planner
+
+/// Which cubes of the loaded box `is_loaded` reported, taken on the game
+/// thread for the planner thread.
+#[derive(Clone, Debug, Default)]
+struct LoadedSnapshot {
+    lo: [i32; 3],
+    size: [i32; 3],
+    bits: Vec<u64>,
+}
+
+impl LoadedSnapshot {
+    fn take(center: SectionPos, loaded: LoadedBox, is_loaded: &dyn Fn(SectionPos) -> bool) -> Self {
+        let (h, v) = (loaded.horizontal.max(0), loaded.vertical.max(0));
+        let lo = [center.x - h, center.y - v, center.z - h];
+        let size = [2 * h + 1, 2 * v + 1, 2 * h + 1];
+        let n = (size[0] as usize) * (size[1] as usize) * (size[2] as usize);
+        let mut bits = vec![0u64; n.div_ceil(64)];
+        let mut i = 0usize;
+        for y in 0..size[1] {
+            for z in 0..size[2] {
+                for x in 0..size[0] {
+                    if is_loaded(SectionPos::new(lo[0] + x, lo[1] + y, lo[2] + z)) {
+                        bits[i >> 6] |= 1 << (i & 63);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        Self { lo, size, bits }
+    }
+    fn get(&self, cube: SectionPos) -> bool {
+        let r = [
+            i64::from(cube.x) - i64::from(self.lo[0]),
+            i64::from(cube.y) - i64::from(self.lo[1]),
+            i64::from(cube.z) - i64::from(self.lo[2]),
+        ];
+        if (0..3).any(|a| r[a] < 0 || r[a] >= i64::from(self.size[a])) {
+            return false;
+        }
+        let i = ((r[1] * i64::from(self.size[2]) + r[2]) * i64::from(self.size[0]) + r[0]) as usize;
+        self.bits[i >> 6] >> (i & 63) & 1 == 1
+    }
+}
+
+/// A plan for the planner thread to make.
+struct PlanJob {
+    /// [`CubeLod::clear`] counts up: a job of an older count starts afresh.
+    epoch: u64,
+    camera: [f64; 3],
+    max_distance: f64,
+    rule: Rule,
+    loaded: LoadedBox,
+    snapshot: LoadedSnapshot,
+    /// The plan in place, for the hysteresis.
+    previous: Arc<Vec<CubeKey>>,
+}
+
+/// A plan made, as the change from the one before.
+struct PlanDone {
+    epoch: u64,
+    /// The plan, nearest first.
+    leaves: Arc<Vec<CubeKey>>,
+    changed: bool,
+    added: Vec<CubeKey>,
+    removed: Vec<CubeKey>,
+    /// The plan with each node's sector, nearest first (empty when unchanged).
+    order: Vec<(u8, CubeKey)>,
+    /// The coverage layer's leaves (empty when unchanged).
+    cover: FxHashSet<CubeKey>,
+    /// The plan in tree order ([`tree_order`], empty when unchanged): the
+    /// nodes inside any node are a run of it.
+    tree: Vec<(u128, CubeKey)>,
+    pruned: usize,
+    limited: bool,
+    coarsened: f64,
+    elapsed: Duration,
+}
+
+/// Where a node's corner falls on the Z-order curve of the world's cubes:
+/// the nodes inside a node of level `l` are exactly those of a lower level
+/// whose code lies in `[code, code + 8^l)`.
+fn tree_order(key: CubeKey) -> u128 {
+    // Cube coordinates offset to be non-negative: 24 bits each.
+    let axis = |c: i32| ((i64::from(c) << key.level) + (1 << 23)) as u64;
+    let (x, y, z) = (axis(key.x), axis(key.y), axis(key.z));
+    let mut code = 0u128;
+    for bit in 0..24 {
+        code |= u128::from(x >> bit & 1) << (3 * bit)
+            | u128::from(z >> bit & 1) << (3 * bit + 1)
+            | u128::from(y >> bit & 1) << (3 * bit + 2);
+    }
+    code
+}
+
+#[derive(Default)]
+struct PlanSlot {
+    job: Option<PlanJob>,
+    busy: bool,
+    done: Option<PlanDone>,
+}
+
+/// Makes the plan of `job`, and its coverage layer, as the change from
+/// `last` (the plan before, which becomes this one).
+fn make_plan(
+    job: &PlanJob,
+    last: &mut FxHashSet<CubeKey>,
+    class: &dyn Fn(CubeKey) -> NodeClass,
+) -> PlanDone {
+    let started = Instant::now();
+    let is_loaded = |cube: SectionPos| job.snapshot.get(cube);
+    let plan = plan_classified(
+        job.camera,
+        job.max_distance,
+        &job.rule,
+        job.loaded,
+        &is_loaded,
+        &job.previous,
+        class,
+    );
+    let next: FxHashSet<CubeKey> = plan.leaves.iter().copied().collect();
+    let added: Vec<CubeKey> = plan
+        .leaves
+        .iter()
+        .copied()
+        .filter(|k| !last.contains(k))
+        .collect();
+    let removed: Vec<CubeKey> = last.iter().copied().filter(|k| !next.contains(k)).collect();
+    let changed = !added.is_empty() || !removed.is_empty();
+    *last = next;
+    let (leaves, order, cover, tree) = if changed {
+        let order = plan
+            .leaves
+            .iter()
+            .map(|&k| (sector(job.camera, k), k))
+            .collect();
+        let mut tree: Vec<(u128, CubeKey)> =
+            plan.leaves.iter().map(|&k| (tree_order(k), k)).collect();
+        tree.sort_unstable();
+        let cover = plan_classified(
+            job.camera,
+            job.max_distance,
+            &job.rule.coarser(COVER_SCALE, COVER_NODES),
+            job.loaded,
+            &is_loaded,
+            &[],
+            class,
+        )
+        .leaves
+        .into_iter()
+        .collect();
+        (Arc::new(plan.leaves), order, cover, tree)
+    } else {
+        (
+            job.previous.clone(),
+            Vec::new(),
+            FxHashSet::default(),
+            Vec::new(),
+        )
+    };
+    PlanDone {
+        epoch: job.epoch,
+        leaves,
+        changed,
+        added,
+        removed,
+        order,
+        cover,
+        tree,
+        pruned: plan.pruned,
+        limited: plan.limited,
+        coarsened: plan.coarsened,
+        elapsed: started.elapsed(),
+    }
+}
+
+/// The planner thread: plans off the game thread, one job at a time.
+fn plan_loop(shared: &Shared) {
+    let mut last = FxHashSet::default();
+    let mut epoch = None;
+    loop {
+        let job = {
+            let mut slot = shared.planner.lock().unwrap();
+            loop {
+                if shared.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(job) = slot.job.take() {
+                    slot.busy = true;
+                    break job;
+                }
+                slot = shared.planner_wake.wait(slot).unwrap();
+            }
+        };
+        if epoch != Some(job.epoch) {
+            epoch = Some(job.epoch);
+            last.clear();
+        }
+        let class = |key: CubeKey| classify_cached(shared, key);
+        let done = make_plan(&job, &mut last, &class);
+        let mut slot = shared.planner.lock().unwrap();
+        slot.busy = false;
+        slot.done = Some(done);
+    }
+}
+
+/// Whether the plan waits for the coverage layer.
+#[derive(Debug)]
+enum Phase {
+    Refine,
+    /// The coverage layer (`wave`: coverage nodes and the coarsest planned
+    /// nodes, one over each hole) is all that is queued, since `since`.
+    Cover {
+        since: Instant,
+        wave: Vec<CubeKey>,
+    },
+}
+
+/// A planned node with nothing drawn over its place, and the coverage leaf
+/// over it when the coverage layer has one.
+type Hole = (CubeKey, Option<CubeKey>);
+
+/// What the last plan job was asked with.
+#[derive(Clone, Copy, Debug)]
+struct Asked {
+    cube: SectionPos,
+    camera: [f64; 3],
+    max_distance: f64,
+    loaded: LoadedBox,
+    rule: Rule,
+    at: Instant,
+}
+
+/// Whether the plan for `now` differs enough from the one for `before` to be
+/// made again: the detail changed by [`REFOCUS`], the zoom came or went, a
+/// zoomed view turned past its margin, or the budget moved a tenth.
+fn refocused(before: &Rule, now: &Rule, view: &FarView) -> bool {
+    let off = |a: f64, b: f64| a > b * REFOCUS || b > a * REFOCUS;
+    if off(before.in_view, now.in_view) || off(before.out_of_view, now.out_of_view) {
+        return true;
+    }
+    if before.budget.abs_diff(now.budget) * 10 > before.budget.max(1) {
+        return true;
+    }
+    match (&before.cone, &now.cone) {
+        (None, None) => false,
+        (Some(a), Some(b)) => angle_between(a.axis, b.axis) > view.turn_margin(),
+        _ => true,
+    }
 }
 
 /// The far terrain of a cubic level, built in the background.
@@ -841,7 +1660,7 @@ struct Shared {
 /// // Once, when the level loads:
 /// let mut far = CubeLod::new(Box::new(generator_sampler), context.clone(), air);
 /// // Every frame:
-/// let meshes = far.update(camera, max_distance, LoadedBox { horizontal: h, vertical: v },
+/// let meshes = far.update(camera, max_distance, &view, LoadedBox { horizontal: h, vertical: v },
 ///                         |cube| world.has_cube(cube));
 /// renderer.queue_cube_lods(meshes, far.removed());
 /// renderer.upload_cube_lods(budget);
@@ -854,19 +1673,60 @@ struct Shared {
 /// only when every node that now covers its place has been handed out (or
 /// none is wanted: out of range), so the renderer never opens a hole.
 ///
+/// The plan is made on a thread of its own ([`plan_classified`] with the
+/// view's [`Rule`]). After a big change (a teleport, joining: a quarter of
+/// the plan has nothing drawn over it) only the coverage layer is queued: the
+/// plan for voxels [`COVER_SCALE`] times coarser, a few hundred nodes, over
+/// the holes. Once it is in and shown, the rest of the plan is queued,
+/// holes first, then by direction (the view's first) and distance; the
+/// coverage nodes stay drawn until the nodes under them are in.
+///
 /// [`removed`]: CubeLod::removed
 pub struct CubeLod {
     shared: Arc<Shared>,
     results: mpsc::Receiver<Done>,
     threads: Vec<thread::JoinHandle<()>>,
     /// The current plan, nearest first.
-    plan: Vec<CubeKey>,
+    plan: Arc<Vec<CubeKey>>,
     wanted: FxHashSet<CubeKey>,
+    /// The plan with each node's sector, nearest first: the queue's source.
+    order: Vec<(u8, CubeKey)>,
+    /// The plan in tree order (`tree_order`).
+    tree: Vec<(u128, CubeKey)>,
+    /// The coverage layer's leaves for the current plan.
+    cover_plan: FxHashSet<CubeKey>,
+    /// Coverage nodes asked for (not in the plan): their results are kept.
+    cover: FxHashSet<CubeKey>,
+    /// Planned nodes with nothing drawn over their place, and the coverage
+    /// leaf over each when the plan had one.
+    holes: Vec<Hole>,
+    /// Planned nodes holding an older plan's (`find_holes`): queued first.
+    holding: Vec<CubeKey>,
+    holes_dirty: bool,
+    holes_at: Instant,
+    phase: Phase,
     /// Handed out and not reported removed.
     delivered: FxHashSet<CubeKey>,
+    /// Delivered nodes not in the plan: coverage nodes, and an older plan's
+    /// nodes still covering a place.
+    stale: FxHashSet<CubeKey>,
+    /// Planned nodes not delivered.
+    missing: usize,
     failed: FxHashMap<CubeKey, Instant>,
-    planned: Option<(SectionPos, f64, LoadedBox, Instant)>,
+    retry_at: Instant,
+    release_dirty: bool,
+    released_at: Instant,
+    /// Stale nodes found releasable, handed out [`RELEASE_BATCH`] at a time.
+    releasing: Vec<CubeKey>,
+    asked: Option<Asked>,
+    /// A replan is owed (new classes came while the planner was busy).
+    replan: bool,
+    /// [`CubeLod::clear`]s so far.
+    epoch: u64,
     camera: [f64; 3],
+    /// The direction the queue's sector order was made for.
+    facing: Option<[f64; 3]>,
+    budget: usize,
     /// The sampler's GPU generator, when it has one.
     backend: Option<GpuBackend>,
     /// Nodes finished for the GPU mesher, not yet taken.
@@ -877,15 +1737,20 @@ pub struct CubeLod {
     biomes_sent: bool,
     air: BlockStateId,
     stats: CubeLodStats,
-    /// Delivered nodes that draw nothing.
+    /// Delivered nodes that draw nothing, and how many of them are planned.
     empty: FxHashSet<CubeKey>,
+    empty_planned: usize,
     /// Nodes the planner left out as uniform, from the class cache.
     pruned: usize,
+    coarsened: f64,
     render: Option<crate::gfx::cube_far::FarStats>,
     /// The sampler has a GPU descent.
     has_descent: bool,
-    /// What the descent was last asked for.
-    descent_asked: Option<(SectionPos, f64, LoadedBox)>,
+    /// What the descent was last asked for, and its run count then.
+    descent_asked: Option<(SectionPos, f64, LoadedBox, u64)>,
+    descent_runs_asked: u64,
+    /// The plan holds for the descent's answer after a jump, since.
+    jumped: Option<Instant>,
 }
 
 impl CubeLod {
@@ -929,6 +1794,15 @@ impl CubeLod {
                     .expect("spawn the cube descent thread"),
             );
         }
+        {
+            let shared = shared.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name("Cube far planner".into())
+                    .spawn(move || plan_loop(&shared))
+                    .expect("spawn the cube planner thread"),
+            );
+        }
         threads.extend(samplers.into_iter().map(|sampler| {
             let (shared, tx, context) = (shared.clone(), tx.clone(), context.clone());
             let backend = backend.clone();
@@ -939,6 +1813,13 @@ impl CubeLod {
         }));
         let mut lod = Self::assemble(shared, results, threads, backend, Some(context), air);
         lod.has_descent = has_descent;
+        // Benchmarks and autoresearch loops set the node budget from outside.
+        if let Some(nodes) = std::env::var(BUDGET_VAR)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            lod.set_budget(nodes);
+        }
         lod
     }
 
@@ -950,16 +1831,36 @@ impl CubeLod {
         context: Option<Arc<WorkerContext>>,
         air: BlockStateId,
     ) -> Self {
+        let now = Instant::now();
         Self {
             shared,
             results,
             threads,
-            plan: Vec::new(),
+            plan: Arc::default(),
             wanted: FxHashSet::default(),
+            order: Vec::new(),
+            tree: Vec::new(),
+            cover_plan: FxHashSet::default(),
+            cover: FxHashSet::default(),
+            holes: Vec::new(),
+            holding: Vec::new(),
+            holes_dirty: false,
+            holes_at: now,
+            phase: Phase::Refine,
             delivered: FxHashSet::default(),
+            stale: FxHashSet::default(),
+            missing: 0,
             failed: FxHashMap::default(),
-            planned: None,
+            retry_at: now,
+            release_dirty: false,
+            released_at: now,
+            releasing: Vec::new(),
+            asked: None,
+            replan: false,
+            epoch: 0,
             camera: [0.0; 3],
+            facing: None,
+            budget: NODE_BUDGET,
             backend,
             gpu_out: Vec::new(),
             context,
@@ -968,10 +1869,14 @@ impl CubeLod {
             air,
             stats: CubeLodStats::default(),
             empty: FxHashSet::default(),
+            empty_planned: 0,
             pruned: 0,
+            coarsened: 1.0,
             render: None,
             has_descent: false,
             descent_asked: None,
+            descent_runs_asked: 0,
+            jumped: None,
         }
     }
 
@@ -981,28 +1886,49 @@ impl CubeLod {
         self.render = stats;
     }
 
+    /// The most nodes a plan may hold (a terrain memory target, in nodes).
+    pub fn set_budget(&mut self, nodes: usize) {
+        self.budget = nodes.max(COVER_NODES);
+    }
+
+    /// The budget for the next plan: [`CubeLod::set_budget`]'s, lowered on
+    /// the GPU path so the plan and the nodes it replaces fit in the node
+    /// table and the quad arena (each holds two plans' worth at the quads
+    /// per node measured so far).
+    pub fn budget(&self) -> usize {
+        let mut budget = self.budget;
+        if self.gpu_path() {
+            budget = budget.min(crate::gfx::cube_far::MAX_NODES as usize / 2);
+            if let Some(r) = self.render
+                && r.nodes >= 1024
+                && r.arena_bytes > 0
+            {
+                let per_node = (r.arena_bytes / r.nodes as u64).max(1);
+                budget = budget.min((r.arena_capacity_bytes / 2 / per_node) as usize);
+            }
+        }
+        budget.max(COVER_NODES)
+    }
+
     /// Progress of the plan. `complete` is exact: every planned node was
     /// handed out (a mesh, or a GPU node) and, on the GPU path, the renderer
     /// holds no node still waiting for its mesh; nodes that draw nothing count
     /// as ready.
     pub fn stats(&self) -> CubeLodStats {
-        let ready = self
-            .plan
-            .iter()
-            .filter(|k| self.delivered.contains(k))
-            .count();
         let mut out = self.stats;
         out.planned = self.plan.len();
-        out.ready = ready;
-        out.pending = self.plan.len() - ready;
-        out.uniform_skipped =
-            self.pruned + self.plan.iter().filter(|k| self.empty.contains(k)).count();
+        out.pending = self.missing;
+        out.ready = self.plan.len() - self.missing;
+        out.uniform_skipped = self.pruned + self.empty_planned;
         if let Some(render) = self.render {
             out.gpu_meshed = render.meshed + render.uniform;
             out.arena_bytes = render.arena_bytes;
             out.pool_bytes = render.pool_bytes;
         }
         out.complete = self.is_complete();
+        out.holes = self.holes.len();
+        out.covering = matches!(self.phase, Phase::Cover { .. });
+        out.budget = self.asked.map_or(self.budget(), |a| a.rule.budget);
         if let Ok(slot) = self.shared.descent.lock() {
             out.descent_runs = slot.runs;
             out.descent_uniform = slot.uniform;
@@ -1013,17 +1939,30 @@ impl CubeLod {
         out
     }
 
-    fn is_complete(&self) -> bool {
-        !self.plan.is_empty()
-            && self.plan.iter().all(|k| self.delivered.contains(k))
-            && self.gpu_out.is_empty()
+    /// Everything handed out has been meshed and shown: the renderer holds
+    /// nothing waiting (always, on the CPU path).
+    fn shown(&self) -> bool {
+        self.gpu_out.is_empty()
             && (!self.gpu_path() || self.render.is_some_and(|r| r.pending == 0 && !r.meshing))
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.plan.is_empty() && self.missing == 0 && self.shown()
     }
 
     fn track_completion(&mut self, now: Instant) {
         match (self.is_complete(), self.stats.plan_complete) {
             (true, None) => self.stats.plan_complete = Some(now),
             (false, Some(_)) => self.stats.plan_complete = None,
+            _ => {}
+        }
+        let covered = !self.plan.is_empty()
+            && self.holes.is_empty()
+            && matches!(self.phase, Phase::Refine)
+            && self.shown();
+        match (covered, self.stats.plan_covered) {
+            (true, None) => self.stats.plan_covered = Some(now),
+            (false, Some(_)) if !self.holes.is_empty() => self.stats.plan_covered = None,
             _ => {}
         }
     }
@@ -1073,7 +2012,7 @@ impl CubeLod {
         if self.shared.descent_on.swap(on, Ordering::Relaxed) == on {
             return false;
         }
-        self.planned = None;
+        self.asked = None;
         self.descent_asked = None;
         true
     }
@@ -1083,20 +2022,34 @@ impl CubeLod {
         self.shared.descent_on.load(Ordering::Relaxed)
     }
 
-    /// Sends the descent its request for this camera, once per cube, and says
-    /// whether the plan should wait for the first answer.
-    fn ask_descent(&mut self, camera: [f64; 3], max_distance: f64, loaded: LoadedBox) -> bool {
+    /// Sends the descent its request for this camera (once per cube, range,
+    /// box and detail), splitting as finely as the plan's out-of-view rule
+    /// does (a zoom's finer nodes in view are not worth classifying the
+    /// whole sphere for). Returns whether the plan should hold for its
+    /// answer: the first plan always, and for [`DESCENT_WAIT`] after a jump.
+    fn ask_descent(
+        &mut self,
+        camera: [f64; 3],
+        max_distance: f64,
+        loaded: LoadedBox,
+        rule: &Rule,
+        now: Instant,
+    ) -> bool {
         let cube = cube_of(camera);
-        let asked = (cube, max_distance, loaded);
+        // Asked again when it moves a fifth or more: not for every small
+        // change of the budget's reach.
+        let detail = rule.out_of_view / self.coarsened.max(1.0) * MERGE;
+        let bits = (detail.max(1e-3).log2() * 4.0).round() as i64 as u64;
+        let asked = (cube, max_distance, loaded, bits);
         if self.descent_asked != Some(asked) {
             self.descent_asked = Some(asked);
             let mut slot = self.shared.descent.lock().unwrap();
+            self.descent_runs_asked = slot.runs;
             slot.request = Some(DescentRequest {
                 camera,
                 max_distance,
-                // The plan's hysteresis splits a node up to `MERGE` times
-                // farther than the plain rule does.
-                split_scale: MERGE,
+                // Up to `MERGE` times the plain rule: the plan's hysteresis.
+                detail,
                 min_level: MIN_LEVEL,
                 loaded: Some(([cube.x, cube.y, cube.z], loaded)),
             });
@@ -1104,7 +2057,16 @@ impl CubeLod {
             self.shared.descent_wake.notify_one();
         }
         let slot = self.shared.descent.lock().unwrap();
-        slot.runs == 0 && (slot.request.is_some() || slot.busy)
+        let answered = slot.runs > self.descent_runs_asked && slot.request.is_none() && !slot.busy;
+        if slot.runs == 0 {
+            return slot.request.is_some() || slot.busy;
+        }
+        drop(slot);
+        if answered {
+            self.jumped = None;
+        }
+        self.jumped
+            .is_some_and(|at| !answered && now.saturating_duration_since(at) < DESCENT_WAIT)
     }
 
     /// The nodes finished for the GPU mesher since the last call (their slots
@@ -1156,54 +2118,87 @@ impl CubeLod {
         }
     }
 
-    /// Plans (again, when the camera crossed into another cube, the range or
-    /// the loaded box changed, or a moment passed), queues what is missing
-    /// nearest first, and returns the meshes finished since: only for nodes
-    /// in the plan.
+    /// Plans (again, when the camera crossed into another cube, the range,
+    /// the loaded box or the view's detail changed, or a moment passed),
+    /// queues what is missing, and returns the meshes finished since: only
+    /// for nodes in the plan and the coverage layer.
     pub fn update(
         &mut self,
         camera: [f64; 3],
         max_distance: f64,
+        view: &FarView,
         loaded: LoadedBox,
         is_loaded: impl Fn(SectionPos) -> bool,
     ) -> Vec<(CubeKey, SectionMesh)> {
         self.camera = camera;
         let now = Instant::now();
         let cube = cube_of(camera);
-        // With the descent on, the first plan waits for its first answer: a
-        // plan of nothing but unclassified (mixed) nodes would queue the
-        // whole octree.
-        let waiting = self.shared.descent_on.load(Ordering::Relaxed)
-            && self.ask_descent(camera, max_distance, loaded)
-            && self.plan.is_empty();
-        let fresh = self.shared.classes_dirty.swap(false, Ordering::Relaxed);
-        let stale = fresh
-            || match self.planned {
-                Some((c, d, l, at)) => {
-                    c != cube || d != max_distance || l != loaded || now - at >= REPLAN
+        self.face(view.forward);
+        let rule = view.rule(self.budget());
+        self.stats.target_px = view.target_px as f32;
+        // A plan the planner finished goes in.
+        let done = self.shared.planner.lock().unwrap().done.take();
+        if let Some(done) = done {
+            self.install(done, now);
+        }
+        if self.jumped.is_none()
+            && self
+                .asked
+                .is_some_and(|a| distance(a.camera, camera) > JUMP)
+        {
+            self.jumped = Some(now);
+        }
+        // With the descent on, the first plan waits for its first answer, and
+        // a plan after a jump for a moment: a plan of nothing but unclassified
+        // (mixed) nodes would queue the whole octree.
+        let hold = self.shared.descent_on.load(Ordering::Relaxed)
+            && self.ask_descent(camera, max_distance, loaded, &rule, now);
+        if self.shared.classes_dirty.swap(false, Ordering::Relaxed) {
+            self.replan = true;
+        }
+        let stale = self.replan
+            || match &self.asked {
+                Some(a) => {
+                    a.cube != cube
+                        || a.max_distance != max_distance
+                        || a.loaded != loaded
+                        || now.saturating_duration_since(a.at) >= self.replan_every()
+                        || refocused(&a.rule, &rule, view)
                 }
                 None => true,
             };
-        if stale && !waiting {
-            let shared = self.shared.clone();
-            let class = move |key: CubeKey| classify_cached(&shared, key);
-            let (next, pruned) =
-                plan_classified(camera, max_distance, loaded, &is_loaded, &self.plan, &class);
-            self.pruned = pruned;
-            if next != self.plan {
-                self.stats.plan_changed = Some(now);
-                self.stats.plan_complete = None;
+        if stale && !hold {
+            let mut slot = self.shared.planner.lock().unwrap();
+            if slot.job.is_none() && !slot.busy && slot.done.is_none() {
+                slot.job = Some(PlanJob {
+                    epoch: self.epoch,
+                    camera,
+                    max_distance,
+                    rule,
+                    loaded,
+                    snapshot: LoadedSnapshot::take(cube, loaded, &is_loaded),
+                    previous: self.plan.clone(),
+                });
+                drop(slot);
+                self.shared.planner_wake.notify_one();
+                self.replan = false;
+                self.jumped = None;
+                self.asked = Some(Asked {
+                    cube,
+                    camera,
+                    max_distance,
+                    loaded,
+                    rule,
+                    at: now,
+                });
             }
-            self.plan = next;
-            self.wanted = self.plan.iter().copied().collect();
-            self.planned = Some((cube, max_distance, loaded, now));
-            self.failed
-                .retain(|key, at| self.wanted.contains(key) && now - *at < RETRY);
-            self.enqueue();
         }
         let mut out = Vec::new();
         while let Ok(done) = self.results.try_recv() {
-            if !self.wanted.contains(&done.key) {
+            let key = done.key;
+            if !(self.wanted.contains(&key) || self.cover.contains(&key))
+                || self.delivered.contains(&key)
+            {
                 if let Some(Product::Gpu(node)) = &done.product {
                     self.release(node);
                 }
@@ -1211,102 +2206,523 @@ impl CubeLod {
             }
             match done.product {
                 Some(Product::Mesh(mesh)) => {
-                    self.delivered.insert(done.key);
-                    out.push((done.key, mesh));
+                    self.deliver(key, mesh.solid.is_empty() && mesh.translucent.is_empty());
+                    out.push((key, mesh));
                 }
                 Some(Product::Gpu(node)) => {
-                    self.delivered.insert(done.key);
-                    match node.content {
-                        GpuContent::Uniform(voxel) if voxel.state == self.air => {
-                            self.empty.insert(done.key);
-                        }
-                        GpuContent::Slot(_) if node.states.is_empty() => {
-                            self.stats.gpu_generated += 1;
-                        }
-                        _ => {}
+                    let empty = matches!(node.content,
+                        GpuContent::Uniform(voxel) if voxel.state == self.air);
+                    if matches!(node.content, GpuContent::Slot(_)) && node.states.is_empty() {
+                        self.stats.gpu_generated += 1;
                     }
+                    self.deliver(key, empty);
                     self.gpu_out.push(node);
                 }
                 None => {
-                    self.failed.insert(done.key, now);
+                    self.failed.insert(key, now);
                 }
             }
         }
+        self.retry(now);
+        self.recheck_holes(now, false);
+        self.advance_phase(now);
         self.track_completion(now);
         out
     }
 
-    fn enqueue(&mut self) {
-        let mut queue = self.shared.queue.lock().unwrap();
-        queue.jobs.clear();
-        let now = Instant::now();
-        for &key in &self.plan {
-            let retry = self.failed.get(&key).is_none_or(|at| now - *at >= RETRY);
-            if retry && !self.delivered.contains(&key) && !queue.running.contains(&key) {
-                queue.jobs.push_back(key);
+    /// How often the plan is redone with nothing else asking: [`REPLAN`], or
+    /// four times what the last plan took, so a big plan keeps the planner
+    /// thread busy a quarter of the time at most.
+    fn replan_every(&self) -> Duration {
+        REPLAN.max(Duration::from_secs_f32(self.stats.plan_ms.max(0.0) * 0.004))
+    }
+
+    /// Notes `key` as handed out (`empty`: it draws nothing).
+    fn deliver(&mut self, key: CubeKey, empty: bool) {
+        if !self.delivered.insert(key) {
+            return;
+        }
+        self.release_dirty = true;
+        self.holes_dirty = true;
+        if empty {
+            self.empty.insert(key);
+        }
+        if self.wanted.contains(&key) {
+            self.missing = self.missing.saturating_sub(1);
+            if empty {
+                self.empty_planned += 1;
+            }
+        } else {
+            self.stale.insert(key);
+        }
+    }
+
+    /// Puts in a plan the planner made: the plan, its holes, and the queue.
+    fn install(&mut self, done: PlanDone, now: Instant) {
+        if done.epoch != self.epoch {
+            return;
+        }
+        self.pruned = done.pruned;
+        self.coarsened = done.coarsened;
+        self.stats.limited = done.limited;
+        self.stats.voxel_px = self.stats.target_px * done.coarsened.max(1.0) as f32;
+        self.stats.plan_ms = done.elapsed.as_secs_f32() * 1000.0;
+        if !done.changed {
+            return;
+        }
+        self.stats.plan_changed = Some(now);
+        self.release_dirty = true;
+        self.releasing.clear();
+        let mut dropped = Vec::new();
+        for &key in &done.removed {
+            self.wanted.remove(&key);
+            if self.delivered.contains(&key) {
+                self.stale.insert(key);
+                if self.empty.contains(&key) {
+                    self.empty_planned = self.empty_planned.saturating_sub(1);
+                }
+            } else {
+                self.missing = self.missing.saturating_sub(1);
+                dropped.push(key);
             }
         }
+        for &key in &done.added {
+            self.wanted.insert(key);
+            if self.delivered.contains(&key) {
+                self.stale.remove(&key);
+                if self.empty.contains(&key) {
+                    self.empty_planned += 1;
+                }
+            } else {
+                self.missing += 1;
+            }
+        }
+        let big = done.added.len() * COVER_HOLES > done.leaves.len();
+        self.plan = done.leaves;
+        self.order = done.order;
+        self.tree = done.tree;
+        self.cover_plan = done.cover;
+        // The holes: all of them after a big change, else the old ones still
+        // planned and the new nodes with nothing over them.
+        let fresh: Vec<CubeKey> = if big {
+            self.plan.to_vec()
+        } else {
+            done.added
+                .iter()
+                .copied()
+                .filter(|k| !self.delivered.contains(k))
+                .collect()
+        };
+        let covering = matches!(self.phase, Phase::Cover { .. });
+        let (new_holes, holding) = self.find_holes(&fresh, big || covering);
+        if big {
+            self.holes = new_holes;
+            self.holding = holding;
+        } else {
+            let wanted = &self.wanted;
+            self.holes.retain(|(k, _)| wanted.contains(k));
+            self.holes.extend(new_holes);
+            self.holding.retain(|k| wanted.contains(k));
+            self.holding.extend(holding);
+        }
+        self.holes_dirty = false;
+        self.holes_at = now;
+        if !self.holes.is_empty() {
+            self.stats.plan_covered = None;
+        }
+        if (big && self.holes.len() * COVER_HOLES > self.plan.len()) || covering {
+            self.begin_cover(now);
+        } else if big {
+            self.fill_queue();
+        } else {
+            // A small change: the new nodes go first, the dropped ones are
+            // skipped if they are queued.
+            let rank = self.rank();
+            let mut first: Vec<CubeKey> = done
+                .added
+                .iter()
+                .copied()
+                .filter(|k| !self.delivered.contains(k))
+                .collect();
+            first.sort_by(|a, b| self.priority(&rank, a).total_cmp(&self.priority(&rank, b)));
+            let mut queue = self.shared.queue.lock().unwrap();
+            for key in &first {
+                queue.dropped.remove(key);
+            }
+            queue.dropped.extend(dropped);
+            queue.first.extend(first);
+            drop(queue);
+            self.shared.wake.notify_all();
+        }
+    }
+
+    /// The rank of each sector in the queue's order now.
+    fn rank(&self) -> [u8; SECTORS] {
+        let order = sector_order(self.facing.unwrap_or([0.0, 0.0, 1.0]));
+        let mut rank = [0u8; SECTORS];
+        for (i, s) in order.into_iter().enumerate() {
+            rank[usize::from(s)] = i as u8;
+        }
+        rank
+    }
+
+    /// The order a short list is queued in: by sector rank, then distance.
+    fn priority(&self, rank: &[u8; SECTORS], key: &CubeKey) -> f64 {
+        f64::from(rank[usize::from(sector(self.camera, *key))]) * 1e9
+            + key.distance(self.camera).min(9e8)
+    }
+
+    /// The planned nodes among `keys` with nothing drawn over their place:
+    /// not delivered, under no delivered node (a coverage node or an older
+    /// plan's, kept by `removed`), and over none (an older plan's finer
+    /// nodes, kept until this one is in). With `cover`, each comes with the
+    /// coverage leaf over it, if any, and only a node as fine as that leaf or
+    /// finer counts as drawn over it. Also returns the planned nodes holding
+    /// an older plan's nodes: once in, those are let go (after a teleport,
+    /// most of the last plan, far away under a few coarse nodes).
+    fn find_holes(&self, keys: &[CubeKey], cover: bool) -> (Vec<Hole>, Vec<CubeKey>) {
+        // Only nodes outside the plan can hold or be held by a planned node.
+        let mut levels = 0u32;
+        let mut inner = FxHashSet::default();
+        for &s in &self.stale {
+            levels |= 1 << s.level;
+            let mut up = s;
+            while up.level < MAX_CUBE_LEVEL && inner.insert(up.parent()) {
+                up = up.parent();
+            }
+        }
+        let mut holes = Vec::new();
+        let mut holding = Vec::new();
+        if !cover {
+            for &key in keys {
+                if self.delivered.contains(&key) {
+                    continue;
+                }
+                if inner.contains(&key) {
+                    holding.push(key);
+                    continue;
+                }
+                let held = (key.level + 1..=MAX_CUBE_LEVEL)
+                    .filter(|l| levels >> l & 1 == 1)
+                    .any(|l| self.stale.contains(&ancestor(key, l)));
+                if !held {
+                    holes.push((key, None));
+                }
+            }
+            return (holes, holding);
+        }
+        // Per node above a hole: whether it or a node over it is drawn, and
+        // the coverage leaf at or over it. Siblings share the walk.
+        let mut memo: FxHashMap<CubeKey, (bool, Option<CubeKey>)> = FxHashMap::default();
+        let mut path = Vec::new();
+        for &key in keys {
+            if self.delivered.contains(&key) {
+                continue;
+            }
+            if inner.contains(&key) {
+                holding.push(key);
+                continue;
+            }
+            path.clear();
+            let mut found = (false, None);
+            let mut up = key;
+            while up.level < MAX_CUBE_LEVEL {
+                up = up.parent();
+                if let Some(&m) = memo.get(&up) {
+                    found = m;
+                    break;
+                }
+                path.push(up);
+            }
+            // A node drawn over the place counts only at the coverage leaf's
+            // size or finer: after a teleport, the last plan's nodes millions
+            // of blocks wide still stand over the new place, a voxel there
+            // tens of thousands of blocks tall.
+            for &n in path.iter().rev() {
+                found = if self.cover_plan.contains(&n) {
+                    (self.stale.contains(&n), Some(n))
+                } else if found.1.is_some() {
+                    (found.0 || self.stale.contains(&n), found.1)
+                } else {
+                    (false, None)
+                };
+                memo.insert(n, found);
+            }
+            if !found.0 {
+                holes.push((key, found.1));
+            }
+        }
+        (holes, holding)
+    }
+
+    /// Drops the holes that something now covers: the node itself, or the
+    /// coverage node over it. A pass over every hole runs at most every
+    /// [`SCAN_EVERY`] while there are many.
+    fn recheck_holes(&mut self, now: Instant, force: bool) {
+        if !self.holes_dirty || self.holes.is_empty() {
+            return;
+        }
+        if !force
+            && self.holes.len() > SLOW_SCAN
+            && now.saturating_duration_since(self.holes_at) < SCAN_EVERY
+        {
+            return;
+        }
+        self.holes_dirty = false;
+        self.holes_at = now;
+        let delivered = &self.delivered;
+        self.holes.retain(|(key, over)| {
+            !(delivered.contains(key) || over.is_some_and(|c| delivered.contains(&c)))
+        });
+    }
+
+    /// Queues only the coverage layer over the holes: a coverage node over a
+    /// hole where the layer has one, else the hole itself (the plan is as
+    /// coarse there).
+    fn begin_cover(&mut self, now: Instant) {
+        let since = match self.phase {
+            Phase::Cover { since, .. } => since,
+            Phase::Refine => now,
+        };
+        let mut seen = FxHashSet::default();
+        let mut wave: Vec<CubeKey> = self
+            .holes
+            .iter()
+            .map(|&(key, over)| over.unwrap_or(key))
+            .chain(self.holding.iter().copied())
+            .filter(|k| seen.insert(*k) && !self.delivered.contains(k))
+            .collect();
+        if wave.is_empty() {
+            self.phase = Phase::Refine;
+            self.fill_queue();
+            return;
+        }
+        let rank = self.rank();
+        wave.sort_by(|a, b| self.priority(&rank, a).total_cmp(&self.priority(&rank, b)));
+        self.cover = wave
+            .iter()
+            .copied()
+            .filter(|k| !self.wanted.contains(k))
+            .collect();
+        self.stats.cover_nodes = wave.len();
+        let mut queue = self.shared.queue.lock().unwrap();
+        queue.clear();
+        queue.first.extend(wave.iter().copied());
+        drop(queue);
+        self.shared.wake.notify_all();
+        self.phase = Phase::Cover { since, wave };
+    }
+
+    /// Ends the coverage phase once its nodes are in and shown (or failed,
+    /// or after [`COVER_WAIT`]), and queues the rest of the plan.
+    fn advance_phase(&mut self, now: Instant) {
+        let Phase::Cover { since, wave } = &self.phase else {
+            return;
+        };
+        let landed = wave.iter().all(|k| {
+            self.delivered.contains(k)
+                || self.failed.contains_key(k)
+                || !(self.wanted.contains(k) || self.cover.contains(k))
+        });
+        if !(landed && self.shown()) && now.saturating_duration_since(*since) < COVER_WAIT {
+            return;
+        }
+        self.phase = Phase::Refine;
+        self.holes_dirty = true;
+        self.recheck_holes(now, true);
+        self.fill_queue();
+    }
+
+    /// Queues every planned node not handed out: holes first, then by sector
+    /// (the view's first) and distance.
+    fn fill_queue(&mut self) {
+        let rank = self.rank();
+        let now = Instant::now();
+        let waiting = |k: &CubeKey| {
+            !self.delivered.contains(k)
+                && self
+                    .failed
+                    .get(k)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= RETRY)
+        };
+        let mut firsts = FxHashSet::default();
+        let mut first: Vec<CubeKey> = self
+            .holes
+            .iter()
+            .map(|h| h.0)
+            .chain(self.holding.iter().copied())
+            .filter(|k| waiting(k) && firsts.insert(*k))
+            .collect();
+        first.sort_by(|a, b| self.priority(&rank, a).total_cmp(&self.priority(&rank, b)));
+        let mut queue = self.shared.queue.lock().unwrap();
+        queue.clear();
+        queue.first.extend(first);
+        for &(s, key) in &self.order {
+            if waiting(&key) && !firsts.contains(&key) {
+                queue.sectors[usize::from(s)].push_back(key);
+            }
+        }
+        queue.order = sector_order(self.facing.unwrap_or([0.0, 0.0, 1.0]));
         drop(queue);
         self.shared.wake.notify_all();
     }
 
+    /// Asks again for nodes whose sampling failed a while ago.
+    fn retry(&mut self, now: Instant) {
+        if now < self.retry_at || self.failed.is_empty() {
+            return;
+        }
+        self.retry_at = now + RETRY / 2;
+        let (wanted, cover) = (&self.wanted, &self.cover);
+        self.failed
+            .retain(|k, _| wanted.contains(k) || cover.contains(k));
+        let due: Vec<CubeKey> = self
+            .failed
+            .iter()
+            .filter(|(_, at)| now.saturating_duration_since(**at) >= RETRY)
+            .map(|(&k, _)| k)
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        for key in &due {
+            self.failed.remove(key);
+        }
+        let mut queue = self.shared.queue.lock().unwrap();
+        queue.first.extend(due);
+        drop(queue);
+        self.shared.wake.notify_all();
+    }
+
+    /// Reorders the queue's sectors when the view turned past [`TURN`].
+    fn face(&mut self, forward: [f64; 3]) {
+        if self
+            .facing
+            .is_some_and(|f| angle_between(f, forward) <= TURN)
+        {
+            return;
+        }
+        self.facing = Some(forward);
+        let order = sector_order(forward);
+        self.shared.queue.lock().unwrap().order = order;
+    }
+
     /// The nodes the renderer can drop: handed out before, no longer in the
     /// plan, and with every node over their place handed out too.
+    ///
+    /// At most [`RELEASE_BATCH`] a call: the renderer retires each with
+    /// writes of its own, and a teleport lets a whole plan go at once.
     pub fn removed(&mut self) -> Vec<CubeKey> {
-        // Plan nodes still missing, and their ancestors: a node holding one
-        // of them still covers a place nothing else draws yet.
-        let mut blocked = FxHashSet::default();
-        for &key in self.plan.iter().filter(|k| !self.delivered.contains(k)) {
-            let mut up = key;
-            while up.level < MAX_CUBE_LEVEL && blocked.insert(up.parent()) {
-                up = up.parent();
-            }
+        if self.releasing.is_empty() {
+            self.releasing = self.releasable();
         }
-        let wanted = &self.wanted;
-        let delivered = &self.delivered;
-        let released: Vec<CubeKey> = delivered
-            .iter()
-            .copied()
-            .filter(|&key| {
-                if wanted.contains(&key) || blocked.contains(&key) {
-                    return false;
-                }
-                // An ancestor in the plan that is not out yet covers it.
-                let mut up = key;
-                while up.level < MAX_CUBE_LEVEL {
-                    up = up.parent();
-                    if wanted.contains(&up) && !delivered.contains(&up) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
+        let take = self.releasing.len().min(RELEASE_BATCH);
+        let mut released: Vec<CubeKey> = self.releasing.drain(..take).collect();
+        // Planned again since it was found, or a plan put in since: kept.
+        released.retain(|k| self.stale.contains(k) && !self.wanted.contains(k));
         for key in &released {
             self.delivered.remove(key);
+            self.stale.remove(key);
+            self.empty.remove(key);
         }
         let camera = self.camera;
-        let mut released = released;
-        released.sort_unstable_by(|a, b| a.distance(camera).total_cmp(&b.distance(camera)));
+        released.sort_by_cached_key(|k| (k.distance(camera) * 16.0) as u64);
+        released
+    }
+
+    /// The stale nodes nothing needs any more: every node over their place
+    /// is handed out, or none is wanted. A pass over the stale nodes, at most
+    /// every [`SCAN_EVERY`] while many planned nodes are missing.
+    fn releasable(&mut self) -> Vec<CubeKey> {
+        let now = Instant::now();
+        if self.stale.is_empty() || !self.release_dirty {
+            return Vec::new();
+        }
+        if self.missing > SLOW_SCAN && now.saturating_duration_since(self.released_at) < SCAN_EVERY
+        {
+            return Vec::new();
+        }
+        self.release_dirty = false;
+        self.released_at = now;
+        // A node holding a planned node still missing covers a place nothing
+        // else draws yet: the planned nodes inside it are a run of the tree.
+        let blocked = |key: CubeKey| {
+            if self.missing == 0 {
+                return false;
+            }
+            let lo = tree_order(key);
+            let hi = lo + (1u128 << (3 * u32::from(key.level)));
+            let start = self.tree.partition_point(|e| e.0 < lo);
+            self.tree[start..]
+                .iter()
+                .take_while(|e| e.0 < hi)
+                .any(|e| e.1.level < key.level && !self.delivered.contains(&e.1))
+        };
+        // Per node over a stale one: whether it or one over it is planned
+        // and not out yet (it then covers the stale node's place).
+        let mut memo: FxHashMap<CubeKey, bool> = FxHashMap::default();
+        let mut path = Vec::new();
+        let mut released = Vec::new();
+        for &key in &self.stale {
+            if blocked(key) {
+                continue;
+            }
+            path.clear();
+            let mut covered = false;
+            let mut up = key;
+            while up.level < MAX_CUBE_LEVEL {
+                up = up.parent();
+                if let Some(&m) = memo.get(&up) {
+                    covered = m;
+                    break;
+                }
+                path.push(up);
+            }
+            for &n in path.iter().rev() {
+                covered = covered || (self.wanted.contains(&n) && !self.delivered.contains(&n));
+                memo.insert(n, covered);
+            }
+            if !covered {
+                released.push(key);
+            }
+        }
         released
     }
 
     /// Forgets everything: nodes handed out, queued and cached.
     pub fn clear(&mut self) {
-        {
-            let mut queue = self.shared.queue.lock().unwrap();
-            queue.jobs.clear();
-        }
+        self.shared.queue.lock().unwrap().clear();
         self.shared.cache.lock().unwrap().nodes.clear();
+        {
+            // A plan in the works belongs to the old count: dropped.
+            let mut slot = self.shared.planner.lock().unwrap();
+            slot.job = None;
+            slot.done = None;
+        }
+        self.epoch += 1;
         // Results of jobs running now are dropped as unwanted.
-        self.plan.clear();
+        self.plan = Arc::default();
         self.wanted.clear();
+        self.order.clear();
+        self.tree.clear();
+        self.cover_plan.clear();
+        self.cover.clear();
+        self.holes.clear();
+        self.holding.clear();
+        self.phase = Phase::Refine;
         self.delivered.clear();
+        self.stale.clear();
+        self.releasing.clear();
+        self.missing = 0;
         self.failed.clear();
         self.empty.clear();
+        self.empty_planned = 0;
         self.stats.plan_changed = None;
         self.stats.plan_complete = None;
-        self.planned = None;
+        self.stats.plan_covered = None;
+        self.asked = None;
+        self.replan = false;
+        self.jumped = None;
         while let Ok(done) = self.results.try_recv() {
             if let Some(Product::Gpu(node)) = &done.product {
                 self.release(node);
@@ -1316,6 +2732,16 @@ impl CubeLod {
             self.release(&node);
         }
     }
+}
+
+/// The node of `level` holding `key` (`level` at least `key.level`).
+fn ancestor(key: CubeKey, level: u8) -> CubeKey {
+    let up = level - key.level;
+    CubeKey::new(level, key.x >> up, key.y >> up, key.z >> up)
+}
+
+fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
 impl Drop for CubeLod {
@@ -1334,6 +2760,10 @@ impl Drop for CubeLod {
         {
             let _descent = self.shared.descent.lock();
             self.shared.descent_wake.notify_all();
+        }
+        {
+            let _planner = self.shared.planner.lock();
+            self.shared.planner_wake.notify_all();
         }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
@@ -1465,23 +2895,51 @@ fn work(
         let gpu = backend
             .as_ref()
             .filter(|_| shared.gpu_path.load(Ordering::Relaxed));
-        // On the GPU path a worker takes a batch of the nearest jobs and asks
+        // On the GPU path a worker takes a batch of the first jobs and asks
         // the sampler for them at once (`resident_many`); on the CPU path one.
         let take = if gpu.is_some() { GPU_BATCH } else { 1 };
+        if let Some(backend) = gpu {
+            // The pool is full while the renderer meshes what is in it: wait
+            // for room rather than fail the batch (a failed node waits RETRY).
+            let mut waited = 0;
+            while backend.pool.free_slots() < GPU_BATCH
+                && waited < POOL_WAITS
+                && !shared.stop.load(Ordering::Relaxed)
+            {
+                thread::sleep(POOL_WAIT);
+                waited += 1;
+            }
+        }
         let keys: Vec<CubeKey> = {
             let mut queue = shared.queue.lock().unwrap();
             loop {
                 if shared.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                if !queue.jobs.is_empty() {
-                    let mut keys = Vec::with_capacity(take.min(queue.jobs.len()));
-                    while keys.len() < take
-                        && let Some(key) = queue.jobs.pop_front()
-                    {
-                        queue.running.insert(key);
-                        keys.push(key);
+                let mut keys = Vec::new();
+                // The finest levels are sampled on the CPU one by one, before
+                // the batch's GPU request: a few per batch, so they never hold
+                // the GPU's nodes back for long. The rest wait at the front,
+                // and the GPU's nodes behind them come in meanwhile.
+                let (mut cpu, mut later) = (0, Vec::new());
+                while keys.len() < take
+                    && later.len() < 8 * take
+                    && let Some(key) = queue.pop()
+                {
+                    if gpu.is_some() && key.level < MIN_LEVEL {
+                        if cpu == CPU_PER_BATCH {
+                            later.push(key);
+                            continue;
+                        }
+                        cpu += 1;
                     }
+                    queue.running.insert(key);
+                    keys.push(key);
+                }
+                for key in later.into_iter().rev() {
+                    queue.first.push_front(key);
+                }
+                if !keys.is_empty() {
                     break keys;
                 }
                 queue = shared.wake.wait(queue).unwrap();
@@ -1535,6 +2993,12 @@ fn work(
 
 /// Jobs a worker on the GPU path takes and asks for at once.
 const GPU_BATCH: usize = 64;
+/// At most this many of them are of the levels sampled on the CPU.
+const CPU_PER_BATCH: usize = 2;
+/// A worker finding the GPU pool without room for a batch waits this long, at
+/// most this many times, before asking anyway.
+const POOL_WAIT: Duration = Duration::from_millis(2);
+const POOL_WAITS: u32 = 250;
 
 /// A CPU node as a [`GpuNode`]: uniform and uncovered ones need no slot, the
 /// rest are uploaded into one. `None` when the pool is full.
@@ -2155,44 +3619,417 @@ mod tests {
         CubeLod::assemble(shared, results, Vec::new(), None, None, AIR)
     }
 
+    /// Puts `keys` in as the plan, as the planner thread would hand it over,
+    /// with `cover` as its coverage layer.
+    fn put(lod: &mut CubeLod, keys: &[CubeKey], cover: &[CubeKey]) {
+        let next: FxHashSet<CubeKey> = keys.iter().copied().collect();
+        let added = keys
+            .iter()
+            .copied()
+            .filter(|k| !lod.wanted.contains(k))
+            .collect();
+        let removed = lod
+            .wanted
+            .iter()
+            .copied()
+            .filter(|k| !next.contains(k))
+            .collect();
+        let camera = lod.camera;
+        let mut leaves = keys.to_vec();
+        leaves.sort_by(|a, b| a.distance(camera).total_cmp(&b.distance(camera)));
+        let mut tree: Vec<(u128, CubeKey)> = keys.iter().map(|&k| (tree_order(k), k)).collect();
+        tree.sort_unstable();
+        let done = PlanDone {
+            epoch: lod.epoch,
+            tree,
+            order: leaves.iter().map(|&k| (sector(camera, k), k)).collect(),
+            leaves: Arc::new(leaves),
+            changed: true,
+            added,
+            removed,
+            cover: cover.iter().copied().collect(),
+            pruned: 0,
+            limited: false,
+            coarsened: 1.0,
+            elapsed: Duration::ZERO,
+        };
+        lod.install(done, Instant::now());
+    }
+
     #[test]
     fn a_node_is_removed_only_once_what_replaces_it_is_in() {
         let mut lod = lod_for_test();
         let coarse = key(1, 0, 0, 0);
         let kids = coarse.children();
-        lod.delivered.insert(coarse);
+        put(&mut lod, &[coarse], &[]);
+        lod.deliver(coarse, false);
         // The plan now wants the eight children; none is in yet.
-        lod.plan = kids.to_vec();
-        lod.wanted = kids.into_iter().collect();
+        put(&mut lod, &kids, &[]);
         assert!(lod.removed().is_empty(), "children missing: a hole");
         for &k in &kids[..7] {
-            lod.delivered.insert(k);
+            lod.deliver(k, false);
         }
         assert!(lod.removed().is_empty(), "one child missing");
-        lod.delivered.insert(kids[7]);
+        lod.deliver(kids[7], false);
         assert_eq!(lod.removed(), vec![coarse]);
         assert!(lod.removed().is_empty(), "reported once");
         // The other way: children out, parent wanted.
-        lod.plan = vec![coarse];
-        lod.wanted = [coarse].into_iter().collect();
+        put(&mut lod, &[coarse], &[]);
         assert!(lod.removed().is_empty(), "the parent is not in");
-        lod.delivered.insert(coarse);
+        lod.deliver(coarse, false);
         assert_eq!(lod.removed().len(), 8);
         // Out of range, nothing replaces it.
-        lod.plan.clear();
-        lod.wanted.clear();
+        put(&mut lod, &[], &[]);
         assert_eq!(lod.removed(), vec![coarse]);
     }
 
     #[test]
     fn the_plan_is_dropped_by_clear() {
         let mut lod = lod_for_test();
-        lod.plan = vec![key(0, 0, 0, 0)];
-        lod.wanted = lod.plan.iter().copied().collect();
-        lod.delivered.insert(key(0, 0, 0, 0));
+        put(&mut lod, &[key(0, 0, 0, 0)], &[]);
+        lod.deliver(key(0, 0, 0, 0), false);
         lod.clear();
         assert!(lod.plan.is_empty() && lod.delivered.is_empty());
         assert!(lod.removed().is_empty());
+        assert_eq!(lod.stats().pending, 0);
+    }
+
+    // ---- detail by size on screen
+
+    const NONE: LoadedBox = LoadedBox {
+        horizontal: 0,
+        vertical: 0,
+    };
+
+    fn mixed(_: CubeKey) -> NodeClass {
+        NodeClass::Mixed
+    }
+
+    /// The leaf of `plan` holding the block at `p`.
+    fn leaf_at(plan: &[CubeKey], p: [f64; 3]) -> CubeKey {
+        let cube = cube_of(p);
+        *plan
+            .iter()
+            .find(|k| k.contains_cube(cube))
+            .unwrap_or_else(|| panic!("nothing holds {p:?}"))
+    }
+
+    /// Pixels a voxel of `node` spans at its nearest point from `camera`,
+    /// with a vertical field of view of `fov` degrees, 720 pixels tall.
+    fn voxel_px(node: CubeKey, camera: [f64; 3], fov: f64) -> f64 {
+        let focal = 720.0 / (2.0 * (fov.to_radians() / 2.0).tan());
+        f64::from(1 << node.level) / node.distance(camera) * focal
+    }
+
+    /// The angle in degrees between `forward` and the direction to `node`'s
+    /// centre.
+    fn off_axis(node: CubeKey, camera: [f64; 3], forward: [f64; 3]) -> f64 {
+        let half = f64::from(node.size()) / 2.0;
+        let o = node.origin();
+        let d = [0, 1, 2].map(|a| f64::from(o[a]) + half - camera[a]);
+        angle_between(d, forward).to_degrees()
+    }
+
+    #[test]
+    fn a_narrower_view_refines_the_nodes_in_view_only() {
+        let camera = [0.5, 100.5, 0.5];
+        let ahead = [0.0, 0.0, 1.0];
+        let view = FarView::standard(8.0);
+        // The spyglass: a tenth of the field of view.
+        let zoom = view.looking(ahead, 7f64.to_radians());
+        let range = 30_000.0;
+        let wide = plan_classified(
+            camera,
+            range,
+            &view.rule(usize::MAX),
+            NONE,
+            &|_| false,
+            &[],
+            &mixed,
+        );
+        let narrow = plan_classified(
+            camera,
+            range,
+            &zoom.rule(usize::MAX),
+            NONE,
+            &|_| false,
+            &[],
+            &mixed,
+        );
+        let far_ahead = [0.5, 100.5, 8000.5];
+        let far_behind = [0.5, 100.5, -8000.5];
+        // Ten times the magnification is a bit over three levels finer.
+        let (w, n) = (
+            leaf_at(&wide.leaves, far_ahead).level,
+            leaf_at(&narrow.leaves, far_ahead).level,
+        );
+        assert!(n + 3 <= w, "ahead: level {n} zoomed, {w} not");
+        assert_eq!(
+            leaf_at(&narrow.leaves, far_behind),
+            leaf_at(&wide.leaves, far_behind),
+            "behind the camera the zoom changes nothing"
+        );
+        // On screen, no voxel is over the target at its node's nearest point;
+        // and each leaf's parent would have been.
+        for (plan, fov, within) in [(&wide.leaves, 70.0, 20.0), (&narrow.leaves, 7.0, 2.0)] {
+            let mut seen = 0;
+            for &leaf in plan.iter().filter(|k| k.level > 0) {
+                if off_axis(leaf, camera, ahead) > within {
+                    continue;
+                }
+                seen += 1;
+                let px = voxel_px(leaf, camera, fov);
+                assert!(px <= 8.0 + 1e-9, "{leaf:?}: {px} px at {fov} degrees");
+                let parent = voxel_px(leaf.parent(), camera, fov);
+                assert!(parent > 8.0, "{leaf:?} split needlessly: {parent} px");
+            }
+            assert!(seen > 20, "{seen} leaves in view at {fov} degrees");
+        }
+        // Behind the zoomed camera, the unzoomed rule holds.
+        for &leaf in narrow.leaves.iter().filter(|k| k.level > 0) {
+            if off_axis(leaf, camera, ahead) > 120.0 {
+                assert!(voxel_px(leaf, camera, 70.0) <= 8.0 + 1e-9, "{leaf:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_finer_target_asks_for_more_nodes_and_the_budget_coarsens_evenly() {
+        let camera = [0.5, 100.5, 0.5];
+        let range = 8000.0;
+        let plan_for = |target: f64, budget: usize| {
+            plan_classified(
+                camera,
+                range,
+                &FarView::standard(target).rule(budget),
+                NONE,
+                &|_| false,
+                &[],
+                &mixed,
+            )
+        };
+        let coarse = plan_for(16.0, usize::MAX);
+        let fine = plan_for(4.0, usize::MAX);
+        assert!(!coarse.limited && !fine.limited);
+        assert!(fine.leaves.len() > coarse.leaves.len() * 4);
+        let budget = fine.leaves.len() / 3;
+        let capped = plan_for(4.0, budget);
+        assert!(capped.limited && capped.coarsened > 1.0);
+        assert!(capped.leaves.len() <= budget, "{}", capped.leaves.len());
+        assert_disjoint(&capped.leaves);
+        // What is smallest on screen stays whole first: no leaf's voxels are
+        // over `coarsened` times the target, and no node was split under it.
+        let over = |k: CubeKey| voxel_px(k, camera, 70.0) / 4.0;
+        for &leaf in capped.leaves.iter().filter(|k| k.level > 0) {
+            assert!(over(leaf) <= capped.coarsened + 1e-9, "{leaf:?}");
+            assert!(over(leaf.parent()) >= capped.coarsened - 1e-9, "{leaf:?}");
+        }
+        // Far out it is coarser than the full plan, and every block in range
+        // is still drawn once.
+        let far = [0.5, 100.5, 7000.5];
+        assert!(leaf_at(&capped.leaves, far).level >= leaf_at(&fine.leaves, far).level);
+        for p in [
+            far,
+            [40.5, 100.5, 20.5],
+            [-3000.5, -300.5, 4000.5],
+            [5000.5, 1500.5, -100.5],
+        ] {
+            let cube = cube_of(p);
+            let holders = capped
+                .leaves
+                .iter()
+                .filter(|k| k.contains_cube(cube))
+                .count();
+            assert_eq!(holders, 1, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn zooming_out_merges_only_past_the_hysteresis() {
+        let camera = [0.5, 100.5, 0.5];
+        let ahead = [0.0, 0.0, 1.0];
+        let view = FarView::standard(8.0);
+        let zoomed = view.looking(ahead, 7f64.to_radians());
+        let range = 30_000.0;
+        let plan_with = |v: &FarView, previous: &[CubeKey]| {
+            plan_classified(
+                camera,
+                range,
+                &v.rule(usize::MAX),
+                NONE,
+                &|_| false,
+                previous,
+                &mixed,
+            )
+            .leaves
+        };
+        let narrow = plan_with(&zoomed, &[]);
+        let back = plan_with(&view, &narrow);
+        assert_disjoint(&back);
+        assert!(back.len() < narrow.len());
+        // A node stays split after the zoom only while its voxels are more
+        // than 1 / MERGE of the target on screen; a leaf is never over it.
+        let focal = view.focal_px(view.fov_y);
+        let ratio = |k: CubeKey| f64::from(1 << k.level) / k.distance(camera) * focal / 8.0;
+        for &leaf in back.iter().filter(|k| k.level > 0) {
+            assert!(ratio(leaf) <= 1.0 + 1e-9, "{leaf:?}");
+            assert!(ratio(leaf.parent()) * MERGE > 1.0, "{leaf:?} kept split");
+        }
+        // A sprint's wider view and back again changes nothing.
+        let sprint = view.looking(ahead, 77f64.to_radians());
+        let settled = plan_with(&view, &plan_with(&view, &[]));
+        let after = plan_with(&view, &plan_with(&sprint, &settled));
+        let set = |v: &[CubeKey]| v.iter().copied().collect::<FxHashSet<_>>();
+        assert_eq!(set(&after), set(&settled));
+    }
+
+    #[test]
+    fn only_tiles_the_tile_module_knows_are_tiles() {
+        let high = key(SURFACE_LEVEL, 3, 0, -2);
+        assert_eq!(node_kind(high, None, None), NodeKind::Cube);
+        let plain = Some(TileInfo { complex: false });
+        let complex = Some(TileInfo { complex: true });
+        assert_eq!(node_kind(high, None, plain), NodeKind::Tile);
+        assert_eq!(node_kind(high.children()[0], None, plain), NodeKind::Cube);
+        // A complex tile turns into cube nodes sooner.
+        assert_eq!(node_kind(high, None, complex), NodeKind::Cube);
+        let higher = key(SURFACE_LEVEL + COMPLEX_LIFT, 0, 0, 0);
+        assert_eq!(node_kind(higher, None, complex), NodeKind::Tile);
+    }
+
+    // ---- coverage first, and the queue's order
+
+    #[test]
+    fn a_big_change_draws_the_coverage_layer_first() {
+        let mut lod = lod_for_test();
+        let camera = [5000.5, 120.5, -3000.5];
+        lod.camera = camera;
+        let job = PlanJob {
+            epoch: lod.epoch,
+            camera,
+            max_distance: 50_000.0,
+            rule: FarView::standard(8.0).rule(usize::MAX),
+            loaded: NONE,
+            snapshot: LoadedSnapshot::default(),
+            previous: Arc::default(),
+        };
+        let done = make_plan(&job, &mut FxHashSet::default(), &mixed);
+        let plan: Vec<CubeKey> = done.leaves.to_vec();
+        lod.install(done, Instant::now());
+        assert!(matches!(lod.phase, Phase::Cover { .. }));
+        assert!(lod.stats().plan_covered.is_none());
+        // Only the layer is queued: few nodes, one over each planned node.
+        let wave = lod.shared.queue.lock().unwrap().drain();
+        assert!(wave.len() <= COVER_NODES && wave.len() * 10 < plan.len());
+        for &leaf in &plan {
+            let over = wave.iter().filter(|w| w.contains(leaf)).count();
+            assert_eq!(over, 1, "{leaf:?}");
+        }
+        // Nearest first within the layer's direction around the camera.
+        assert!(wave[0].distance(camera) < 1.0);
+        // The layer comes in: the place is covered, and the rest is queued.
+        for &w in &wave {
+            lod.deliver(w, false);
+        }
+        let now = Instant::now();
+        lod.recheck_holes(now, false);
+        lod.advance_phase(now);
+        lod.track_completion(now);
+        assert!(matches!(lod.phase, Phase::Refine));
+        assert!(lod.stats().plan_covered.is_some());
+        let rest = lod.shared.queue.lock().unwrap().drain();
+        let delivered_plan = plan.iter().filter(|k| wave.contains(k)).count();
+        assert_eq!(rest.len(), plan.len() - delivered_plan);
+        // The coverage nodes stay until the nodes under them are in.
+        if let Some(earlier) = Instant::now().checked_sub(Duration::from_secs(1)) {
+            lod.released_at = earlier;
+        }
+        assert!(lod.removed().is_empty());
+        for &k in &rest {
+            lod.deliver(k, false);
+        }
+        let gone: FxHashSet<CubeKey> = lod.removed().into_iter().collect();
+        let layer: FxHashSet<CubeKey> =
+            wave.iter().copied().filter(|k| !plan.contains(k)).collect();
+        assert_eq!(gone, layer);
+        assert!(lod.stats().complete || lod.gpu_path());
+    }
+
+    #[test]
+    fn a_small_change_skips_the_coverage_layer() {
+        let mut lod = lod_for_test();
+        let coarse = key(6, 0, 0, 0);
+        put(&mut lod, &[coarse], &[]);
+        lod.deliver(coarse, false);
+        lod.advance_phase(Instant::now());
+        lod.shared.queue.lock().unwrap().clear();
+        // Its children replace it: the parent still covers them.
+        put(&mut lod, &coarse.children(), &[coarse]);
+        assert!(matches!(lod.phase, Phase::Refine));
+        assert!(lod.holes.is_empty());
+        let queued = lod.shared.queue.lock().unwrap().drain();
+        assert_eq!(queued.len(), 8);
+    }
+
+    #[test]
+    fn the_queue_takes_what_the_camera_faces_first() {
+        let mut lod = lod_for_test();
+        let camera = [0.5, 70.5, 0.5];
+        lod.camera = camera;
+        // Level-4 nodes (256 blocks) in a ring 2,000 blocks out, every 30 degrees.
+        let ring: Vec<CubeKey> = (0..12)
+            .map(|i| {
+                let a = f64::from(i) * 30f64.to_radians();
+                CubeKey::containing(4, cube_of([2000.0 * a.sin(), 70.0, 2000.0 * a.cos()]))
+            })
+            .collect();
+        let near = key(4, 0, 0, 0);
+        let mut all = ring.clone();
+        all.push(near);
+        all.sort_by(|a, b| a.distance(camera).total_cmp(&b.distance(camera)));
+        lod.order = all.iter().map(|&k| (sector(camera, k), k)).collect();
+        let first_of = |lod: &mut CubeLod, facing: [f64; 3]| {
+            lod.facing = None;
+            lod.face(facing);
+            lod.fill_queue();
+            lod.shared.queue.lock().unwrap().drain()
+        };
+        // Looking along +Z: the node around the camera, then the one ahead,
+        // the one behind last.
+        let order = first_of(&mut lod, [0.0, 0.0, 1.0]);
+        assert_eq!(order.len(), all.len());
+        assert_eq!(order[0], near);
+        assert_eq!(order[1], ring[0], "{order:?}");
+        assert_eq!(*order.last().unwrap(), ring[6]);
+        // Turned around: behind comes first. Nothing is sorted again, the
+        // sectors are taken in another order.
+        let turned = first_of(&mut lod, [0.0, 0.0, -1.0]);
+        assert_eq!(turned[1], ring[6]);
+        assert_eq!(*turned.last().unwrap(), ring[0]);
+        // A hole comes before anything, whichever way the camera looks.
+        lod.holes = vec![(ring[6], None)];
+        let holed = first_of(&mut lod, [0.0, 0.0, 1.0]);
+        assert_eq!(holed[0], ring[6]);
+        assert_eq!(holed.iter().filter(|&&k| k == ring[6]).count(), 1);
+    }
+
+    #[test]
+    fn a_turn_reorders_the_queue_taken_from() {
+        let mut queue = Queue::default();
+        let camera = [0.5, 0.5, 0.5];
+        let east = key(3, 20, 0, 0);
+        let west = key(3, -21, 0, 0);
+        for k in [east, west] {
+            queue.sectors[usize::from(sector(camera, k))].push_back(k);
+        }
+        queue.order = sector_order([1.0, 0.0, 0.0]);
+        assert_eq!(queue.pop(), Some(east));
+        queue.sectors[usize::from(sector(camera, east))].push_back(east);
+        queue.order = sector_order([-1.0, 0.0, 0.0]);
+        assert_eq!(queue.pop(), Some(west));
+        // A key the plan dropped is skipped.
+        queue.dropped.insert(east);
+        assert_eq!(queue.pop(), None);
     }
 }
 
@@ -2235,10 +4072,19 @@ mod whole_world_tests {
 
     #[test]
     fn the_whole_world_plan_is_bounded_disjoint_and_inside_the_world() {
-        let (plan, pruned) =
-            plan_classified([0.0, 100.0, 0.0], WORLD, NONE, &|_| false, &[], &|_| {
-                NodeClass::Mixed
-            });
+        let Plan {
+            leaves: plan,
+            pruned,
+            ..
+        } = plan_classified(
+            [0.0, 100.0, 0.0],
+            WORLD,
+            &Rule::distance(DETAIL),
+            NONE,
+            &|_| false,
+            &[],
+            &|_| NodeClass::Mixed,
+        );
         assert_eq!(pruned, 0);
         assert!(!plan.is_empty() && plan.len() < 100_000, "{}", plan.len());
         assert!(plan.iter().all(|k| in_world(*k)));
@@ -2251,7 +4097,9 @@ mod whole_world_tests {
     fn nodes_known_uniform_are_left_out_or_stay_whole() {
         let camera = [0.0, 100.0, 0.0];
         let all = |_: SectionPos| false;
-        let (mixed, _) = plan_classified(camera, WORLD, NONE, &all, &[], &|_| NodeClass::Mixed);
+        let rule = Rule::distance(DETAIL);
+        let mixed =
+            plan_classified(camera, WORLD, &rule, NONE, &all, &[], &|_| NodeClass::Mixed).leaves;
         // Everything above y = 1000 is air, everything below y = -1000 rock.
         let class = |k: CubeKey| {
             let [_, y, _] = k.origin();
@@ -2263,7 +4111,11 @@ mod whole_world_tests {
                 NodeClass::Mixed
             }
         };
-        let (plan, pruned) = plan_classified(camera, WORLD, NONE, &all, &[], &class);
+        let Plan {
+            leaves: plan,
+            pruned,
+            ..
+        } = plan_classified(camera, WORLD, &rule, NONE, &all, &[], &class);
         assert!(pruned > 0);
         assert!(
             plan.len() < mixed.len() / 2,
@@ -2285,9 +4137,16 @@ mod whole_world_tests {
             horizontal: 2,
             vertical: 2,
         };
-        let (plan, _) = plan_classified([8.0, 8.0, 8.0], 4096.0, loaded, &|_| true, &[], &|_| {
-            NodeClass::Rock
-        });
+        let plan = plan_classified(
+            [8.0, 8.0, 8.0],
+            4096.0,
+            &Rule::distance(DETAIL),
+            loaded,
+            &|_| true,
+            &[],
+            &|_| NodeClass::Rock,
+        )
+        .leaves;
         // Every cube around the camera is drawn by the near renderer: none planned inside.
         for k in &plan {
             for dy in -2..=2 {

@@ -883,8 +883,9 @@ pub struct CubeGen {
     params: Arc<CubeGenParams>,
 }
 
-/// Slots of the pool the sampler makes (about 17 MB per 1000).
-pub const DEFAULT_POOL_SLOTS: u32 = 2048;
+/// Slots of the pool the sampler makes (about 17 MB per 1000): room for the
+/// far workers' batches while the renderer meshes the last ones.
+pub const DEFAULT_POOL_SLOTS: u32 = 4096;
 
 impl CubeGen {
     /// The generator on this device with a pool of `slots` nodes, or `None` if

@@ -1513,13 +1513,24 @@ impl Game<'_> {
                     "pool_bytes": s.pool_bytes,
                     "complete": s.complete,
                     "gpu_path": lod.on_gpu_path(),
-                "descent_runs": s.descent_runs,
-                "descent_uniform": s.descent_uniform,
-                "descent_leaves": s.descent_leaves,
-                "descent_ms": s.descent_ms,
-                "descent_overflow": s.descent_overflow,
+                    "descent_runs": s.descent_runs,
+                    "descent_uniform": s.descent_uniform,
+                    "descent_leaves": s.descent_leaves,
+                    "descent_ms": s.descent_ms,
+                    "descent_overflow": s.descent_overflow,
+                    // Detail by size on screen, the budget and the coverage layer.
+                    "target_px": s.target_px,
+                    "voxel_px": s.voxel_px,
+                    "budget": s.budget,
+                    "limited": s.limited,
+                    "plan_ms": s.plan_ms,
+                    "holes": s.holes,
+                    "cover_nodes": s.cover_nodes,
+                    "covering": s.covering,
                     "plan_changed_ago_s": ago(s.plan_changed),
                     "plan_complete_ago_s": ago(s.plan_complete),
+                    // When every part of the plan last had something drawn over it.
+                    "plan_covered_ago_s": ago(s.plan_covered),
                     "fill_s": match (s.plan_changed, s.plan_complete) {
                         (Some(changed), Some(complete)) if s.complete => {
                             Some(complete.saturating_duration_since(changed).as_secs_f64())

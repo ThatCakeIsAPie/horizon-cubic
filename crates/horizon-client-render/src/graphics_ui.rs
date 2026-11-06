@@ -6,9 +6,9 @@
 //! looks comes from `graphics_style`.
 use crate::{
     graphics::{
-        CUBIC_VERTICAL_MAX, CUBIC_VERTICAL_MIN, EntityCullingMode, FarDetail, FrameGeneration,
-        GraphicsApi, LeafCullingMode, Overlay, Pacing, ParticleCullingMode, PresentMode, Preset,
-        Upscaling,
+        CUBIC_VERTICAL_MAX, CUBIC_VERTICAL_MIN, CubicFarDetail, EntityCullingMode, FarDetail,
+        FrameGeneration, GraphicsApi, LeafCullingMode, Overlay, Pacing, ParticleCullingMode,
+        PresentMode, Preset, Upscaling,
     },
     graphics_style::{self as style, Cost},
     hud::{HudAtlas, HudBatch},
@@ -69,6 +69,7 @@ pub enum H {
     Preset,
     LodDistance,
     CubicVertical,
+    CubicFarDetail,
     GpuFar,
     FarDetail,
     BlueMapAutoDetect,
@@ -203,6 +204,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             H::CubicVertical,
                             Medium,
                             "Cubic Chunks worlds: cubes loaded above and below you. Lower is faster.",
+                        ),
+                        h(
+                            H::CubicFarDetail,
+                            High,
+                            "Cubic worlds: how small far blocks get on screen. Higher is sharper.",
                         ),
                         h(
                             H::GpuFar,
@@ -836,6 +842,7 @@ impl H {
                 "Vertical Distance",
                 lang::tr("%s cubes", &[&g.cubic_vertical]),
             ),
+            H::CubicFarDetail => labelled("Cubic Far Detail", g.cubic_far_detail.label()),
             H::GpuFar => labelled("Far Terrain on GPU", if g.gpu_far { "Auto" } else { "Off" }),
             H::FarDetail => labelled("Far Detail", g.far_detail.label()),
             H::BlueMapAutoDetect => labelled("Find BlueMap", on_off(g.blue_map.auto_detect)),
@@ -1014,6 +1021,9 @@ impl H {
         let g = &mut s.horizon;
         match self {
             H::GpuFar => g.gpu_far = !g.gpu_far,
+            H::CubicFarDetail => {
+                g.cubic_far_detail = step(&CubicFarDetail::ALL, g.cubic_far_detail, back)
+            }
             H::FarDetail => {
                 g.far_detail = step(&[FarDetail::Full, FarDetail::Reduced], g.far_detail, back)
             }

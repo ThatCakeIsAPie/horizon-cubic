@@ -17719,6 +17719,16 @@ impl Game<'_> {
             .as_ref()
             .map(|p| [p.position.x, p.position.y, p.position.z])
             .and_then(|camera| self.lod_aim(camera));
+        // The cube octree's view (`lod::cube::FarView`): the field of view drawn
+        // now (spyglass and dynamic FOV included) and where the camera looks, read
+        // here for the same reason.
+        let cube_view = match (&self.cube_lod, &self.player) {
+            (Some(_), Some(p)) => Some((
+                self.fov_degrees(1.0, [p.position.x, p.position.y, p.position.z]),
+                view_vector(self.yaw, self.pitch),
+            )),
+            _ => None,
+        };
         if let Some(renderer) = self.renderer.as_mut() {
             let g = &self.settings.horizon;
             let budgeted = g.chunk_updates > 0 || g.upload_budget_kib > 0;
@@ -17856,20 +17866,21 @@ impl Game<'_> {
                 // The window sections a moved window left as placeholders until their column
                 // arrives (`remote_cubic_window`) are not held: the octree draws them.
                 let placeholders = self.remote.as_ref().map(|r| &r.cubic_placeholders);
-                let meshes = horizon_client::spans::time("cube_lod_update", || {
-                    cube_lod.update(camera, f64::from(lod_distance) * 16.0, loaded, |p| {
-                        shape.has_section(p.y)
-                            && world.chunks.get(&(p.x, p.z)).is_some_and(|c| c.lit)
-                            && !placeholders.is_some_and(|set| {
-                                set.get(&(p.x, p.z)).is_some_and(|mask| {
-                                    usize::try_from(p.y - shape.min_section())
-                                        .is_ok_and(|i| mask.contains(i))
-                                })
-                            })
-                    })
-                });
+                // Detail by size on screen: a far voxel spans at most the Cubic Far
+                // Detail setting's pixels before its node splits.
+                let (fov, forward) = cube_view.unwrap_or((self.settings.fov, [0.0, 0.0, 1.0]));
+                let view = horizon_client::lod::cube::FarView {
+                    forward,
+                    fov_y: f64::from(fov).to_radians(),
+                    base_fov_y: f64::from(self.settings.fov.clamp(1.0, 179.0)).to_radians(),
+                    aspect: f64::from(renderer.config.width.max(1))
+                        / f64::from(renderer.config.height.max(1)),
+                    height_px: f64::from(renderer.config.height.max(1)),
+                    target_px: self.settings.horizon.cubic_far_detail.target_px(),
+                };
                 // Far terrain meshed and drawn on the GPU where the sampler generates there
-                // and the setting allows (`CubeLod::set_gpu_path`).
+                // and the setting allows (`CubeLod::set_gpu_path`). Decided before the
+                // update, so the first plan already has the descent's classes to wait for.
                 let facts = self.res.facts();
                 let gpu = self.settings.horizon.gpu_far
                     && cube_lod.gpu_backend().is_some_and(|backend| {
@@ -17881,6 +17892,18 @@ impl Game<'_> {
                 // The sparse descent rides the GPU path (the sampler has one
                 // only in a Custom world).
                 cube_lod.set_gpu_descent(gpu);
+                let meshes = horizon_client::spans::time("cube_lod_update", || {
+                    cube_lod.update(camera, f64::from(lod_distance) * 16.0, &view, loaded, |p| {
+                        shape.has_section(p.y)
+                            && world.chunks.get(&(p.x, p.z)).is_some_and(|c| c.lit)
+                            && !placeholders.is_some_and(|set| {
+                                set.get(&(p.x, p.z)).is_some_and(|mask| {
+                                    usize::try_from(p.y - shape.min_section())
+                                        .is_ok_and(|i| mask.contains(i))
+                                })
+                            })
+                    })
+                });
                 renderer.queue_cube_lods(meshes, cube_lod.removed());
                 if cube_lod.gpu_path() {
                     renderer.queue_gpu_cube_lods(cube_lod.take_gpu_nodes());
