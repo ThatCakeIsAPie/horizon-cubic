@@ -156,6 +156,7 @@ fn packed_wanted() -> bool {
 
 mod animate;
 mod arena;
+pub mod biome_gen;
 pub mod capture;
 pub mod compositor;
 pub(crate) mod core_lines;

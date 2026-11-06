@@ -170,10 +170,11 @@ v2 lays the ground for this. v3 finishes it with the far-terrain path running on
 1. **Generate on the GPU** (`gfx/cube_gen`, v2). A node's 16³ voxels are written into a slot of a GPU-resident node pool. Reading them back to the CPU is optional, and only v2's CPU mesher uses it.
    - **In huge batches.** Far terrain is only noise, so a ring of the plan, possibly thousands of nodes and on the order of 1024 × 1024 chunks at the coarse levels, goes out in one dispatch rather than one node at a time.
    - **A 2D pre-pass bounds the surface.** Per voxel column it computes the depth noise and the biome height and volatility once. From the noise amplitude it derives the Y range where the surface can be. Nodes outside that range are uniform without any 3D noise, so the cost scales with surface area, not volume.
-2. **Biomes on the GPU.**
-   - Port 26.3's climate sampler (six normal noises) to WGSL.
-   - Flatten the biome parameter tree into a buffer.
-   - The CPU then gives far nodes nothing at all.
+2. **Biomes on the GPU** (`gfx/biome_gen`, written; not yet wired into the far-terrain producer).
+   - Done: 26.3's climate at sea level (the offset-noise shifts and the five shifted `NormalNoise` fields, as Perlin layers with per-node, per-layer `f64` origin splits) runs in WGSL. The parameter tree is flattened (`ClimateIndex::tree`) and searched on the GPU with `Climate.RTree`'s branch and bound.
+   - Done: CubicWorldGen's 5x5 quart blend for voxels of 8 blocks or less, and the column's own biome for coarser ones. One pass makes a whole batch's `NodeColumns` straight into `cube_gen`'s input buffers (`CubeGen::generate_to_pool_gpu`). The CPU path (`CpuBiomes`) stays as the fallback and the test reference.
+   - Not done: the per-biome table comes from the terrain generator (`BiomeTerrain`); the 2D pre-pass (`classify`) still needs CPU columns, so GPU-column nodes all take the 3D pass; wiring into `GpuCubeSampler`/the LOD producer.
+   - The CPU then gives far nodes nothing at all, once wired.
 3. **Mesh on the GPU.**
    - A compute pass turns pool slots into compact quads of 8 bytes each (position in node, size, face, block texture id, light and tint) in a GPU geometry arena.
    - Faces are merged greedily per block texture, so the far view keeps block textures, tints and block-scale UVs, as `mesh_cube` does today.
