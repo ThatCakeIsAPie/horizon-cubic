@@ -97,7 +97,7 @@ the original alone. Design, what is and is not carried over, and the options are
   - 116–120 fps, no errors in the log.
 - **Far-fill benchmark** (`tools/cubic_far_bench.py --hops 2`, Whole World):
   - First benchmark run, before the batching fix: spawn 30.1 s, hops 33.2 s and 18.4 s (**mean 25.8 s**), about 7,500 planned nodes, fps min 100 and mean 119.
-  - The bottleneck: far workers at below-normal priority compute biome columns on the CPU while near terrain generates. Moving those columns to the GPU is in progress on `cubic/gpu-columns`.
+  - After `cubic/store-reads` (an in-memory index of saved cubes, per-region locks, and fine nodes from whole generated cubes): **2.1 s mean per hop** (2.4 / 2.6 / 1.4 s) and 12.6 s at spawn, at 93–117 fps. The owner's reference, the Meridian LOD mod, took about 20 s on a top CPU.
 
 ### Known gaps
 

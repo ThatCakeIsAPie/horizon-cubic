@@ -219,7 +219,12 @@ Fallback: devices without compute or `MULTI_DRAW_INDIRECT_COUNT` keep v2's CPU p
 
 ### Whole World, then autoresearch
 
-The target is the Meridian LOD mod's whole-world toggle. In the owner's video it took about 20 s to show an LOD of the whole world, on a top gaming CPU. Our first benchmark on this 4-core/8-thread i7 was 25.8 s per hop. The aim is to beat that clearly: under 10 s. In a cubic level, LOD Distance's top step is **Whole World**:
+The target is the Meridian LOD mod's whole-world toggle. In the owner's video it took about 20 s to show an LOD of the whole world, on a top gaming CPU. Our first benchmark on this 4-core/8-thread i7 was 25.8 s per hop. The aim was to beat that clearly: under 10 s.
+
+**Where it stands (2026-11-06): 2.1 s per hop** (`tools/cubic_far_bench.py --hops 3`: 2.4, 2.6 and 1.4 s for about 7,000 planned nodes; 12.6 s at spawn including startup; 93 fps min, 117 fps mean). Two changes got there:
+1. Reads of cubes never saved are answered from an in-memory index, with per-region locks. Before, every read queued behind the store's global locks while the near terrain wrote cubes, at 30–600 ms per read.
+2. Unsaved fine nodes (levels 0–1) are built from whole generated cubes instead of 4,096 point queries.
+The GPU columns, the batched worker requests and the descent each helped less than the noise between runs. The next lever is the spawn fill. In a cubic level, LOD Distance's top step is **Whole World**:
 - The octree's root covers vanilla's world border (±30 M blocks) and the whole cube range (±8.4 M blocks).
 - The plan subdivides by distance as usual.
 - Subtrees the 2D pre-pass proves uniform are never requested.
