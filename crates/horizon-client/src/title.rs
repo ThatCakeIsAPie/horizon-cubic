@@ -157,6 +157,8 @@ enum WorldToast {
         bytes: u64,
     },
     Failed(String),
+    /// Horizon's Convert to Cubic Chunks finished: the new world's name.
+    Converted(String),
     /// `SystemToast.onWorldAccessFailure`: the folder of a world that couldn't be locked.
     AccessFailure(String),
 }
@@ -174,6 +176,10 @@ impl WorldToast {
             Self::Failed(error) => (
                 lang::get_or("selectWorld.edit.backupFailed", "Backup failed"),
                 error.clone(),
+            ),
+            Self::Converted(name) => (
+                lang::get_or("horizon.cubic.convert.done", "Converted to Cubic Chunks"),
+                name.clone(),
             ),
             Self::AccessFailure(folder) => (
                 lang::get_or("selectWorld.access_failure", "Failed to access world"),
@@ -308,6 +314,16 @@ pub enum Mode {
     Optimize {
         world: WorldEntry,
     },
+    /// Horizon's Convert to Cubic Chunks, asked from Edit World.
+    ConvertConfirm {
+        world: WorldEntry,
+        /// The Edit World screen's name field, restored by Cancel.
+        name: String,
+    },
+    /// The conversion running in the background (`Title::convert`).
+    Converting {
+        world: WorldEntry,
+    },
     /// `openWorldCheckDiskSpace`'s ConfirmScreen: little space is left on the device.
     LowDiskSpace {
         world: WorldEntry,
@@ -412,6 +428,17 @@ pub enum Action {
         selected: Vec<String>,
     },
 }
+/// A background conversion to a cubic world (`cubic_convert`): its updates
+/// and the last one's progress.
+struct ConvertJob {
+    updates: mpsc::Receiver<ConvertUpdate>,
+    progress: crate::cubic_convert::Progress,
+}
+enum ConvertUpdate {
+    Progress(crate::cubic_convert::Progress),
+    /// The new world's folder, or why it failed.
+    Done(Result<String, String>),
+}
 pub struct Title {
     pub mode: Mode,
     /// Direct Connection's address, synchronized with `options.txt`'s `lastServer`.
@@ -452,6 +479,8 @@ pub struct Title {
     restore_after_backup: bool,
     /// The running `WorldUpgrader` of `Mode::Optimize`.
     optimize: Option<WorldUpgrader>,
+    /// The running conversion of `Mode::Converting`.
+    convert: Option<ConvertJob>,
     /// The Erase Cached Data box as last drawn: x, y, width, height.
     erase_check: Cell<[f32; 4]>,
     /// The folder to open next, once that backup has finished.
@@ -748,6 +777,8 @@ impl Mode {
             Self::BackupBeforeUpgrade { .. } => "world_backup_confirm",
             Self::OptimizeConfirm { .. } => "world_optimize_confirm",
             Self::Optimize { .. } => "world_optimize",
+            Self::ConvertConfirm { .. } => "world_convert_confirm",
+            Self::Converting { .. } => "world_convert",
             Self::LowDiskSpace { .. } => "low_disk_space",
             Self::Delete { .. } => "world_delete",
             Self::Recover { .. } => "world_recover",
@@ -810,6 +841,7 @@ impl Title {
             optimize_after_backup: None,
             restore_after_backup: false,
             optimize: None,
+            convert: None,
             erase_check: Cell::new([0.0; 4]),
             open_request: None,
             connect_request: None,
@@ -1312,6 +1344,7 @@ impl Title {
         self.poll_onboarding(std::time::Instant::now());
         self.poll_account();
         self.poll_optimize();
+        self.poll_convert();
         if !self.backup_shown.get() {
             return;
         }
@@ -1576,6 +1609,107 @@ impl Title {
         self.mode = Mode::Optimize { world };
     }
     /// `OptimizeWorldScreen.tick`: a finished upgrader ends the screen with `true`.
+    /// Horizon's Convert to Cubic Chunks: starts the conversion of `world`
+    /// into `saves/<folder> (Cubic)` on a thread of its own.
+    fn start_convert(&mut self, world: WorldEntry) {
+        let (send, updates) = mpsc::channel();
+        let saves = self.saves.clone();
+        let resources = self.resources.clone();
+        let folder = world.folder.clone();
+        std::thread::spawn(move || {
+            let target = crate::cubic_convert::destination_for(&saves, &folder);
+            let options = crate::cubic_convert::ConvertOptions::new(resources);
+            let progress = send.clone();
+            let result =
+                crate::cubic_convert::convert_with(&saves.join(&folder), &target, &options, |p| {
+                    let _ = progress.send(ConvertUpdate::Progress(p));
+                });
+            let done = result.map(|report| {
+                log::info!("Horizon: {}", crate::cubic_convert::summary(&report));
+                target
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+            let _ = send.send(ConvertUpdate::Done(done));
+        });
+        self.convert = Some(ConvertJob {
+            updates,
+            progress: crate::cubic_convert::Progress::Checking,
+        });
+        self.mode = Mode::Converting { world };
+    }
+    /// Reads the conversion's updates; when it is done the list shows the
+    /// new world, or the error.
+    fn poll_convert(&mut self) {
+        let Some(job) = &mut self.convert else {
+            return;
+        };
+        let mut done = None;
+        loop {
+            match job.updates.try_recv() {
+                Ok(ConvertUpdate::Progress(p)) => job.progress = p,
+                Ok(ConvertUpdate::Done(result)) => done = Some(result),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    done.get_or_insert(Err("The conversion stopped".into()));
+                    break;
+                }
+            }
+        }
+        let Some(result) = done else {
+            return;
+        };
+        self.convert = None;
+        let Mode::Converting { world } = &self.mode else {
+            return;
+        };
+        let source = world.folder.clone();
+        match result {
+            Ok(folder) => {
+                self.return_to_list(Some(&folder));
+                let name = crate::save::Level::read_summary(&self.saves.join(&folder))
+                    .map_or(folder, |level| level.name);
+                self.toast = Some((crate::toasts::Slide::default(), WorldToast::Converted(name)));
+            }
+            Err(error) => {
+                self.return_to_list(Some(&source));
+                self.failed(error);
+            }
+        }
+    }
+    /// The progress line of the running conversion.
+    fn convert_line(&self) -> String {
+        use crate::cubic_convert::Progress;
+        let Some(job) = &self.convert else {
+            return String::new();
+        };
+        match &job.progress {
+            Progress::Checking => {
+                lang::get_or("horizon.cubic.convert.checking", "Checking the world")
+            }
+            Progress::Copying { files, total } => translate(
+                "horizon.cubic.convert.copying",
+                "Copying files: %s / %s",
+                &[files, total],
+            ),
+            Progress::Upgrading => lang::get_or(
+                "horizon.cubic.convert.upgrading",
+                "Upgrading the world to this version",
+            ),
+            Progress::Converting {
+                columns,
+                total,
+                per_second,
+                ..
+            } => translate(
+                "horizon.cubic.convert.columns",
+                "Converting columns: %s / %s (%s per second)",
+                &[columns, total, &(per_second.round() as u64)],
+            ),
+            Progress::Finishing => lang::get_or("horizon.cubic.convert.finishing", "Finishing"),
+        }
+    }
     fn poll_optimize(&mut self) {
         if matches!(self.mode, Mode::Optimize { .. })
             && self
@@ -2029,6 +2163,15 @@ impl Title {
                     ),
                     b(
                         x,
+                        top + 189.0,
+                        200.0,
+                        &lang::get_or("horizon.cubic.convert.button", "Convert to Cubic Chunks..."),
+                        !world.locked
+                            && !crate::cubic::is_cubic_world(&self.saves.join(&world.folder)),
+                        160,
+                    ),
+                    b(
+                        x,
                         top + 214.0,
                         98.0,
                         &lang::get_or("selectWorld.edit.save", "Save"),
@@ -2250,6 +2393,31 @@ impl Title {
                     .does(crate::widgets::Action::Cancel),
                 ]
             }
+            Mode::ConvertConfirm { .. } => {
+                let y = confirm_top(h, self.message_lines.get())
+                    + 41.0
+                    + self.message_lines.get() as f32 * 9.0;
+                vec![
+                    b(
+                        (w / 2.0).floor() - 152.0,
+                        y,
+                        150.0,
+                        &lang::get_or("horizon.cubic.convert.proceed", "Convert"),
+                        true,
+                        161,
+                    ),
+                    b(
+                        (w / 2.0).floor() + 2.0,
+                        y,
+                        150.0,
+                        &lang::get_or("gui.cancel", "Cancel"),
+                        true,
+                        162,
+                    )
+                    .does(crate::widgets::Action::Cancel),
+                ]
+            }
+            Mode::Converting { .. } => Vec::new(),
             // No `does`: Escape is inert here on purpose, so B is too. A on the button stops it.
             Mode::Optimize { .. } => vec![b(
                 (w / 2.0).floor() - 100.0,
@@ -2402,6 +2570,18 @@ impl Title {
             Mode::OptimizeConfirm { .. } => ScreenInfo::new(
                 "optimize_confirm",
                 get("optimizeWorld.confirm.title", "Optimize World"),
+            ),
+            Mode::ConvertConfirm { .. } => ScreenInfo::new(
+                "convert_confirm",
+                get("horizon.cubic.convert.title", "Convert to Cubic Chunks?"),
+            ),
+            Mode::Converting { world } => ScreenInfo::new(
+                "convert_world",
+                translate(
+                    "horizon.cubic.convert.converting",
+                    "Converting '%s'",
+                    &[&world.name],
+                ),
             ),
             Mode::Optimize { world } => ScreenInfo::new(
                 "optimize_world",
@@ -3088,6 +3268,51 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
                 self.draw_optimize(atlas, batch, w, h, &world.name);
             }
+            Mode::ConvertConfirm { world, .. } => {
+                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+                let message = translate(
+                    "horizon.cubic.convert.message",
+                    "Horizon will make a copy of '%s' as a Hybrid Cubic Chunks world, '%s (Cubic)'. The world stays as it is: the copy keeps vanilla terrain between y -64 and 320 and goes on above and below. Bedrock at the bottom becomes deepslate. Vanilla Minecraft cannot open the copy, and it cannot be converted back.",
+                    &[&world.name, &world.name],
+                );
+                let lines = wrapped(atlas, &message, w - 50.0);
+                self.message_lines.set(lines.len());
+                let top = confirm_top(h, lines.len());
+                centered(
+                    atlas,
+                    batch,
+                    &lang::get_or("horizon.cubic.convert.title", "Convert to Cubic Chunks?"),
+                    top,
+                    u32::MAX,
+                );
+                for (i, line) in lines.iter().enumerate() {
+                    centered(atlas, batch, line, top + 17.0 + i as f32 * 9.0, u32::MAX);
+                }
+            }
+            Mode::Converting { world } => {
+                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+                centered(
+                    atlas,
+                    batch,
+                    &translate(
+                        "horizon.cubic.convert.converting",
+                        "Converting '%s'",
+                        &[&world.name],
+                    ),
+                    80.0,
+                    u32::MAX,
+                );
+                let dots = ["O o o", "o O o", "o o O", "o O o"]
+                    [(self.started.elapsed().as_millis() / 300 % 4) as usize];
+                centered(atlas, batch, dots, 120.0, rgba(128, 128, 128, 255));
+                centered(
+                    atlas,
+                    batch,
+                    &self.convert_line(),
+                    132.0,
+                    rgba(170, 170, 170, 255),
+                );
+            }
             Mode::LowDiskSpace { .. } => {
                 crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
                 let message = lang::get_or(
@@ -3733,6 +3958,22 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 Action::None
             }
             (Mode::OptimizeConfirm { .. }, Some(45)) => {
+                self.escape();
+                Action::None
+            }
+            (Mode::Edit { world, name, .. }, Some(160)) => {
+                self.mode = Mode::ConvertConfirm {
+                    world: world.clone(),
+                    name: name.clone(),
+                };
+                Action::None
+            }
+            (Mode::ConvertConfirm { world, .. }, Some(161)) => {
+                let world = world.clone();
+                self.start_convert(world);
+                Action::None
+            }
+            (Mode::ConvertConfirm { .. }, Some(162)) => {
                 self.escape();
                 Action::None
             }
@@ -4783,7 +5024,15 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
         }
         match &self.mode {
             // OptimizeWorldScreen: `shouldCloseOnEsc` is false; the Backup wait takes no input.
-            Mode::Backup { .. } | Mode::Optimize { .. } => {}
+            Mode::Backup { .. } | Mode::Optimize { .. } | Mode::Converting { .. } => {}
+            // Cancel: the Edit World screen again.
+            Mode::ConvertConfirm { world, name } => {
+                self.mode = Mode::Edit {
+                    world: world.clone(),
+                    name: name.clone(),
+                    focused: true,
+                };
+            }
             // BackupConfirmScreen.keyPressed: Escape runs `onCancel`, the Edit World screen again.
             Mode::OptimizeConfirm { world, name, .. } => {
                 self.mode = Mode::Edit {

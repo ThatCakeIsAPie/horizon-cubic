@@ -2464,6 +2464,32 @@ fn the_title_screens_have_their_own_ids() {
     assert_eq!(f.title.mode.id(), "world_edit");
 }
 
+/// Edit World offers Convert to Cubic Chunks: it asks first, Cancel goes back,
+/// and a conversion that cannot run shows its error and leaves the world.
+#[test]
+fn edit_world_converts_to_cubic_after_asking() {
+    let mut f = Fixture::new();
+    f.world("World", "World");
+    f.select();
+    f.click("Edit");
+    f.click("Convert to Cubic Chunks...");
+    assert_eq!(f.title.mode.id(), "world_convert_confirm");
+    f.click("Cancel");
+    assert_eq!(f.title.mode.id(), "world_edit");
+    f.click("Convert to Cubic Chunks...");
+    f.click("Convert");
+    assert_eq!(f.title.mode.id(), "world_convert");
+    // The fixture has no resources, so the conversion fails; the world stays.
+    let started = std::time::Instant::now();
+    while f.title.mode.id() == "world_convert" && started.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        f.title.poll_backup();
+    }
+    assert_eq!(f.title.mode.id(), "error");
+    assert!(f.title.saves.join("World").join("level.dat").is_file());
+    assert!(!f.title.saves.join("World (Cubic)").exists());
+}
+
 /// The multiplayer screens' ids, the ones the title's `Multiplayer` mode
 /// passes through.
 #[test]

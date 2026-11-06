@@ -116,6 +116,41 @@ level's `LevelShape` (`cubic: true`) is a **window**: `2V + 3` cubes (19 by defa
   player), meshed with the far mesher, and drawn through the far-tile pipeline. The 2D far terrain is off
   in cubic levels.
 
+## Converting a world
+
+A vanilla world becomes a cubic **Hybrid** world with `crates/horizon-client/src/cubic_convert.rs`. The
+original is never written: the converter builds `<name> (Cubic)` beside it (in a `.converting` folder,
+renamed when done, so a failed run leaves nothing).
+
+- **How to run it.**
+  - CLI: `horizon-client --game-dir DIR --convert-cubic "<world>"` converts `saves/<world>` to
+    `saves/<world> (Cubic)`, prints progress and exits. `--keep-bedrock` keeps vanilla's bedrock floor.
+  - Game: Singleplayer › select the world › Edit › Convert to Cubic Chunks…
+  - Code: `cubic_convert::convert_to_cubic(src, dst, progress)` (default options) or `convert_with`.
+- **Carried over.**
+  - Everything except the Overworld's `region/`, `entities/` and `poi/`: `level.dat` (renamed),
+    players, advancements, stats, `data/`, the Nether and the End, data packs, `icon.png`.
+  - Each Overworld column as 24 cubes (-64..320), written by the same code that saves a column the game
+    generated (`cubic::vanilla_column_records`): the marker cube with structure starts and references and
+    `horizon:cubic_surface`; block entities; entities by the cube they are in (`horizon:entities`);
+    block and fluid ticks. Cubes of one block state go to the uniform sidecar.
+  - `horizon_cubic.json` (`"type": "hybrid"`, a window around the spawn) and `cubicgen.json` (the Hybrid
+    defaults).
+- **Changed.** Bedrock at y -64..-60 becomes deepslate (as in a Hybrid world the game generates);
+  `--keep-bedrock` leaves it.
+- **Not carried.** POI (the game rebuilds it from blocks); light (made again on load); post-processing
+  lists; columns the source never finished (Status other than full) and columns that do not read. Those
+  are counted in the report, and the game generates the unfinished ones when they are visited. Entities
+  saved for a column that is not converted are lost with it.
+- **Older worlds.** A world saved by an older version is copied whole, upgraded in the copy with the data
+  fixers, converted from there, and its chunk folders removed. Newer worlds, flat and debug worlds, worlds
+  already cubic, and worlds whose Overworld is not -64..320 high (the 4,096-high To The Max data pack, or a
+  custom Overworld dimension type) are refused with a message.
+- **Speed.** Source regions are converted in parallel (up to 8 threads, one column per thread at a time,
+  one cube store per source region so a worker's 24 cube files stay open). The report gives columns per
+  second.
+- **No way back.** Vanilla cannot open the copy and nothing converts it back.
+
 ## Phases
 
 Each phase lands as small PRs (AGENTS.md: under ~500 lines), with tests. Vanilla levels stay byte-identical

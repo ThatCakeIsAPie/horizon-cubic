@@ -247,14 +247,7 @@ impl CubeIo {
     }
 
     fn write_now(&self, pos: SectionPos, tag: &Arc<NamedTag>) {
-        let written = if is_uniform_record(tag) {
-            self.store
-                .write_uniform(pos, tag)
-                .or_else(|_| self.store.write(pos, tag))
-        } else {
-            self.store.write(pos, tag)
-        };
-        if let Err(e) = written {
+        if let Err(e) = store_record(&self.store, pos, tag) {
             log::warn!("Horizon: cube {pos:?} not saved: {e}");
         }
         let mut pending = self.pending.lock().unwrap();
@@ -279,6 +272,115 @@ impl CubeIo {
         drop(count);
         if let Err(e) = self.store.sync() {
             log::warn!("Horizon: cubes not synced: {e}");
+        }
+    }
+}
+
+/// Writes cube record `tag` at `pos`: in the store's uniform sidecar when it
+/// is one block state and nothing else, else in a region file.
+pub(crate) fn store_record(
+    store: &CubeStore,
+    pos: SectionPos,
+    tag: &NamedTag,
+) -> std::io::Result<()> {
+    if is_uniform_record(tag) {
+        store
+            .write_uniform(pos, tag)
+            .or_else(|_| store.write(pos, tag))
+    } else {
+        store.write(pos, tag)
+    }
+}
+
+/// One cube of a vanilla column, as `finish_vanilla` saves it.
+pub(crate) struct ColumnCube {
+    pub cy: i32,
+    /// `None` for a cube that needs no record (air with nothing in it; a
+    /// missing vanilla cube reads as air).
+    pub root: Option<NamedTag>,
+    pub block_ticks: Vec<SavedTick>,
+    pub fluid_ticks: Vec<SavedTick>,
+    pub has_entities: bool,
+}
+
+/// A finished vanilla column's cubes as records (`vanilla_column_records`).
+pub(crate) struct ColumnRecords {
+    pub cubes: Vec<ColumnCube>,
+    /// The column's surface heights, kept in its marker cube.
+    pub heights: Vec<i32>,
+}
+
+/// The records of a finished vanilla column (`-64..320`) in a Hybrid world:
+/// one per vanilla cube, `entities` (by cube, `split_by_cube`) in theirs, the
+/// marker cube with the column's structures and surface heights. The one
+/// definition of the record format: `finish_vanilla` and the world converter
+/// both save through it.
+pub(crate) fn vanilla_column_records(
+    registry: &BlockRegistry,
+    biomes: &Biomes,
+    tables: Option<&SaveTables>,
+    vanilla: &Chunk,
+    entities: &BTreeMap<i32, Vec<Tag>>,
+) -> ColumnRecords {
+    let ctx = Codec {
+        registry,
+        biomes,
+        tables,
+    };
+    let air = |v: u32| v == 0;
+    let heights: Vec<i32> = (0..256)
+        .map(|i| vanilla.world_surface(i & 15, i >> 4, air))
+        .collect();
+    let vanilla_base = vanilla.min_y() >> 4;
+    let mut cubes = Vec::new();
+    for (s, section) in vanilla.sections.iter().enumerate() {
+        let cy = vanilla_base + s as i32;
+        if !VANILLA_CUBES.contains(&cy) {
+            continue;
+        }
+        let (block_ticks, fluid_ticks) = cube_ticks(vanilla, cy);
+        let marker = cy == MARKER_CUBE;
+        let low = cy * 16;
+        // A missing vanilla cube reads as air: the air above the ground
+        // needs no record (the marker always has one).
+        let bare = !marker
+            && section.blocks.uniform() == Some(0)
+            && block_ticks.is_empty()
+            && fluid_ticks.is_empty()
+            && !entities.contains_key(&cy)
+            && !vanilla
+                .block_entities
+                .iter()
+                .any(|(p, _)| p.1 >= low && p.1 < low + 16);
+        let here = entities.get(&cy).map_or(&[][..], |e| &e[..]);
+        let root = (!bare).then(|| {
+            let mut root = ctx.encode(vanilla, s, marker, here);
+            if marker && let Tag::Compound(map) = &mut root.tag {
+                map.insert(SURFACE_KEY.into(), Tag::IntArray(heights.clone()));
+            }
+            root
+        });
+        cubes.push(ColumnCube {
+            cy,
+            root,
+            block_ticks,
+            fluid_ticks,
+            has_entities: !here.is_empty(),
+        });
+    }
+    ColumnRecords { cubes, heights }
+}
+
+/// Vanilla's bedrock floor (y -64..-60) as `deepslate`, so the world can go
+/// deeper.
+pub(crate) fn replace_bedrock(chunk: &mut Chunk, bedrock: u32, deepslate: u32) {
+    for y in chunk.min_y()..chunk.min_y() + 5 {
+        for z in 0..16 {
+            for x in 0..16 {
+                if chunk.get(x, y, z) == bedrock {
+                    chunk.set(x, y, z, deepslate);
+                }
+            }
         }
     }
 }
@@ -969,46 +1071,20 @@ impl CubicLevel {
     fn finish_vanilla(&self, mut vanilla: Chunk, window: ColumnLayout, ctx: &Codec) -> Chunk {
         let (x, z) = (vanilla.x, vanilla.z);
         self.strip_bedrock(&mut vanilla);
-        // The column's surface, for sky light in windows below it.
-        let air = |v: u32| v == 0;
-        let mut heights = Vec::with_capacity(256);
-        for i in 0..256 {
-            heights.push(vanilla.world_surface(i & 15, i >> 4, air));
-        }
-        let vanilla_base = vanilla.min_y() >> 4;
         // The column's entities by cube: each is saved in its cube's record.
         let entities = split_by_cube(std::mem::take(&mut vanilla.entities));
-        for (s, section) in vanilla.sections.iter().enumerate() {
-            let cy = vanilla_base + s as i32;
-            if !self.is_vanilla(cy) {
+        let records =
+            vanilla_column_records(self.registry, &self.biomes, ctx.tables, &vanilla, &entities);
+        let heights = records.heights;
+        let vanilla_base = vanilla.min_y() >> 4;
+        for cube in records.cubes {
+            let pos = SectionPos::new(x, cube.cy, z);
+            let section = &vanilla.sections[(cube.cy - vanilla_base) as usize];
+            self.note_clean(pos, section, &cube.block_ticks, &cube.fluid_ticks);
+            let Some(root) = cube.root else {
                 continue;
-            }
-            let pos = SectionPos::new(x, cy, z);
-            let (block_ticks, fluid_ticks) = cube_ticks(&vanilla, cy);
-            self.note_clean(pos, section, &block_ticks, &fluid_ticks);
-            // A missing vanilla cube reads as air: the air above the ground
-            // needs no record (the marker always has one).
-            let low = cy * 16;
-            if !self.is_marker(cy)
-                && section.blocks.uniform() == Some(0)
-                && block_ticks.is_empty()
-                && fluid_ticks.is_empty()
-                && !entities.contains_key(&cy)
-                && !vanilla
-                    .block_entities
-                    .iter()
-                    .any(|(p, _)| p.1 >= low && p.1 < low + 16)
-            {
-                continue;
-            }
-            let here = entities.get(&cy).map_or(&[][..], |e| &e[..]);
-            self.note_entities(pos, !here.is_empty());
-            let mut root = ctx.encode(&vanilla, s, self.is_marker(cy), here);
-            if self.is_marker(cy)
-                && let Tag::Compound(map) = &mut root.tag
-            {
-                map.insert(SURFACE_KEY.into(), Tag::IntArray(heights.clone()));
-            }
+            };
+            self.note_entities(pos, cube.has_entities);
             self.write_later(pos, root);
         }
         self.vanilla_done.lock().unwrap().insert((x, z));
@@ -1069,18 +1145,8 @@ impl CubicLevel {
     }
 
     fn strip_bedrock(&self, chunk: &mut Chunk) {
-        let (Some(bedrock), Some(deepslate)) = (self.bedrock, self.deepslate) else {
-            return;
-        };
-        // Vanilla's floor is y -64..-60.
-        for y in chunk.min_y()..chunk.min_y() + 5 {
-            for z in 0..16 {
-                for x in 0..16 {
-                    if chunk.get(x, y, z) == bedrock {
-                        chunk.set(x, y, z, deepslate);
-                    }
-                }
-            }
+        if let (Some(bedrock), Some(deepslate)) = (self.bedrock, self.deepslate) {
+            replace_bedrock(chunk, bedrock, deepslate);
         }
     }
 
@@ -1475,7 +1541,7 @@ fn entity_cube(entity: &Tag) -> Option<i32> {
 }
 
 /// A column's entities by the cube Y they are in.
-fn split_by_cube(entities: Vec<Tag>) -> BTreeMap<i32, Vec<Tag>> {
+pub(crate) fn split_by_cube(entities: Vec<Tag>) -> BTreeMap<i32, Vec<Tag>> {
     let mut cubes: BTreeMap<i32, Vec<Tag>> = BTreeMap::new();
     for entity in entities {
         match entity_cube(&entity) {
@@ -1503,7 +1569,7 @@ fn cube_ticks(chunk: &Chunk, cy: i32) -> (Vec<SavedTick>, Vec<SavedTick>) {
 
 /// Whether a cube record is one block state and one biome throughout with
 /// nothing else in it: what the store keeps in its uniform sidecar.
-fn is_uniform_record(root: &NamedTag) -> bool {
+pub(crate) fn is_uniform_record(root: &NamedTag) -> bool {
     let empty = |key: &str| match root.tag.get(key) {
         None => true,
         Some(Tag::List(list)) => list.is_empty(),
