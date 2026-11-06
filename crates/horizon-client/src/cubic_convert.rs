@@ -639,8 +639,10 @@ impl Job<'_> {
             }
             self.counts.done.fetch_add(1, Ordering::Relaxed);
         }
+        // No fsync: the copy is renamed into place when everything is done and
+        // thrown away if anything fails, so a crash costs a run, not a world.
         store
-            .sync()
+            .flush_uniform()
             .map_err(|e| format!("writing cubes {}: {e}", self.level_dir.display()))
     }
 
