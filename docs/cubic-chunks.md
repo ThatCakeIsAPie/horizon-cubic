@@ -79,12 +79,12 @@ Notes from a survey of `main` on 2026-11-05. Root abbreviations: **R** is `crate
 ## v1 architecture: a moving window of cubes
 
 The first playable version keeps Horizon's column `Chunk` and its single layout per level. A cubic
-level's `LevelShape` (`cubic: true`) is a **window**: 32 cubes (512 blocks) around the players
+level's `LevelShape` (`cubic: true`) is a **window**: `2V + 3` cubes (19 by default, 304 blocks) around the players
 (`LevelShape::cubic_window`, `ColumnLayout::window`). That layout isn't held to a dimension type's
 ±2032.
 
 - **Every index stays relative to one layout.** That covers light regions, `SectionKey`, `DirtySections`,
-  `Streaming`'s keys and the mesher. Inside the window, the game is a 512-high level, and code that reads
+  `Streaming`'s keys and the mesher. Inside the window, the game is a level as high as the window, and code that reads
   `bottom_y`/`top_y` sees the window.
 - **Cubes are the unit on disk and in generation.**
   - A column of the window is assembled from cubes: saved ones (`CubeStore`, `region3d/`), the vanilla
@@ -93,15 +93,16 @@ level's `LevelShape` (`cubic: true`) is a **window**: 32 cubes (512 blocks) arou
     decoration, structures. Its bedrock floor is replaced by deepslate, and it is saved as cubes.
   - Modified cubes are saved. Unmodified generated cubes outside the vanilla range are not, because the
     generator makes them again.
-- **Recentring.** When a player comes within 96 blocks of the window's top or bottom, the level gets a
-  new window centred on them.
-  - The server saves every loaded column's cubes, then switches the level to itself with the new window.
-    This is the dimension-change path: save, new `World` and `Streaming`, players held until their
-    terrain has loaded.
-  - The client gets a `horizon:cubic_window` payload and clears its sections. The far LOD stays drawn
-    meanwhile.
-  - This costs a short reload every ~160 blocks of vertical travel. Shifting sections in place, without
-    clearing, is later work.
+- **Sliding.** The window is `2V + 3` cubes tall, centred on the player's cube (V is the Vertical
+  Distance setting, sent as `horizon:cubic_view`; with several players, the union of their ranges, at
+  most 99 cubes). It slides by whole layers, in place, when a player's cube is two or more from its
+  centre cube or V changes (`game/cubic.rs`).
+  - The cubes that enter come from the prefetch ring (`cubic_prefetch.rs`): the two layers beyond the
+    window for every loaded column, ready in memory.
+  - The leaving cubes are saved with their entities, block entities and ticks. The sections both
+    windows hold keep their `Arc`s (`World::relayout`).
+  - The hub sends `horizon:cubic_window`, then only the entering cubes (`horizon:cubes`), nearest
+    column first, paced like chunk batches. The client lays out its level in place.
 - **Sky light.** A column is open to the sky at the window's top only if no known cube above has a block
   (`ColumnTops::covered_above`, which also counts the vanilla surface). Otherwise its top is dark.
 - **Network.** Single player runs on its server thread over the byte `Pipe`, so the wire matters there

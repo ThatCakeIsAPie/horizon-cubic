@@ -53,13 +53,33 @@ pub const VANILLA_CUBES: std::ops::RangeInclusive<i32> = -4..=19;
 /// holds the column's own data (structure starts and references, the
 /// surface heights).
 pub const MARKER_CUBE: i32 = -4;
-/// A cubic window's height in blocks: 32 cubes.
-pub const WINDOW_HEIGHT: i32 = 512;
-/// How near a window's top or bottom a player may come before the window
-/// moves (blocks).
-pub const WINDOW_MARGIN: i32 = 96;
-/// The window a new cubic world opens with: vanilla's surface in its middle.
-pub const FIRST_WINDOW_MIN_Y: i32 = -192;
+/// The window a new cubic world opens with: vanilla's surface in its
+/// middle (the default vertical distance's height; the first player
+/// resizes and recentres it, `follow_cubic_window`).
+pub const FIRST_WINDOW_MIN_Y: i32 = -80;
+/// The window is `2V + 3` cubes tall around the player's cube (V is the
+/// vertical distance in cubes, `Graphics.cubic_vertical`): V cubes each way
+/// and one of hysteresis.
+pub const fn window_cubes(vertical: i32) -> i32 {
+    2 * vertical + 3
+}
+/// The most cubes a window may hold, whatever the players' ranges add up to.
+pub const MAX_WINDOW_CUBES: i32 = 99;
+/// A window is centred again when a player's cube is this many cubes (or
+/// more) from its centre cube.
+pub const RECENTRE_CUBES: i32 = 2;
+/// The layers above and below the window the prefetch ring keeps ready in
+/// memory (`cubic_prefetch`); a window moves at most this far at a time.
+pub const RING: i32 = 2;
+/// The vertical distance a guest has until its client says otherwise.
+pub const DEFAULT_VERTICAL: u8 = crate::graphics::CUBIC_VERTICAL_DEFAULT as u8;
+/// A guest's vertical distance, kept to what the setting allows.
+pub fn clamp_vertical(vertical: u8) -> u8 {
+    vertical.clamp(
+        crate::graphics::CUBIC_VERTICAL_MIN as u8,
+        crate::graphics::CUBIC_VERTICAL_MAX as u8,
+    )
+}
 /// The key in a column's marker cube with its vanilla surface heights.
 const SURFACE_KEY: &str = "horizon:cubic_surface";
 /// The key in a cube record with the entities whose position is in the cube.
@@ -67,6 +87,7 @@ const ENTITIES_KEY: &str = "horizon:entities";
 
 /// A cube as saved, for putting into a column that is loaded (a window
 /// moving in place) or for building one.
+#[derive(Clone)]
 pub struct LoadedCube {
     pub pos: SectionPos,
     /// Blocks and biomes.
@@ -89,18 +110,111 @@ pub struct LoadedCube {
     pub generated: bool,
 }
 
-/// The window around block height `y`: `WINDOW_HEIGHT` high, its bottom on
-/// a multiple of 64 blocks, with `y` near its middle.
-pub fn window_around(level: LevelShape, y: i32) -> LevelShape {
-    let min_y = (y - WINDOW_HEIGHT / 2).div_euclid(64) * 64;
-    LevelShape::cubic_window(level, min_y, WINDOW_HEIGHT)
+/// The cubes (first, last) a player in cube `cube` with vertical distance
+/// `vertical` wants loaded: `[cube - V - 1, cube + V + 1]`.
+pub fn wanted_cubes(cube: i32, vertical: u8) -> (i32, i32) {
+    let v = i32::from(clamp_vertical(vertical));
+    (cube - v - 1, cube + v + 1)
 }
 
-/// Whether a player at height `y` in `window` should have a new window.
-pub fn needs_new_window(window: LevelShape, y: f64) -> bool {
-    window.cubic
-        && (y < f64::from(window.min_y + WINDOW_MARGIN)
-            || y >= f64::from(window.max_y() - WINDOW_MARGIN))
+/// The union of players' cube ranges, capped at `MAX_WINDOW_CUBES` (around
+/// the middle of the union when it is taller) and kept in the cubic range;
+/// `None` for no players.
+pub fn union_cubes(ranges: impl IntoIterator<Item = (i32, i32)>) -> Option<(i32, i32)> {
+    // TODO(shards): players whose windows do not overlap get shards of
+    // their own (docs/cubic-v2-plan.md, "Residency"); until then the level
+    // holds one window for all of them, and a union taller than the cap
+    // leaves the outermost players on its edge.
+    let (lo, hi) = ranges
+        .into_iter()
+        .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))?;
+    let (mut lo, mut hi) = (lo, hi);
+    if hi - lo + 1 > MAX_WINDOW_CUBES {
+        let middle = lo + (hi - lo) / 2;
+        lo = middle - MAX_WINDOW_CUBES / 2;
+        hi = lo + MAX_WINDOW_CUBES - 1;
+    }
+    let (min, max) = (
+        horizon_world::cubic::MIN_CUBE_Y,
+        horizon_world::cubic::MAX_CUBE_Y,
+    );
+    let shift = (min - lo).max(0) - (hi - max).max(0);
+    Some(((lo + shift).max(min), (hi + shift).min(max)))
+}
+
+/// The cubes (first, last) a window holds.
+pub fn window_cube_range(window: LevelShape) -> (i32, i32) {
+    (window.min_y >> 4, (window.max_y() >> 4) - 1)
+}
+
+/// The window of cubes `first..=last`.
+pub fn window_of_cubes(level: LevelShape, (first, last): (i32, i32)) -> LevelShape {
+    LevelShape::cubic_window(level, first * 16, (last - first + 1) * 16)
+}
+
+/// Whether the level's `window` should move to the cubes `wanted` (the
+/// union of the players' ranges): its height changed (a vertical distance
+/// did), or its centre cube is `RECENTRE_CUBES` or more from the wanted
+/// one's. For one player the wanted centre is the player's cube.
+pub fn needs_new_window(window: LevelShape, wanted: (i32, i32)) -> bool {
+    if !window.cubic {
+        return false;
+    }
+    let have = window_cube_range(window);
+    let centre = |(lo, hi): (i32, i32)| (lo + hi).div_euclid(2);
+    have.1 - have.0 != wanted.1 - wanted.0
+        || (centre(have) - centre(wanted)).abs() >= RECENTRE_CUBES
+}
+
+/// The window a slide moves to on the way to `wanted`: each end moves at
+/// most `RING` layers (what the ring has ready), unless the two do not
+/// overlap, which is a jump to `wanted` whole.
+pub fn next_window(have: (i32, i32), wanted: (i32, i32)) -> (i32, i32) {
+    if wanted.1 < have.0 || wanted.0 > have.1 {
+        return wanted;
+    }
+    let step = |from: i32, to: i32| from + (to - from).clamp(-RING, RING);
+    let (lo, hi) = (step(have.0, wanted.0), step(have.1, wanted.1));
+    (lo.min(hi), hi.max(lo))
+}
+
+impl LoadedCube {
+    /// A cube of `section` with nothing else in it.
+    pub fn empty(pos: SectionPos, section: Arc<Section>) -> Self {
+        Self {
+            pos,
+            section,
+            block_entities: Vec::new(),
+            block_names: Vec::new(),
+            entities: Vec::new(),
+            block_ticks: Vec::new(),
+            fluid_ticks: Vec::new(),
+            structure_refs: Vec::new(),
+            structure_starts: Vec::new(),
+            surface: None,
+            generated: false,
+        }
+    }
+}
+
+/// The cubes `next` holds that `have` does not, nearest the window's middle
+/// last (they are layers on its two sides).
+pub fn entering_cubes(have: (i32, i32), next: (i32, i32)) -> Vec<i32> {
+    (next.0..=next.1)
+        .filter(|cy| !(have.0..=have.1).contains(cy))
+        .collect()
+}
+
+/// The runs of cubes `have` holds that `next` does not: below and above.
+pub fn leaving_ranges(have: (i32, i32), next: (i32, i32)) -> Vec<std::ops::RangeInclusive<i32>> {
+    let mut ranges = Vec::new();
+    if next.0 > have.0 {
+        ranges.push(have.0..=(next.0 - 1).min(have.1));
+    }
+    if next.1 < have.1 {
+        ranges.push((next.1 + 1).max(have.0)..=have.1);
+    }
+    ranges
 }
 
 /// A cubic level's cube store and the writes queued for it, shared with its
@@ -165,14 +279,9 @@ impl CubeIo {
     }
 }
 
-/// Makes the level's streaming again over the same generator (a moved
-/// window keeps the generator, its saves and this level).
-pub type StreamingFactory = Box<dyn Fn() -> Option<crate::streaming::Streaming> + Send + Sync>;
-
 /// One cubic level's cubes on disk and in generation.
 pub struct CubicLevel {
     io: Arc<CubeIo>,
-    streaming: std::sync::OnceLock<StreamingFactory>,
     send: Mutex<Option<Sender<(SectionPos, Arc<NamedTag>)>>>,
     /// Columns whose vanilla range is known to be generated (`has_vanilla`).
     vanilla_done: Mutex<std::collections::HashSet<(i32, i32)>>,
@@ -194,6 +303,8 @@ pub struct CubicLevel {
     tables: std::sync::OnceLock<Arc<SaveTables>>,
     /// Uniform cubes made by the generator, shared by every column.
     uniform: Mutex<HashMap<(u32, u16), Arc<Section>>>,
+    /// The air section of a generated vanilla range's missing cubes.
+    air: std::sync::OnceLock<Arc<Section>>,
     /// The biomes of the generator's cubes below and above vanilla's range.
     deep_biome: u16,
     sky_biome: u16,
@@ -205,6 +316,12 @@ pub struct CubicLevel {
     /// The far terrain the level remembers (`horizon_cube_lod/`): every cube
     /// saved erases the nodes over it.
     lod_cache: Option<Arc<crate::lod::cube_cache::CubeLodCache>>,
+    /// The cubes just outside the window, ready in memory
+    /// (`cubic_prefetch`).
+    ring: crate::cubic_prefetch::Ring,
+    /// Each column's vanilla surface heights, for the sky a window's top
+    /// leaves open (`sky_cover`); `None` for a column without them.
+    surfaces: Mutex<HashMap<(i32, i32), Option<Arc<Vec<i32>>>>>,
 }
 
 impl CubicLevel {
@@ -232,7 +349,6 @@ impl CubicLevel {
             .map_err(|e| e.to_string())?;
         let level = Arc::new(Self {
             io,
-            streaming: std::sync::OnceLock::new(),
             send: Mutex::new(Some(send)),
             vanilla_done: Mutex::default(),
             generator,
@@ -242,6 +358,7 @@ impl CubicLevel {
             edit: Mutex::default(),
             tables: std::sync::OnceLock::new(),
             uniform: Mutex::default(),
+            air: std::sync::OnceLock::new(),
             deep_biome: biomes.id("minecraft:deep_dark"),
             sky_biome: biomes.id("minecraft:plains"),
             bedrock: registry.default_state("minecraft:bedrock").map(|s| s.0),
@@ -252,7 +369,10 @@ impl CubicLevel {
                 &level_dir.join("horizon_cube_lod"),
                 &crate::lod::cube_cache::fingerprint(seed, registry.len()),
             ),
+            ring: crate::cubic_prefetch::Ring::new(),
+            surfaces: Mutex::default(),
         });
+        level.ring.start(Arc::downgrade(&level));
         Ok(level)
     }
 
@@ -297,22 +417,33 @@ impl CubicLevel {
     }
 
     /// Moves the level's window: the columns loaded from now on hold
-    /// `window`. The caller saved the old window's columns and their
-    /// entities (`save_entities` reads the window to know which cubes a
-    /// column's entity list stands for) and drops them.
+    /// `window`. The caller saved the leaving cubes and their entities
+    /// (`save_leaving_entities`) first. What is known of the cubes that stay
+    /// (`clean`) stays.
     pub fn set_window(&self, window: LevelShape) {
         *self.window.lock().unwrap() = window.column();
-        self.clean.lock().unwrap().clear();
     }
 
-    /// Sets how the level's streaming is made again (once, when it opens).
-    pub fn set_streaming_factory(&self, factory: StreamingFactory) {
-        let _ = self.streaming.set(factory);
+    /// Forgets that cube `pos` was loaded as it is (it left the window and
+    /// was saved): memory for a flight of a million cubes would otherwise
+    /// grow with it.
+    pub fn release_cube(&self, pos: SectionPos) {
+        self.clean.lock().unwrap().remove(&pos);
     }
 
-    /// A new streaming over the level's generator, for a moved window.
-    pub fn new_streaming(&self) -> Option<crate::streaming::Streaming> {
-        self.streaming.get()?()
+    /// Aims the prefetch ring at the layers around the window of `columns`,
+    /// nearest to `centres` first (`cubic_prefetch`).
+    pub fn retarget_ring(
+        &self,
+        centres: &[(i32, i32)],
+        columns: impl IntoIterator<Item = (i32, i32)>,
+    ) {
+        self.ring.retarget(self.window(), centres, columns);
+    }
+
+    /// Whether cube `pos` waits in the ring.
+    pub fn is_prefetched(&self, pos: SectionPos) -> bool {
+        self.ring.has(pos)
     }
 
     /// Cube `pos`'s record: a queued write's, else the disk's.
@@ -323,6 +454,11 @@ impl CubicLevel {
     fn write_later(&self, pos: SectionPos, tag: NamedTag) {
         if let Some(cache) = &self.lod_cache {
             cache.invalidate(pos);
+        }
+        // A cube read before this write is older than its record.
+        self.ring.invalidate(pos);
+        if pos.y == MARKER_CUBE {
+            self.surfaces.lock().unwrap().remove(&(pos.x, pos.z));
         }
         let tag = Arc::new(tag);
         self.io.pending.lock().unwrap().insert(pos, tag.clone());
@@ -430,6 +566,28 @@ impl CubicLevel {
     }
 
     fn load_cube_with(&self, pos: SectionPos, ctx: &Codec) -> Option<LoadedCube> {
+        let cube = self.read_cube(pos, ctx)?;
+        self.adopt_cube(&cube);
+        Some(cube)
+    }
+
+    /// Notes cube `cube` as loaded: unchanged since, and holding entities or
+    /// not, as far as saves are concerned.
+    fn adopt_cube(&self, cube: &LoadedCube) {
+        self.note_clean(
+            cube.pos,
+            &cube.section,
+            &cube.block_ticks,
+            &cube.fluid_ticks,
+        );
+        if !cube.generated {
+            self.note_entities(cube.pos, !cube.entities.is_empty());
+        }
+    }
+
+    /// Cube `pos` as it is now, changing nothing in the level's books (so
+    /// the ring's thread may call it): `load_cube`'s answer.
+    fn read_cube(&self, pos: SectionPos, ctx: &Codec) -> Option<LoadedCube> {
         if let Some(root) = self.read(pos)
             && let Some(mut cube) = ctx.decode(&root, pos.y)
         {
@@ -440,8 +598,6 @@ impl CubicLevel {
                 .unwrap_or_default();
             let marker = pos.y == MARKER_CUBE;
             let section = cube.sections[0].clone();
-            self.note_clean(pos, &section, &block_ticks, &fluid_ticks);
-            self.note_entities(pos, !entities.is_empty());
             return Some(LoadedCube {
                 pos,
                 section,
@@ -467,21 +623,38 @@ impl CubicLevel {
         if VANILLA_CUBES.contains(&pos.y) {
             return None;
         }
-        let section = self.generate(pos);
-        self.note_clean(pos, &section, &[], &[]);
-        Some(LoadedCube {
-            pos,
-            section,
-            block_entities: Vec::new(),
-            block_names: Vec::new(),
-            entities: Vec::new(),
-            block_ticks: Vec::new(),
-            fluid_ticks: Vec::new(),
-            structure_refs: Vec::new(),
-            structure_starts: Vec::new(),
-            surface: None,
-            generated: true,
+        let mut cube = LoadedCube::empty(pos, self.generate(pos));
+        cube.generated = true;
+        Some(cube)
+    }
+
+    /// Whether `make_cube` can answer for `pos` now: not for a cube in
+    /// vanilla's range of a column whose vanilla generation has not run
+    /// (that column goes the normal way), nor before the save tables are set.
+    pub fn can_make_cube(&self, pos: SectionPos) -> bool {
+        self.tables.get().is_some()
+            && (!VANILLA_CUBES.contains(&pos.y) || self.has_vanilla(pos.x, pos.z))
+    }
+
+    /// Cube `pos` from its record, else the generator's, else air (a cube of
+    /// a generated vanilla range with no record). The one place cubes are
+    /// made; a generator needing neighbours extends it here. Changes nothing
+    /// in the level's books: [`Self::ready_cube`] does that for the cube it
+    /// hands out.
+    pub fn make_cube(&self, pos: SectionPos) -> LoadedCube {
+        self.read_cube(pos, &self.codec()).unwrap_or_else(|| {
+            LoadedCube::empty(pos, self.air.get_or_init(Default::default).clone())
         })
+    }
+
+    /// Cube `pos` for a window sliding over it: the ring's when it is ready,
+    /// else made now. The level notes it as loaded (unchanged, its entities
+    /// as saved). For a cube in vanilla's range the column must have its
+    /// vanilla generation (`can_make_cube`).
+    pub fn ready_cube(&self, pos: SectionPos) -> LoadedCube {
+        let cube = self.ring.take(pos).unwrap_or_else(|| self.make_cube(pos));
+        self.adopt_cube(&cube);
+        cube
     }
 
     fn note_entities(&self, pos: SectionPos, has: bool) {
@@ -656,6 +829,57 @@ impl CubicLevel {
                     }
                 }
             }
+        }
+    }
+
+    /// The columns whose sky is cut off above `window` at column (`x`, `z`)
+    /// (`Chunk::sky_covered`), from the column's vanilla surface (cached).
+    pub fn sky_cover(&self, x: i32, z: i32, window: ColumnLayout) -> Option<Arc<[u64; 4]>> {
+        let cached = self.surfaces.lock().unwrap().get(&(x, z)).cloned();
+        let surface = match cached {
+            Some(surface) => surface,
+            None => {
+                let surface = self
+                    .read(SectionPos::new(x, MARKER_CUBE, z))
+                    .and_then(|root| surface_heights(&root))
+                    .map(Arc::new);
+                let mut surfaces = self.surfaces.lock().unwrap();
+                if surfaces.len() >= 1 << 16 {
+                    surfaces.clear();
+                }
+                surfaces.insert((x, z), surface.clone());
+                surface
+            }
+        };
+        sky_covered(surface.as_deref().map(Vec::as_slice), window)
+    }
+
+    /// Saves the `entities` of column (`x`, `z`) in cubes `cubes` (those
+    /// leaving a window that slides): each of those cubes' records takes the
+    /// entities of the list that are in it, and loses the ones it had. Other
+    /// cubes are untouched, unlike [`Self::save_entities`], whose list stands
+    /// for the whole window.
+    pub fn save_leaving_entities(
+        &self,
+        x: i32,
+        z: i32,
+        cubes: std::ops::RangeInclusive<i32>,
+        entities: Vec<Tag>,
+    ) {
+        let mut groups = split_by_cube(entities);
+        for cy in cubes {
+            let here = groups.remove(&cy).unwrap_or_default();
+            let pos = SectionPos::new(x, cy, z);
+            let known = self.with_entities.lock().unwrap().contains(&pos);
+            if here.is_empty() && !known {
+                continue;
+            }
+            self.save_cube_entities(pos, here);
+        }
+        // An entity that strayed outside the cubes it was listed for keeps
+        // its own cube's record.
+        for (cy, here) in groups {
+            self.add_cube_entities(SectionPos::new(x, cy, z), here);
         }
     }
 
@@ -1220,19 +1444,34 @@ pub fn is_cubic_world(world_root: &Path) -> bool {
 /// Makes the world in `world_root` cubic, its Overworld opening on its
 /// first window. Done once, when the world is created.
 pub fn mark_cubic_world(world_root: &Path) -> std::io::Result<()> {
-    save_window(world_root, FIRST_WINDOW_MIN_Y)
+    save_window(
+        world_root,
+        FIRST_WINDOW_MIN_Y,
+        window_cubes(i32::from(DEFAULT_VERTICAL)) * 16,
+    )
 }
 
-/// The bottom of the window a cubic world's Overworld last held.
-pub fn saved_window(world_root: &Path) -> Option<i32> {
+/// The bottom and height (blocks) of the window a cubic world's Overworld
+/// last held. A save from before windows had a height of their own has 512.
+pub fn saved_window(world_root: &Path) -> Option<(i32, i32)> {
     let text = std::fs::read_to_string(world_root.join(WORLD_FILE)).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-    json["window_min_y"].as_i64().map(|y| y as i32)
+    let min_y = json["window_min_y"].as_i64()? as i32;
+    let height = json["window_height"]
+        .as_i64()
+        .map_or(512, |h| h as i32)
+        .max(16);
+    Some((min_y, height))
 }
 
-/// Records the bottom of the window a cubic world's Overworld holds.
-pub fn save_window(world_root: &Path, min_y: i32) -> std::io::Result<()> {
-    let json = serde_json::json!({ "cubic": true, "window_min_y": min_y });
+/// Records the bottom and height (blocks) of the window a cubic world's
+/// Overworld holds.
+pub fn save_window(world_root: &Path, min_y: i32, height: i32) -> std::io::Result<()> {
+    let json = serde_json::json!({
+        "cubic": true,
+        "window_min_y": min_y,
+        "window_height": height,
+    });
     let temporary = world_root.join(format!("{WORLD_FILE}.tmp"));
     std::fs::write(&temporary, json.to_string())?;
     std::fs::rename(temporary, world_root.join(WORLD_FILE))
@@ -1251,8 +1490,11 @@ pub fn cubic_shapes(
     {
         return shapes;
     }
-    let min_y = saved_window(world_root).unwrap_or(FIRST_WINDOW_MIN_Y);
-    shapes.overworld = LevelShape::cubic_window(shapes.overworld, min_y, WINDOW_HEIGHT);
+    let (min_y, height) = saved_window(world_root).unwrap_or((
+        FIRST_WINDOW_MIN_Y,
+        window_cubes(i32::from(DEFAULT_VERTICAL)) * 16,
+    ));
+    shapes.overworld = LevelShape::cubic_window(shapes.overworld, min_y, height);
     shapes
 }
 
@@ -1261,19 +1503,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_follow_the_player_in_steps_of_64() {
-        let w = window_around(LevelShape::OVERWORLD, 70);
-        assert!(w.cubic);
-        assert_eq!((w.min_y, w.max_y()), (-192, 320));
-        assert!(!needs_new_window(w, 70.0));
-        assert!(needs_new_window(w, f64::from(w.min_y + WINDOW_MARGIN - 1)));
-        assert!(needs_new_window(w, f64::from(w.max_y() - WINDOW_MARGIN)));
-        let far = window_around(LevelShape::OVERWORLD, 1_000_123);
-        assert_eq!(far.min_y % 64, 0);
-        assert!(f64::from(far.min_y + WINDOW_MARGIN) <= 1_000_123.0);
-        assert!(f64::from(far.max_y() - WINDOW_MARGIN) > 1_000_123.0);
-        assert!(!needs_new_window(far, 1_000_123.0));
-        assert!(!needs_new_window(LevelShape::OVERWORLD, -10_000.0));
+    fn a_window_is_two_v_plus_three_cubes_around_the_player() {
+        assert_eq!(window_cubes(8), 19);
+        assert_eq!(wanted_cubes(4, 8), (-5, 13));
+        let level = LevelShape::OVERWORLD;
+        let window = window_of_cubes(level, wanted_cubes(4, 8));
+        assert!(window.cubic);
+        assert_eq!((window.min_y, window.height), (-80, 304));
+        assert_eq!(window_cube_range(window), (-5, 13));
+        // A far window keeps its exact cubes.
+        let far = window_of_cubes(level, wanted_cubes(62_000, 32));
+        assert_eq!(window_cube_range(far), (61_967, 62_033));
+        // The vertical distance is kept to what the setting allows.
+        assert_eq!(wanted_cubes(0, 0), wanted_cubes(0, 2));
+        assert_eq!(wanted_cubes(0, 200), wanted_cubes(0, 32));
+    }
+
+    #[test]
+    fn a_window_recentres_two_cubes_from_the_middle_or_when_v_changes() {
+        let window = window_of_cubes(LevelShape::OVERWORLD, wanted_cubes(10, 8));
+        assert!(!needs_new_window(window, wanted_cubes(10, 8)));
+        assert!(!needs_new_window(window, wanted_cubes(11, 8)));
+        assert!(!needs_new_window(window, wanted_cubes(9, 8)));
+        assert!(needs_new_window(window, wanted_cubes(12, 8)));
+        assert!(needs_new_window(window, wanted_cubes(8, 8)));
+        assert!(needs_new_window(window, wanted_cubes(10, 9)), "V changed");
+        assert!(!needs_new_window(
+            LevelShape::OVERWORLD,
+            wanted_cubes(10, 8)
+        ));
+    }
+
+    #[test]
+    fn several_players_share_the_union_of_their_ranges_up_to_99_cubes() {
+        assert_eq!(union_cubes([]), None);
+        assert_eq!(
+            union_cubes([wanted_cubes(0, 8), wanted_cubes(5, 8)]),
+            Some((-9, 14))
+        );
+        // Far apart: capped at 99 cubes around the middle of the union.
+        let (lo, hi) = union_cubes([wanted_cubes(0, 8), wanted_cubes(500, 8)]).unwrap();
+        assert_eq!(hi - lo + 1, MAX_WINDOW_CUBES);
+        assert!(lo < 250 && hi > 250);
+        // Kept in the cubic range.
+        let (lo, hi) = union_cubes([wanted_cubes(horizon_world::cubic::MAX_CUBE_Y, 8)]).unwrap();
+        assert_eq!(hi, horizon_world::cubic::MAX_CUBE_Y);
+        assert_eq!(lo, hi - 18);
+    }
+
+    #[test]
+    fn a_slide_moves_each_end_by_the_ring_at_most() {
+        assert_eq!(next_window((0, 18), (1, 19)), (1, 19));
+        assert_eq!(next_window((0, 18), (2, 20)), (2, 20));
+        assert_eq!(next_window((0, 18), (5, 23)), (2, 20), "two layers a step");
+        assert_eq!(next_window((0, 18), (-5, 13)), (-2, 16));
+        // The window growing: its ends move apart by the ring.
+        assert_eq!(next_window((0, 18), (-10, 28)), (-2, 20));
+        // No overlap: a jump.
+        assert_eq!(next_window((0, 18), (100, 118)), (100, 118));
+    }
+
+    #[test]
+    fn a_slide_enters_and_leaves_whole_layers() {
+        let runs = |ranges: Vec<std::ops::RangeInclusive<i32>>| -> Vec<(i32, i32)> {
+            ranges.iter().map(|r| (*r.start(), *r.end())).collect()
+        };
+        assert_eq!(entering_cubes((0, 18), (2, 20)), [19, 20]);
+        assert_eq!(runs(leaving_ranges((0, 18), (2, 20))), [(0, 1)]);
+        assert_eq!(entering_cubes((0, 18), (-2, 16)), [-2, -1]);
+        assert_eq!(runs(leaving_ranges((0, 18), (-2, 16))), [(17, 18)]);
+        // Growing keeps everything; shrinking leaves both ends.
+        assert_eq!(entering_cubes((0, 18), (-2, 20)), [-2, -1, 19, 20]);
+        assert!(leaving_ranges((0, 18), (-2, 20)).is_empty());
+        assert_eq!(runs(leaving_ranges((0, 18), (3, 15))), [(0, 2), (16, 18)]);
+        // A jump: the whole old window leaves once, the whole new one enters.
+        assert_eq!(runs(leaving_ranges((0, 18), (100, 118))), [(0, 18)]);
+        assert_eq!(runs(leaving_ranges((0, 18), (-100, -82))), [(0, 18)]);
+        assert_eq!(entering_cubes((0, 18), (100, 118)).len(), 19);
     }
 
     #[test]
@@ -1312,12 +1618,15 @@ mod tests {
         assert!(!is_cubic_world(&dir));
         mark_cubic_world(&dir).unwrap();
         assert!(is_cubic_world(&dir));
-        assert_eq!(saved_window(&dir), Some(FIRST_WINDOW_MIN_Y));
-        save_window(&dir, 4096).unwrap();
-        assert_eq!(saved_window(&dir), Some(4096));
+        assert_eq!(saved_window(&dir), Some((FIRST_WINDOW_MIN_Y, 304)));
+        save_window(&dir, 4096, 160).unwrap();
+        assert_eq!(saved_window(&dir), Some((4096, 160)));
         let shapes = cubic_shapes(&dir, crate::chunk::LevelShapes::VANILLA);
         assert!(shapes.overworld.cubic && !shapes.nether.cubic);
-        assert_eq!(shapes.overworld.min_y, 4096);
+        assert_eq!(
+            (shapes.overworld.min_y, shapes.overworld.height),
+            (4096, 160)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1611,6 +1920,163 @@ mod tests {
         let column = level.assemble(x, z, level.window(), &f.codec());
         let saved = column.saved.as_deref().expect("ticks");
         assert_eq!(saved.block_ticks, [tick(0, 2, 70, 2, 5)]);
+    }
+
+    /// Waits (a few seconds at most) until `ready` holds.
+    fn wait_until(ready: impl Fn() -> bool) -> bool {
+        for _ in 0..500 {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        ready()
+    }
+
+    #[test]
+    fn the_ring_has_the_layers_beyond_the_window_ready_and_drops_what_the_store_writes() {
+        let Some(f) = Fixture::new("ring") else {
+            return;
+        };
+        let level = f.level();
+        // Cubes -12..=19 (the fixture's window): the ring is -14, -13, 20 and 21.
+        level.retarget_ring(&[(0, 0)], [(0, 0), (1, 0)]);
+        let ring: Vec<SectionPos> = [(0, 0), (1, 0)]
+            .into_iter()
+            .flat_map(|(x, z)| [-13, -14, 20, 21].map(|cy| SectionPos::new(x, cy, z)))
+            .collect();
+        assert!(wait_until(|| ring.iter().all(|&p| level.is_prefetched(p))));
+        // A ready cube is the one `make_cube` makes, and is handed out once.
+        let pos = SectionPos::new(0, 20, 0);
+        let cube = level.ready_cube(pos);
+        assert!(cube.generated && !level.is_prefetched(pos));
+        assert!(cube.section.same_as(&level.make_cube(pos).section));
+        // The store writing a cube drops it; the ring loads it again, entities and all.
+        let above = SectionPos::new(0, 21, 0);
+        assert!(level.is_prefetched(above));
+        level.save_cube_entities(above, vec![mob(1, 21.0 * 16.0 + 3.0)]);
+        assert!(!level.is_prefetched(above) || level.ready_cube(above).entities.len() == 1);
+        assert!(wait_until(|| level.is_prefetched(above)));
+        assert_eq!(
+            level.ready_cube(above).entities,
+            [mob(1, 21.0 * 16.0 + 3.0)]
+        );
+    }
+
+    #[test]
+    fn the_ring_leaves_vanilla_cubes_of_columns_without_vanilla_generation_to_the_streaming() {
+        let Some(f) = Fixture::new("ring-vanilla") else {
+            return;
+        };
+        let level = f.level();
+        // Cubes 0..=18: the ring below, -2 and -1, is vanilla's range; above it 19 is, 20 is not.
+        level.set_window(LevelShape::cubic_window(LevelShape::OVERWORLD, 0, 304));
+        level.retarget_ring(&[(0, 0)], [(0, 0)]);
+        assert!(wait_until(|| level.is_prefetched(SectionPos::new(0, 20, 0))));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for cy in [-1, -2, 19] {
+            assert!(
+                !level.is_prefetched(SectionPos::new(0, cy, 0)),
+                "cube {cy} waits for its column's vanilla generation"
+            );
+            assert!(!level.can_make_cube(SectionPos::new(0, cy, 0)));
+        }
+        // Once the column has it, the next aim loads them (air where nothing was saved).
+        level.vanilla_done.lock().unwrap().insert((0, 0));
+        level.retarget_ring(&[(0, 0)], [(0, 0), (1, 0)]);
+        assert!(wait_until(|| {
+            [-1, -2, 19]
+                .iter()
+                .all(|&cy| level.is_prefetched(SectionPos::new(0, cy, 0)))
+        }));
+        let air = level.ready_cube(SectionPos::new(0, -1, 0));
+        assert!(!air.generated && air.section.blocks.uniform() == Some(0));
+    }
+
+    /// A window sliding over a column: the sections both windows hold stay (the same
+    /// `Arc`s), and the ones that enter, from the ring, are those the column assembled for
+    /// the new window has.
+    #[test]
+    fn a_slide_keeps_the_arcs_of_unchanged_sections_and_enters_what_a_reload_would_hold() {
+        let Some(f) = Fixture::new("slide") else {
+            return;
+        };
+        let level = f.level();
+        let a = LevelShape::cubic_window(LevelShape::OVERWORLD, 100 * 16, 19 * 16);
+        let b = LevelShape::cubic_window(LevelShape::OVERWORLD, 102 * 16, 19 * 16);
+        level.set_window(a);
+        let ctx = f.codec();
+        let before = level.assemble(0, 0, a.column(), &ctx);
+        let mut world = crate::world::World::new(horizon_world::registry::BlockStateId(0), 0);
+        world.shape = a;
+        world.chunks.insert((0, 0), Arc::new(before.clone()));
+        level.retarget_ring(&[(0, 0)], [(0, 0)]);
+        assert!(wait_until(
+            || (119..=120).all(|cy| level.is_prefetched(SectionPos::new(0, cy, 0)))
+        ));
+        level.set_window(b);
+        world.relayout(b, |x, z, cy| {
+            level.ready_cube(SectionPos::new(x, cy, z)).section
+        });
+        let after = &world.chunks[&(0, 0)];
+        let reloaded = level.assemble(0, 0, b.column(), &ctx);
+        assert_eq!(after.layout(), b.column());
+        for (s, section) in after.sections.iter().enumerate() {
+            assert!(section.same_as(&reloaded.sections[s]), "section {s}");
+            // Cube 102 + s was in window A at index s + 2, up to its top.
+            if s + 2 < before.sections.len() {
+                assert!(
+                    Arc::ptr_eq(section, &before.sections[s + 2]),
+                    "section {s} moved"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn entities_of_leaving_cubes_are_saved_there_and_come_back_with_the_window() {
+        let Some(f) = Fixture::new("leaving") else {
+            return;
+        };
+        let level = f.level();
+        let a = LevelShape::cubic_window(LevelShape::OVERWORLD, 100 * 16, 19 * 16);
+        level.set_window(a);
+        let (x, z) = (3, -4);
+        let (low, high) = (mob(1, 1610.5), mob(2, 1900.0));
+        // The window's entities are saved whole; then cubes 100..=101 leave with theirs.
+        level.save_entities(x, z, vec![low.clone(), high.clone()]);
+        let gone = (100..=101).collect::<Vec<_>>();
+        assert_eq!(gone.len(), 2);
+        level.save_leaving_entities(x, z, 100..=101, vec![low.clone()]);
+        level.flush();
+        let cube = |cy: i32| level.load_cube(SectionPos::new(x, cy, z)).unwrap();
+        assert_eq!(cube(100).entities, std::slice::from_ref(&low));
+        assert_eq!(
+            cube(118).entities,
+            std::slice::from_ref(&high),
+            "the other cubes are untouched"
+        );
+        // The window slides up: only the leaving cubes' lists were replaced.
+        level.set_window(LevelShape::cubic_window(
+            LevelShape::OVERWORLD,
+            102 * 16,
+            19 * 16,
+        ));
+        level.save_leaving_entities(x, z, 100..=101, Vec::new());
+        level.flush();
+        assert!(
+            cube(100).entities.is_empty(),
+            "an empty list empties the cube"
+        );
+        assert_eq!(cube(118).entities, std::slice::from_ref(&high));
+        // Back down: the column holds what the cubes saved.
+        level.save_leaving_entities(x, z, 100..=101, vec![low.clone()]);
+        level.flush();
+        level.set_window(a);
+        let column = level.assemble(x, z, a.column(), &f.codec());
+        let mut entities = column.entities.clone();
+        entities.sort_by_key(|e| entity_y(e).unwrap() as i64);
+        assert_eq!(entities, [low, high]);
     }
 
     #[test]

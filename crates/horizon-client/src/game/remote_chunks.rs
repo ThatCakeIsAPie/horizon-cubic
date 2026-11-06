@@ -73,6 +73,80 @@ impl ChunkFormat {
         }
     }
 
+    /// A wire section's block states as ours.
+    fn blocks_of(&self, s: &horizon_protocol::chunk::Section) -> Result<PalettedContainer, String> {
+        // A global section is as wide as the server's registry: 16 bits
+        // from a vanilla server, wider from a Horizon host with the same
+        // content mods. Read it at that width, then widen it to ours.
+        let ours = block_strategy();
+        let strategy = if ours.wire_has_palette(s.states.bits) {
+            ours
+        } else {
+            Strategy::blocks(s.states.bits)
+        };
+        let palette = s.states.palette.iter().map(|&p| p as u32).collect();
+        let words = s.states.data.iter().map(|&w| w as u64).collect();
+        let mut blocks = PalettedContainer::from_wire(strategy, s.states.bits, palette, words)
+            .map_err(|e| e.to_string())?;
+        if strategy.global_bits != ours.global_bits {
+            let mut values = [0u32; 4096];
+            blocks.unpack(&mut values);
+            // Ids past our registry (a host with mods we lack) read as air.
+            let limit = 1u64 << ours.global_bits;
+            for v in &mut values {
+                if u64::from(*v) >= limit {
+                    *v = 0;
+                }
+            }
+            blocks = PalettedContainer::from_values(ours, &values);
+        }
+        Ok(blocks)
+    }
+
+    /// A cube of a `horizon:cubes` payload as a section: its blocks, its biomes (the server's
+    /// table mapped to ours) and its light.
+    pub(super) fn cube(&self, cube: &horizon_protocol::cubic::Cube) -> Result<Section, String> {
+        use horizon_protocol::cubic::CubeLight;
+        let wire = horizon_protocol::chunk::Section::read(
+            &mut horizon_protocol::buf::Reader::new(&cube.section),
+            16,
+            self.biome_bits,
+        )
+        .map_err(|e| e.to_string())?;
+        let cells: Vec<u32> = (0..64)
+            .map(|j| {
+                u32::from(
+                    self.biome_map
+                        .get(wire.biomes.get(j) as usize)
+                        .copied()
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
+        let mut biomes = PalettedContainer::from_values(BIOME_STRATEGY, &cells);
+        if let Some(v) = biomes.uniform() {
+            biomes = PalettedContainer::new(BIOME_STRATEGY, v);
+        }
+        let light = match &cube.light {
+            CubeLight::Uniform(v) => Light::Uniform(*v),
+            CubeLight::Full(values) => {
+                let packed: Box<[u8; 4096]> = values
+                    .clone()
+                    .into_boxed_slice()
+                    .try_into()
+                    .map_err(|_| "a cube's light is not 4096 values".to_string())?;
+                Light::Full(packed)
+            }
+        };
+        let mut section = Section {
+            blocks: self.blocks_of(&wire)?,
+            biomes,
+            light,
+        };
+        section.compact();
+        Ok(section)
+    }
+
     /// LevelChunkSection data into the client's column.
     fn column(&self, p: &play::LevelChunkWithLight) -> Result<Chunk, String> {
         let sections = p
@@ -87,31 +161,7 @@ impl ChunkFormat {
             if !(0..column).contains(&target) {
                 continue;
             }
-            // A global section is as wide as the server's registry: 16 bits
-            // from a vanilla server, wider from a Horizon host with the same
-            // content mods. Read it at that width, then widen it to ours.
-            let ours = block_strategy();
-            let strategy = if ours.wire_has_palette(s.states.bits) {
-                ours
-            } else {
-                Strategy::blocks(s.states.bits)
-            };
-            let palette = s.states.palette.iter().map(|&p| p as u32).collect();
-            let words = s.states.data.iter().map(|&w| w as u64).collect();
-            let mut blocks = PalettedContainer::from_wire(strategy, s.states.bits, palette, words)
-                .map_err(|e| e.to_string())?;
-            if strategy.global_bits != ours.global_bits {
-                let mut values = [0u32; 4096];
-                blocks.unpack(&mut values);
-                // Ids past our registry (a host with mods we lack) read as air.
-                let limit = 1u64 << ours.global_bits;
-                for v in &mut values {
-                    if u64::from(*v) >= limit {
-                        *v = 0;
-                    }
-                }
-                blocks = PalettedContainer::from_values(ours, &values);
-            }
+            let blocks = self.blocks_of(s)?;
             let mut section = Section {
                 blocks,
                 biomes: PalettedContainer::new(BIOME_STRATEGY, 0),
@@ -336,6 +386,79 @@ impl Game<'_> {
                 _ => true,
             });
         }
+    }
+
+    /// `horizon:cubes` (docs/cubic-chunks.md): cubes of a column the client holds, the ones
+    /// that entered when the window moved over it (`remote_cubic_window`). Each replaces the
+    /// air placeholder at its place and stops being one, its block entities load their update
+    /// tags, and it and the sections around it are meshed (`Streaming::light_updated`). A cube
+    /// outside the window now, or of a column not here, is ignored.
+    pub(super) fn remote_cubes(&mut self, data: &[u8]) {
+        let cubes = match horizon_protocol::cubic::Cubes::decode(data) {
+            Ok(cubes) => cubes,
+            Err(e) => {
+                log::warn!("Horizon: a bad cubes payload: {e}");
+                return;
+            }
+        };
+        let Some(format) = self.remote.as_ref().map(|r| r.chunk_format.clone()) else {
+            return;
+        };
+        let (x, z) = (cubes.x, cubes.z);
+        if !self.world.chunks.contains_key(&(x, z)) {
+            return;
+        }
+        let layout = self.world.layout();
+        let mut decoded = Vec::with_capacity(cubes.cubes.len());
+        for cube in &cubes.cubes {
+            let Some(index) = usize::try_from(cube.cy - (layout.min_y() >> 4))
+                .ok()
+                .filter(|&i| i < layout.sections())
+            else {
+                continue;
+            };
+            match format.cube(cube) {
+                Ok(section) => decoded.push((index, cube, section)),
+                Err(e) => log::warn!("Horizon: cube {x} {} {z}: {e}", cube.cy),
+            }
+        }
+        if decoded.is_empty() {
+            return;
+        }
+        let mut changed = Vec::with_capacity(decoded.len());
+        if let Some(chunk) = self.world.chunks.get_mut(&(x, z)) {
+            let chunk = Arc::make_mut(chunk);
+            for (index, _, section) in &decoded {
+                chunk.sections[*index] = Arc::new(section.clone());
+                changed.push(*index);
+            }
+            horizon_client::chunk::share_uniform(&mut chunk.sections);
+        }
+        if let Some(r) = self.remote.as_mut() {
+            let empty = r.cubic_placeholders.get_mut(&(x, z)).is_some_and(|mask| {
+                for &index in &changed {
+                    mask.remove(index);
+                }
+                mask.is_empty()
+            });
+            if empty {
+                r.cubic_placeholders.remove(&(x, z));
+            }
+        }
+        self.world.revision = self.world.revision.wrapping_add(1);
+        for (_, cube, _) in &decoded {
+            for info in &cube.block_entities {
+                let pos = (
+                    x * 16 + i32::from(info.packed_xz >> 4),
+                    info.y,
+                    z * 16 + i32::from(info.packed_xz & 15),
+                );
+                let state = self.world.block(pos.0, pos.1, pos.2);
+                self.sync_block_entity(pos, None, state);
+                self.remote_block_entity_data([pos.0, pos.1, pos.2], info.kind, &info.tag);
+            }
+        }
+        Streaming::light_updated(&mut self.world, x, z, &changed);
     }
 
     /// `ClientPacketListener.handleChunksBiomes`: each loaded column takes

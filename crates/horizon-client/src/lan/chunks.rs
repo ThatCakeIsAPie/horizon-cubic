@@ -25,6 +25,10 @@ use std::{
     },
 };
 
+/// The most cubes one `horizon:cubes` payload carries (a payload stays well under a
+/// clientbound custom payload's megabyte).
+const CUBES_PER_PAYLOAD: usize = 16;
+
 const NON_AIR: u8 = 1;
 const FLUID: u8 = 2;
 const ENTITY: u8 = 4;
@@ -1153,6 +1157,79 @@ impl ChunkEncoder {
             )
         });
         (wires, entity_infos)
+    }
+
+    /// The cubes `cys` (cube Ys) of a cubic level's column as `horizon:cubes`
+    /// payloads (`horizon_protocol::cubic`), a few cubes each: every section as
+    /// `LevelChunkSection.write` has it (cached with the section), its light
+    /// as the section holds it, and its block entities as the chunk packet
+    /// lists them. Cubes the column does not hold are left out.
+    pub fn cubes(
+        &self,
+        chunk: &Chunk,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        cys: &[i32],
+    ) -> Vec<Vec<u8>> {
+        use horizon_protocol::cubic::{Cube, CubeBlockEntity, CubeLight, Cubes};
+        let mut cubes = Vec::with_capacity(cys.len());
+        for &cy in cys {
+            let Some(section) = usize::try_from(cy - (chunk.min_y() >> 4))
+                .ok()
+                .and_then(|i| chunk.sections.get(i))
+            else {
+                continue;
+            };
+            let (wire, entities) = self.section_wire(section);
+            let mut infos = Vec::new();
+            for &(index, state) in entities.iter() {
+                let Some(kind) = self.entity_type(state) else {
+                    continue;
+                };
+                let (x, y, z) = (
+                    i32::from(index & 15),
+                    i32::from(index >> 8),
+                    i32::from(index >> 4 & 15),
+                );
+                let wy = cy * 16 + y;
+                let pos = (chunk.x * 16 + x, wy, chunk.z * 16 + z);
+                let entity = block_entities.get(&pos);
+                if self.mod_entities[state as usize] && !matches!(entity, Some(BlockEntity::Mod(_)))
+                {
+                    continue;
+                }
+                infos.push(CubeBlockEntity {
+                    packed_xz: ((x << 4) | z) as u8,
+                    y: wy,
+                    kind,
+                    tag: entity
+                        .and_then(|e| self.update_tag(pos, e))
+                        .or_else(|| pot_tag(chunk, pos))
+                        .filter(|t| !matches!(t, Tag::Compound(c) if c.is_empty()))
+                        .unwrap_or(Tag::End),
+                });
+            }
+            let light = match &section.light {
+                Light::Uniform(v) => CubeLight::Uniform(*v),
+                light => CubeLight::Full((0..BLOCKS).map(|i| light.get(i)).collect()),
+            };
+            cubes.push(Cube {
+                cy,
+                section: wire.to_vec(),
+                light,
+                block_entities: infos,
+            });
+        }
+        cubes
+            .chunks(CUBES_PER_PAYLOAD)
+            .map(|cubes| {
+                Cubes {
+                    x: chunk.x,
+                    z: chunk.z,
+                    cubes: cubes.to_vec(),
+                }
+                .encode()
+            })
+            .collect()
     }
 
     /// ClientboundLightUpdatePacketData: the light layers of the sections

@@ -2223,6 +2223,10 @@ impl Hub {
             }
         }
         if batches.is_empty() {
+            // The cubes a slid window brought, when no chunk batch is due.
+            for i in 0..self.guests.len() {
+                self.send_cubes(i, ctx);
+            }
             return;
         }
         // Each column once, however many players it goes to, with the
@@ -2333,6 +2337,7 @@ impl Hub {
         for (x, z) in forget {
             g.sent_chunks.remove(&(x, z));
             g.far_sent_chunks.remove(&(x, z));
+            g.cube_queue.retain(|due| due.column != (x, z));
             g.send(&C::ForgetLevelChunk(play::ForgetLevelChunk { pos: [x, z] }));
         }
         // Far columns have no attachment snapshots. Resend them as near chunks
@@ -4292,6 +4297,7 @@ impl Hub {
         g.sent_chunks.clear();
         g.far_sent_chunks.clear();
         g.chunk_queue.clear();
+        g.cube_queue.clear();
         g.far_queue.clear();
         let id = g.entity_id;
         self.respawned(id);
@@ -4321,6 +4327,7 @@ impl Hub {
         g.sent_chunks.clear();
         g.far_sent_chunks.clear();
         g.chunk_queue.clear();
+        g.cube_queue.clear();
         g.far_queue.clear();
         g.tracker.clear();
         self.resend_teleport(i, None);
@@ -4397,43 +4404,196 @@ impl Hub {
         }
     }
 
-    /// The server swapped level `dimension` for one with a new window
-    /// (`shape`, `LevelShape::cubic_window`). Every player in that level is
-    /// told the window, then sent the level's chunks again, nearest first, as
-    /// after a join: what was sent of the level is forgotten (the client drops
-    /// its chunks on the window payload, so no ForgetLevelChunk is sent). The
-    /// hub's encoder and levels follow. Entities stay tracked. Call it after
-    /// the new `World` is the one `TickCtx` carries, before the next
-    /// `update_chunks`.
+    /// The server slid level `dimension`'s window (`shape`,
+    /// `LevelShape::cubic_window`) in place: the sections both windows hold
+    /// stay, and the cubes that entered are new. Every player in that level is
+    /// told the window (its client lays its level out again in place, keeping
+    /// what it has), then sent only the entering cubes of the columns it
+    /// holds, nearest column first and paced as chunks are
+    /// (`send_cubes`). What was sent is not forgotten. The hub's encoder and
+    /// levels follow. Entities stay tracked. Call it after the level's
+    /// `World` holds the new window, before the next `update_chunks`.
+    ///
+    /// The first time (the level was not cubic yet) there are no cubes to
+    /// slide: the players' chunks are forgotten and sent again whole.
     pub fn cubic_window_changed(&mut self, dimension: &str, shape: crate::chunk::LevelShape) {
         debug_assert!(shape.cubic);
+        let old = self.config.levels.get(dimension);
         *self.config.levels.get_mut(dimension) = shape;
         if self.wide.is_none() {
             self.wide = Some(hold_wide());
             self.lan.shared.set_cubic(true);
         }
-        // Sections offered under the old window and bulk changes of its columns.
-        // The handoff is the process's (single player's server and window): in
-        // this crate's tests, other tests use it at the same time.
-        #[cfg(not(test))]
-        super::handoff::forget_all();
+        let slid = old.cubic;
+        if !slid {
+            // Sections offered under the old window and bulk changes of its columns.
+            // The handoff is the process's (single player's server and window): in
+            // this crate's tests, other tests use it at the same time.
+            #[cfg(not(test))]
+            super::handoff::forget_all();
+        }
         if self.config.dimension != dimension {
             return;
         }
         self.encoder.set_dimension(shape);
+        let have = crate::cubic::window_cube_range(old);
+        let now = crate::cubic::window_cube_range(shape);
+        let ticks = self.ticks;
         for g in self.guests.iter_mut().filter(|g| g.dimension == dimension) {
             send_window(g, shape);
-            g.sent_chunks.clear();
-            g.far_sent_chunks.clear();
-            g.chunk_queue.clear();
-            g.far_queue.clear();
-            // Both ends forget the view: the next update requeues it around the
-            // player and sends the centre again.
-            g.center = None;
-            g.center_sent = None;
-            // Batches in flight were of the old window; their acknowledgements
-            // still come and pace the new ones.
+            if !slid {
+                g.sent_chunks.clear();
+                g.far_sent_chunks.clear();
+                g.chunk_queue.clear();
+                g.cube_queue.clear();
+                g.far_queue.clear();
+                g.cube_queue.clear();
+                // Both ends forget the view: the next update requeues it around the
+                // player and sends the centre again.
+                g.center = None;
+                g.center_sent = None;
+                // Batches in flight were of the old window; their acknowledgements
+                // still come and pace the new ones.
+                continue;
+            }
+            let player = (g.position[1].floor() as i32) >> 4;
+            let mut entering: Vec<i32> = (now.0..=now.1)
+                .filter(|cy| !(have.0..=have.1).contains(cy))
+                .collect();
+            entering.sort_by_key(|cy| ((cy - player).abs(), *cy));
+            if entering.is_empty() {
+                continue;
+            }
+            for &column in &g.sent_chunks {
+                match g.cube_queue.iter_mut().find(|d| d.column == column) {
+                    Some(due) => {
+                        for &cy in &entering {
+                            if !due.cubes.contains(&cy) {
+                                due.cubes.push(cy);
+                            }
+                        }
+                    }
+                    None => g.cube_queue.push(super::guest::CubesDue {
+                        column,
+                        cubes: entering.clone(),
+                        since: ticks,
+                    }),
+                }
+            }
         }
+    }
+
+    /// The level took `columns` out to load them again (a cubic window that slid
+    /// into vanilla's range found them without their vanilla generation): every
+    /// player that holds one forgets it and is sent it again, whole, when the
+    /// level has it.
+    pub fn reload_columns(
+        &mut self,
+        dimension: &str,
+        columns: &std::collections::HashSet<(i32, i32)>,
+    ) {
+        if self.config.dimension != dimension {
+            return;
+        }
+        for g in self.guests.iter_mut().filter(|g| g.dimension == dimension) {
+            let mut forgotten = false;
+            for &(x, z) in columns {
+                if g.sent_chunks.remove(&(x, z)) {
+                    g.far_sent_chunks.remove(&(x, z));
+                    g.send(&C::ForgetLevelChunk(play::ForgetLevelChunk { pos: [x, z] }));
+                    forgotten = true;
+                }
+                g.cube_queue.retain(|due| due.column != (x, z));
+            }
+            if forgotten {
+                let center = g.chunk();
+                requeue(&mut g.chunk_queue, &g.sent_chunks, center, g.view_distance);
+            }
+        }
+    }
+
+    /// The cubes the window slid over, sent to player `i`: its queued columns
+    /// nearest first, a column once its light has settled (or
+    /// `CUBES_WAIT` ticks after it was queued), as many as the batch quota the
+    /// client's acknowledgements pace allows after the chunks the tick sent.
+    /// One batch: `ChunkBatchStart`, a `horizon:cubes` payload or more for
+    /// each column, `ChunkBatchFinished` counting the columns.
+    fn send_cubes(&mut self, i: usize, ctx: &TickCtx) {
+        let world = &*ctx.world;
+        let here = self.here(&self.guests[i]);
+        let ticks = self.ticks;
+        let shape = self.config.levels.get(&self.config.dimension);
+        let window = crate::cubic::window_cube_range(shape);
+        let encoder = &self.encoder;
+        let g = &mut self.guests[i];
+        if !here
+            || g.cube_queue.is_empty()
+            || ticks <= g.placed_at + 1
+            || g.unacknowledged >= g.max_unacknowledged
+        {
+            return;
+        }
+        let budget = g.batch_quota.floor() as usize;
+        if budget == 0 {
+            return;
+        }
+        let (cx, cz) = g.chunk();
+        let near = |(x, z): (i32, i32)| {
+            let (dx, dz) = (i64::from(x - cx), i64::from(z - cz));
+            dx * dx + dz * dz
+        };
+        g.cube_queue.sort_by_key(|due| near(due.column));
+        let settled = |column: (i32, i32)| {
+            !world.dirty_light.contains(&column)
+                && !ctx
+                    .streaming
+                    .is_some_and(|s| s.is_relighting(column.0, column.1))
+        };
+        let mut bodies = Vec::new();
+        let mut columns = 0;
+        let mut at = 0;
+        while at < g.cube_queue.len() && columns < budget {
+            let column = g.cube_queue[at].column;
+            if !g.sent_chunks.contains(&column) || !world.chunks.contains_key(&column) {
+                // The client forgot it, or the level did: nothing to add cubes to.
+                g.cube_queue.remove(at);
+                continue;
+            }
+            if !settled(column) && ticks.saturating_sub(g.cube_queue[at].since) < CUBES_WAIT {
+                at += 1;
+                continue;
+            }
+            let due = g.cube_queue.remove(at);
+            let cys: Vec<i32> = due
+                .cubes
+                .into_iter()
+                .filter(|cy| (window.0..=window.1).contains(cy))
+                .collect();
+            if cys.is_empty() {
+                continue;
+            }
+            if let Some(chunk) = world.chunks.get(&column) {
+                bodies.extend(encoder.cubes(chunk, &world.block_entities, &cys));
+                columns += 1;
+            }
+        }
+        if columns == 0 {
+            return;
+        }
+        g.batch_quota -= columns as f32;
+        g.send(&C::ChunkBatchStart(horizon_protocol::packets::Empty));
+        for data in bodies {
+            g.send(&C::CustomPayload(
+                horizon_protocol::packets::configuration::CustomPayload {
+                    channel: horizon_protocol::cubic::CUBES_CHANNEL.into(),
+                    data,
+                },
+            ));
+        }
+        g.send(&C::ChunkBatchFinished(play::ChunkBatchFinished {
+            size: columns as i32,
+        }));
+        g.unacknowledged += 1;
     }
 
     /// ServerPlayer.teleport(TeleportTransition) into the level the hub now
@@ -4466,6 +4626,7 @@ impl Hub {
         g.sent_chunks.clear();
         g.far_sent_chunks.clear();
         g.chunk_queue.clear();
+        g.cube_queue.clear();
         g.far_queue.clear();
         g.center = None;
         g.yaw = yaw;
@@ -4559,6 +4720,10 @@ fn wrap_degrees(degrees: f32) -> f32 {
     }
     wrapped
 }
+
+/// Ticks a column's entering cubes wait for its light to settle before they are sent as
+/// they are (`Hub::send_cubes`).
+const CUBES_WAIT: u64 = 100;
 
 /// The packets of one player handled in a tick; the rest wait for the next.
 const PACKETS_PER_TICK: usize = 400;
@@ -4957,6 +5122,8 @@ mod tests {
         Login,
         Window(i32, i32),
         Chunk(i32, i32),
+        /// A `horizon:cubes` payload: its column and its cube Ys.
+        Cubes(i32, i32, Vec<i32>),
     }
 
     fn seen(rx: &std::sync::mpsc::Receiver<crate::lan::Out>) -> Vec<Seen> {
@@ -4970,6 +5137,14 @@ mod tests {
                 Ok(C::CustomPayload(p)) if p.channel == horizon_protocol::cubic::WINDOW_CHANNEL => {
                     let w = horizon_protocol::cubic::Window::decode(&p.data).unwrap();
                     out.push(Seen::Window(w.min_y, w.height));
+                }
+                Ok(C::CustomPayload(p)) if p.channel == horizon_protocol::cubic::CUBES_CHANNEL => {
+                    let c = horizon_protocol::cubic::Cubes::decode(&p.data).unwrap();
+                    out.push(Seen::Cubes(
+                        c.x,
+                        c.z,
+                        c.cubes.iter().map(|cube| cube.cy).collect(),
+                    ));
                 }
                 _ => {}
             }
@@ -4998,11 +5173,36 @@ mod tests {
         world
     }
 
+    /// A tick context over `world`, the player standing at `y`.
+    fn cubic_ctx<'a>(
+        world: &'a mut World,
+        next: &'a mut u32,
+        border: &'a crate::worldborder::WorldBorder,
+        y: f64,
+    ) -> TickCtx<'a> {
+        TickCtx {
+            world,
+            entities: &[],
+            next_entity: next,
+            spawn: [0.5, y, 0.5],
+            difficulty: 2,
+            difficulty_locked: false,
+            clock_rate: 1.0,
+            tick_rate: 20.0,
+            tick_frozen: false,
+            tick_steps: Default::default(),
+            collision: None,
+            border,
+            streaming: None,
+        }
+    }
+
     /// A player in a cubic level is told its window after the Login packet and before any
-    /// chunk; when the server moves the window it is told the new one and sent every chunk
-    /// again, nearest first.
+    /// chunk; when the server slides the window it is told the new one and sent only the
+    /// cubes that entered, for the columns it holds, nearest first, and the chunks are not
+    /// sent again.
     #[test]
-    fn a_cubic_levels_window_comes_before_its_chunks_and_again_when_it_moves() {
+    fn a_cubic_levels_window_comes_before_its_chunks_and_then_only_the_entering_cubes() {
         use crate::chunk::LevelShape;
         let (mut hub, rx) = hub_with_a_guest();
         let first = LevelShape::cubic_window(LevelShape::OVERWORLD, 1_000_000, 512);
@@ -5014,21 +5214,7 @@ mod tests {
         let mut world = cubic_world(first);
         let border = crate::worldborder::WorldBorder::default();
         let mut next = 100;
-        let mut ctx = TickCtx {
-            world: &mut world,
-            entities: &[],
-            next_entity: &mut next,
-            spawn: [0.5, 1_000_100.0, 0.5],
-            difficulty: 2,
-            difficulty_locked: false,
-            clock_rate: 1.0,
-            tick_rate: 20.0,
-            tick_frozen: false,
-            tick_steps: Default::default(),
-            collision: None,
-            border: &border,
-            streaming: None,
-        };
+        let mut ctx = cubic_ctx(&mut world, &mut next, &border, 1_000_100.0);
         hub.guests[0].position = [0.5, 1_000_100.0, 0.5];
         hub.place_new_player(1, &mut ctx);
         let mut stream = seen(&rx);
@@ -5056,23 +5242,13 @@ mod tests {
             !stream[2..].iter().any(|s| matches!(s, Seen::Window(..))),
             "one window, before the chunks"
         );
-        // The server swaps the level for one with a new window.
+        assert!(
+            !stream.iter().any(|s| matches!(s, Seen::Cubes(..))),
+            "no cubes before a slide"
+        );
+        // The server slides the window by 16 cubes (the same level, in place).
         let mut moved = cubic_world(second);
-        let ctx = TickCtx {
-            world: &mut moved,
-            entities: &[],
-            next_entity: &mut next,
-            spawn: [0.5, 1_000_100.0, 0.5],
-            difficulty: 2,
-            difficulty_locked: false,
-            clock_rate: 1.0,
-            tick_rate: 20.0,
-            tick_frozen: false,
-            tick_steps: Default::default(),
-            collision: None,
-            border: &border,
-            streaming: None,
-        };
+        let ctx = cubic_ctx(&mut moved, &mut next, &border, 1_000_100.0);
         hub.cubic_window_changed("minecraft:overworld", second);
         let mut again = seen(&rx);
         assert_eq!(again, vec![Seen::Window(1_000_256, 512)]);
@@ -5082,16 +5258,112 @@ mod tests {
             again.extend(seen(&rx));
             hub.guests[0].unacknowledged = 0;
         }
-        let resent: Vec<_> = again
+        assert!(
+            !again.iter().any(|s| matches!(s, Seen::Chunk(..))),
+            "the chunks are not sent again"
+        );
+        // Window 1 held cubes 62500..=62531, window 2 holds 62516..=62547: 62532..=62547
+        // entered, in every column the player holds.
+        let entering: Vec<i32> = (62_532..=62_547).collect();
+        let cubes: Vec<_> = again
             .iter()
             .filter_map(|s| match s {
-                Seen::Chunk(x, z) => Some((*x, *z)),
+                Seen::Cubes(x, z, cys) => Some((*x, *z, cys.clone())),
                 _ => None,
             })
             .collect();
-        assert_eq!(resent, chunks, "every chunk again, in the same order");
+        assert!(cubes.iter().all(|(_, _, cys)| *cys == entering));
+        let mut sent: Vec<_> = cubes.iter().map(|(x, z, _)| (*x, *z)).collect();
+        assert_eq!(sent[0], (0, 0), "nearest first");
+        let near = |&(x, z): &(i32, i32)| x * x + z * z;
+        assert!(
+            sent.windows(2).all(|w| near(&w[0]) <= near(&w[1])),
+            "by distance"
+        );
+        sent.sort_unstable();
+        let mut held = chunks.clone();
+        held.sort_unstable();
+        assert_eq!(sent, held, "a payload for every column the player holds");
         // The encoder follows the new window: its sections start at the new floor.
         assert_eq!(hub.encoder.window_min_y(), 1_000_256);
+        horizon_protocol::buf::set_wide_positions(false);
+    }
+
+    /// The window sliding by a layer sends the layer; sliding the other way sends the one
+    /// that entered there; a column whose light has not settled waits for it.
+    #[test]
+    fn entering_cubes_wait_for_light_and_follow_each_slide() {
+        use crate::chunk::LevelShape;
+        let (mut hub, rx) = hub_with_a_guest();
+        let first = LevelShape::cubic_window(LevelShape::OVERWORLD, 0, 304);
+        hub.cubic_window_changed("minecraft:overworld", first);
+        let _ = seen(&rx);
+        let mut world = cubic_world(first);
+        let border = crate::worldborder::WorldBorder::default();
+        let mut next = 100;
+        {
+            let mut ctx = cubic_ctx(&mut world, &mut next, &border, 100.0);
+            hub.guests[0].position = [0.5, 100.0, 0.5];
+            hub.place_new_player(1, &mut ctx);
+        }
+        let ctx = cubic_ctx(&mut world, &mut next, &border, 100.0);
+        for _ in 0..40 {
+            hub.ticks += 1;
+            hub.update_chunks(&ctx);
+            hub.guests[0].unacknowledged = 0;
+        }
+        let _ = seen(&rx);
+        let columns = hub.guests[0].sent_chunks.len();
+        assert!(columns > 20);
+        // Up one layer.
+        let up = LevelShape::cubic_window(LevelShape::OVERWORLD, 16, 304);
+        let mut slid = cubic_world(up);
+        slid.dirty_light.insert((0, 0));
+        let ctx = cubic_ctx(&mut slid, &mut next, &border, 100.0);
+        hub.cubic_window_changed("minecraft:overworld", up);
+        let mut stream = seen(&rx);
+        for _ in 0..60 {
+            hub.ticks += 1;
+            hub.update_chunks(&ctx);
+            stream.extend(seen(&rx));
+            hub.guests[0].unacknowledged = 0;
+        }
+        let cubes: Vec<_> = stream
+            .iter()
+            .filter_map(|s| match s {
+                Seen::Cubes(x, z, cys) => Some(((*x, *z), cys.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cubes.len(), columns - 1, "the unlit column waits");
+        assert!(
+            cubes
+                .iter()
+                .all(|(column, cys)| *column != (0, 0) && *cys == [19])
+        );
+        // Its light settles: the column's cubes follow.
+        slid.dirty_light.clear();
+        let ctx = cubic_ctx(&mut slid, &mut next, &border, 100.0);
+        hub.ticks += 1;
+        hub.update_chunks(&ctx);
+        assert_eq!(seen(&rx), vec![Seen::Cubes(0, 0, vec![19])]);
+        // Down two layers: the cubes that entered below, nearest the player first.
+        let down = LevelShape::cubic_window(LevelShape::OVERWORLD, -16, 304);
+        let mut slid = cubic_world(down);
+        let ctx = cubic_ctx(&mut slid, &mut next, &border, 100.0);
+        hub.cubic_window_changed("minecraft:overworld", down);
+        let mut stream = seen(&rx);
+        for _ in 0..60 {
+            hub.ticks += 1;
+            hub.update_chunks(&ctx);
+            stream.extend(seen(&rx));
+            hub.guests[0].unacknowledged = 0;
+        }
+        assert!(
+            stream
+                .iter()
+                .any(|s| matches!(s, Seen::Cubes(0, 0, cys) if *cys == [0, -1]))
+        );
         horizon_protocol::buf::set_wide_positions(false);
     }
 

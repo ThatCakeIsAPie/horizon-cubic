@@ -53,11 +53,12 @@ See `docs/cubic-chunks.md`, "v1 architecture". The code:
 | File | What it holds |
 |---|---|
 | `horizon-world/src/cubic/` | The cube range, `CubeStore` (`region3d/y<cy>/r.x.z.mca`), `CubeWindow`, `ColumnTops`, `generator.rs` (deep and sky) |
-| `horizon-client/src/cubic.rs` | `CubicLevel` (cube store with queued writes, clean hashes, parked entities, a streaming factory) and `CubicTerrain`, the `ChunkGenerator` around vanilla. A cube record is a vanilla chunk record holding one section |
-| `horizon-client/src/game/cubic.rs` | The window follows the first player, saving without waiting and keeping the generator (`renew_level_in_place`) |
+| `horizon-client/src/cubic.rs` | `CubicLevel` (cube store with queued writes, clean hashes, `ready_cube`, the window maths) and `CubicTerrain`, the `ChunkGenerator` around vanilla. A cube record is a vanilla chunk record holding one section |
+| `horizon-client/src/cubic_prefetch.rs` | The prefetch ring: the two layers beyond the window of every loaded column, ready in memory (one background thread) |
+| `horizon-client/src/game/cubic.rs` | The window slides in place by whole layers (`follow_cubic_window`, `slide_cubic_window`), driven by the players' Vertical Distance |
 | `horizon-client/src/cubic_lod.rs` | The far terrain's sampler |
 | `horizon-client-render/src/lod/cube.rs`, `lod/mesh.rs` (`mesh_cube`), `gfx/lod.rs` | The octree producer and renderer |
-| `horizon-protocol` (`buf.rs`, `cubic.rs`), `lan/hub.rs`, `game/remote*.rs` | Wide positions and the `horizon:cubic` / `horizon:cubic_window` payloads |
+| `horizon-protocol` (`buf.rs`, `cubic.rs`), `lan/hub.rs`, `game/remote*.rs` | Wide positions and the `horizon:cubic`, `horizon:cubic_window`, `horizon:cubic_view` and `horizon:cubes` payloads |
 
 How the far terrain's sampler builds nodes:
 - Levels 0 and 1 come from saved cubes, downsampled.
@@ -99,8 +100,9 @@ this machine's driver. clippy `-D warnings` and fmt are clean.
 
 ### Known gaps
 
-- **A window move reloads the nearby terrain.** Columns are cleared and sent again; the far
-  terrain stays drawn. It happens every ~130-250 blocks of vertical travel.
+- **A window slide relights every column.** The entering layers (and the ones beside them) are lit
+  by the whole-column light job (`dirty_light`), and the cubes wait for it before they are sent.
+  A finer, per-layer relight is later work.
 - **Single player only.**
   - The window follows the first player. LAN guests at other heights get that player's window.
   - A dedicated server has not been tried.
@@ -117,8 +119,7 @@ this machine's driver. clippy `-D warnings` and fmt are clean.
 
 ### Next
 
-1. **Shift loaded sections in place on a window move.** Remap `SectionKey` and keep the overlap,
-   on both the server and the client, so moving vertically doesn't reload.
+1. (Done on `cubic/slide`: the window slides in place, by whole layers, from the prefetch ring.)
 2. **Per-player windows on a server.** This needs true cube residency (phases 3-4 of
    `docs/cubic-chunks.md`).
 3. **POI and block ticks in cube records.**
