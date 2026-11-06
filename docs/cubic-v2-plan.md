@@ -66,7 +66,7 @@ v2 keeps a window per World, but makes it as small and as cheap to move as per-c
   - Each column's top comes from `ColumnTops`, which is persisted per column and covers unloaded cubes.
   - A cube above the top is uniform sky light 15.
   - Light spreads by BFS only inside loaded cubes.
-  - Adding a layer relights that layer and the layer next to it. Today a whole column is relit.
+  - Adding a layer relights that layer and the layer next to it (`light::relight_entering`); no column is relit whole.
 - **Simulation:**
   - Random ticks, block ticks and fluids run only in cubes within the simulation distance of a player, horizontally and vertically.
   - Entities are kept per cube (see storage) and unload with their cube.

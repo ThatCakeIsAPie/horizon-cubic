@@ -705,8 +705,24 @@ pub trait LightWorld {
     fn sky_covered(&self, _x: i32, _z: i32) -> bool {
         false
     }
+    /// `sky_covered` for the 256 block columns of chunk (cx, cz), a bit each
+    /// (`z << 4 | x`, as `Chunk::sky_covered`).
+    fn sky_covered_column(&self, cx: i32, cz: i32) -> [u64; 4] {
+        let mut bits = [0u64; 4];
+        for i in 0..256 {
+            if self.sky_covered(cx * 16 + (i & 15), cz * 16 + (i >> 4)) {
+                bits[i as usize / 64] |= 1 << (i % 64);
+            }
+        }
+        bits
+    }
 }
 impl<S: std::hash::BuildHasher> LightWorld for HashMap<(i32, i32), Arc<Chunk>, S> {
+    fn sky_covered_column(&self, cx: i32, cz: i32) -> [u64; 4] {
+        self.get(&(cx, cz))
+            .and_then(|c| c.sky_covered.as_deref().copied())
+            .unwrap_or([0; 4])
+    }
     fn layout(&self) -> ColumnLayout {
         self.values()
             .next()
@@ -1021,6 +1037,375 @@ pub fn relight(
     relight_region(&mut region, tables, sky_light, positions, force, changed);
     region.finish();
 }
+/// The light of the cubes a cubic level's window slid over, and of what they
+/// change in the kept cubes, without lighting any column whole.
+///
+/// `entering` are the section indexes (of the world's layout, which already
+/// holds the new window) of the layers that entered, in every column of
+/// `columns` (lit columns of the level, all moved together). Their blocks are
+/// in place; their light is whatever the fill left, and is replaced here:
+/// 1. **Sky.** A column's source runs down from the top of the window, unless
+///    `Chunk::sky_covered` says a known block is higher (`ColumnTops`), and
+///    from a kept cube above through its bottom face (a cell at 15 is a
+///    source, as in `lowest_sky_source`), until an occluded edge. A cube that
+///    is one block with an open column through it is `Light::Uniform(0xF0)`,
+///    and one with no sky and no emitter is `Uniform(0)`: no cell is visited.
+/// 2. **Block light** starts at the emitters in the entering cubes.
+/// 3. **Spread.** Increase-only passes (`increase_pass`, the one block edits
+///    use) run from the cells that are brighter than a neighbour by more than
+///    one: the entering cubes' own, found by comparing with their neighbours,
+///    and the kept cubes' faces beside them. Light goes on only where it
+///    increases, so the kept cubes change only next to the entering ones.
+///    A sky source that leaves the entering run into the kept cube below it
+///    (a column whose top block lets sky through) goes on down as one.
+///
+/// What leaves takes no work: the kept cubes beside a leaving layer keep the
+/// light that leaving cubes gave them, as at a window's edge (the next full
+/// light job of the column drops it). Light is never taken away, so a kept
+/// cell can only be brighter than a whole relight of the new window would
+/// leave it, by what the leaving cubes lit. Columns not lit are not read, as
+/// by `relight`.
+///
+/// Adds the cells whose light changed (entering and kept) to `changed`.
+pub fn relight_entering(
+    world: &mut impl LightWorld,
+    tables: &LightTables,
+    sky_light: bool,
+    columns: &[(i32, i32)],
+    entering: &[usize],
+    changed: &mut LightChanges,
+) {
+    let layout = world.layout();
+    let n = layout.sections();
+    let mut is_entering = vec![false; n];
+    for &s in entering.iter().filter(|&&s| s < n) {
+        is_entering[s] = true;
+    }
+    let entering: Vec<usize> = (0..n).filter(|&s| is_entering[s]).collect();
+    if entering.is_empty() {
+        return;
+    }
+    changed.keyed(layout);
+    // 1, 2: the entering sections' own light, top down in each column.
+    let mut sources_below: Vec<Pos> = Vec::new();
+    for &(cx, cz) in columns {
+        let covered = if sky_light {
+            world.sky_covered_column(cx, cz)
+        } else {
+            [u64::MAX; 4]
+        };
+        for &s in entering.iter().rev() {
+            let Some(section) = world.section(cx, s, cz).cloned() else {
+                continue;
+            };
+            let open = open_above(&*world, tables, n, (cx, s, cz), &section, &covered);
+            let light = entering_light(tables, &section, &open);
+            if s > 0
+                && !is_entering[s - 1]
+                && !matches!(open, Open::None)
+                && !matches!(light, Light::Uniform(v) if v >> 4 != 15)
+                && let Some(below) = world.section(cx, s - 1, cz)
+                && !matches!(below.light, Light::Uniform(v) if v >> 4 == 15)
+            {
+                // Sky sources that go on into the kept section below.
+                for i in 0..256 {
+                    let top = 15 << 8 | i;
+                    if light.get(i) >> 4 == 15
+                        && below.light.get(top) >> 4 != 15
+                        && !tables.edge_occluded(section.get(i) as usize, below.get(top) as usize)
+                    {
+                        sources_below.push((
+                            cx * 16 + (i & 15) as i32,
+                            layout.section_y(s),
+                            cz * 16 + (i >> 4) as i32,
+                        ));
+                    }
+                }
+            }
+            if !section.light.same_as(&light) {
+                world.set_section_light(cx, s, cz, light);
+            }
+        }
+    }
+    // 3: where light has to spread from.
+    let (mut sky_seeds, mut block_seeds) = (Vec::new(), Vec::new());
+    {
+        let world: &dyn LightWorld = &*world;
+        let mut seeds: Seeds = (&mut sky_seeds, &mut block_seeds);
+        for &(cx, cz) in columns {
+            for &s in &entering {
+                let Some(e) = world.section(cx, s, cz) else {
+                    continue;
+                };
+                if opaque_dark(tables, e) {
+                    continue;
+                }
+                let base = (cx * 16, layout.section_y(s), cz * 16);
+                if !matches!(e.light, Light::Uniform(_)) {
+                    interior_seeds(&e.light, base, &mut seeds);
+                }
+                for (d, (ox, oy, oz)) in OFFSETS.iter().enumerate() {
+                    let Some(ns) = s.checked_add_signed(*oy as isize).filter(|&ns| ns < n) else {
+                        continue;
+                    };
+                    let Some(other) = world.section(cx + ox, ns, cz + oz) else {
+                        continue;
+                    };
+                    face_seeds(tables, e, other, d, base, &mut seeds);
+                    if !is_entering[ns] {
+                        let beside = (base.0 + ox * 16, base.1 + oy * 16, base.2 + oz * 16);
+                        face_seeds(tables, other, e, d ^ 1, beside, &mut seeds);
+                    }
+                }
+            }
+        }
+    }
+    if !sky_light {
+        sky_seeds.clear();
+    }
+    let mut region = Region::new(world);
+    let mut sky_queue: VecDeque<Pos> = sky_seeds.into();
+    for p in sources_below {
+        extend_sky_source(&mut region, tables, p, &mut sky_queue, changed);
+    }
+    crate::spans::time("lt_slide_sky", || {
+        increase_pass(&mut region, tables, true, sky_queue, changed)
+    });
+    crate::spans::time("lt_slide_block", || {
+        increase_pass(&mut region, tables, false, block_seeds.into(), changed)
+    });
+    region.finish();
+}
+/// Which of a section's 256 block columns have a sky source in the cell
+/// above its top (see [`relight_entering`]).
+enum Open {
+    None,
+    All,
+    Some(Box<[bool; 256]>),
+}
+/// The one state of a section of one block.
+fn uniform_state(section: &Section) -> Option<u32> {
+    (section.blocks.bits() == 0).then(|| section.get(0))
+}
+/// A section of one block no light enters or leaves, with no light of its
+/// own (stone, say).
+fn opaque_dark(tables: &LightTables, section: &Section) -> bool {
+    matches!(section.light, Light::Uniform(0))
+        && uniform_state(section).is_some_and(|s| tables.cells[s as usize].dampening >= 15)
+}
+/// `Open` for section `s` of a column: from the window's top (a column that
+/// is not covered), else from the section above, whose bottom cells at sky
+/// 15 are sources that go on while the edge between the blocks lets them.
+fn open_above(
+    world: &dyn LightWorld,
+    tables: &LightTables,
+    sections: usize,
+    (cx, s, cz): (i32, usize, i32),
+    this: &Section,
+    covered: &[u64; 4],
+) -> Open {
+    if s + 1 == sections {
+        let covered_count: u32 = covered.iter().map(|w| w.count_ones()).sum();
+        return match covered_count {
+            256 => Open::None,
+            0 => Open::All,
+            _ => Open::Some(Box::new(std::array::from_fn(|i| {
+                covered[i / 64] >> (i % 64) & 1 == 0
+            }))),
+        };
+    }
+    let Some(above) = world.section(cx, s + 1, cz) else {
+        return Open::None;
+    };
+    let uniform_sky = match above.light {
+        Light::Uniform(v) => Some(v >> 4),
+        _ => None,
+    };
+    if uniform_sky.is_some_and(|sky| sky != 15) {
+        return Open::None;
+    }
+    if uniform_sky == Some(15)
+        && let (Some(a), Some(b)) = (uniform_state(above), uniform_state(this))
+    {
+        return if tables.edge_occluded(a as usize, b as usize) {
+            Open::None
+        } else {
+            Open::All
+        };
+    }
+    let mut open = Box::new([false; 256]);
+    let mut any = false;
+    for i in 0..256 {
+        if above.light.get(i) >> 4 == 15
+            && !tables.edge_occluded(above.get(i) as usize, this.get(15 << 8 | i) as usize)
+        {
+            open[i] = true;
+            any = true;
+        }
+    }
+    if any { Open::Some(open) } else { Open::None }
+}
+/// The light an entering section starts with: its sky sources and its
+/// emitters, nothing spread yet.
+fn entering_light(tables: &LightTables, section: &Section, open: &Open) -> Light {
+    if let Some(state) = uniform_state(section) {
+        let emission = tables.cells[state as usize].emission;
+        match open {
+            Open::None => return Light::Uniform(emission),
+            Open::All if !tables.edge_occluded(state as usize, state as usize) => {
+                return Light::Uniform(0xF0 | emission);
+            }
+            _ => {}
+        }
+    }
+    let mut ids = [0u32; 4096];
+    section.unpack(&mut ids);
+    let mut data = Box::new([0u8; 4096]);
+    for i in 0..256 {
+        let mut source = match open {
+            Open::None => false,
+            Open::All => true,
+            Open::Some(columns) => columns[i],
+        };
+        for ly in (0..16).rev() {
+            let at = ly << 8 | i;
+            let state = ids[at] as usize;
+            data[at] = tables.cells[state].emission | if source { 0xF0 } else { 0 };
+            if source && ly > 0 {
+                source = !tables.edge_occluded(state, ids[at - 256] as usize);
+            }
+        }
+    }
+    Light::packed(data)
+}
+type Seeds<'a> = (&'a mut Vec<Pos>, &'a mut Vec<Pos>);
+/// The cell of a section whose lowest corner is `base`, by index.
+fn cell_pos(base: Pos, i: usize) -> Pos {
+    (
+        base.0 + (i & 15) as i32,
+        base.1 + (i >> 8) as i32,
+        base.2 + (i >> 4 & 15) as i32,
+    )
+}
+/// The cells of a section's face in direction `d` (`OFFSETS`' order) and the
+/// cells of the neighbour's face across it, by index, for `t` in 0..256.
+fn face_index(d: usize, t: usize) -> (usize, usize) {
+    let (u, v) = (t & 15, t >> 4);
+    match d {
+        0 => (t, 15 << 8 | t),
+        1 => (15 << 8 | t, t),
+        2 => (v << 8 | u, v << 8 | 15 << 4 | u),
+        3 => (v << 8 | 15 << 4 | u, v << 8 | u),
+        4 => (v << 8 | u << 4, v << 8 | u << 4 | 15),
+        _ => (v << 8 | u << 4 | 15, v << 8 | u << 4),
+    }
+}
+/// The cells of `light` that are brighter than a neighbour in the section by
+/// more than one (sky and block light apart): light has to spread from them.
+fn interior_seeds(light: &Light, base: Pos, (sky, block): &mut Seeds) {
+    let cells = light.to_array();
+    for (i, &v) in cells.iter().enumerate() {
+        let (s, k) = (v >> 4, v & 15);
+        if s <= 1 && k <= 1 {
+            continue;
+        }
+        let (x, y, z) = (i & 15, i >> 8, i >> 4 & 15);
+        let (mut dark_sky, mut dark_block) = (false, false);
+        for (inside, j) in [
+            (x > 0, i.wrapping_sub(1)),
+            (x < 15, i + 1),
+            (z > 0, i.wrapping_sub(16)),
+            (z < 15, i + 16),
+            (y > 0, i.wrapping_sub(256)),
+            (y < 15, i + 256),
+        ] {
+            if inside {
+                let w = cells[j];
+                dark_sky |= s > (w >> 4) + 1;
+                dark_block |= k > (w & 15) + 1;
+            }
+        }
+        if dark_sky {
+            sky.push(cell_pos(base, i));
+        }
+        if dark_block {
+            block.push(cell_pos(base, i));
+        }
+    }
+}
+/// The cells of `a`'s face in direction `d` (`a`'s lowest corner at `base`)
+/// that could brighten the cell of `b` across it: lit more than one above it
+/// even after the block's dampening.
+fn face_seeds(
+    tables: &LightTables,
+    a: &Section,
+    b: &Section,
+    d: usize,
+    base: Pos,
+    (sky, block): &mut Seeds,
+) {
+    let uniform = |section: &Section| matches!(section.light, Light::Uniform(_));
+    let damp_of = |state: u32| tables.cells[state as usize].dampening.max(1);
+    if uniform(a) && uniform(b) {
+        let (la, lb) = (a.light.get(0), b.light.get(0));
+        let damp = uniform_state(b).map_or(1, damp_of);
+        let (spreads_sky, spreads_block) = (
+            (la >> 4).saturating_sub(damp) > lb >> 4,
+            (la & 15).saturating_sub(damp) > lb & 15,
+        );
+        if spreads_sky || spreads_block {
+            for t in 0..256 {
+                let p = cell_pos(base, face_index(d, t).0);
+                if spreads_sky {
+                    sky.push(p);
+                }
+                if spreads_block {
+                    block.push(p);
+                }
+            }
+        }
+        return;
+    }
+    for t in 0..256 {
+        let (ia, ib) = face_index(d, t);
+        let (la, lb) = (a.light.get(ia), b.light.get(ib));
+        if la >> 4 <= 1 && la & 15 <= 1 {
+            continue;
+        }
+        let damp = damp_of(b.get(ib));
+        if (la >> 4).saturating_sub(damp) > lb >> 4 {
+            sky.push(cell_pos(base, ia));
+        }
+        if (la & 15).saturating_sub(damp) > lb & 15 {
+            block.push(cell_pos(base, ia));
+        }
+    }
+}
+/// A sky source that came out of the bottom of the entering cubes at `from`
+/// (the cell it stands on) goes on down the kept cubes below, at 15, until an
+/// occluded edge or a cell already at 15 (a source already).
+fn extend_sky_source(
+    world: &mut Region,
+    tables: &LightTables,
+    (x, from, z): Pos,
+    queue: &mut VecDeque<Pos>,
+    changed: &mut LightChanges,
+) {
+    let Some(mut above) = world.state(x, from, z) else {
+        return;
+    };
+    let mut y = from - 1;
+    while let Some((state, packed)) = world.cell(x, y, z) {
+        if tables.edge_occluded(above as usize, state as usize) || packed >> 4 == 15 {
+            break;
+        }
+        set_level(world, true, (x, y, z), 15);
+        changed.push((x, y, z));
+        queue.push_back((x, y, z));
+        above = state;
+        y -= 1;
+    }
+}
 /// The columns `changed` touched that border a loaded column not lit yet
 /// (`unlit`). `relight` reads and writes only lit columns, so an edit's
 /// darkening can take away light such a neighbour sends in and never put it
@@ -1161,6 +1546,19 @@ fn relight_layer(
             }
         }
     });
+    increase_pass(world, tables, sky, increase, changed);
+}
+/// The increase half of vanilla's `runLightUpdates`: from the cells in
+/// `increase`, light spreads into every neighbour it would brighten, and on
+/// from there, never darkening anything. Shared by the block edits above and
+/// by a window's slide ([`relight_entering`]).
+fn increase_pass(
+    world: &mut Region,
+    tables: &LightTables,
+    sky: bool,
+    mut increase: VecDeque<Pos>,
+    changed: &mut LightChanges,
+) {
     while let Some(p) = increase.pop_front() {
         let Some((from, packed)) = world.cell(p.0, p.1, p.2) else {
             continue;
@@ -2328,6 +2726,331 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // A window's slide (`relight_entering`): the entering cubes are lit, and
+    // what spreads out of them into the kept cubes, as a whole relight of the
+    // new window would leave it.
+    type Lit = HashMap<(i32, i32), Arc<Chunk>>;
+    /// Chunks (-1..=1)^2 of `layout`, their blocks from `f` (world x, y, z).
+    fn cubic_chunks(
+        layout: ColumnLayout,
+        f: &dyn Fn(i32, i32, i32) -> u32,
+    ) -> HashMap<(i32, i32), Chunk> {
+        let mut chunks = HashMap::new();
+        for cz in -1..=1 {
+            for cx in -1..=1 {
+                let mut c = Chunk::with_layout(cx, cz, layout);
+                for y in layout.min_y()..layout.max_y() {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            let v = f(cx * 16 + x, y, cz * 16 + z);
+                            if v != AIR {
+                                c.set(x, y, z, v);
+                            }
+                        }
+                    }
+                }
+                // A block known above the window cuts the column's sky off.
+                let mut covered = [0u64; 4];
+                for z in 0..16 {
+                    for x in 0..16 {
+                        if (layout.max_y()..160).any(|y| f(cx * 16 + x, y, cz * 16 + z) != AIR) {
+                            let i = (z << 4 | x) as usize;
+                            covered[i / 64] |= 1 << (i % 64);
+                        }
+                    }
+                }
+                c.sky_covered = covered.iter().any(|&b| b != 0).then(|| Arc::new(covered));
+                chunks.insert((cx, cz), c);
+            }
+        }
+        chunks
+    }
+    /// Every chunk lit whole, by its 3x3.
+    fn light_all(chunks: &HashMap<(i32, i32), Chunk>) -> Lit {
+        let t = tables();
+        chunks
+            .keys()
+            .map(|&(x, z)| {
+                let region: [[Option<&Chunk>; 3]; 3] = std::array::from_fn(|dz| {
+                    std::array::from_fn(|dx| chunks.get(&(x + dx as i32 - 1, z + dz as i32 - 1)))
+                });
+                let mut c = chunks[&(x, z)].clone();
+                apply_lighting(&mut c, light_chunk(&region, &t, true));
+                c.lit = true;
+                ((x, z), Arc::new(c))
+            })
+            .collect()
+    }
+    /// A world lit in window `from`, slid to window `to` and lit by
+    /// `relight_entering` (entering sections start dark), and the same world
+    /// lit whole in `to`.
+    fn slid(from: ColumnLayout, to: ColumnLayout, f: &dyn Fn(i32, i32, i32) -> u32) -> (Lit, Lit) {
+        let mut slid = light_all(&cubic_chunks(from, f));
+        let target = cubic_chunks(to, f);
+        let (low, high) = (
+            from.min_y() >> 4,
+            (from.min_y() >> 4) + from.sections() as i32,
+        );
+        let entering: Vec<usize> = (0..to.sections())
+            .filter(|&i| !(low..high).contains(&((to.min_y() >> 4) + i as i32)))
+            .collect();
+        for (key, chunk) in slid.iter_mut() {
+            let fresh = &target[key];
+            Arc::make_mut(chunk).sky_covered = fresh.sky_covered.clone();
+            Arc::make_mut(chunk).relayout(to, |sy| {
+                let mut section = (*fresh.sections[(sy - (to.min_y() >> 4)) as usize]).clone();
+                section.light = Light::Uniform(0);
+                Arc::new(section)
+            });
+        }
+        let columns: Vec<_> = slid.keys().copied().collect();
+        let mut changed = LightChanges::default();
+        relight_entering(
+            &mut slid,
+            &tables(),
+            true,
+            &columns,
+            &entering,
+            &mut changed,
+        );
+        (slid, light_all(&target))
+    }
+    fn assert_same_light(slid: &Lit, whole: &Lit) {
+        for (key, a) in slid {
+            let b = &whole[key];
+            for y in a.min_y()..a.max_y() {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let (l, w) = (a.light(x, y, z), b.light(x, y, z));
+                        assert_eq!(
+                            l,
+                            w,
+                            "chunk {key:?} cell ({x}, {y}, {z}): slid sky {} block {}, whole sky {} block {}",
+                            l >> 4,
+                            l & 15,
+                            w >> 4,
+                            w & 15
+                        );
+                    }
+                }
+            }
+        }
+    }
+    /// A hollow box of stone from (x0, y0, z0) to (x1, y1, z1), `inside` its air.
+    fn in_shell(
+        (x, y, z): (i32, i32, i32),
+        (x0, y0, z0): (i32, i32, i32),
+        (x1, y1, z1): (i32, i32, i32),
+    ) -> Option<bool> {
+        let within = (x0..=x1).contains(&x) && (y0..=y1).contains(&y) && (z0..=z1).contains(&z);
+        within.then_some(x > x0 && x < x1 && y > y0 && y < y1 && z > z0 && z < z1)
+    }
+    /// Stone below y 36, a closed room across the old window's top (a torch in
+    /// it), a slab above, and a sealed cave in the entering cubes.
+    fn up_world(x: i32, y: i32, z: i32) -> u32 {
+        if y < 36 {
+            return STONE;
+        }
+        if let Some(inside) = in_shell((x, y, z), (4, 59, 4), (12, 73, 12)) {
+            return if !inside {
+                STONE
+            } else if (x, y, z) == (8, 66, 8) {
+                TORCH
+            } else {
+                AIR
+            };
+        }
+        if let Some(inside) = in_shell((x, y, z), (20, 68, 2), (28, 76, 10)) {
+            return if inside { AIR } else { STONE };
+        }
+        if y == 80 && (18..30).contains(&x) && (-10..2).contains(&z) {
+            return SLAB;
+        }
+        if y == 84 && (-6..6).contains(&x) && (14..24).contains(&z) {
+            return STONE;
+        }
+        AIR
+    }
+    #[test]
+    fn a_slide_up_lights_like_a_whole_relight() {
+        let (slid, whole) = slid(
+            ColumnLayout::window(0, 64),
+            ColumnLayout::window(32, 64),
+            &up_world,
+        );
+        assert_same_light(&slid, &whole);
+    }
+    #[test]
+    fn a_torch_in_an_entering_cube_lights_the_kept_boundary() {
+        let (slid, _) = slid(
+            ColumnLayout::window(0, 64),
+            ColumnLayout::window(32, 64),
+            &up_world,
+        );
+        // The torch at y 66 is in the entering cube (64..80); y 63 is kept.
+        assert_eq!(block(&slid, 8, 66, 8), 14);
+        assert_eq!(block(&slid, 8, 63, 8), 11, "three blocks below the torch");
+        assert_eq!(block(&slid, 8, 60, 8), 8, "and on down the kept cube");
+    }
+    #[test]
+    fn a_sealed_cave_entering_stays_dark() {
+        let (slid, whole) = slid(
+            ColumnLayout::window(0, 64),
+            ColumnLayout::window(32, 64),
+            &up_world,
+        );
+        for (x, y, z) in [(24, 72, 6), (22, 70, 4), (26, 74, 8)] {
+            assert_eq!(slid[&(x >> 4, z >> 4)].light(x & 15, y, z & 15), 0);
+            assert_eq!(whole[&(x >> 4, z >> 4)].light(x & 15, y, z & 15), 0);
+        }
+    }
+    #[test]
+    fn cubes_above_the_top_are_uniform_sky_light() {
+        // Stone to y 20 and nothing above: the entering cubes (64..96) are
+        // open air in every column, one value, and nothing was visited.
+        let ground = |_: i32, y: i32, _: i32| if y < 20 { STONE } else { AIR };
+        let (slid, whole) = slid(
+            ColumnLayout::window(0, 64),
+            ColumnLayout::window(32, 64),
+            &ground,
+        );
+        for chunk in slid.values() {
+            for s in [2, 3] {
+                assert!(matches!(chunk.sections[s].light, Light::Uniform(0xF0)));
+            }
+        }
+        assert_same_light(&slid, &whole);
+    }
+    #[test]
+    fn stone_entering_below_takes_no_light() {
+        let ground = |_: i32, y: i32, _: i32| if y < 40 { STONE } else { AIR };
+        let (slid, whole) = slid(
+            ColumnLayout::window(32, 64),
+            ColumnLayout::window(0, 64),
+            &ground,
+        );
+        for chunk in slid.values() {
+            for s in [0, 1] {
+                assert!(matches!(chunk.sections[s].light, Light::Uniform(0)));
+            }
+        }
+        assert_same_light(&slid, &whole);
+    }
+    /// Ground to y 48 with a shaft open to the sky and a tunnel under it,
+    /// torches in the tunnel and the shaft: sky and torch light cross the
+    /// kept and entering cubes both ways.
+    fn down_world(x: i32, y: i32, z: i32) -> u32 {
+        if (x, y, z) == (7, 30, 7) {
+            return TORCH;
+        }
+        if y < 48 {
+            let shaft = (6..10).contains(&x) && (6..10).contains(&z);
+            let tunnel = (20..24).contains(&y) && (6..10).contains(&z) && (6..30).contains(&x);
+            if shaft || tunnel {
+                return AIR;
+            }
+            return STONE;
+        }
+        AIR
+    }
+    #[test]
+    fn a_slide_down_lights_like_a_whole_relight() {
+        let (slid, whole) = slid(
+            ColumnLayout::window(32, 64),
+            ColumnLayout::window(0, 64),
+            &down_world,
+        );
+        assert_same_light(&slid, &whole);
+        // The shaft's sky came down through the kept cube into the entering ones.
+        assert_eq!(sky(&slid, 7, 40, 7), 15);
+        assert_eq!(sky(&slid, 7, 10, 7), 15);
+        assert_eq!(block(&slid, 7, 32, 7), 12, "the torch lights the kept cube");
+    }
+    #[test]
+    fn slides_of_one_and_two_layers_up_light_like_whole_relights() {
+        for (from, to) in [(0, 32), (0, 16), (16, 48)] {
+            let (slid, whole) = slid(
+                ColumnLayout::window(from, 64),
+                ColumnLayout::window(to, 64),
+                &|x, y, z| if y < 24 { STONE } else { up_world(x, y - 8, z) },
+            );
+            assert_same_light(&slid, &whole);
+        }
+    }
+    /// What it costs: two entering layers over 4,096 columns, going up through
+    /// open air (one value per cube) and down through rock with a few pockets
+    /// of air (no sky or light in any). Run by hand: `cargo test -p
+    /// horizon-client-render --release slide_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn slide_cost() {
+        let ground = |y: i32| if y < 100 { STONE } else { AIR };
+        let rock = |x: i32, y: i32, z: i32| {
+            if y < 0 && (x * 7 + z * 13 + y).rem_euclid(97) < 3 {
+                AIR
+            } else {
+                ground(y)
+            }
+        };
+        let from = ColumnLayout::window(0, 256);
+        let mut template = Chunk::with_layout(0, 0, from);
+        for y in from.min_y()..from.max_y() {
+            if ground(y) != AIR {
+                for i in 0..256 {
+                    template.set(i & 15, y, i >> 4, STONE);
+                }
+            }
+        }
+        template.lit = true;
+        let side = 64;
+        for (to, entering) in [
+            (ColumnLayout::window(32, 256), [14, 15]),
+            (ColumnLayout::window(-32, 256), [0, 1]),
+        ] {
+            let mut chunks: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
+            for cz in 0..side {
+                for cx in 0..side {
+                    let mut c = template.clone();
+                    (c.x, c.z) = (cx, cz);
+                    chunks.insert((cx, cz), Arc::new(c));
+                }
+            }
+            let columns: Vec<_> = chunks.keys().copied().collect();
+            for (&(cx, cz), chunk) in chunks.iter_mut() {
+                Arc::make_mut(chunk).relayout(to, |sy| {
+                    let mut section = Section::default();
+                    for i in 0..4096 {
+                        let v = rock(
+                            cx * 16 + (i & 15) as i32,
+                            sy * 16 + (i >> 8) as i32,
+                            cz * 16 + (i >> 4 & 15) as i32,
+                        );
+                        if v != AIR {
+                            section.set(i, v);
+                        }
+                    }
+                    Arc::new(section)
+                });
+            }
+            let started = std::time::Instant::now();
+            let mut changed = LightChanges::default();
+            relight_entering(
+                &mut chunks,
+                &tables(),
+                true,
+                &columns,
+                &entering,
+                &mut changed,
+            );
+            eprintln!(
+                "{} columns x 2 layers, window to {}: {:?}",
+                columns.len(),
+                to.min_y(),
+                started.elapsed()
+            );
         }
     }
 }
