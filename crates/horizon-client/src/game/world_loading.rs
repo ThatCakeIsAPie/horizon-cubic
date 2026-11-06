@@ -218,6 +218,11 @@ impl WorldRequest {
         if created {
             level.allow_commands.get_or_insert(creative);
         }
+        // A cubic world (`--cubic`, or Create World's choice): its Overworld
+        // is unbounded (docs/cubic-chunks.md).
+        if created && (options.cubic || create.is_some_and(|o| o.cubic)) {
+            horizon_client::cubic::mark_cubic_world(&save_root)?;
+        }
         if let Some(d) = &options.dimension {
             level.dimension = d.clone();
             level.position = None;
@@ -622,7 +627,7 @@ pub(super) fn level_shapes(
         .collect();
     let mut shapes = LevelShapes::VANILLA;
     if enabled.is_empty() {
-        return shapes;
+        return horizon_client::cubic::cubic_shapes(world_root, shapes);
     }
     // What the packs leave out is logged when the generator reads them.
     let (overrides, _) =
@@ -650,7 +655,7 @@ pub(super) fn level_shapes(
             ),
         }
     }
-    shapes
+    horizon_client::cubic::cubic_shapes(world_root, shapes)
 }
 
 pub(super) fn make_streaming(
@@ -664,9 +669,15 @@ pub(super) fn make_streaming(
     seed: i64,
     enabled_features: &[String],
 ) -> Result<(Streaming, Arc<SaveDir>, Option<Arc<VanillaTerrain>>)> {
+    // A cubic level's proto chunks and vanilla records keep vanilla's
+    // column; its columns are saved as cubes (`SaveDir::cubic`).
     let save = Arc::new(SaveDir::new(
         horizon_client::save::dimension_dir(world_root, dim.id()),
-        shape,
+        if shape.cubic {
+            horizon_client::chunk::LevelShape::OVERWORLD
+        } else {
+            shape
+        },
     ));
     if dim == Dim::End {
         // Migrate before any chunk reader can cache the old block entities. A side file it
@@ -854,16 +865,33 @@ pub(super) fn make_streaming(
             }));
         }
         locator = Some(inner.clone());
-        Streaming::new(
-            Arc::new(Persistent {
-                inner,
-                save: save.clone(),
-                registry: pack.assets.clone(),
-                biomes: biomes.clone(),
-            }),
-            pack.context_with(biomes.clone()),
-            res.threads(),
-        )
+        let persistent = Arc::new(Persistent {
+            inner,
+            save: save.clone(),
+            registry: pack.assets.clone(),
+            biomes: biomes.clone(),
+        });
+        if shape.cubic {
+            // A cubic level: its window's columns from cubes (docs/cubic-chunks.md).
+            let level = horizon_client::cubic::CubicLevel::new(
+                &save.root,
+                seed,
+                pack.assets.registry,
+                &biomes,
+                shape,
+            )?;
+            let _ = save.cubic.set(level.clone());
+            Streaming::new(
+                Arc::new(horizon_client::cubic::CubicTerrain {
+                    inner: persistent,
+                    level,
+                }),
+                pack.context_with(biomes.clone()),
+                res.threads(),
+            )
+        } else {
+            Streaming::new(persistent, pack.context_with(biomes.clone()), res.threads())
+        }
     };
     streaming.forced = save.load_forced_chunks();
     streaming.radius = settings.render_distance;

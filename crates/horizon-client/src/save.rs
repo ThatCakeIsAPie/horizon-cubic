@@ -2408,6 +2408,9 @@ pub struct SaveDir {
     pub tables: OnceLock<Arc<SaveTables>>,
     /// The dimension's skylight and height, from its folder name.
     pub shape: LevelShape,
+    /// A cubic level's cubes (docs/cubic-chunks.md): its columns are saved
+    /// as cubes there, and its entities outside the window kept.
+    pub cubic: OnceLock<Arc<crate::cubic::CubicLevel>>,
     /// Which chunks each region file holds, for far terrain (`lod_saved`).
     lod_regions: Mutex<crate::fast_hash::FxHashMap<(i32, i32), LodRegion>>,
     /// Saved chunks decoded for far terrain, shared by its sampling threads
@@ -2504,6 +2507,7 @@ impl SaveDir {
             outstanding: Default::default(),
             tables: OnceLock::new(),
             shape,
+            cubic: OnceLock::new(),
             lod_regions: Default::default(),
             lod_decoded: Default::default(),
             datafix_context: OnceLock::new(),
@@ -2926,10 +2930,14 @@ impl SaveDir {
     pub fn save(
         &self,
         chunks: &[Arc<Chunk>],
-        registry: &BlockRegistry,
+        registry: &'static BlockRegistry,
         biomes: &Biomes,
     ) -> Result<usize> {
         let tables = self.tables.get().map(|t| &**t);
+        if let Some(cubic) = self.cubic.get() {
+            cubic.save_columns(chunks, registry, biomes, tables, true);
+            return Ok(chunks.len());
+        }
         let records = chunks
             .iter()
             .map(|c| {
@@ -2961,6 +2969,11 @@ impl SaveDir {
         registry: &'static BlockRegistry,
         biomes: &Arc<Biomes>,
     ) -> Result<usize> {
+        if let Some(cubic) = self.cubic.get() {
+            let tables = self.tables.get().map(|t| &**t);
+            cubic.save_columns(chunks, registry, biomes, tables, false);
+            return Ok(chunks.len());
+        }
         let encoding = Arc::new(Encoding {
             registry,
             biomes: biomes.clone(),
@@ -2984,6 +2997,14 @@ impl SaveDir {
         self.write_entities(chunks, false)
     }
     fn write_entities(&self, chunks: Vec<((i32, i32), Vec<Tag>)>, wait: bool) -> Result<()> {
+        // A cubic level keeps each column's entities outside the window.
+        let chunks: Vec<_> = match self.cubic.get() {
+            Some(cubic) => chunks
+                .into_iter()
+                .map(|((x, z), e)| ((x, z), cubic.with_parked(x, z, e)))
+                .collect(),
+            None => chunks,
+        };
         let records = chunks
             .into_iter()
             .map(|((x, z), entities)| {

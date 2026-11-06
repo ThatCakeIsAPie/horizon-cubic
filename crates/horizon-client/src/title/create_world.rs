@@ -46,6 +46,8 @@ pub struct WorldOptions {
     /// The folder of packs for the new world (vanilla's `mcworld-`
     /// temporary folder), made when Data Packs first opens.
     pub pack_dir: Option<std::path::PathBuf>,
+    /// Cubic Chunks: the Overworld has no height limit (docs/cubic-chunks.md).
+    pub cubic: bool,
 }
 impl Default for WorldOptions {
     fn default() -> Self {
@@ -62,6 +64,7 @@ impl Default for WorldOptions {
             rules: crate::gamerules::GameRules::default(),
             data_packs: vec!["vanilla".into()],
             pack_dir: None,
+            cubic: false,
         }
     }
 }
@@ -91,6 +94,7 @@ impl WorldOptions {
             rules: crate::gamerules::GameRules::load_with_features(dir, &level.enabled_features),
             data_packs,
             pack_dir,
+            cubic: crate::cubic::is_cubic_world(dir),
             ..Self::default()
         }
     }

@@ -499,6 +499,8 @@ struct Options {
     distance_override: Option<i32>,
     seed: i64,
     creative: bool,
+    /// `--cubic`: a world `--world` creates is cubic (docs/cubic-chunks.md).
+    cubic: bool,
     test_terrain: bool,
     /// `--pregen`: enable the command even when the saved Extras switch is off.
     pregen: bool,
@@ -667,6 +669,7 @@ impl Options {
             distance_override: None,
             seed: 0,
             creative: false,
+            cubic: false,
             test_terrain: false,
             pregen: false,
             frames: None,
@@ -726,6 +729,8 @@ impl Options {
                     break;
                 }
                 "--creative" => o.creative = true,
+                // A new world made with --world is cubic (docs/cubic-chunks.md).
+                "--cubic" => o.cubic = true,
                 "--test-terrain" => o.test_terrain = true,
                 "--no-pause" => o.no_pause = true,
                 "--offscreen" => o.offscreen = true,
