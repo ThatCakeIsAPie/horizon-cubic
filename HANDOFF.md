@@ -1,4 +1,4 @@
-# Handoff: Horizon Cubic (2026-11-05)
+# Handoff: Horizon Cubic (2026-11-06)
 
 **ThatCakeIsAPie/horizon-cubic** is the Cubic Chunks fork of the fork:
 
@@ -17,7 +17,7 @@ To take in TTM's and upstream's changes:
   `upstream/main`.
 - Keep this file and `docs/cubic-chunks.md` as this repo has them.
 
-The port's plan and progress are in `docs/cubic-chunks.md`.
+The port's plan and progress are in `docs/cubic-v2-plan.md`; `docs/cubic-chunks.md` has the v1 design notes.
 
 This history starts from horizon-ttm's `merge/upstream-2026-11-05`: TTM brought up to upstream
 `c4e4800d4` on 2026-11-05. The rest of this file is that sync's handoff. The previous TTM handoff
@@ -25,111 +25,76 @@ is `git show 58fc487fa:HANDOFF.md`.
 
 ## Prompt for the next agent
 
-> Pick up `main` of ThatCakeIsAPie/horizon-cubic. Read `HANDOFF.md`, then `docs/cubic-chunks.md`
-> ("v1 architecture"). Cubic Chunks v1 is playable in single player. Next is the "Next" list
-> below, starting with keeping loaded sections across a window move instead of reloading them.
-> Test in the real game with `horizon-ctl` as described under "How it was tested". Ask me
-> before pushing. Follow AGENTS.md.
+> Pick up `main` of ThatCakeIsAPie/horizon-cubic. Read `HANDOFF.md`, then `docs/cubic-v2-plan.md`,
+> which is the plan, the budgets and what is done. Cubic Chunks v2 is playable in single player.
+> The owner's order is speed first, then detail. Next:
+> 1. Shorten far-terrain fill time (`tools/cubic_far_bench.py` is the metric), then run autoresearch loops on it.
+> 2. Vertical shards for multiplayer.
+> 3. Vanilla-to-cubic conversion.
+> Follow AGENTS.md. Run tests once after a batch of changes, not after each one.
 
-## Cubic Chunks v1 (2026-11-05)
+## Cubic Chunks v2 (2026-11-06)
 
 ### How to play
 
-- **Folder:** `E:\Horizon Cubic` holds `play.bat`, a README and this build's binaries, built
-  with `--profile fast`. `play.bat` uses the Horizon launcher's prepared resources.
-- **New world:** Create New World, then on the World tab turn **Cubic Chunks** ON. Or run
-  `play.bat --world NAME --cubic [--creative] [--seed N]`.
-- **What a cubic world is:**
-  - Vanilla terrain between −64 and 320, with no bedrock floor.
-  - Below that, deepslate caves with ores, lava, geodes and obsidian pockets.
-  - Above, open sky with floating islands in bands every 1000 blocks from 600.
-  - The range is ±8.4 M blocks.
-  - The cube octree draws the far terrain.
+- **Folder:** `E:\Horizon Cubic` holds `play.bat`, `README.txt` and this build's binaries
+  (`--profile fast`).
+- **Create a world:** Create New World › World tab › Cubic Chunks: Custom Cubic, Hybrid or
+  Flat Cubic. Customize… opens CubicWorldGen's five pages and the Presets JSON box.
+  `--world NAME --cubic` makes a Custom world.
+- **Settings:** Video Settings › Distance has Vertical Distance (cubes), LOD Distance (top step
+  Whole World) and Far Terrain on GPU.
+- **F3:** shows `Cubic:` and `Far:` lines.
 
-### How it works
+### What v2 is
 
-See `docs/cubic-chunks.md`, "v1 architecture". The code:
+The plan is `docs/cubic-v2-plan.md`. The parts, and the branches they came from (merged):
 
-| File | What it holds |
+| Branch | What |
 |---|---|
-| `horizon-world/src/cubic/` | The cube range, `CubeStore` (`region3d/y<cy>/r.x.z.mca`), `CubeWindow`, `ColumnTops`, `generator.rs` (deep and sky) |
-| `horizon-client/src/cubic.rs` | `CubicLevel` (cube store with queued writes, clean hashes, `ready_cube`, the window maths) and `CubicTerrain`, the `ChunkGenerator` around vanilla. A cube record is a vanilla chunk record holding one section |
-| `horizon-client/src/cubic_prefetch.rs` | The prefetch ring: the two layers beyond the window of every loaded column, ready in memory (one background thread) |
-| `horizon-client/src/game/cubic.rs` | The window slides in place by whole layers (`follow_cubic_window`, `slide_cubic_window`), driven by the players' Vertical Distance |
-| `horizon-client/src/cubic_lod.rs` | The far terrain's sampler |
-| `horizon-client-render/src/lod/cube.rs`, `lod/mesh.rs` (`mesh_cube`), `gfx/lod.rs` | The octree producer and renderer |
-| `horizon-protocol` (`buf.rs`, `cubic.rs`), `lan/hub.rs`, `game/remote*.rs` | Wide positions and the `horizon:cubic`, `horizon:cubic_window`, `horizon:cubic_view` and `horizon:cubes` payloads |
+| `cubic/shift-client` | The client lays out a new window in place. Kept sections keep their meshes. |
+| `cubic/slide` | The window slides by cube layers, from a prefetch ring. Clients get `horizon:cubes` for the entering layer only. `horizon:cubic_view` carries the vertical distance. |
+| `cubic/light` | A slide lights only its entering layers, plus what they reach. |
+| `cubic/store2` | Uniform cubes in a sidecar, about 6 bytes each. Entities and ticks are stored per cube. |
+| `cubic/cwg` | The CubicWorldGen port (`horizon-world/src/cubic/custom/`): settings v9 JSON, density, biome blend, replacers, caves and ravines, ores, lakes, springs, flat. |
+| `cubic/bounds` | A proven 3D density bound: uniform cubes skip the lattice. |
+| `cubic/integrate` | The world types; CWG population (populated flags, striped locks); vegetation from 26.3's biome features; the climate biome adapter; the far sampler. The v1 deep/sky generator (floating islands) is deleted. |
+| `cubic/customize` | The world-type cycle, the Customize screen and its preview, `cubicgen.json`. |
+| `cubic/far2` | The far-terrain node cache, plan hysteresis and overhang shading. |
+| `cubic/gpu-lod`, `gpu-biome`, `gpu-mesh`, `gpu-descent` | Far nodes generated, biome-sampled, meshed, culled and drawn on the GPU. Also Whole World (octree root level 22), `CubeLodStats`, and the sparse descent: uniform, or right-sized, or subdivide. |
 
-How the far terrain's sampler builds nodes:
-- Levels 0 and 1 come from saved cubes, downsampled.
-- Other nodes use the vanilla far sampler for −64..320 and the cube generator outside it.
-
-Engine changes outside the cubic modules:
-- `LevelShape::cubic` and `ColumnLayout::window`.
-- Chunk heightmaps stored as `u16` offsets from the chunk's `min_y`.
-- `Chunk::sky_covered`, which is used in light seeding and in `lowest_sky_source`.
-- Section `Y` saved as an int when it doesn't fit a byte.
-- `World::void_y`.
-- The Create World switch, id 36.
-
-Built in parallel by subagents and merged:
-- `cubic/cube-generator`, the generator;
-- `cubic/lod-octree`, the octree far terrain;
-- `cubic/wire`, the network side.
+Lead commits on main:
+- the F3 lines;
+- `horizon-ctl status` `cube_lod`;
+- `tools/cubic_far_bench.py`;
+- the descent wired for Custom;
+- batched GPU requests from the far workers;
+- the test-pass fixes.
 
 ### How it was tested
 
-The game ran offscreen with a control socket, through `horizon-ctl launch --game ... --world W
---cubic --offscreen --wait --resources <launcher's 26.3> --game-dir <scratch>`. The scripts are in
-the session scratchpad. They are easy to redo: tp, `block X Y Z`, `status`, `screenshot`.
-
-Checked:
-- Spawn on the surface.
-- tp to y 400, 3000, −2000 and 1,000,000: terrain, caves, lava, islands and far terrain all
-  drew.
-- Edits at y −2001 and 999,996 survived a quit and a reopen.
-- A climb from 100 to 900 and down to −280 in steps of 40-60 blocks: 10 window moves, each
-  reloading in about 2 s with no server stall. The game ran at 120 fps.
-- No void damage in survival at −280.
-- Create World with the switch on through the menus makes a cubic world.
-
-Tests: `cargo test` for horizon-world, horizon-protocol, horizon-client-render, horizon-client-lib
-and horizon-client (lib, tests). All pass except the GPU pixel test
-`gfx::end_sky::tests::separate_draws_match_combined_celestial_pixels`, upstream's, which fails on
-this machine's driver. clippy `-D warnings` and fmt are clean.
+- **Test pass:** one full `cargo test` of horizon-core, -world, -protocol, -client-render,
+  -client-lib and -client, with `HORIZON_TEST_RESOURCES` set to the launcher's 26.3 resources.
+  - First run: 5,491 passed, 13 failed, 175 ignored.
+  - Of the 13 failures, three were bugs, all fixed: `saved_ys` missed unflushed uniform cubes, `in_world`'s edge was inclusive, and the far mesher's sky test asked whether air is opaque. The other ten were stale tests.
+  - After the fixes, the world, render and client-lib lib targets pass with 0 failures. The other targets passed in the first run.
+- **Smoke run** (`D:\ClaudeData\cubic-play\smoke.sh`, offscreen, scratch home):
+  - A Custom world spawned on land at y 75–81: savanna, rivers, acacia trees, grass and flowers.
+  - Climbing from 80 to 600 and diving to −600 slid the window 2 layers at a time, with jumps for long moves.
+  - 116–120 fps, no errors in the log.
+- **Far-fill benchmark** (`tools/cubic_far_bench.py --hops 2`, Whole World):
+  - First benchmark run, before the batching fix: spawn 30.1 s, hops 33.2 s and 18.4 s (**mean 25.8 s**), about 7,500 planned nodes, fps min 100 and mean 119.
+  - The bottleneck: far workers at below-normal priority compute biome columns on the CPU while near terrain generates. Moving those columns to the GPU is in progress on `cubic/gpu-columns`.
 
 ### Known gaps
 
-- **A window slide lights only what it changes.** `Streaming::relight_slide` (`light::relight_entering`)
-  lights the entering layers in the slide's own call (a one-block cube is a single `Light` value), then
-  spreads light, increase only, from the entering cubes into the kept layer beside them and on where it
-  increases. Leaving cubes take no work: kept cubes beside them keep the light they gave (a whole relight
-  would drop it). Kept sections whose light changed go to every player holding the column as vanilla light
-  updates (`Hub::cubic_light_changed`); the entering cubes go out with their light, no longer waiting for a
-  column job. Only a jump (more than `SLIDE_RELIGHT_MAX` entering layers) and columns not lit yet use
-  `dirty_light`.
-- **Single player only.**
-  - The window follows the first player. LAN guests at other heights get that player's window.
-  - A dedicated server has not been tried.
-  - Vanilla clients are refused.
-- **Terrain at a window edge.** Entities and block entities outside the window wait in the
-  save. Mobs at the window edge may see "unloaded" as air for a tick.
-- **Not saved in cubic levels:** POI (villager workstations, bells) and block ticks.
-- **Far terrain:**
-  - Coarse deep nodes are drawn solid.
-  - Unvisited vanilla terrain at levels 2+ is undecorated (no trees until near).
-  - Islands cast no shadow on what's below.
-- Once in the window, the deep generator's lava and caves are not flowed or updated by vanilla
-  rules until something changes there.
-
-### Next
-
-1. (Done on `cubic/slide`: the window slides in place, by whole layers, from the prefetch ring.)
-2. **Per-player windows on a server.** This needs true cube residency (phases 3-4 of
-   `docs/cubic-chunks.md`).
-3. **POI and block ticks in cube records.**
-4. **Far terrain:** decorate levels 2+ from saved cubes as they are visited, and add hysteresis
-   to the plan.
+- **Single player only.** LAN guests share one window. Vertical shards are planned in `docs/cubic-v2-plan.md` ("Residency").
+- **No structures in Custom Cubic,** as in CubicWorldGen. The structure toggles are marked `*`.
+- **Not generated yet:** snow and ice layers, dungeons and Bryce pillars.
+- **Seen from inside solid rock in spectator,** the far terrain's rock shells around the loaded box show as walls.
+- **The slide's relight runs on the tick thread.** A cave-heavy slide may take more than a tick.
+- **The Customize preview and layout** have not been looked at in the game.
+- **Unmeasured:** cube generate and populate costs (`CubicLevel::population_stats()`).
 
 ## What the TTM sync brought
 
