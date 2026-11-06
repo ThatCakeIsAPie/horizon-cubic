@@ -265,12 +265,15 @@ impl CubicLodSampler {
     /// the CPU reference.
     pub fn with_device(mut self, device: wgpu::Device, queue: wgpu::Queue) -> Self {
         if let Some(f) = &self.far_setup {
-            self.far = Some(Box::new(GpuCubeSampler::new(
-                device,
-                queue,
-                f.params.clone(),
-                f.columns.clone(),
-            )));
+            let sampler = GpuCubeSampler::new(device, queue, f.params.clone(), f.columns.clone());
+            // The sparse descent proves subtrees uniform from CubicWorldGen's
+            // density bound alone, so only where that density is the whole
+            // world: Custom (Hybrid's vanilla band is another generator's).
+            let sampler = match self.wg.generator.gpu_terms() {
+                Some(terms) if self.wg.kind == CubicKind::Custom => sampler.with_descent(&terms),
+                _ => sampler,
+            };
+            self.far = Some(Box::new(sampler));
         }
         self
     }
@@ -603,6 +606,10 @@ impl CubeSampler for CubicLodSampler {
 
     fn gpu(&self) -> Option<GpuBackend> {
         self.far.as_ref()?.gpu()
+    }
+
+    fn descent(&self) -> Option<std::sync::Arc<crate::gfx::cube_descent::GpuDescent>> {
+        self.far.as_ref()?.descent()
     }
 
     fn changes(&mut self) -> Changes {

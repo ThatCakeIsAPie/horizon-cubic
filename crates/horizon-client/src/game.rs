@@ -17858,6 +17858,9 @@ impl Game<'_> {
                 if cube_lod.set_gpu_path(gpu) {
                     renderer.clear_cube_lods();
                 }
+                // The sparse descent rides the GPU path (the sampler has one
+                // only in a Custom world).
+                cube_lod.set_gpu_descent(gpu);
                 renderer.queue_cube_lods(meshes, cube_lod.removed());
                 if cube_lod.gpu_path() {
                     renderer.queue_gpu_cube_lods(cube_lod.take_gpu_nodes());
