@@ -58,8 +58,18 @@ impl Game<'_> {
         if let Err(e) = cubic::save_window(&self.world_root, window.min_y) {
             log::warn!("Horizon: the cubic window was not recorded: {e}");
         }
-        // The old window's level, saved above, goes.
-        self.reopen_level_in_place()?;
+        // The old window's level, saved above, goes; the new one keeps the
+        // generator, its saves and the cube store (no new stronghold search).
+        match self.save.cubic.get().cloned() {
+            Some(level) => {
+                level.set_window(window);
+                match level.new_streaming() {
+                    Some(streaming) => self.renew_level_in_place(streaming),
+                    None => self.reopen_level_in_place()?,
+                }
+            }
+            None => self.reopen_level_in_place()?,
+        }
         // The players' clients lay out the new window and get its chunks.
         if let Some(h) = self.lan.as_mut() {
             h.hub.cubic_window_changed(self.dim.id(), window);

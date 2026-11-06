@@ -1,5 +1,7 @@
 {
   "horizon.extras.header.ultimine": "Ultimine",
+  "horizon.cubic.world": "Cubic Chunks",
+  "horizon.cubic.world.info": "No height limit: the Overworld goes on for millions of blocks up and down, loaded in 16x16x16 cubes around you. Vanilla Minecraft cannot open such a world.",
   "horizon.extras.header.world": "World",
   "horizon.extras.pregen": "Chunk pregeneration",
   "horizon.extras.pregen.tooltip": "Enables /pregen in your single-player and LAN worlds. With cheats enabled, use /pregen start to generate an area before exploring it. Does not enable the command on servers you join.",

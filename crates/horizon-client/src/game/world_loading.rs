@@ -881,18 +881,37 @@ pub(super) fn make_streaming(
                 shape,
             )?;
             let _ = save.cubic.set(level.clone());
-            Streaming::new(
-                Arc::new(horizon_client::cubic::CubicTerrain {
-                    inner: persistent,
-                    level,
-                }),
-                pack.context_with(biomes.clone()),
-                res.threads(),
-            )
+            let terrain = Arc::new(horizon_client::cubic::CubicTerrain {
+                inner: persistent,
+                level: level.clone(),
+            });
+            let context = pack.context_with(biomes.clone());
+            let threads = res.threads();
+            // A moved window opens a new streaming over this same generator.
+            let weak = Arc::downgrade(&terrain);
+            let again = context.clone();
+            level.set_streaming_factory(Box::new(move || {
+                Some(Streaming::new(weak.upgrade()?, again.clone(), threads))
+            }));
+            Streaming::new(terrain, context, threads)
         } else {
             Streaming::new(persistent, pack.context_with(biomes.clone()), res.threads())
         }
     };
+    configure_streaming(&mut streaming, &save, options, settings, dim, seed);
+    Ok((streaming, save, locator))
+}
+
+/// A new level's streaming settings: its forced chunks, the render
+/// distance and the meshing options.
+pub(super) fn configure_streaming(
+    streaming: &mut Streaming,
+    save: &SaveDir,
+    options: &Options,
+    settings: &Settings,
+    dim: Dim,
+    seed: i64,
+) {
     streaming.forced = save.load_forced_chunks();
     streaming.radius = settings.render_distance;
     streaming.biome_blend = settings.biome_blend;
@@ -907,7 +926,6 @@ pub(super) fn make_streaming(
     // A server draws nothing: neither the integrated server nor the
     // dedicated one meshes sections.
     streaming.mesh = options.execution_role.is_client();
-    Ok((streaming, save, locator))
 }
 
 #[cfg(test)]

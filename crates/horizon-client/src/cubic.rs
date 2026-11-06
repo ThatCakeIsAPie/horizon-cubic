@@ -59,15 +59,72 @@ pub fn needs_new_window(window: LevelShape, y: f64) -> bool {
             || y >= f64::from(window.max_y() - WINDOW_MARGIN))
 }
 
-/// One cubic level's cubes on disk and in generation.
-pub struct CubicLevel {
+/// A cubic level's cube store and the writes queued for it, shared with its
+/// writer thread, which drains the queue before it ends.
+struct CubeIo {
     store: CubeStore,
     /// Cube records queued for the writer and not yet on disk: loads read
     /// these first.
     pending: Mutex<HashMap<SectionPos, Arc<NamedTag>>>,
     /// Writes in flight, and a signal for `flush`.
-    queued: Arc<(Mutex<usize>, Condvar)>,
+    queued: (Mutex<usize>, Condvar),
+}
+
+impl CubeIo {
+    fn read(&self, pos: SectionPos) -> Option<NamedTag> {
+        if let Some(tag) = self.pending.lock().unwrap().get(&pos) {
+            return Some((**tag).clone());
+        }
+        match self.store.read(pos) {
+            Ok(tag) => tag,
+            Err(e) => {
+                log::warn!("Horizon: cube {pos:?} unreadable: {e}");
+                None
+            }
+        }
+    }
+
+    fn write_now(&self, pos: SectionPos, tag: &Arc<NamedTag>) {
+        if let Err(e) = self.store.write(pos, tag) {
+            log::warn!("Horizon: cube {pos:?} not saved: {e}");
+        }
+        let mut pending = self.pending.lock().unwrap();
+        if pending.get(&pos).is_some_and(|t| Arc::ptr_eq(t, tag)) {
+            pending.remove(&pos);
+        }
+        drop(pending);
+        let (count, done) = &self.queued;
+        let mut count = count.lock().unwrap();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            done.notify_all();
+        }
+    }
+
+    fn flush(&self) {
+        let (count, done) = &self.queued;
+        let mut count = count.lock().unwrap();
+        while *count > 0 {
+            count = done.wait(count).unwrap();
+        }
+        drop(count);
+        if let Err(e) = self.store.sync() {
+            log::warn!("Horizon: cubes not synced: {e}");
+        }
+    }
+}
+
+/// Makes the level's streaming again over the same generator (a moved
+/// window keeps the generator, its saves and this level).
+pub type StreamingFactory = Box<dyn Fn() -> Option<crate::streaming::Streaming> + Send + Sync>;
+
+/// One cubic level's cubes on disk and in generation.
+pub struct CubicLevel {
+    io: Arc<CubeIo>,
+    streaming: std::sync::OnceLock<StreamingFactory>,
     send: Mutex<Option<Sender<(SectionPos, Arc<NamedTag>)>>>,
+    /// Columns whose vanilla range is known to be generated (`has_vanilla`).
+    vanilla_done: Mutex<std::collections::HashSet<(i32, i32)>>,
     generator: Arc<CubeGenerator>,
     /// The window the level's chunks hold now.
     window: Mutex<ColumnLayout>,
@@ -99,13 +156,22 @@ impl CubicLevel {
     ) -> Result<Arc<Self>, String> {
         let palette = horizon_world::cubic::generator::CubePalette::from_registry(registry)?;
         let generator = Arc::new(CubeGenerator::new(seed, palette));
-        let queued = Arc::new((Mutex::new(0usize), Condvar::new()));
-        let (send, receive) = channel::<(SectionPos, Arc<NamedTag>)>();
-        let level = Arc::new(Self {
+        let io = Arc::new(CubeIo {
             store: CubeStore::new(level_dir),
             pending: Mutex::default(),
-            queued: queued.clone(),
+            queued: (Mutex::new(0usize), Condvar::new()),
+        });
+        let (send, receive) = channel::<(SectionPos, Arc<NamedTag>)>();
+        let writer = io.clone();
+        std::thread::Builder::new()
+            .name("Cube writer".into())
+            .spawn(move || write_cubes(&writer, receive))
+            .map_err(|e| e.to_string())?;
+        let level = Arc::new(Self {
+            io,
+            streaming: std::sync::OnceLock::new(),
             send: Mutex::new(Some(send)),
+            vanilla_done: Mutex::default(),
             generator,
             window: Mutex::new(window.column()),
             clean: Mutex::default(),
@@ -116,11 +182,6 @@ impl CubicLevel {
             bedrock: registry.default_state("minecraft:bedrock").map(|s| s.0),
             deepslate: registry.default_state("minecraft:deepslate").map(|s| s.0),
         });
-        let weak = Arc::downgrade(&level);
-        std::thread::Builder::new()
-            .name("Cube writer".into())
-            .spawn(move || write_cubes(weak, receive, queued))
-            .map_err(|e| e.to_string())?;
         Ok(level)
     }
 
@@ -148,24 +209,33 @@ impl CubicLevel {
         *self.window.lock().unwrap()
     }
 
+    /// Moves the level's window: the columns loaded from now on hold
+    /// `window`. The caller saved the old window's columns and drops them.
+    pub fn set_window(&self, window: LevelShape) {
+        *self.window.lock().unwrap() = window.column();
+        self.clean.lock().unwrap().clear();
+        self.parked.lock().unwrap().clear();
+    }
+
+    /// Sets how the level's streaming is made again (once, when it opens).
+    pub fn set_streaming_factory(&self, factory: StreamingFactory) {
+        let _ = self.streaming.set(factory);
+    }
+
+    /// A new streaming over the level's generator, for a moved window.
+    pub fn new_streaming(&self) -> Option<crate::streaming::Streaming> {
+        self.streaming.get()?()
+    }
+
     /// Cube `pos`'s record: a queued write's, else the disk's.
     pub fn read(&self, pos: SectionPos) -> Option<NamedTag> {
-        if let Some(tag) = self.pending.lock().unwrap().get(&pos) {
-            return Some((**tag).clone());
-        }
-        match self.store.read(pos) {
-            Ok(tag) => tag,
-            Err(e) => {
-                log::warn!("Horizon: cube {pos:?} unreadable: {e}");
-                None
-            }
-        }
+        self.io.read(pos)
     }
 
     fn write_later(&self, pos: SectionPos, tag: NamedTag) {
         let tag = Arc::new(tag);
-        self.pending.lock().unwrap().insert(pos, tag.clone());
-        *self.queued.0.lock().unwrap() += 1;
+        self.io.pending.lock().unwrap().insert(pos, tag.clone());
+        *self.io.queued.0.lock().unwrap() += 1;
         let sent = self
             .send
             .lock()
@@ -174,44 +244,26 @@ impl CubicLevel {
             .is_some_and(|send| send.send((pos, tag.clone())).is_ok());
         if !sent {
             // No writer: write here.
-            self.write_now(pos, &tag);
-        }
-    }
-
-    fn write_now(&self, pos: SectionPos, tag: &Arc<NamedTag>) {
-        if let Err(e) = self.store.write(pos, tag) {
-            log::warn!("Horizon: cube {pos:?} not saved: {e}");
-        }
-        let mut pending = self.pending.lock().unwrap();
-        if pending.get(&pos).is_some_and(|t| Arc::ptr_eq(t, tag)) {
-            pending.remove(&pos);
-        }
-        drop(pending);
-        let (count, done) = &*self.queued;
-        let mut count = count.lock().unwrap();
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            done.notify_all();
+            self.io.write_now(pos, &tag);
         }
     }
 
     /// Waits until every queued cube is on disk.
     pub fn flush(&self) {
-        let (count, done) = &*self.queued;
-        let mut count = count.lock().unwrap();
-        while *count > 0 {
-            count = done.wait(count).unwrap();
-        }
-        drop(count);
-        if let Err(e) = self.store.sync() {
-            log::warn!("Horizon: cubes not synced: {e}");
-        }
+        self.io.flush();
     }
 
     /// Whether column (x, z)'s vanilla range was generated (its marker cube
     /// is saved).
     pub fn has_vanilla(&self, x: i32, z: i32) -> bool {
-        self.read(SectionPos::new(x, MARKER_CUBE, z)).is_some()
+        if self.vanilla_done.lock().unwrap().contains(&(x, z)) {
+            return true;
+        }
+        let done = self.read(SectionPos::new(x, MARKER_CUBE, z)).is_some();
+        if done {
+            self.vanilla_done.lock().unwrap().insert((x, z));
+        }
+        done
     }
 
     /// The generator's cube `pos`, uniform cubes shared.
@@ -326,6 +378,7 @@ impl CubicLevel {
             self.write_later(pos, root);
             self.note_clean(pos, section);
         }
+        self.vanilla_done.lock().unwrap().insert((x, z));
         let mut chunk = Chunk::with_layout(x, z, window);
         let base = window.min_y() >> 4;
         for s in 0..window.sections() {
@@ -464,17 +517,14 @@ impl Drop for CubicLevel {
     }
 }
 
-/// The writer thread: cubes to disk in the order they were queued.
-fn write_cubes(
-    level: std::sync::Weak<CubicLevel>,
-    receive: Receiver<(SectionPos, Arc<NamedTag>)>,
-    _queued: Arc<(Mutex<usize>, Condvar)>,
-) {
+/// The writer thread: cubes to disk in the order they were queued, until
+/// the level is gone and its queue empty.
+fn write_cubes(io: &CubeIo, receive: Receiver<(SectionPos, Arc<NamedTag>)>) {
     while let Ok((pos, tag)) = receive.recv() {
-        let Some(level) = level.upgrade() else {
-            return;
-        };
-        level.write_now(pos, &tag);
+        io.write_now(pos, &tag);
+    }
+    if let Err(e) = io.store.sync() {
+        log::warn!("Horizon: cubes not synced: {e}");
     }
 }
 
@@ -639,10 +689,16 @@ impl<G: ChunkGenerator> ChunkGenerator for CubicTerrain<G> {
         self.inner.lod_surface(worker, x, z)
     }
     fn load(&self, x: i32, z: i32) -> Option<Chunk> {
-        if !self.level.has_vanilla(x, z) {
+        let window = self.level.window();
+        // A window that doesn't reach vanilla's range needs no vanilla
+        // column: its cubes are saved ones and the generator's.
+        let base = window.min_y() >> 4;
+        let reaches_vanilla = VANILLA_CUBES
+            .clone()
+            .any(|cy| (base..base + window.sections() as i32).contains(&cy));
+        if reaches_vanilla && !self.level.has_vanilla(x, z) {
             return None;
         }
-        let window = self.level.window();
         let mut chunk = self.level.assemble(x, z, window, &self.codec());
         let entities = self.inner.save.load_entities(x, z);
         chunk.entities = self.level.park_outside(x, z, entities, window);

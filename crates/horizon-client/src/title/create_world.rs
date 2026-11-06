@@ -169,6 +169,13 @@ impl WorldOptions {
         !self.hardcore && self.commands.unwrap_or(creative)
     }
     /// `isBonusChest`: never in Hardcore.
+    /// Whether the world type can be cubic: not the flat or debug presets.
+    pub fn cubic_allowed(&self) -> bool {
+        !matches!(
+            self.world_type,
+            crate::save::WorldPreset::Flat | crate::save::WorldPreset::Debug
+        )
+    }
     pub fn bonus_chest(&self) -> bool {
         !self.hardcore && self.bonus_chest
     }
@@ -229,6 +236,7 @@ impl WorldOptions {
             }
             27 => self.structures = !self.structures,
             28 => self.bonus_chest = !self.bonus_chest,
+            29 => self.cubic = !self.cubic,
             _ => {}
         }
     }
@@ -440,6 +448,16 @@ pub(super) fn buttons(w: f32, h: f32, creative: bool, o: &WorldOptions) -> Vec<B
                 !o.hardcore,
                 28,
             ),
+            // Horizon's Cubic Chunks (docs/cubic-chunks.md): not for the
+            // flat and debug presets.
+            b(
+                gx + 266.0,
+                gy + 121.0,
+                44.0,
+                on_off(o.cubic && o.cubic_allowed()),
+                o.cubic_allowed(),
+                29,
+            ),
         ],
         // The More tab, as vanilla lays it out: Game Rules, Experiments
         // (the resources' feature packs), Data Packs.
@@ -548,6 +566,11 @@ pub(super) fn button_narration(
             o.structures,
         ),
         28 => switch("selectWorld.bonusItems", None, o.bonus_chest()),
+        29 => switch(
+            "horizon.cubic.world",
+            Some("horizon.cubic.world.info"),
+            o.cubic && o.cubic_allowed(),
+        ),
         _ => Narratable::button(b.label.clone(), rect, b.enabled),
     };
     // The World tab adds its type and Customize row before the seed box,
@@ -698,6 +721,7 @@ impl Title {
                 // SwitchGrid labels, centred on their switch rows.
                 label(batch, "selectWorld.mapFeatures", gx, gy + 78.0);
                 label(batch, "selectWorld.bonusItems", gx, gy + 102.0);
+                label(batch, "horizon.cubic.world", gx, gy + 126.0);
             }
             _ => {}
         }
@@ -785,6 +809,9 @@ impl Title {
             }
             1 if over(gx + 266.0, gy + 73.0, 44.0) => {
                 Some(Text::translate("selectWorld.mapFeatures.info", &[]))
+            }
+            1 if over(gx + 266.0, gy + 121.0, 44.0) => {
+                Some(Text::translate("horizon.cubic.world.info", &[]))
             }
             _ => None,
         };

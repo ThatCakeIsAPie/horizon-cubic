@@ -7,8 +7,21 @@ whole columns. This is a port of the idea of the
 not a port of its code: Horizon is Rust, and its world model differs from
 NeoForge's.
 
-Status: **phase 1 of 9** (the engine-agnostic primitives, `horizon-world/src/cubic/`).
-Nothing in the game uses them yet. Vanilla levels are unchanged.
+Status: **v1, playable in single player** (see "v1 architecture" below). How to play:
+- **Create World**, World tab: turn on **Cubic Chunks**. Or from the command line:
+  `horizon-client --world NAME --cubic`.
+- The Overworld is vanilla between y −64 and 320, with no bedrock floor.
+- Below that are endless deepslate caves, with ores, lava and geodes (`cubic::generator`).
+- Above it is open sky, with floating islands in bands every 1000 blocks from y 600.
+- The far terrain is the cube octree.
+- Vanilla levels and the Nether and End are unchanged.
+
+Where the code is:
+- `horizon-world/src/cubic/`: the cube range, store, window, tops and generator.
+- `horizon-client/src/cubic.rs` and `cubic_lod.rs`: the level's cubes and far-terrain sampler.
+- `horizon-client/src/game/cubic.rs`: the window that follows the players.
+- `horizon-client-render/src/lod/cube.rs`: the octree far terrain.
+- `horizon-protocol/src/cubic.rs`: the payloads.
 
 No other Cubic Chunks port for Horizon exists. As of 2026-11-05, nothing came up in
 horizon-rust/horizon's code, branches, issues and PRs, or in its forks'

@@ -222,11 +222,22 @@ impl Game<'_> {
             self.level.seed,
             &self.level.enabled_features,
         )?;
+        Ok(self.new_parked(dim, streaming, save, locator))
+    }
+
+    /// A level of `dim` over `streaming` and `save`, with nothing in it yet.
+    fn new_parked(
+        &self,
+        dim: Dim,
+        streaming: horizon_client::streaming::Streaming,
+        save: Arc<horizon_client::save::SaveDir>,
+        locator: Option<Arc<horizon_client::vanillagen::VanillaTerrain>>,
+    ) -> Parked {
         let mut world = World::new(self.res.facts().air, self.level.seed);
         world.attachments = save.load_attachments();
         world.shape = self.level_shapes.get(dim.id());
         world.fast_lava = dim == Dim::Nether;
-        Ok(Parked {
+        Parked {
             world,
             streaming,
             locator,
@@ -276,7 +287,7 @@ impl Game<'_> {
             creaking: Default::default(),
             spawn_scratch: Default::default(),
             idle: 0,
-        })
+        }
     }
 
     /// Exchange the level in place with `p`.
@@ -353,15 +364,39 @@ impl Game<'_> {
     /// saves it first.
     pub(super) fn reopen_level_in_place(&mut self) -> Result<()> {
         let mut p = self.open_level(self.dim)?;
+        self.carry_into(&mut p);
+        Ok(())
+    }
+
+    /// The level in place made again over `streaming`, its saves and its
+    /// generator kept (a cubic level's moved window, `game/cubic.rs`): its
+    /// chunks and entities start over from the save.
+    pub(super) fn renew_level_in_place(
+        &mut self,
+        mut streaming: horizon_client::streaming::Streaming,
+    ) {
+        super::world_loading::configure_streaming(
+            &mut streaming,
+            &self.save,
+            &self.options,
+            &self.settings,
+            self.dim,
+            self.level.seed,
+        );
+        let mut p = self.new_parked(self.dim, streaming, self.save.clone(), self.end.locator());
+        self.carry_into(&mut p);
+    }
+
+    /// Swaps `p` into place with the clock, weather, rules and watched
+    /// blocks of the level it replaces, which is then dropped.
+    fn carry_into(&mut self, p: &mut Parked) {
         p.world.game_time = self.world.game_time;
         p.world.day_time = self.world.day_time;
         p.world.weather = self.world.weather;
         p.world.health_rules = self.world.health_rules;
         p.world.watched = std::mem::take(&mut self.world.watched);
-        self.swap_level(&mut p);
-        drop(p);
+        self.swap_level(p);
         self.apply_settings();
-        Ok(())
     }
 
     /// Put `target`'s level in place, opening it first if it is not loaded.
