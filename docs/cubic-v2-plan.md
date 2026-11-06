@@ -289,6 +289,36 @@ What we take from it:
      - make the target a setting (like Meridian's Detail), and measure the fill time at each step.
 6. **The coarse levels alias.** From y = 5,000,000 the ground is a regular tile pattern. Each coarse voxel point-samples the noise at a spacing that lines up with the noise's period. The surface layer (2) with averaged colour (3) fixes this.
 
+### Detail by size on screen, coverage first (2026-11-06, `cubic/far-detail`)
+
+Points 1 and 5 above are built (`lod/cube.rs`):
+- **The rule.** A node splits while one of its voxels would span more than `target_px` pixels at the node's nearest point: `voxel / distance * height_px / (2 tan(fov_y / 2)) > target_px` (`FarView`, `Rule`). The hysteresis is kept (`MERGE`). The game passes the field of view drawn now (spyglass and dynamic FOV included), the view direction and the viewport (`CubeLod::update`).
+  - Nodes in view use the current field of view, nodes out of view the unzoomed one, so the spyglass refines only what it looks at. A zoom of less than 1.5 times (a bow, a sprint) changes nothing.
+  - The plan is redone when the detail changes by a quarter (spyglass in and out), and when a zoomed view turns past a quarter of its field of view.
+- **Cubic Far Detail** (Video Settings › Distance, key `cubicFarDetail`): Low 16 px, Normal 8, High 4, Ultra 2, Extreme 1. Extreme is the owner's switch point: a block stays a block until it is about a pixel.
+- **A budget** (`NODE_BUDGET`, `HORIZON_FAR_NODES` for benchmarks): past it, the plan splits the nodes furthest over their target first and stops, so what is smallest on screen stays coarse; on the GPU path it is also capped so two plans fit the node table and the quad arena.
+- **Coverage first.** When a quarter of a new plan has nothing drawn over it (a teleport, joining), only the coverage layer is queued: the plan for voxels 8 times bigger, at most 768 nodes, one node over each hole, and the planned nodes that hold the last plan's (so those can go). Once it is in and shown, the rest is queued; `removed` keeps the coverage nodes until the nodes under them are in. `status`'s `cube_lod.plan_covered_ago_s` stamps when the plan last had no hole.
+- **On screen first.** The queue is holes first, then the plan by direction from the camera (48 sectors and the nodes around the camera), the sectors the camera faces first, nearest first in each. Turning only reorders the sectors.
+- **The planner runs on its own thread**, and hands the game thread the change from the last plan: little while moving, the whole plan once after a teleport.
+- **Seam for the 2D tiles:** `node_kind(key, view, tile)` and `SURFACE_LEVEL`. It answers `Cube` until the tile module gives tile information.
+
+**Measured** (`tools/cubic_far_bench.py --detail <step>`, Whole World, 1280 x 720 offscreen, 4-core i7 and GTX 1070 Ti; medians of 2 runs x 3 hops of 5,000,000 blocks; nodes and MB at the last hop):
+
+| Step | Target px | Reached px | Nodes | Arena MB (peak) | `cover_s` | `far_fill_s` | Spawn cover / fill s | fps steady | fps min |
+|---|---|---|---|---|---|---|---|---|---|
+| main (`DETAIL` 2.5, ~13 px) | - | - | 7,444 | 11 | 2.15 (= fill) | 2.15 | 13.6 / 13.6 | 118 | 47 |
+| Low | 16 | 16 | 4,116 | 9 | 0.08 | 0.60 | 2.0 / 9.3 | 118 | 95 |
+| Normal | 8 | 8 | 13,507 | 15 | 0.08 | 2.81 | 0.9 / 11.2 | 120 | 97 |
+| High | 4 | 4 | 44,842 | 47 | 0.14 | 16.7 | 1.4 / 30.8 | 120 | 97 |
+| **Ultra (default)** | 2 | 2.5 (budget) | 120,000 | 96 | 0.21 | 48.2 | 1.6 / 54.5 | 120 | 61 |
+| Extreme | 1 | 2.5 (budget) | 120,000 | 95 | 0.22 | 48.4 | 6.6 / 54.1 | 118 | 69 |
+
+- The coverage layer is in after 0.1–0.2 s at every step (main had no coverage: nothing showed until the nearest nodes landed). Normal is finer than main and fills about as fast: workers now wait for room in the GPU pool instead of failing a batch for a second, and take at most two CPU-sampled nodes per batch.
+- The node budget (120,000) stops Ultra and Extreme at about 2.5 px at 720 pixels; it grows with the viewport's height squared, so at 1440 pixels High meets it too. True 1 px at 720 pixels needs about 700,000 nodes by the counts above (nodes grow with the square of the detail): about 700 MB of arena and a fill of four to five minutes at the measured ~2,600 nodes/s. Not measured yet: it needs a build with a bigger node table.
+- Teleport hitch, measured before `RELEASE_BATCH`: the longest frame after a teleport was 17–81 ms on main, 117–131 ms at High and 235–281 ms at Ultra. The renderer retires each released node with buffer writes of its own (`CubeFar::upload`), and a teleport released the whole last plan in one frame; `removed` now hands out 4,096 at a time. To re-measure.
+- Fill rate (~2,600 planned nodes/s, ~1,700 generated on the GPU) is the next lever, for the autoresearch loops: GPU batch sizes, the pool, the mesher's batch.
+- Not run yet (`tools/cubic_far_check.py`): the spyglass (`--spyglass`), a cavern at y -2,000 (`--cavern`), the teleport hitch after `RELEASE_BATCH` (`--hitch`).
+
 ### Where the GPU far view stands
 
 Done: generate, mesh and draw (stages 1, 3 and most of 4) run on the GPU for a cubic level's far nodes; the CPU only chooses which nodes exist.
