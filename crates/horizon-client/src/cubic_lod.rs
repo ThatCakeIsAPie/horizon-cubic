@@ -8,12 +8,17 @@
 //! - Levels 2 and up come from `GpuCubeSampler` (`far`, built from the
 //!   generator's noise tables: [`far_setup`]), on the renderer's device when
 //!   [`CubicLodSampler::with_device`] gave it one, else its CPU reference.
-//!   Its 2D input, the node's columns, is made on the calling worker with
-//!   the CPU biome pass (`CpuBiomes`, the reference of `gfx/biome_gen`) when
-//!   the biome size is the default, else from the generator's own blend. The
-//!   GPU biome pass is not used: it cannot feed the 2D pre-pass (`classify`),
-//!   which settles most far nodes without any 3D noise, and the columns run on
-//!   the workers in parallel anyway.
+//!   Its 2D input, the node's columns, is made with the biome pass
+//!   (`gfx/biome_gen`) when the biome size is the default, else from the
+//!   generator's own blend (on the CPU: the fixed-biome and non-default
+//!   `biomeSize` worlds keep that, and the CPU pre-pass with it).
+//!   - On the GPU path of a Custom level (sparse descent on) the columns are
+//!     made by the GPU thread in the same submission as the generation
+//!     (`GpuCubeSampler::with_biomes`): the far workers do no per-node CPU
+//!     work, and the descent keeps uniform nodes from being requested.
+//!   - Otherwise (CPU reference, Hybrid) the columns are made on the calling
+//!     worker with `CpuBiomes`, the biome pass's reference, which also feeds
+//!     the 2D pre-pass (`classify`).
 //! - A Hybrid world's vanilla band (-64..320) is read from the vanilla
 //!   generator's far-terrain columns (one grid per node column, kept for the
 //!   nodes above and below it); a node straddling the band's edge is sampled
@@ -36,7 +41,7 @@
 
 use crate::cubic::CubicLevel;
 use crate::cubic_gen::{CubicKind, Generation};
-use crate::gfx::biome_gen::{BiomeTerrain, CpuBiomes};
+use crate::gfx::biome_gen::{BiomeGenParams, BiomeTerrain, ClimateNoises, CpuBiomes};
 use crate::gfx::cube_gen::{
     BiomeBlocks, ColumnFn, CubeGenParams, GpuBackend, GpuCubeSampler, NodeColumns, NoiseDesc,
     OctaveDesc,
@@ -97,6 +102,10 @@ pub struct CubicLodSampler {
 pub struct FarSetup {
     pub params: CubeGenParams,
     pub columns: ColumnFn,
+    /// The same climate, flattened for the GPU biome pass (`gfx/biome_gen`);
+    /// `None` for worlds whose columns come from the generator's own blend
+    /// (another biome size, a single biome) or whose noises do not fit.
+    pub biomes: Option<BiomeGenParams>,
 }
 
 /// The block state a name gives, air when unknown.
@@ -174,6 +183,7 @@ pub fn far_setup(level: &CubicLevel, registry: &BlockRegistry) -> Option<FarSetu
             height_variation: i.height_variation,
         })
         .collect();
+    let mut gpu_biomes = None;
     let columns: ColumnFn = match (
         &wg.climate,
         scale == 1.0 && wg.settings.as_ref().is_some_and(|s| s.biome.is_empty()),
@@ -198,11 +208,22 @@ pub fn far_setup(level: &CubicLevel, registry: &BlockRegistry) -> Option<FarSetu
                 .collect();
             let index =
                 Arc::new(horizon_world::worldgen::climate::ClimateIndex::new(entries).ok()?);
+            // The GPU pass reads the same climate, from a router compiled
+            // for the seed again (the adapter keeps only the sampler).
+            gpu_biomes = data
+                .overworld_climate(wg.seed)
+                .ok()
+                .and_then(|c| ClimateNoises::from_router(c.router, &c.compiler))
+                .and_then(|noises| BiomeGenParams::new(noises, &index, terrain.clone()));
             Arc::new(CpuBiomes::new(climate.climate().clone(), index, terrain)).column_fn()
         }
         _ => generator_columns(wg.clone(), biomes.clone()),
     };
-    Some(FarSetup { params, columns })
+    Some(FarSetup {
+        params,
+        columns,
+        biomes: gpu_biomes,
+    })
 }
 
 /// A node's columns from the generator's own blend (`column_terrain`) and
@@ -271,6 +292,13 @@ impl CubicLodSampler {
             // world: Custom (Hybrid's vanilla band is another generator's).
             let sampler = match self.wg.generator.gpu_terms() {
                 Some(terms) if self.wg.kind == CubicKind::Custom => sampler.with_descent(&terms),
+                _ => sampler,
+            };
+            // Columns on the GPU only where the descent replaces the 2D
+            // pre-pass (which needs CPU columns): otherwise every uniform
+            // node would be generated.
+            let sampler = match &f.biomes {
+                Some(biomes) if sampler.descent().is_some() => sampler.with_biomes(biomes.clone()),
                 _ => sampler,
             };
             self.far = Some(Box::new(sampler));

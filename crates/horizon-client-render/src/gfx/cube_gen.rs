@@ -99,6 +99,7 @@
 //! 3. Make the sampler with `GpuCubeSampler::new(device, queue, params,
 //!    columns)` (the renderer's device, or `with_own_device`) and hand it to
 //!    the cube LOD producer; `fork()` gives each worker a handle.
+use crate::gfx::biome_gen::{BiomeGen, BiomeGenParams};
 use crate::gfx::cube_descent::GpuDescent;
 use crate::lod::cube::{CubeKey, CubeNode, CubeSampler, NodeClass, Resident, SIDE, VOLUME, Voxel};
 use bytemuck::Zeroable;
@@ -1260,6 +1261,56 @@ impl CubeGen {
         out
     }
 
+    /// [`CubeGen::generate_resident`] with the columns made on the GPU by
+    /// `biomes` in the same submission as each chunk's generation: no CPU
+    /// columns, no pre-pass. Nodes read back take their biomes from the slot.
+    pub fn generate_resident_gpu(
+        &mut self,
+        keys: &[CubeKey],
+        slot: &[bool],
+        biomes: &BiomeGen,
+    ) -> Vec<Option<Resident>> {
+        debug_assert_eq!(keys.len(), slot.len());
+        let mut out = Vec::with_capacity(keys.len());
+        let mut at = 0;
+        while at < keys.len() {
+            let size = (keys.len() - at)
+                .min(MAX_BATCH)
+                .min(self.pool.free_slots().max(1));
+            let chunk = &keys[at..at + size];
+            let keep = &slot[at..at + size];
+            match self.generate_to_pool_gpu(chunk, |encoder, targets| {
+                biomes.encode(encoder, chunk, targets)
+            }) {
+                None => out.extend(chunk.iter().map(|_| None)),
+                Some(slots) => {
+                    let wanted: Vec<usize> = (0..size).filter(|&i| !keep[i]).collect();
+                    let read: Vec<u32> = wanted.iter().map(|&i| slots[i]).collect();
+                    let words = self.read_back(&read);
+                    for &s in &read {
+                        self.pool.free(s);
+                    }
+                    for i in 0..size {
+                        out.push(if keep[i] {
+                            Some(Resident::Slot(slots[i]))
+                        } else {
+                            let w = wanted.iter().position(|&j| j == i).unwrap();
+                            words.as_ref().map(|words| {
+                                let node = &words[w * SLOT_WORDS..(w + 1) * SLOT_WORDS];
+                                Resident::Node(CubeNode::from_fn(chunk[i], |x, y, z| Voxel {
+                                    state: BlockStateId(node[CubeNode::index(x, y, z)]),
+                                    biome: node[SLOT_STATES + z * 16 + x] as u16,
+                                }))
+                            })
+                        });
+                    }
+                }
+            }
+            at += size;
+        }
+        out
+    }
+
     /// Any number of nodes: the 2D pre-pass settles what it can on the CPU
     /// (uniform air, water or rock, with no 3D noise run), and the rest go to
     /// the GPU in as few dispatches as the buffers allow. `Vec` in job order.
@@ -1303,6 +1354,23 @@ struct Message {
     reply: mpsc::Sender<Vec<Option<Resident>>>,
 }
 
+/// What the GPU thread is asked for.
+enum Work {
+    /// Nodes with their columns made by the caller.
+    Jobs(Message),
+    /// Nodes whose columns the GPU thread makes (`BiomeGen`).
+    Keys(KeysMessage),
+    /// The biome pass, once the sampler built it.
+    Biomes(Box<BiomeGen>),
+}
+
+/// Keys from one caller; the GPU thread makes the columns.
+struct KeysMessage {
+    keys: Vec<CubeKey>,
+    slots: bool,
+    reply: mpsc::Sender<Vec<Option<Resident>>>,
+}
+
 /// What a sampler on the GPU gives the GPU mesher: the device it generates on,
 /// the pool its nodes stay in, and the block states it can write.
 #[derive(Clone)]
@@ -1322,10 +1390,13 @@ pub struct GpuBackend {
 pub struct GpuCubeSampler {
     params: Arc<CubeGenParams>,
     columns: ColumnFn,
-    gpu: Option<mpsc::Sender<Message>>,
+    gpu: Option<mpsc::Sender<Work>>,
     backend: Option<GpuBackend>,
     /// The GPU descent (`gfx::cube_descent`), once `with_descent` made it.
     descent: Option<Arc<GpuDescent>>,
+    /// Columns are made by the GPU thread (`with_biomes`): requests skip the
+    /// CPU columns and the CPU pre-pass.
+    gpu_columns: bool,
     reply: mpsc::Sender<Vec<Option<Resident>>>,
     replies: mpsc::Receiver<Vec<Option<Resident>>>,
 }
@@ -1362,7 +1433,7 @@ impl GpuCubeSampler {
                 pool: generator.pool.handle(),
                 states,
             });
-            let (tx, rx) = mpsc::channel::<Message>();
+            let (tx, rx) = mpsc::channel::<Work>();
             std::thread::Builder::new()
                 .name("cube-gen-gpu".into())
                 .spawn(move || gpu_thread(generator, rx))
@@ -1390,7 +1461,7 @@ impl GpuCubeSampler {
     fn with(
         params: Arc<CubeGenParams>,
         columns: ColumnFn,
-        gpu: Option<mpsc::Sender<Message>>,
+        gpu: Option<mpsc::Sender<Work>>,
     ) -> Self {
         let (reply, replies) = mpsc::channel();
         Self {
@@ -1399,6 +1470,7 @@ impl GpuCubeSampler {
             gpu,
             backend: None,
             descent: None,
+            gpu_columns: false,
             reply,
             replies,
         }
@@ -1420,6 +1492,35 @@ impl GpuCubeSampler {
             .map(Arc::new);
         }
         self
+    }
+
+    /// Makes the columns of the nodes `request_resident` takes on the GPU
+    /// thread, in the same submission as their generation (`BiomeGen`), so a
+    /// far node costs the calling worker no CPU work beyond bookkeeping. The
+    /// 2D pre-pass is skipped with them (the GPU descent, `with_descent`, is
+    /// what keeps uniform nodes from being requested). `classify` keeps using
+    /// the CPU columns. Without a GPU generator, or when the device cannot
+    /// run the biome pass, the sampler is returned as it was (CPU columns).
+    pub fn with_biomes(mut self, params: BiomeGenParams) -> Self {
+        let (Some(backend), Some(gpu)) = (&self.backend, &self.gpu) else {
+            return self;
+        };
+        let Some(biomes) = BiomeGen::new(
+            backend.device.clone(),
+            backend.queue.clone(),
+            Arc::new(params),
+        ) else {
+            return self;
+        };
+        if gpu.send(Work::Biomes(Box::new(biomes))).is_ok() {
+            self.gpu_columns = true;
+        }
+        self
+    }
+
+    /// Whether the columns of requested nodes are made on the GPU.
+    pub fn gpu_columns(&self) -> bool {
+        self.gpu_columns
     }
 
     /// Whether requests go to the GPU.
@@ -1453,6 +1554,31 @@ impl GpuCubeSampler {
     /// Nodes the pre-pass settled are [`Resident::Node`] (uniform, no slot).
     pub fn request_resident(&mut self, keys: &[CubeKey], slots: bool) -> Vec<Option<Resident>> {
         let mut out: Vec<Option<Resident>> = (0..keys.len()).map(|_| None).collect();
+        if self.gpu_columns
+            && let Some(gpu) = &self.gpu
+        {
+            let places: Vec<usize> = (0..keys.len())
+                .filter(|&i| keys[i].level >= MIN_LEVEL)
+                .collect();
+            if places.is_empty() {
+                return out;
+            }
+            let sent = gpu.send(Work::Keys(KeysMessage {
+                keys: places.iter().map(|&i| keys[i]).collect(),
+                slots,
+                reply: self.reply.clone(),
+            }));
+            if sent.is_err() {
+                return out;
+            }
+            for (i, node) in places
+                .into_iter()
+                .zip(self.replies.recv().unwrap_or_default())
+            {
+                out[i] = node;
+            }
+            return out;
+        }
         let mut jobs = Vec::new();
         let mut places = Vec::new();
         for (i, &key) in keys.iter().enumerate() {
@@ -1483,11 +1609,11 @@ impl GpuCubeSampler {
                 })
                 .collect(),
             Some(gpu) => {
-                let sent = gpu.send(Message {
+                let sent = gpu.send(Work::Jobs(Message {
                     jobs,
                     slots,
                     reply: self.reply.clone(),
-                });
+                }));
                 if sent.is_err() {
                     return out;
                 }
@@ -1503,32 +1629,62 @@ impl GpuCubeSampler {
 
 /// Merges every queued message (up to [`BATCH_NODES`] nodes) and runs them
 /// through the generator; ends when every handle is gone.
-fn gpu_thread(mut generator: CubeGen, messages: mpsc::Receiver<Message>) {
+fn gpu_thread(mut generator: CubeGen, messages: mpsc::Receiver<Work>) {
+    let mut biomes: Option<BiomeGen> = None;
     while let Ok(first) = messages.recv() {
-        let mut batch = vec![first];
-        let mut nodes = batch[0].jobs.len();
-        while nodes < BATCH_NODES {
-            match messages.try_recv() {
-                Ok(m) => {
+        let (mut jobs_in, mut keys_in) = (Vec::new(), Vec::new());
+        let mut nodes = 0;
+        let mut work = Some(first);
+        while let Some(w) = work.take() {
+            match w {
+                Work::Biomes(b) => biomes = Some(*b),
+                Work::Jobs(m) => {
                     nodes += m.jobs.len();
-                    batch.push(m);
+                    jobs_in.push(m);
                 }
-                Err(_) => break,
+                Work::Keys(m) => {
+                    nodes += m.keys.len();
+                    keys_in.push(m);
+                }
+            }
+            if nodes < BATCH_NODES {
+                work = messages.try_recv().ok();
             }
         }
-        let jobs: Vec<(CubeKey, &NodeColumns)> = batch
-            .iter()
-            .flat_map(|m| m.jobs.iter().map(|(k, c)| (*k, c)))
-            .collect();
-        let slot: Vec<bool> = batch
-            .iter()
-            .flat_map(|m| std::iter::repeat_n(m.slots, m.jobs.len()))
-            .collect();
-        let mut results = generator.generate_resident(&jobs, &slot).into_iter();
-        drop(jobs);
-        for message in batch {
-            let part: Vec<_> = results.by_ref().take(message.jobs.len()).collect();
-            let _ = message.reply.send(part);
+        if !jobs_in.is_empty() {
+            let jobs: Vec<(CubeKey, &NodeColumns)> = jobs_in
+                .iter()
+                .flat_map(|m| m.jobs.iter().map(|(k, c)| (*k, c)))
+                .collect();
+            let slot: Vec<bool> = jobs_in
+                .iter()
+                .flat_map(|m| std::iter::repeat_n(m.slots, m.jobs.len()))
+                .collect();
+            let mut results = generator.generate_resident(&jobs, &slot).into_iter();
+            drop(jobs);
+            for message in jobs_in {
+                let part: Vec<_> = results.by_ref().take(message.jobs.len()).collect();
+                let _ = message.reply.send(part);
+            }
+        }
+        if !keys_in.is_empty() {
+            let keys: Vec<CubeKey> = keys_in
+                .iter()
+                .flat_map(|m| m.keys.iter().copied())
+                .collect();
+            let slot: Vec<bool> = keys_in
+                .iter()
+                .flat_map(|m| std::iter::repeat_n(m.slots, m.keys.len()))
+                .collect();
+            let mut results = match &biomes {
+                Some(biomes) => generator.generate_resident_gpu(&keys, &slot, biomes),
+                None => keys.iter().map(|_| None).collect(),
+            }
+            .into_iter();
+            for message in keys_in {
+                let part: Vec<_> = results.by_ref().take(message.keys.len()).collect();
+                let _ = message.reply.send(part);
+            }
         }
     }
 }
@@ -1566,6 +1722,7 @@ impl CubeSampler for GpuCubeSampler {
         let mut fork = Self::with(self.params.clone(), self.columns.clone(), self.gpu.clone());
         fork.backend = self.backend.clone();
         fork.descent = self.descent.clone();
+        fork.gpu_columns = self.gpu_columns;
         Some(Box::new(fork))
     }
 }
