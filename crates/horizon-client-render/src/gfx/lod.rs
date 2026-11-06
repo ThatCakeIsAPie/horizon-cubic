@@ -516,6 +516,13 @@ impl Renderer {
         for key in work.retire {
             tiles.retire(key);
         }
+        // A tile asked for again while it fades out is made again: `request`
+        // skips resident tiles, and this one is about to be freed.
+        for &key in &work.request {
+            if tiles.ready(key) {
+                tiles.free(key);
+            }
+        }
         tiles.request(&work.request);
     }
 
