@@ -145,6 +145,9 @@ pub struct CubicLevel {
     /// What cube records are decoded with for the far terrain.
     registry: &'static BlockRegistry,
     biomes: Arc<Biomes>,
+    /// The far terrain the level remembers (`horizon_cube_lod/`): every cube
+    /// saved erases the nodes over it.
+    lod_cache: Option<Arc<crate::lod::cube_cache::CubeLodCache>>,
 }
 
 impl CubicLevel {
@@ -186,6 +189,10 @@ impl CubicLevel {
             deepslate: registry.default_state("minecraft:deepslate").map(|s| s.0),
             registry,
             biomes: biomes.clone(),
+            lod_cache: crate::lod::cube_cache::CubeLodCache::open(
+                &level_dir.join("horizon_cube_lod"),
+                &crate::lod::cube_cache::fingerprint(seed, registry.len()),
+            ),
         });
         Ok(level)
     }
@@ -221,6 +228,7 @@ impl CubicLevel {
             vec![id("minecraft:water"), id("minecraft:lava")],
             self.deep_biome,
             self.sky_biome,
+            self.lod_cache.clone(),
         )
     }
 
@@ -253,6 +261,9 @@ impl CubicLevel {
     }
 
     fn write_later(&self, pos: SectionPos, tag: NamedTag) {
+        if let Some(cache) = &self.lod_cache {
+            cache.invalidate(pos);
+        }
         let tag = Arc::new(tag);
         self.io.pending.lock().unwrap().insert(pos, tag.clone());
         *self.io.queued.0.lock().unwrap() += 1;

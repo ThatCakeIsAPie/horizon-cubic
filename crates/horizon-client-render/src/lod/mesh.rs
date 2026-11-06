@@ -1,7 +1,7 @@
 //! Exposed voxel-column faces, merged without changing their block-scale UVs.
 use super::{
     Column, Span, Spans, TileKey,
-    cube::{CubeNode, SIDE as CUBE_SIDE, Voxel},
+    cube::{CubeNode, SIDE as CUBE_SIDE, VOLUME, Voxel},
 };
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
@@ -737,6 +737,34 @@ pub(super) fn mesh_cube(
     );
 }
 
+/// A voxel in the sun: sky light 15.
+const SUNLIT: u16 = 240;
+/// A voxel with a roof over it, in the node or above it: sky light 4. Far
+/// terrain has no light propagation, so this stands for the dark under an
+/// overhang (an island over the sea, a cliff) without lighting its inside.
+const SHADED: u16 = 4 << 4;
+
+/// Which voxels see the sky: no opaque voxel above them in the node, and the
+/// node's column not covered above it (`CubeNode::column_covered`).
+fn sky_lit(node: &CubeNode, mut opaque: impl FnMut(Voxel) -> bool) -> Box<[bool; VOLUME]> {
+    let mut lit = Box::new([true; VOLUME]);
+    if node.covered_mask().is_none() && node.as_uniform().is_some() {
+        return lit;
+    }
+    for z in 0..CUBE_SIDE {
+        for x in 0..CUBE_SIDE {
+            let mut open = !node.column_covered(x, z);
+            for y in (0..CUBE_SIDE).rev() {
+                lit[CubeNode::index(x, y, z)] = open;
+                if open && opaque(node.get(x, y, z)) {
+                    open = false;
+                }
+            }
+        }
+    }
+    lit
+}
+
 fn mesh_voxels(
     node: &CubeNode,
     air: BlockStateId,
@@ -748,15 +776,24 @@ fn mesh_voxels(
     }
     let scale = (1_i32 << node.key.level) as f32;
     let [ox, _, oz] = node.key.origin();
-    let span = |voxel: Voxel| Span {
+    let span = |voxel: Voxel, light: u16| Span {
         min: 0,
         max: 1,
         state: voxel.state,
         biome: voxel.biome,
-        light: 240,
+        light,
     };
     // (opaque, fluid) by state: whether a voxel hides a face behind it.
     let mut hiding: FxHashMap<u32, (bool, u8)> = FxHashMap::default();
+    let lit = sky_lit(node, |voxel| {
+        hiding
+            .entry(voxel.state.0)
+            .or_insert_with(|| {
+                let m = material(&span(voxel, SUNLIT), Direction::Up, [0, 0]);
+                (m.opaque, m.fluid)
+            })
+            .0
+    });
     let mut faces = Faces::new();
     const SIDES: [(Direction, [i32; 3]); 6] = [
         (Direction::Up, [0, 1, 0]),
@@ -773,7 +810,14 @@ fn mesh_voxels(
                 if voxel.state == air {
                     continue;
                 }
-                let own = span(voxel);
+                let own = span(
+                    voxel,
+                    if lit[CubeNode::index(x, y, z)] {
+                        SUNLIT
+                    } else {
+                        SHADED
+                    },
+                );
                 let at = [ox + x as i32 * scale as i32, oz + z as i32 * scale as i32];
                 for (direction, [dx, dy, dz]) in SIDES {
                     let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
@@ -788,7 +832,7 @@ fn mesh_voxels(
                         if next.state != air {
                             let (opaque, fluid) =
                                 *hiding.entry(next.state.0).or_insert_with(|| {
-                                    let m = material(&span(next), Direction::Up, at);
+                                    let m = material(&span(next, SUNLIT), Direction::Up, at);
                                     (m.opaque, m.fluid)
                                 });
                             let (_, own_fluid) =
@@ -2090,6 +2134,68 @@ mod cube_tests {
         // Water beside water shares nothing either.
         let pool = node(0, &[([3, 3, 3], WATER), ([4, 3, 3], WATER)]);
         assert_eq!(quads(&mesh(&pool).translucent).len(), 6);
+    }
+
+    /// The light of the quads in `plane` of axis `axis`, with their extent.
+    fn lights_at(mesh: &SectionMesh, axis: usize, plane: f32) -> Vec<(u16, [f32; 3], [f32; 3])> {
+        quads(&mesh.solid)
+            .iter()
+            .filter(|q| flat_at(q, axis, plane))
+            .map(|q| {
+                let (lo, hi) = extent(q);
+                (q[0].light, lo, hi)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn voxels_under_an_overhang_are_darker() {
+        // A floor, and a roof over its western half.
+        let node = CubeNode::from_fn(CubeKey::new(0, 0, 0, 0), |x, y, _| {
+            voxel(if y == 0 || (y == 8 && x < 8) {
+                STONE
+            } else {
+                AIR
+            })
+        });
+        let mesh = mesh(&node);
+        let floor = lights_at(&mesh, 1, 1.0);
+        assert_eq!(floor.len(), 2, "shaded and sunlit halves: {floor:?}");
+        for (light, _, hi) in floor {
+            let under_roof = hi[0] <= 8.0;
+            assert_eq!(light, if under_roof { 0x40 } else { 240 }, "{hi:?}");
+        }
+        // The roof's own top is in the sun.
+        let roof = lights_at(&mesh, 1, 9.0);
+        assert!(!roof.is_empty() && roof.iter().all(|r| r.0 == 240));
+    }
+
+    #[test]
+    fn a_column_the_sky_is_blocked_over_is_dark_all_the_way_down() {
+        // Solid rock whose column (3, 3) has an island over the node.
+        let mut mask = Box::new([0u64; 4]);
+        let bit = 3 << 4 | 3;
+        mask[bit >> 6] |= 1 << (bit & 63);
+        let node =
+            CubeNode::uniform(CubeKey::new(0, 0, 0, 0), voxel(STONE)).with_covered(Some(mask));
+        let top = lights_at(&mesh(&node), 1, 16.0);
+        assert!(top.iter().any(|(light, lo, hi)| {
+            *light == 0x40 && lo[0] == 3.0 && hi[0] == 4.0 && lo[2] == 3.0 && hi[2] == 4.0
+        }));
+        assert!(
+            top.iter()
+                .filter(|(_, lo, hi)| !(lo[0] <= 3.0
+                    && hi[0] >= 4.0
+                    && lo[2] <= 3.0
+                    && hi[2] >= 4.0))
+                .all(|r| r.0 == 240),
+            "everything else is lit"
+        );
+        // Without the cover the node is one lit face a side.
+        let open = CubeNode::uniform(CubeKey::new(0, 0, 0, 0), voxel(STONE));
+        let top = lights_at(&mesh(&open), 1, 16.0);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].0, 240);
     }
 
     #[test]
