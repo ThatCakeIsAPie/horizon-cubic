@@ -68,8 +68,7 @@ def main():
         f'lodDistance:{args.lod}\nfarDetail:full\ncubicVertical:{args.vertical}\ngpuFarTerrain:{args.gpu}\n')
     # Vanilla's inactivity limit drops to 30 fps after a minute without input, which a
     # script never gives: keep it to minimized windows.
-    (game_dir / 'options.txt').write_text('inactivityFpsLimit:"minimized"
-')
+    (game_dir / 'options.txt').write_text('inactivityFpsLimit:"minimized"'+chr(10))
     env = dict(os.environ, HORIZON_HOME=str(home), HORIZON_NO_AUDIO='1')
 
     def ctl_run(*argv, timeout=60):
