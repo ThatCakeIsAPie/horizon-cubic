@@ -2408,8 +2408,9 @@ pub struct SaveDir {
     pub tables: OnceLock<Arc<SaveTables>>,
     /// The dimension's skylight and height, from its folder name.
     pub shape: LevelShape,
-    /// A cubic level's cubes (docs/cubic-chunks.md): its columns are saved
-    /// as cubes there, and its entities outside the window kept.
+    /// A cubic level's cubes (docs/cubic-chunks.md): its columns and their
+    /// entities are saved as cubes there. Its points of interest are not
+    /// saved (they are rebuilt from blocks).
     pub cubic: OnceLock<Arc<crate::cubic::CubicLevel>>,
     /// Which chunks each region file holds, for far terrain (`lod_saved`).
     lod_regions: Mutex<crate::fast_hash::FxHashMap<(i32, i32), LodRegion>>,
@@ -2997,14 +2998,27 @@ impl SaveDir {
         self.write_entities(chunks, false)
     }
     fn write_entities(&self, chunks: Vec<((i32, i32), Vec<Tag>)>, wait: bool) -> Result<()> {
-        // A cubic level keeps each column's entities outside the window.
-        let chunks: Vec<_> = match self.cubic.get() {
-            Some(cubic) => chunks
-                .into_iter()
-                .map(|((x, z), e)| ((x, z), cubic.with_parked(x, z, e)))
-                .collect(),
-            None => chunks,
-        };
+        // A cubic level keeps entities in the records of their cubes.
+        if let Some(cubic) = self.cubic.get() {
+            for ((x, z), entities) in chunks {
+                cubic.save_entities(x, z, entities);
+            }
+            if wait {
+                cubic.flush();
+            }
+            return Ok(());
+        }
+        self.write_entity_records(chunks, wait)
+    }
+
+    /// Empties column (x, z)'s entity file: its entities moved into cubes.
+    pub fn clear_entity_file(&self, x: i32, z: i32) {
+        if let Err(e) = self.write_entity_records(vec![((x, z), Vec::new())], false) {
+            log::warn!("Horizon: entity file of column {x} {z} not cleared: {e}");
+        }
+    }
+
+    fn write_entity_records(&self, chunks: Vec<((i32, i32), Vec<Tag>)>, wait: bool) -> Result<()> {
         let records = chunks
             .into_iter()
             .map(|((x, z), entities)| {
