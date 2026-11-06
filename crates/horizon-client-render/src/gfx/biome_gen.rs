@@ -1253,6 +1253,7 @@ mod tests {
         for (key, g) in keys.iter().zip(&gpu) {
             let o = key.origin();
             let mut agree = 0;
+            let mut centre = 0;
             for z in 0..16i32 {
                 for x in 0..16i32 {
                     let [jx, jz] = column_jitter(
@@ -1267,10 +1268,24 @@ mod tests {
                     let i = (z * 16 + x) as usize;
                     assert_eq!(params.column_terrain(b), (h, v));
                     agree += usize::from(u32::from(g.biome[i]) == b);
+                    let cx = o[0] + (x << key.level) + (1 << key.level) / 2;
+                    let cz = o[2] + (z << key.level) + (1 << key.level) / 2;
+                    let (_, _, bc) = f.cpu.column_at(&mut context, cx, cz);
+                    centre += usize::from(u32::from(g.biome[i]) == bc);
                 }
             }
-            // The octave cut moves a few biome edges.
-            assert!(agree >= 220, "{key:?}: {agree}/256");
+            // The octave cut (climate detail under 256 blocks) moves biome
+            // edges. At 64-block columns that is a few; at 1,024-block columns,
+            // where neighbouring samples are unrelated, most samples sit near
+            // some edge, so about 70% agree (measured 176-185 of 256). The
+            // jittered point must still be the one sampled: far more agree
+            // with it than with the column's centre (about 25%).
+            let need = if key.level <= 6 { 220 } else { 160 };
+            assert!(agree >= need, "{key:?}: {agree}/256");
+            assert!(
+                key.level <= 6 || agree >= 2 * centre,
+                "{key:?}: jittered {agree}/256, centre {centre}/256"
+            );
         }
     }
 
