@@ -339,6 +339,7 @@ These came from the owner while reviewing the Meridian video. They are recorded 
    - ceilings and stacked layers;
    - extreme height settings: no height cap in tiles; the cube range is ±8.4 M blocks, the border ±30 M;
    - very tall thin towers (5 above).
+8. **A realistic-scale terrain preset.** *Later; terrain-generator work, not far-view work.* The tall-mountain test (`heightFactor` 64 → 30,000, `heightVariationFactor` 64 → 1,000) only stretches the terrain upwards. Every hill becomes a needle thousands of blocks tall and a couple of hundred wide. A Minecraft Everest of about 9,000 blocks also needs the terrain stretched sideways: lower horizontal noise frequencies and a bigger biome scale, so mountains are miles wide as well as tall. Erosion-like shaping may follow. The far view already draws any height.
 
 ### Detail by size on screen, coverage first (2026-11-06, `cubic/far-detail`)
 
@@ -389,7 +390,8 @@ Points 1 and 5 above are built (`lod/cube.rs`):
 - **Views:** from y 300 to 5,000,000 there are no holes and no log errors. From 100,000 up, the ground is a mix of real biomes and oceans; the regular pattern is gone.
 - **Tall world** (peaks of 8,000–12,000 blocks): complete in 1.7–5.3 s from y 60,000, with 16 complex tiles. From y 20,000 at 60° it took over 180 s (budget-limited).
 - **Cavern:** at y -2,000, in rock and in a carved open space, it is complete in 5.7 s and 0.2 s, with no holes, no errors and no tile over the camera.
-- **Spyglass: not verified.** At Ultra the plan was already at the budget (`planned` went 123,582 → 123,577), and the test's screenshot shows the spyglass held but not zoomed. Rerun at High, with the check fixed to really use the spyglass.
+- **Spyglass, at High:** the field of view goes to 7°, and the plan refines what it looks at (35,881 → 123,580 nodes, the budget, in 25 s). Zoomed in, the budget binds at about 9 px per voxel. It goes back to 50,007 nodes 11 s after letting go. The first attempt, at Ultra, was invalid: the plan was already at the budget, and the check let go before its screenshot.
+- **Dark walls fixed.** Both far meshers lit a face by whether its own voxel saw the sky, so only a column's top voxel was in the sun, and tall cliffs and pillars drew near-black. A face now takes the light of the cell in front of it, as in Minecraft. The tall world's pillars now draw with lit stone walls (`D:\ClaudeData\far-detail-runs\light\tall_cmp.png`).
 - **Not run:** `SURFACE_LEVEL` 10/14, the per-step sweep with tiles at Low/Normal/Extreme, and true 1 px.
 
 ### Where the GPU far view stands
@@ -464,7 +466,7 @@ Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertica
    - Install to `E:\Horizon Cubic`.
    - Update `HANDOFF.md` and these docs.
    - Push to horizon-cubic.
-6. **Far-view rework (2026-11-06, in flight).** Steps 1–5 above are done.
+6. **Far-view rework (2026-11-06, merged).** Steps 1–5 above are done.
    1. `cubic/far-detail`:
       - detail by size on screen (FOV and spyglass aware);
       - a Far Detail setting (top step about 1 px per voxel);
@@ -473,8 +475,9 @@ Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertica
       - the benchmark's two numbers, `cover_s` and `far_fill_s`;
       - the per-node `node_kind` seam.
    2. `cubic/far-surface`: layered height-map tiles on the GPU for the coarsest levels, with exact heights and jittered samples.
-   3. Lead: merge both, wire the tiles into the plan through `node_kind`, one test pass, benchmark at each Far Detail step, screenshots from y 300 to 5,000,000, install.
-   4. Then, in this order:
+   3. Lead: merge both, wire the tiles into the plan through `node_kind`, one test pass, benchmark at each Far Detail step, screenshots from y 300 to 5,000,000, install. Done, except benchmarking every step: only High and Ultra were run with tiles.
+   4. Still to measure: `SURFACE_LEVEL` 10/14, Low/Normal/Extreme with tiles, true 1 px. Then find why Ultra is slower with tiles; the first suspect is tile draw compaction.
+   5. Then, in this order:
       1. far views of the player's builds;
       2. occlusion-driven refinement;
       3. far block light;
