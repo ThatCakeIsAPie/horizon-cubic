@@ -519,6 +519,11 @@ pub(super) struct Remote {
     /// What chunk packets decode with (the dimension's height and sky, the
     /// biome registry); replaced whenever one of them changes.
     pub(super) chunk_format: Arc<ChunkFormat>,
+    /// A cubic level's columns still holding placeholder (air) sections where the window
+    /// moved over them, until the server's column arrives: the section indexes, by column.
+    /// The cube far terrain draws those sections meanwhile (`remote_cubic_window`).
+    pub(super) cubic_placeholders:
+        horizon_client::fast_hash::FxHashMap<(i32, i32), horizon_client::section_mask::SectionMask>,
     /// Decodes chunk packets as they arrive, off the frame.
     decoder: ChunkDecoder,
     /// Options.serverRenderDistance: the server's view distance from the
@@ -1089,6 +1094,7 @@ impl Game<'_> {
                 Vec::new(),
                 7,
             )),
+            cubic_placeholders: Default::default(),
             decoder: ChunkDecoder::new(),
             view_distance: self.settings.render_distance,
             simulation_distance: self.settings.simulation_distance,
@@ -2238,6 +2244,7 @@ impl Game<'_> {
         // handleRespawn keeps the ClientLevel only for the same level key:
         // two levels sharing a dimension type are still two levels.
         let same = keep_world && r.heard_level.as_deref() == Some(spawn.dimension.as_str());
+        r.cubic_placeholders.clear();
         r.chunk_format = Arc::new(
             r.chunk_format
                 .with_dimension(&dimension)
@@ -2345,13 +2352,15 @@ impl Game<'_> {
     }
 
     /// `horizon:cubic_window` (docs/cubic-chunks.md): the level the player is in is now the
-    /// window of cubes from `window.min_y`. The level is laid out again in place, as a
-    /// dimension change lays out a new one, minus what outlives the window: the entities, the
-    /// player, the far terrain (`clear_lod` is not called) and the sounds. Every loaded column
-    /// goes (the server sends them all again, nearest first), with the meshes and what
-    /// streaming keeps per section; the chunk format changes, so a column still decoding for
-    /// the old window is decoded again. Until the player's column is lit again the local
-    /// player does not move (`tick_remote_player` waits for `Streaming::is_lit`).
+    /// window of cubes from `window.min_y`. The level is laid out again in place
+    /// (`World::relayout`): every loaded column keeps the sections both windows hold, with
+    /// their meshes, and the sections that enter are air placeholders until the server sends
+    /// the columns again (nearest first). A placeholder is not loaded for the cube far
+    /// terrain, which draws there meanwhile. Entities, the player and the far terrain are
+    /// untouched, and so are the attachments (they are keyed by column and block position).
+    /// The chunk format changes, so a column still decoding for the old window is decoded
+    /// again. Until the player's column is lit again the local player does not move
+    /// (`tick_remote_player` waits for `Streaming::is_lit`).
     pub(super) fn remote_cubic_window(&mut self, window: horizon_protocol::cubic::Window) {
         let shape = horizon_client::chunk::LevelShape::cubic_window(
             self.world.shape,
@@ -2362,37 +2371,39 @@ impl Game<'_> {
             return;
         };
         r.chunk_format = Arc::new(r.chunk_format.with_window(shape));
-        // The attachments of columns and block entities that are gone; entities keep theirs.
-        r.attachments
-            .retain(|holder, _| !matches!(holder, Holder::Chunk(_) | Holder::BlockEntity(_)));
-        let mut streaming = Streaming::new(
-            Arc::new(NoTerrain),
-            self.worker_context(),
-            self.res.threads(),
-        );
-        streaming.remote = true;
-        streaming.radius = self.streaming.radius;
-        streaming.center = self.streaming.center;
-        streaming.sky_light = self.streaming.sky_light;
-        streaming.nether_shading = self.streaming.nether_shading;
-        streaming.biome_zoom = self.streaming.biome_zoom;
-        self.streaming = streaming;
-        let fresh = World::new(self.res.facts().air, 0);
-        let old = std::mem::replace(&mut self.world, fresh);
-        let world = &mut self.world;
-        world.random = old.random;
-        world.health_rules = old.health_rules;
-        world.fast_lava = old.fast_lava;
-        world.revision = old.revision;
-        world.game_time = old.game_time;
-        world.day_time = old.day_time;
-        world.weather = old.weather;
-        world.shape = shape;
-        let count = old.chunks.len();
-        horizon_client::chunk::free_columns(old.chunks, count);
-        self.pending_uploads.clear();
+        let (old, new) = (self.world.layout(), shape.column());
+        let mut air = [Arc::new(horizon_client::chunk::Section::default())];
+        horizon_client::chunk::share_uniform(&mut air);
+        let [air] = air;
+        self.world.relayout(shape, |_, _, _| air.clone());
+        self.streaming.shift_layout(old, new);
+        // The sections that entered, per column, wait for the server's columns.
+        use horizon_client::section_mask::SectionMask;
+        let delta = (old.min_y() - new.min_y()) >> 4;
+        let old_low = old.min_y() >> 4;
+        let old_high = old_low + old.sections() as i32;
+        let entering: SectionMask = (0..new.sections())
+            .filter(|&i| {
+                let y = (new.min_y() >> 4) + i as i32;
+                !(old_low..old_high).contains(&y)
+            })
+            .collect();
+        let keep = SectionMask::below(new.sections());
+        r.cubic_placeholders.retain(|_, mask| {
+            *mask = mask.shifted(delta) & keep;
+            !mask.is_empty()
+        });
+        for &column in self.world.chunks.keys() {
+            *r.cubic_placeholders.entry(column).or_default() |= entering;
+        }
+        r.cubic_placeholders.retain(|_, mask| !mask.is_empty());
+        // Meshes waiting to upload are still right for their sections: moved with them.
+        self.pending_uploads.retain_mut(|(key, _)| {
+            key.1 += delta;
+            (0..new.sections() as i32).contains(&key.1)
+        });
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.clear_sections(self.world.layout());
+            renderer.shift_layout(new);
         }
         self.apply_settings();
     }
@@ -2433,6 +2444,10 @@ impl Game<'_> {
             for chunk in &freed {
                 lod.observe(chunk.clone(), self.res.facts());
             }
+        }
+        if let Some(r) = self.remote.as_mut() {
+            r.cubic_placeholders
+                .retain(|column, _| !gone.contains(column));
         }
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.remove_columns(gone.iter().copied());

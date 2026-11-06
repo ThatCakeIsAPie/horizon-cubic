@@ -55,6 +55,14 @@ impl SectionMask {
     pub fn from(self, i: usize) -> Self {
         self & !Self::below(i)
     }
+    /// Every index moved by `delta` (a layout moving by whole sections);
+    /// those leaving `0..CAPACITY` are dropped.
+    pub fn shifted(self, delta: i32) -> Self {
+        self.iter()
+            .filter_map(|i| usize::try_from(i as i32 + delta).ok())
+            .filter(|&i| i < Self::CAPACITY)
+            .collect()
+    }
     /// The indexes, lowest first.
     pub fn iter(self) -> Indexes {
         Indexes(self)

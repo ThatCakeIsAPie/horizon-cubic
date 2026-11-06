@@ -480,6 +480,10 @@ pub struct Streaming {
     saves_beside_final: bool,
     lighting: FxHashMap<(i32, i32), u64>,
     meshing: FxHashMap<(i32, i32, i32), u64>,
+    /// Sections (new indexes) whose mesh job a layout shift abandoned, dirty again at the next
+    /// `update`; and the columns whose light job it abandoned.
+    shifted_dirty: Vec<(i32, i32, i32)>,
+    shifted_light: Vec<(i32, i32)>,
     /// The sequence each section's latest accepted mesh was dispatched at
     /// (`CompiledSectionMesh.compileTaskStartTimeNs`).
     compile_started: FxHashMap<(i32, i32, i32), u64>,
@@ -1076,6 +1080,8 @@ impl Streaming {
             saves_beside_final: generator.decorates_beside_final(),
             lighting: Default::default(),
             meshing: Default::default(),
+            shifted_dirty: Vec::new(),
+            shifted_light: Vec::new(),
             compile_started: Default::default(),
             lit: Default::default(),
             meshed: Default::default(),
@@ -1134,13 +1140,68 @@ impl Streaming {
             }
         }
     }
+    /// The level's columns now hold `new` where they held `old` (`World::relayout`, a cubic
+    /// window moving in place): the per-section state moves with its sections, by
+    /// `(old.min_y - new.min_y) / 16` indexes, and what falls outside `new` is dropped
+    /// (`compile_started`, `waiting`). Jobs in flight address sections by their old index, so
+    /// they are abandoned: `meshing` and `lighting` are emptied, which makes their results
+    /// stale (a result is taken only while its sequence is the one recorded), and the
+    /// sections and columns they were for are dirty again at the next `update`.
+    pub fn shift_layout(
+        &mut self,
+        old: crate::chunk::ColumnLayout,
+        new: crate::chunk::ColumnLayout,
+    ) {
+        let delta = (old.min_y() - new.min_y()) >> 4;
+        if delta == 0 && old.sections() == new.sections() {
+            return;
+        }
+        self.shifted_dirty.extend(shift_pending_sections(
+            &mut self.meshing,
+            &mut self.compile_started,
+            &mut self.waiting,
+            delta,
+            new.sections() as i32,
+        ));
+        self.shifted_light.extend(self.lighting.keys().copied());
+        self.lighting.clear();
+        self.light_snapshots.clear();
+    }
     /// A column received from a server, with the light it sent
     /// (`ClientPacketListener.handleLevelChunkWithLight`): nothing is
     /// relit, and it and its neighbours remesh (`enableChunkLight`).
-    pub fn insert_remote(&mut self, world: &mut World, chunk: Chunk) {
+    ///
+    /// A column that replaces one of the same layout (a cubic window moved under it, the old
+    /// column's sections kept in place by `World::relayout`) keeps the old sections that are
+    /// `same_as` the new ones, and only the sections that differ remesh, with their
+    /// neighbours (`light_updated`): the terrain that did not change is not drawn again.
+    pub fn insert_remote(&mut self, world: &mut World, mut chunk: Chunk) {
         let key = (chunk.x, chunk.z);
         self.lighting.remove(&key);
         self.light_snapshots.remove(&key);
+        let old = world
+            .chunks
+            .get(&key)
+            .filter(|old| old.layout() == chunk.layout() && self.lit.contains(&key))
+            .cloned();
+        if let Some(old) = old {
+            let mut changed = Vec::new();
+            for (s, section) in chunk.sections.iter_mut().enumerate() {
+                if Arc::ptr_eq(section, &old.sections[s]) {
+                    continue;
+                }
+                if section.same_as(&old.sections[s]) {
+                    *section = old.sections[s].clone();
+                } else {
+                    changed.push(s);
+                }
+            }
+            world.chunks.insert(key, Arc::new(chunk));
+            self.lit.insert(key);
+            self.generated_total += 1;
+            Self::light_updated(world, key.0, key.1, &changed);
+            return;
+        }
         world.chunks.insert(key, Arc::new(chunk));
         self.lit.insert(key);
         self.generated_total += 1;
@@ -1636,6 +1697,12 @@ impl Streaming {
         self.scan_area = area;
         self.scan_age = if sweep { 0 } else { self.scan_age + 1 };
         self.requeue();
+        for section in self.shifted_dirty.drain(..) {
+            world.dirty_sections.insert(section);
+        }
+        for column in self.shifted_light.drain(..) {
+            world.dirty_light.insert(column);
+        }
         self.relight_edits(world);
         let deferred = std::mem::take(&mut self.deferred);
         let received = self.shared.done.take();
@@ -3094,6 +3161,30 @@ fn whole_relight_columns(
     (columns, inline)
 }
 
+/// `Streaming::shift_layout` for the pending sections: `compile_started` and `waiting` follow
+/// their sections to index `y + delta` (those outside `0..sections` go), `meshing` is emptied
+/// because its jobs name the old indexes. Returns the new keys of the sections that were meshing:
+/// they are dirty again.
+fn shift_pending_sections(
+    meshing: &mut FxHashMap<(i32, i32, i32), u64>,
+    compile_started: &mut FxHashMap<(i32, i32, i32), u64>,
+    waiting: &mut FxHashSet<(i32, i32, i32)>,
+    delta: i32,
+    sections: i32,
+) -> Vec<(i32, i32, i32)> {
+    let remap = move |&(x, sy, z): &(i32, i32, i32)| {
+        let s = sy + delta;
+        (0..sections).contains(&s).then_some((x, s, z))
+    };
+    let dirty = meshing.keys().filter_map(remap).collect();
+    meshing.clear();
+    *compile_started = std::mem::take(compile_started)
+        .into_iter()
+        .filter_map(|(k, seq)| Some((remap(&k)?, seq)))
+        .collect();
+    *waiting = std::mem::take(waiting).iter().filter_map(remap).collect();
+    dirty
+}
 /// Drops the pending sections (`meshing`, `compile_started`, `waiting`) of
 /// the `gone` columns: one pass over each store when that is cheaper than a
 /// lookup per section of every column (a far teleport at render distance 32
@@ -3271,6 +3362,28 @@ mod tests {
                 .is_none()
         );
         assert!(waiting.elapsed() >= std::time::Duration::from_millis(10));
+    }
+
+    /// A window moving up two sections: the pending sections follow theirs, the ones outside go, and
+    /// what was being meshed is dirty again at its new place.
+    #[test]
+    fn shifted_pending_sections_follow_their_sections() {
+        let mut meshing: FxHashMap<_, u64> = [((0, 5, 0), 7), ((1, 1, 0), 8)].into_iter().collect();
+        let mut started: FxHashMap<_, u64> = [((0, 3, 0), 4), ((0, 1, 0), 5), ((0, 31, 0), 6)]
+            .into_iter()
+            .collect();
+        let mut waiting: FxHashSet<_> = [(2, 2, 2), (2, 0, 2), (2, 30, 2)].into_iter().collect();
+        // new index = old index - 2 (the window moved up by two sections), 32 sections
+        let mut dirty = shift_pending_sections(&mut meshing, &mut started, &mut waiting, -2, 32);
+        dirty.sort_unstable();
+        assert_eq!(dirty, [(0, 3, 0)]);
+        assert!(meshing.is_empty());
+        let mut started: Vec<_> = started.into_iter().collect();
+        started.sort_unstable();
+        assert_eq!(started, [((0, 1, 0), 4), ((0, 29, 0), 6)]);
+        let mut waiting: Vec<_> = waiting.into_iter().collect();
+        waiting.sort_unstable();
+        assert_eq!(waiting, [(2, 0, 2), (2, 28, 2)]);
     }
 
     /// Whether the forgotten columns are few (looked up by key) or many

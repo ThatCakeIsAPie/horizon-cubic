@@ -28,6 +28,15 @@ impl DirtySections {
                 .get(&(x, z))
                 .is_some_and(|m| m.contains(sy as usize))
     }
+    /// Every index moved by `delta` sections (a layout moving: `new index = index +
+    /// delta`), those outside `0..sections` dropped.
+    pub fn shift(&mut self, delta: i32, sections: usize) {
+        let keep = SectionMask::below(sections);
+        self.columns.retain(|_, mask| {
+            *mask = mask.shifted(delta) & keep;
+            !mask.is_empty()
+        });
+    }
     /// The dirty section indexes of column (x, z), removed.
     pub fn take_column(&mut self, x: i32, z: i32) -> SectionMask {
         self.columns.remove(&(x, z)).unwrap_or_default()
@@ -286,6 +295,46 @@ impl World {
         }
         world.revision = 0;
         Ok(world)
+    }
+    /// Lays the level out again as `shape`, in place, keeping what the old and the new
+    /// layout share (a cubic level's window following the players, docs/cubic-chunks.md).
+    /// Every loaded column keeps the `Arc` of each section at an absolute section Y
+    /// (`block Y >> 4`) both layouts hold (`Chunk::relayout`); `fill(x, z, section_y)`
+    /// makes the others (`x`, `z` are the column's). Everything keyed by section index is
+    /// moved by the same offset or cleared: `dirty_sections` and `light_log` are shifted
+    /// (the entries outside the new layout are dropped, the others stay as marked). What is
+    /// keyed by block position or by column (`block_entities`, `modified`, `inhabited`,
+    /// `dirty_light`, `light_edits`) is untouched; `pois` (a cache by section index) is cleared.
+    /// Entering sections are not marked dirty: the caller marks them when it fills them
+    /// with something. The caller moves its own per-index state (`Streaming::shift_layout`,
+    /// `Renderer::shift_layout`). Does nothing when the layout is the same.
+    pub fn relayout(
+        &mut self,
+        shape: LevelShape,
+        mut fill: impl FnMut(i32, i32, i32) -> Arc<crate::chunk::Section>,
+    ) {
+        let old = self.layout();
+        let new = shape.column();
+        self.shape = shape;
+        if old == new {
+            return;
+        }
+        for chunk in self.chunks.values_mut() {
+            let chunk = Arc::make_mut(chunk);
+            let (x, z) = (chunk.x, chunk.z);
+            chunk.relayout(new, |sy| fill(x, z, sy));
+        }
+        let delta = (old.min_y() - new.min_y()) >> 4;
+        self.dirty_sections.shift(delta, new.sections());
+        if let Some(log) = &mut self.light_log {
+            let keep = SectionMask::below(new.sections());
+            log.retain(|_, mask| {
+                *mask = mask.shifted(delta) & keep;
+                !mask.is_empty()
+            });
+        }
+        // The cached POI lists are keyed by section index; the next read builds them again.
+        self.pois = Default::default();
     }
     /// The column the level's chunks hold.
     pub fn layout(&self) -> ColumnLayout {
@@ -644,5 +693,58 @@ mod tests {
         // Past the top, and the palette of air below it.
         assert!(!world.may_hold([0, 400, 0], [0, 401, 0], nine));
         assert!(world.may_hold([0, 400, 0], [0, 401, 0], |s| s.0 == 0));
+    }
+
+    /// A cubic window moving in place: the columns keep the sections both windows hold, the
+    /// entering ones come from `fill`, and the dirty sections follow their sections.
+    #[test]
+    fn relayout_shifts_dirty_sections_and_keeps_shared_sections() {
+        use crate::chunk::{ColumnLayout, LevelShape, Section};
+        let shape = |min_y| LevelShape::cubic_window(LevelShape::OVERWORLD, min_y, 512);
+        let mut world = World::new(BlockStateId(0), 0);
+        world.shape = shape(0);
+        let layout = world.layout();
+        assert_eq!(layout, ColumnLayout::window(0, 512));
+        let mut column = Chunk::with_layout(1, 2, layout);
+        column.set(0, 16, 0, 5);
+        world.chunks.insert((1, 2), Arc::new(column));
+        world.light_log = Some(Default::default());
+        world
+            .light_log
+            .as_mut()
+            .unwrap()
+            .insert((1, 2), [0usize, 4, 31].into_iter().collect());
+        for sy in [0, 3, 4, 31] {
+            world.dirty_sections.insert((1, sy, 2));
+        }
+        world.dirty_sections.insert((7, 2, 7));
+        let kept = world.chunks[&(1, 2)].sections[4].clone();
+        let mut asked = Vec::new();
+        // Up by four sections: index i becomes i - 4.
+        world.relayout(shape(64), |x, z, sy| {
+            asked.push((x, z, sy));
+            Arc::new(Section::default())
+        });
+        assert_eq!(world.layout().min_y(), 64);
+        assert_eq!(asked, [(1, 2, 32), (1, 2, 33), (1, 2, 34), (1, 2, 35)]);
+        let column = &world.chunks[&(1, 2)];
+        assert_eq!(column.min_y(), 64);
+        assert!(Arc::ptr_eq(&column.sections[0], &kept));
+        assert_eq!(column.get(0, 16, 0), 0, "section 1 left the window");
+        let mut dirty: Vec<_> = world
+            .dirty_sections
+            .columns()
+            .map(|(c, m)| (c, m.iter().collect::<Vec<_>>()))
+            .collect();
+        dirty.sort_unstable();
+        // 0 and 3 left; 4 -> 0 and 31 -> 27 stay; the other column's 2 left too.
+        assert_eq!(dirty, [((1, 2), vec![0, 27])]);
+        let log: Vec<_> = world.light_log.as_ref().unwrap()[&(1, 2)].iter().collect();
+        assert_eq!(log, [0, 27]);
+        // Back down: the section that stayed is the one that was at index 5.
+        let before = world.chunks[&(1, 2)].sections[5].clone();
+        world.relayout(shape(0), |_, _, _| Arc::new(Section::default()));
+        assert!(Arc::ptr_eq(&world.chunks[&(1, 2)].sections[9], &before));
+        assert!(world.shape.cubic);
     }
 }

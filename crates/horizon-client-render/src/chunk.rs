@@ -634,6 +634,30 @@ impl Chunk {
             sky_covered: None,
         }
     }
+    /// The column now holds `layout`, moved in place (a cubic level's window
+    /// following the players): the sections at an absolute section Y in both
+    /// layouts stay as they are (the same `Arc`, no copy), and the others are
+    /// `fill(section_y)` (a section index is `(section_y * 16 - layout.min_y())
+    /// / 16`; `section_y` is `block Y >> 4`). `min_y` follows and the
+    /// heightmaps are dropped, to be built again on their next read. Nothing
+    /// else changes: block entities and the like are keyed by block position.
+    pub fn relayout(&mut self, layout: ColumnLayout, mut fill: impl FnMut(i32) -> Arc<Section>) {
+        let old_min = self.min_y;
+        let old = std::mem::take(&mut self.sections);
+        self.sections = (0..layout.sections())
+            .map(|i| {
+                let section_y = (layout.min_y() >> 4) + i as i32;
+                usize::try_from(section_y - (old_min >> 4))
+                    .ok()
+                    .and_then(|j| old.get(j))
+                    .cloned()
+                    .unwrap_or_else(|| fill(section_y))
+            })
+            .collect();
+        self.min_y = layout.min_y();
+        self.surface = OnceLock::new();
+        self.motion_blocking = OnceLock::new();
+    }
     /// Whether column (`x`, `z`, within the chunk) gets no sky at the top
     /// of its sections (`sky_covered`).
     pub fn sky_covered_at(&self, x: i32, z: i32) -> bool {
@@ -1155,5 +1179,74 @@ mod tests {
         assert_eq!(chunk.light(0, -65, 0), 0);
         chunk.set_biome_cell(0, 130 * 4 + 3, 0, 9);
         assert_eq!(chunk.biome(0, 5000, 0), 9);
+    }
+
+    /// A column moved in place keeps the `Arc`s of the sections both layouts hold and takes the
+    /// others from `fill`, whichever way it moves, however far.
+    #[test]
+    fn relayout_keeps_shared_sections_and_fills_the_rest() {
+        let layout = |min_y| ColumnLayout::window(min_y, 64);
+        let marked = |chunk: &Chunk| {
+            // The block at each section's first cell, which names the section it was made for.
+            chunk
+                .sections
+                .iter()
+                .map(|s| s.get(0))
+                .collect::<Vec<u32>>()
+        };
+        let make = || {
+            let mut chunk = Chunk::with_layout(3, -2, layout(160));
+            for s in 0..4 {
+                chunk.set(0, 160 + s * 16, 0, 10 + s as u32);
+            }
+            chunk
+        };
+        let fresh = |y: i32| {
+            let mut section = Section::default();
+            section.set(0, (1000 + y) as u32);
+            Arc::new(section)
+        };
+        // Up two sections: section Y 10 and 11 stay (now indexes 0 and 1).
+        let mut up = make();
+        let before = up.sections.clone();
+        let mut asked = Vec::new();
+        up.relayout(layout(192), |y| {
+            asked.push(y);
+            fresh(y)
+        });
+        assert_eq!(up.min_y(), 192);
+        assert_eq!(asked, [14, 15]);
+        assert!(Arc::ptr_eq(&up.sections[0], &before[2]));
+        assert!(Arc::ptr_eq(&up.sections[1], &before[3]));
+        assert_eq!(marked(&up), [12, 13, 1014, 1015]);
+        // Down one section.
+        let mut down = make();
+        let before = down.sections.clone();
+        down.relayout(layout(144), &fresh);
+        assert_eq!(down.min_y(), 144);
+        assert!(Arc::ptr_eq(&down.sections[1], &before[0]));
+        assert!(Arc::ptr_eq(&down.sections[3], &before[2]));
+        assert_eq!(marked(&down), [1009, 10, 11, 12]);
+        // Disjoint: all new.
+        let mut far = make();
+        far.relayout(layout(-4000), fresh);
+        assert_eq!(far.min_y(), -4000);
+        assert_eq!(far.sections.len(), 4);
+        assert_eq!(marked(&far), [750, 751, 752, 753]);
+        // The same layout changes nothing; the heightmaps follow the new sections.
+        let mut same = make();
+        let before = same.sections.clone();
+        same.relayout(layout(160), |_| unreachable!());
+        assert!(
+            same.sections
+                .iter()
+                .zip(&before)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        );
+        let mut up = make();
+        assert_eq!(up.world_surface(0, 0, |v| v == 0), 160 + 3 * 16 + 1);
+        up.relayout(layout(176), |_| Arc::new(Section::default()));
+        assert_eq!(up.world_surface(0, 0, |v| v == 0), 176 + 2 * 16 + 1);
+        assert_eq!(up.get(0, 176 + 16, 0), 12);
     }
 }

@@ -5893,6 +5893,85 @@ impl Renderer {
             self.sections.set_min_y(layout.min_y());
         }
     }
+    /// The level's chunks now hold `layout` where they held the renderer's (a cubic window
+    /// moved in place, `World::relayout`): the resident sections whose absolute section Y
+    /// is inside `layout` stay, rekeyed by `(old.min_y - layout.min_y) / 16`, with their
+    /// GPU allocations, GPU culling records, fade state and `section_uploaded` (no
+    /// fade-in again); those outside are released as a removed section is. Everything
+    /// keyed by section index moves with them (block entities and their revisions, light
+    /// sources, `lod_retiring`, `lod_leaving`, GPU culling's fades, capture copies,
+    /// `detail_columns`) or is rebuilt (the cave culling graph). Far tiles and cube tiles
+    /// are untouched: they are keyed by position.
+    pub fn shift_layout(&mut self, layout: crate::chunk::ColumnLayout) {
+        let old = self.layout;
+        if layout == old {
+            return;
+        }
+        let delta = (old.min_y() - layout.min_y()) >> 4;
+        let n = layout.sections() as i32;
+        let map = move |(x, y, z): SectionKey| {
+            let y = y + delta;
+            (0..n).contains(&y).then_some((x, y, z))
+        };
+        if let Some(copies) = &mut self.capture_copies {
+            copies.rekey(delta, n);
+        }
+        self.layout = layout;
+        let released: Vec<SectionGpu> = self
+            .sections
+            .rekey(delta, layout.min_y(), n)
+            .into_iter()
+            .map(|(_, section)| section)
+            .collect();
+        self.release_meshes(released);
+        if let Some(gpu) = &mut self.gpu_culling {
+            for (key, section, _) in self.sections.iter_mut() {
+                if let Some(id) = section.gpu_id {
+                    gpu.records.rekey(id, key.1);
+                }
+            }
+            gpu.fades.rekey(map);
+        }
+        fn rekey_map<V>(
+            keyed: &mut FxHashMap<SectionKey, V>,
+            map: impl Fn(SectionKey) -> Option<SectionKey>,
+        ) -> bool {
+            let before = keyed.len();
+            *keyed = std::mem::take(keyed)
+                .into_iter()
+                .filter_map(|(key, value)| Some((map(key)?, value)))
+                .collect();
+            keyed.len() != before
+        }
+        rekey_map(&mut self.block_entities, map);
+        rekey_map(&mut self.block_entity_section_revisions, map);
+        rekey_map(&mut self.block_entity_membership_revisions, map);
+        // The static block-entity cache reconciles by revision: the keys it knew are gone
+        // or hold other revisions, so it rebuilds what moved.
+        self.block_entity_revision = next_block_entity_revision();
+        if rekey_map(&mut self.light_blocks, map) {
+            self.light_revision += 1;
+        }
+        rekey_map(&mut self.section_uploaded, map);
+        self.lod_retiring = std::mem::take(&mut self.lod_retiring)
+            .into_iter()
+            .filter_map(map)
+            .collect();
+        self.lod_leaving = std::mem::take(&mut self.lod_leaving)
+            .into_iter()
+            .filter_map(|(key, since)| Some((map(key)?, since)))
+            .collect();
+        let keep = SectionMask::below(layout.sections());
+        self.detail_columns = std::mem::take(&mut self.detail_columns)
+            .into_iter()
+            .filter_map(|(column, mask)| {
+                let mask = mask.shifted(delta) & keep;
+                (!mask.is_empty()).then_some((column, mask))
+            })
+            .collect();
+        self.detail_revision += 1;
+        self.occlusion.relayout(layout.min_y(), n, delta);
+    }
     /// Lays the sections out as `translucent_split` says for the shader pack that
     /// runs, before a world frame draws them. A change drops every section and far
     /// tile, as a new renderer has none, and changes the sorted indices' arena with

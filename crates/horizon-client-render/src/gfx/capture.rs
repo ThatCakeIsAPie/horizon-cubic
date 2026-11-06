@@ -50,6 +50,18 @@ impl Copies {
         self.sections
             .retain(|&(x, _, z), _| !gone.contains(&(x, z)));
     }
+    /// The level's column moved (`Renderer::shift_layout`): index `y` is now `y + delta`;
+    /// the copies of sections that left the `sections` are dropped.
+    pub(super) fn rekey(&mut self, delta: i32, sections: i32) {
+        self.sections = std::mem::take(&mut self.sections)
+            .into_iter()
+            .filter_map(|((x, y, z), mesh)| {
+                (0..sections)
+                    .contains(&(y + delta))
+                    .then_some(((x, y + delta, z), mesh))
+            })
+            .collect();
+    }
     pub(super) fn tile(&mut self, key: TileKey, mesh: &SectionMesh) {
         self.tiles.insert(key, copy(mesh));
     }
