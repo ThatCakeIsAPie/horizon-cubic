@@ -800,6 +800,10 @@ fn mesh_voxels(
     // (opaque, fluid) by state: whether a voxel hides a face behind it.
     let mut hiding: FxHashMap<u32, (bool, u8)> = FxHashMap::default();
     let lit = sky_lit(node, |voxel| {
+        // Air never roofs anything, whatever the material lookup says of it.
+        if voxel.state == air {
+            return false;
+        }
         hiding
             .entry(voxel.state.0)
             .or_insert_with(|| {

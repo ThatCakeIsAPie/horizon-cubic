@@ -453,7 +453,8 @@ mod tests {
         let b = blend(Arc::new(FixedBiome::new("plains")));
         let t = b.terrain_at(1000, -1000);
         assert!((t.height - convert_height(0.125)).abs() < 1e-9);
-        assert!((t.volatility - convert_variation(0.05)).abs() < 1e-9);
+        // The table holds f32s: 0.05 is 0.05 to f32 precision.
+        assert!((t.volatility - convert_variation(f64::from(0.05_f32))).abs() < 1e-9);
         assert_eq!(b.biome_at(5, 5).name, "minecraft:plains");
     }
 
@@ -470,7 +471,12 @@ mod tests {
         let deep = b.terrain_at(-40, 0).height;
         let high = b.terrain_at(40, 0).height;
         assert!(high > deep + 0.1);
-        assert!(max_step < 0.05, "{max_step}");
+        // CubicWorldGen's (and 1.12's) weights favour the lower biome
+        // (`1 / (base + 2)`, taller neighbours halved), so between deep ocean
+        // and hills most of the change comes as the last deep-ocean section
+        // leaves the 5 x 5 window: a coast's slope, not a seam. The bilinear
+        // corners keep it continuous: no step beyond a quarter of the span.
+        assert!(max_step < (high - deep) / 4.0, "{max_step}");
     }
 
     #[test]

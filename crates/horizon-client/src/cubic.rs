@@ -2251,10 +2251,11 @@ mod tests {
             .flat_map(|(x, z)| [-13, -14, 20, 21].map(|cy| SectionPos::new(x, cy, z)))
             .collect();
         assert!(wait_until(|| ring.iter().all(|&p| level.is_prefetched(p))));
-        // A ready cube is the one `make_cube` makes, and is handed out once.
+        // A ready cube is the one `make_cube` makes. (Population saves the
+        // cubes it writes, so it comes back as a record, not `generated`; and
+        // the ring may take it up again at once, as its window still wants it.)
         let pos = SectionPos::new(0, 20, 0);
         let cube = level.ready_cube(pos);
-        assert!(cube.generated && !level.is_prefetched(pos));
         assert!(cube.section.same_as(&level.make_cube(pos).section));
         // The store writing a cube drops it; the ring loads it again, entities and all.
         let above = SectionPos::new(0, 21, 0);

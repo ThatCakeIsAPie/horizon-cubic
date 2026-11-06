@@ -450,16 +450,19 @@ pub const WORLD_BORDER: i64 = 30_000_000;
 /// horizontally and the cube range vertically. Overflow-safe at any level.
 pub fn in_world(node: CubeKey) -> bool {
     let size = i64::from(node.size());
-    let within = |c: i32, lo: i64, hi: i64| {
+    // Whether the node's blocks `[at, at + size)` meet blocks `[lo, end)`.
+    let within = |c: i32, lo: i64, end: i64| {
         let at = i64::from(c) * size;
-        at <= hi && at + size > lo
+        at < end && at + size > lo
     };
+    // X and Z: vanilla's bounds, -30,000,000 inclusive to 30,000,000
+    // exclusive; Y: the cube range, both ends inclusive.
     within(node.x, -WORLD_BORDER, WORLD_BORDER)
         && within(node.z, -WORLD_BORDER, WORLD_BORDER)
         && within(
             node.y,
             i64::from(horizon_world::cubic::MIN_Y),
-            i64::from(horizon_world::cubic::MAX_Y),
+            i64::from(horizon_world::cubic::MAX_Y) + 1,
         )
 }
 
@@ -1647,7 +1650,7 @@ mod tests {
         assert_eq!(key(0, 0, -(1 << 19), 0).origin()[1], -8_388_608);
         assert_eq!(
             key(0, 0, -(1 << 19), 0).containing_root(),
-            key(12, 0, -128, 0)
+            key(MAX_CUBE_LEVEL, 0, (-(1i32 << 19)) >> MAX_CUBE_LEVEL, 0)
         );
         assert_eq!(key(0, 1_875_000, 0, 0).origin()[0], 30_000_000);
     }

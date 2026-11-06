@@ -1069,6 +1069,7 @@ mod tests {
         assert_eq!(r.find((4, 1, -3)), Some(&2));
         // Still removable and walkable through its column afterwards.
         assert_eq!(r.remove((4, 1, -3)), Some(2));
-        assert_eq!(r.len(), 3);
+        // Left: 5 at (4, 4, -3) and 100 at (9, 2, 9).
+        assert_eq!(r.len(), 2);
     }
 }

@@ -194,20 +194,34 @@ impl CubeStore {
     /// cube Y's folder: for tools and tests, not for every column load.
     pub fn saved_ys(&self, x: i32, z: i32) -> io::Result<Vec<i32>> {
         let mut ys = Vec::new();
-        let entries = match std::fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ys),
-            Err(e) => return Err(e),
+        // Cube Ys with a folder on disk, and those whose uniform sidecar is
+        // only in memory so far (written, not yet persisted: no folder yet).
+        let mut candidates: Vec<i32> = {
+            let all = self.uniform.lock().unwrap_or_else(|e| e.into_inner());
+            all.keys()
+                .filter(|(_, rx, rz)| *rx == x >> 5 && *rz == z >> 5)
+                .map(|(y, _, _)| *y)
+                .collect()
         };
-        for entry in entries {
-            let name = entry?.file_name();
-            let Some(y) = name
-                .to_str()
-                .and_then(|n| n.strip_prefix('y'))
-                .and_then(|n| n.parse::<i32>().ok())
-            else {
-                continue;
-            };
+        match std::fs::read_dir(&self.root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let name = entry?.file_name();
+                    if let Some(y) = name
+                        .to_str()
+                        .and_then(|n| n.strip_prefix('y'))
+                        .and_then(|n| n.parse::<i32>().ok())
+                    {
+                        candidates.push(y);
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        for y in candidates {
             let cube = SectionPos::new(x, y, z);
             if !has_cube(cube) {
                 continue;

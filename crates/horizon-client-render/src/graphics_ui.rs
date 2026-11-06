@@ -207,7 +207,7 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         h(
                             H::GpuFar,
                             Medium,
-                            "Cubic Chunks worlds: Auto meshes and draws far terrain on the GPU. Off uses the CPU.",
+                            "Cubic worlds: Auto meshes and draws far terrain on the GPU. Off uses the CPU.",
                         ),
                         h(H::FarDetail, Medium, far),
                         h(

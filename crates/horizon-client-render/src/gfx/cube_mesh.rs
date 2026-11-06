@@ -1087,7 +1087,7 @@ mod tests {
 
     /// The GPU's quad count for nodes against the CPU reference of exposed
     /// faces (merging only lowers it: the GPU count is at most the CPU's, and
-    /// at least a sixteenth of it).
+    /// at least 1/256 of it, a whole 16 x 16 face as one quad).
     #[test]
     fn gpu_counts_agree_with_the_cpu_reference() {
         let Some((device, queue)) = device() else {
@@ -1144,7 +1144,7 @@ mod tests {
             let total = m.total() as usize;
             assert!(!m.failed);
             assert!(
-                total <= reference && total * 16 >= reference,
+                total <= reference && total * 256 >= reference,
                 "{total} vs {reference}"
             );
         }

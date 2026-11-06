@@ -12414,6 +12414,9 @@ mod tests {
             } else if name == "visbuffer.wgsl" {
                 // Appended to terrain.wgsl (gfx/visbuffer.rs).
                 sources.push((path, include_str!("terrain.wgsl").to_owned() + &text));
+            } else if name == "cube_far.wgsl" {
+                // Appended to terrain.wgsl (gfx/cube_far.rs).
+                sources.push((path, crate::gfx::cube_far::shader_source()));
             } else if name == "oit_border.wgsl" {
                 let base = include_str!("border.wgsl").to_owned() + include_str!("oit.wgsl");
                 sources.push((path, base + &text));
