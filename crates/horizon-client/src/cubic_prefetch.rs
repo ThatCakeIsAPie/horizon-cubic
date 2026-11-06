@@ -22,7 +22,7 @@
 use crate::chunk::ColumnLayout;
 use crate::cubic::{CubicLevel, LoadedCube, RING};
 use horizon_core::position::SectionPos;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
@@ -39,13 +39,19 @@ pub fn ring_cubes(window: ColumnLayout, x: i32, z: i32) -> impl Iterator<Item = 
         .map(move |cy| SectionPos::new(x, cy, z))
 }
 
+/// One shard's window and loaded columns (nearest the players first).
+#[derive(PartialEq)]
+struct Target {
+    window: ColumnLayout,
+    columns: Vec<(i32, i32)>,
+}
+
 #[derive(Default)]
 struct State {
     /// What the ring is for now, in the order it is loaded.
     wanted: Vec<SectionPos>,
-    /// The window and columns `wanted` was made from.
-    window: Option<ColumnLayout>,
-    columns: Vec<(i32, i32)>,
+    /// The windows and columns `wanted` was made from, by shard.
+    targets: BTreeMap<u16, Target>,
     /// Where in `wanted` the cubes before are ready or skipped.
     cursor: usize,
     ready: HashMap<SectionPos, LoadedCube>,
@@ -98,11 +104,24 @@ impl Ring {
     }
 
     /// Aims the ring at the layers around `window` of `columns` (the level's
-    /// loaded columns), nearest to `centres` (the players' columns) first.
-    /// Nothing changes when the window and the columns are the same as the
-    /// last time; cubes no longer wanted are dropped.
+    /// loaded columns), nearest to `centres` (the players' columns) first:
+    /// the target of the primary shard.
     pub fn retarget(
         &self,
+        window: ColumnLayout,
+        centres: &[(i32, i32)],
+        columns: impl IntoIterator<Item = (i32, i32)>,
+    ) {
+        self.retarget_shard(0, window, centres, columns);
+    }
+
+    /// `retarget` for shard `shard`: the ring serves every shard's window,
+    /// each with its own columns. Nothing changes when the shard's window and
+    /// columns are the same as the last time; cubes no longer wanted are
+    /// dropped.
+    pub fn retarget_shard(
+        &self,
+        shard: u16,
         window: ColumnLayout,
         centres: &[(i32, i32)],
         columns: impl IntoIterator<Item = (i32, i32)>,
@@ -119,17 +138,38 @@ impl Ring {
                 .unwrap_or(0)
         };
         columns.sort_unstable_by_key(|c| (distance(c), *c));
+        let target = Target { window, columns };
         let mut st = self.shared.state.lock().unwrap();
-        if st.window == Some(window) && st.columns == columns {
+        if st.targets.get(&shard) == Some(&target) {
             return;
         }
+        st.targets.insert(shard, target);
+        self.rebuild(&mut st);
+        drop(st);
+        self.shared.wake.notify_all();
+    }
+
+    /// Drops shard `shard`'s target (it closed): its cubes are no longer wanted.
+    pub fn forget(&self, shard: u16) {
+        let mut st = self.shared.state.lock().unwrap();
+        if st.targets.remove(&shard).is_some() {
+            self.rebuild(&mut st);
+            drop(st);
+            self.shared.wake.notify_all();
+        }
+    }
+
+    /// What is wanted now, from every shard's target.
+    fn rebuild(&self, st: &mut State) {
         let mut wanted = Vec::new();
         // Layer by layer outward, so the nearest layers of every column come
         // before the farther ones.
         for k in 0..RING * 2 {
-            for &(x, z) in &columns {
-                if let Some(pos) = ring_cubes(window, x, z).nth(k as usize) {
-                    wanted.push(pos);
+            for target in st.targets.values() {
+                for &(x, z) in &target.columns {
+                    if let Some(pos) = ring_cubes(target.window, x, z).nth(k as usize) {
+                        wanted.push(pos);
+                    }
                 }
             }
         }
@@ -138,11 +178,7 @@ impl Ring {
         st.ready.retain(|pos, _| keep.contains(pos));
         st.skipped.clear();
         st.wanted = wanted;
-        st.window = Some(window);
-        st.columns = columns;
         st.cursor = 0;
-        drop(st);
-        self.shared.wake.notify_all();
     }
 
     /// Whether cube `pos` is ready.
@@ -296,6 +332,35 @@ mod tests {
         ring.retarget(window(40, 19), &[(0, 0)], [(0, 0)]);
         assert!(!ring.has(pos));
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn every_shard_has_its_own_target_and_a_closed_shard_takes_its_cubes_with_it() {
+        let ring = Ring::new();
+        ring.retarget_shard(0, window(0, 19), &[(0, 0)], [(0, 0)]);
+        ring.retarget_shard(1, window(1250, 19), &[(0, 0)], [(0, 0), (1, 0)]);
+        let wanted = |ring: &Ring| ring.shared.state.lock().unwrap().wanted.clone();
+        let all = wanted(&ring);
+        // Four cubes for the lower shard's column, four for each of the upper's two.
+        assert_eq!(all.len(), 4 + 8);
+        assert!(all.contains(&SectionPos::new(0, -1, 0)));
+        assert!(all.contains(&SectionPos::new(1, 1269, 0)));
+        // Retargeting one shard leaves the other's cubes ready.
+        let kept = SectionPos::new(0, -1, 0);
+        ring.shared
+            .state
+            .lock()
+            .unwrap()
+            .ready
+            .insert(kept, crate::cubic::LoadedCube::empty(kept, Arc::default()));
+        ring.retarget_shard(1, window(1260, 19), &[(0, 0)], [(0, 0)]);
+        assert!(ring.has(kept));
+        assert_eq!(wanted(&ring).len(), 4 + 4);
+        // A closed shard stops being wanted.
+        ring.forget(1);
+        assert_eq!(wanted(&ring).len(), 4);
+        ring.forget(0);
+        assert!(wanted(&ring).is_empty() && ring.is_empty());
     }
 
     #[test]

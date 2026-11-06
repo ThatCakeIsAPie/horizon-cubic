@@ -101,7 +101,7 @@ the original alone. Design, what is and is not carried over, and the options are
 
 ### Known gaps
 
-- **Single player only.** LAN guests share one window. Vertical shards are planned in `docs/cubic-v2-plan.md` ("Residency").
+- **Vertical shards (branch `cubic/shards`).** LAN guests are grouped into shards by their vertical ranges (`cubic_shards.rs`); see `docs/cubic-v2-plan.md`, "Residency", "As built". Not done: vehicles carried across shards, mod API calls (`native_*` by dimension name) reach the shard in place only, and no trial on a long-running dedicated server yet.
 - **No structures in Custom Cubic,** as in CubicWorldGen. The structure toggles are marked `*`.
 - **Not generated yet:** snow and ice layers, dungeons and Bryce pillars.
 - **Seen from inside solid rock in spectator,** the far terrain's rock shells around the loaded box show as walls.

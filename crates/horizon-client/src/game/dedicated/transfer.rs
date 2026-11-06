@@ -6,7 +6,7 @@
 //! between two ticks, on the server thread, so the player is never caught half-way through a
 //! tick. The rules are `lan/arrivals.rs`'s. All of them are refused while `server.toml`'s
 //! `[transfer]` is off.
-use crate::game::{Dim, Game, lan::LanHost};
+use crate::game::{Game, LevelId, lan::LanHost};
 use horizon_client::lan::arrivals;
 use horizon_protocol::packets::play::{self, Clientbound as C};
 use serde_json::{Value, json};
@@ -74,8 +74,8 @@ impl Game<'_> {
         let window = host.hub.guests[i].menu.as_ref().map(|m| m.window);
         // The menu closes in the player's own level, as when it leaves (`game/lan.rs`'s close of
         // every guest): a chest's lid, a villager's trade and a dropped cursor stack belong there.
-        let back = self.dim;
-        let level = Dim::from_id(&host.hub.guests[i].dimension);
+        let back = self.here();
+        let level = LevelId::of(&host.hub.guests[i]);
         if let Err(e) = self.enter_level(Some(host), level) {
             return json!({ "error": format!("the player's level could not be opened: {e}") });
         }

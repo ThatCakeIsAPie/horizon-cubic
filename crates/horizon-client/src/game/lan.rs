@@ -1503,13 +1503,13 @@ impl Game<'_> {
         // Every open menu closes first, in its guest's level
         // (`ServerPlayer.disconnect` -> `doCloseContainer`), so the cursor,
         // the trade and the inputs are back in the file that is saved.
-        let back = self.dim;
-        let open: Vec<(u32, super::Dim)> = host
+        let back = self.here();
+        let open: Vec<(u32, super::LevelId)> = host
             .hub
             .guests
             .iter()
             .filter(|g| g.placed)
-            .map(|g| (g.conn, super::Dim::from_id(&g.dimension)))
+            .map(|g| (g.conn, super::LevelId::of(g)))
             .collect();
         for (conn, dim) in open {
             if self.enter_level(Some(host), dim).is_ok() {
@@ -1582,9 +1582,9 @@ impl Game<'_> {
         remove: bool,
     ) -> Option<(horizon_world::nbt::Tag, [i32; 4])> {
         vehicle?;
-        let back = self.dim;
+        let back = self.here();
         let theirs = super::Dim::from_id(dim);
-        if theirs != back
+        if theirs != back.dim
             && let Err(e) = self.enter_level(host.as_deref_mut(), theirs)
         {
             log::error!("could not open {}: {e}", theirs.id());
@@ -1598,7 +1598,7 @@ impl Game<'_> {
         if remove && let Some((_, root, _)) = &found {
             self.remove_vehicle_tree(*root);
         }
-        if self.dim != back
+        if self.here() != back
             && let Err(e) = self.enter_level(host, back)
         {
             log::error!("could not reopen {}: {e}", back.id());
@@ -1652,6 +1652,7 @@ impl Game<'_> {
                 g.placed
                     && g.vehicle.is_none()
                     && g.dimension == self.dim.id()
+                    && g.shard == self.shard
                     && g.sent_chunks.contains(&chunk)
             })
             .collect();
@@ -2079,8 +2080,8 @@ impl Game<'_> {
                     // The menu they had open closes, in the level they were in
                     // (`ServerPlayer.disconnect` -> `doCloseContainer`).
                     if guest.placed {
-                        let back = self.dim;
-                        let theirs = super::Dim::from_id(&guest.dimension);
+                        let back = self.here();
+                        let theirs = super::LevelId::of(&guest);
                         if self.enter_level(Some(&mut host), theirs).is_ok() {
                             let conn = guest.conn;
                             let at = host.hub.guests.len();
@@ -2735,11 +2736,13 @@ impl Game<'_> {
             g.dimension = super::Dim::Overworld.id().to_owned();
         }
         // A server places each player in their own level (`PlayerList.placeNewPlayer`).
-        let back = self.dim;
+        let back = self.here();
         let level = super::Dim::from_id(&g.dimension);
-        let elsewhere = level != back;
+        let elsewhere = level != back.dim;
         if !elsewhere {
             g.dimension = in_place;
+        } else {
+            g.shard = self.levels.primary_shard_of(level);
         }
         self.load_guest_records(host, conn);
         // The mods say which commands the newcomer's tree keeps.

@@ -911,12 +911,31 @@ pub(super) fn make_streaming(
                 Some(&inner_data),
             )?;
             let _ = save.cubic.set(level.clone());
+            let window = horizon_client::cubic::shard_window(shape);
+            level.set_primary_window(window.clone());
             let terrain = Arc::new(horizon_client::cubic::CubicTerrain {
-                inner: persistent,
+                inner: persistent.clone(),
                 level: level.clone(),
+                window,
             });
             let context = pack.context_with(biomes.clone());
             let threads = res.threads();
+            // Another vertical shard (docs/cubic-v2-plan.md, "Residency") is
+            // the same terrain around a window of its own.
+            {
+                let (weak, context) = (Arc::downgrade(&level), context.clone());
+                level.set_shard_maker(Box::new(move |window| {
+                    let level = weak
+                        .upgrade()
+                        .expect("a level makes its shards while it is alive");
+                    let terrain = Arc::new(horizon_client::cubic::CubicTerrain {
+                        inner: persistent.clone(),
+                        level,
+                        window,
+                    });
+                    Streaming::new(terrain, context.clone(), threads)
+                }));
+            }
             Streaming::new(terrain, context, threads)
         } else {
             Streaming::new(persistent, pack.context_with(biomes.clone()), res.threads())

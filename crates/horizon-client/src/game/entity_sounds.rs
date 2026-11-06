@@ -76,10 +76,12 @@ impl Game<'_> {
             });
         }
         if let Some(guest) = self.lan.as_ref().and_then(|host| {
-            host.hub
-                .guests
-                .iter()
-                .find(|g| g.entity_id as u32 == id && g.placed && g.dimension == self.dim.id())
+            host.hub.guests.iter().find(|g| {
+                g.entity_id as u32 == id
+                    && g.placed
+                    && g.dimension == self.dim.id()
+                    && g.shard == self.shard
+            })
         }) {
             return Some(SoundEntityState {
                 position: guest.position,

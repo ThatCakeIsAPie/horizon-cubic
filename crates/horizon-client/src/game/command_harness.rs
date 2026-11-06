@@ -91,13 +91,13 @@ impl Game<'_> {
             self.lan = Some(host);
             return Err("command harness: owner is not connected".into());
         };
-        let (conn, dim, back) = (guest.conn, super::Dim::from_id(&guest.dimension), self.dim);
+        let (conn, dim, back) = (guest.conn, crate::game::LevelId::of(guest), self.here());
         if let Err(error) = self.enter_level(Some(&mut host), dim) {
             self.lan = Some(host);
             return Err(error);
         }
         let swap = self
-            .enter_guest(&mut host, conn, back)
+            .enter_guest(&mut host, conn, back.dim)
             .expect("the owner is not already acting");
         self.lan = Some(host);
         let result = f(self);
@@ -822,7 +822,7 @@ impl Game<'_> {
                     let dimension = op["dimension"].as_str().unwrap_or("minecraft:overworld");
                     let block = op["block"].as_str().unwrap_or("minecraft:sand");
                     let no_gravity = op["no_gravity"].as_bool().unwrap_or(false);
-                    let back = self.dim;
+                    let back = self.here();
                     self.enter_level(None, super::Dim::from_id(dimension))?;
                     let facts = self.res.facts();
                     let matches = |f: &super::FallingBlock| {

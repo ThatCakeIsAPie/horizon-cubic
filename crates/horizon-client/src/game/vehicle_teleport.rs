@@ -243,12 +243,13 @@ impl Game<'_> {
         };
         self.in_target_level(target, |game| {
             let source = game.dim;
+            let back = game.here();
             if source == destination {
                 return Ok(false);
             }
             // Open the destination before changing or removing any entity.
             game.enter_level(None, destination)?;
-            game.enter_level(None, source)?;
+            game.enter_level(None, back)?;
             if game
                 .mobs
                 .iter()
@@ -344,7 +345,7 @@ impl Game<'_> {
                     });
             }
             game.native_joins_flush(false, 0);
-            game.enter_level(None, source)?;
+            game.enter_level(None, back)?;
             Ok(true)
         })
         .unwrap_or(Ok(false))
