@@ -9,6 +9,7 @@ use crate::{
 };
 pub mod bake;
 pub mod cache;
+pub mod cube;
 mod mesh;
 use horizon_world::registry::BlockStateId;
 use std::{

@@ -1,5 +1,8 @@
 //! Exposed voxel-column faces, merged without changing their block-scale UVs.
-use super::{Column, Span, Spans, TileKey};
+use super::{
+    Column, Span, Spans, TileKey,
+    cube::{CubeNode, SIDE as CUBE_SIDE, Voxel},
+};
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
     mesher::{OPAQUE_LAYER, SectionMesh, TerrainVertex, fluid_face},
@@ -712,6 +715,124 @@ fn mesh_columns_with_edges(
     }
     mesh.finish_sprite_layers();
     mesh
+}
+
+/// A cube node as a closed shell: a face wherever a drawn voxel meets air, a
+/// voxel that does not hide it, or the edge of the node (which has no
+/// neighbours here, so no crack opens between levels). Faces are `1 << level`
+/// blocks per voxel, in node-local blocks, merged like the far columns' and
+/// appended to `out` (the caller sorts the solid quads: `SectionMesh::sort_solid`).
+pub(super) fn mesh_cube(
+    mesher: &mut Mesher,
+    node: &CubeNode,
+    air: BlockStateId,
+    context: &WorkerContext,
+    out: &mut SectionMesh,
+) {
+    mesh_voxels(
+        node,
+        air,
+        |span, direction, at| mesher.material(span, direction, at, context),
+        out,
+    );
+}
+
+fn mesh_voxels(
+    node: &CubeNode,
+    air: BlockStateId,
+    mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material,
+    out: &mut SectionMesh,
+) {
+    if node.as_uniform().is_some_and(|v| v.state == air) {
+        return;
+    }
+    let scale = (1_i32 << node.key.level) as f32;
+    let [ox, _, oz] = node.key.origin();
+    let span = |voxel: Voxel| Span {
+        min: 0,
+        max: 1,
+        state: voxel.state,
+        biome: voxel.biome,
+        light: 240,
+    };
+    // (opaque, fluid) by state: whether a voxel hides a face behind it.
+    let mut hiding: FxHashMap<u32, (bool, u8)> = FxHashMap::default();
+    let mut faces = Faces::new();
+    const SIDES: [(Direction, [i32; 3]); 6] = [
+        (Direction::Up, [0, 1, 0]),
+        (Direction::Down, [0, -1, 0]),
+        (Direction::North, [0, 0, -1]),
+        (Direction::South, [0, 0, 1]),
+        (Direction::West, [-1, 0, 0]),
+        (Direction::East, [1, 0, 0]),
+    ];
+    for y in 0..CUBE_SIDE {
+        for z in 0..CUBE_SIDE {
+            for x in 0..CUBE_SIDE {
+                let voxel = node.get(x, y, z);
+                if voxel.state == air {
+                    continue;
+                }
+                let own = span(voxel);
+                let at = [ox + x as i32 * scale as i32, oz + z as i32 * scale as i32];
+                for (direction, [dx, dy, dz]) in SIDES {
+                    let (nx, ny, nz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                    let inside = [nx, ny, nz]
+                        .iter()
+                        .all(|&c| (0..CUBE_SIDE as i32).contains(&c));
+                    if inside {
+                        let next = node.get(nx as usize, ny as usize, nz as usize);
+                        if next.state == voxel.state {
+                            continue;
+                        }
+                        if next.state != air {
+                            let (opaque, fluid) =
+                                *hiding.entry(next.state.0).or_insert_with(|| {
+                                    let m = material(&span(next), Direction::Up, at);
+                                    (m.opaque, m.fluid)
+                                });
+                            let (_, own_fluid) =
+                                *hiding.entry(voxel.state.0).or_insert_with(|| {
+                                    let m = material(&own, Direction::Up, at);
+                                    (m.opaque, m.fluid)
+                                });
+                            if opaque || (fluid != 0 && fluid == own_fluid) {
+                                continue;
+                            }
+                        }
+                    }
+                    let (a, b, plane) = match direction {
+                        Direction::Up => (x, z, y + 1),
+                        Direction::Down => (x, z, y),
+                        Direction::North => (x, y, z),
+                        Direction::South => (x, y, z + 1),
+                        Direction::West => (z, y, x),
+                        Direction::East => (z, y, x + 1),
+                    };
+                    let rect = Rect {
+                        u0: a as f32 * scale,
+                        v0: b as f32 * scale,
+                        u1: (a + 1) as f32 * scale,
+                        v1: (b + 1) as f32 * scale,
+                    };
+                    add_face(
+                        &mut faces,
+                        direction,
+                        plane as f32 * scale,
+                        rect,
+                        material(&own, direction, at),
+                    );
+                }
+            }
+        }
+    }
+    for (key, mut rects) in faces {
+        merge(&mut rects);
+        for rect in rects {
+            emit(out, key, rect);
+        }
+    }
+    out.finish_sprite_layers();
 }
 
 #[cfg(test)]
@@ -1817,5 +1938,165 @@ mod tests {
                 .all(|q| q.iter().all(|v| (10.0..=12.0).contains(&v.pos[1]))),
             "cut faces keep finite voxel bounds"
         );
+    }
+}
+
+#[cfg(test)]
+mod cube_tests {
+    use super::*;
+    use crate::lod::cube::CubeKey;
+
+    const AIR: BlockStateId = BlockStateId(0);
+    const STONE: BlockStateId = BlockStateId(1);
+    const GRASS: BlockStateId = BlockStateId(2);
+    const WATER: BlockStateId = BlockStateId(3);
+
+    fn material(span: &Span, _: Direction, _: [i32; 2]) -> Material {
+        let water = span.state == WATER;
+        Material {
+            faces: [
+                Some(Paint {
+                    layer: span.state.0 as u16,
+                    light: span.light,
+                    color: u32::MAX,
+                    translucent: water,
+                }),
+                None,
+            ],
+            fluid: u8::from(water),
+            opaque: !water,
+        }
+    }
+    fn voxel(state: BlockStateId) -> Voxel {
+        Voxel { state, biome: 0 }
+    }
+    /// A node of `level` with the voxels `put` lists, the rest air.
+    fn node(level: u8, put: &[([usize; 3], BlockStateId)]) -> CubeNode {
+        CubeNode::from_fn(CubeKey::new(level, 0, 0, 0), |x, y, z| {
+            let state = put
+                .iter()
+                .find(|(at, _)| *at == [x, y, z])
+                .map_or(AIR, |&(_, s)| s);
+            voxel(state)
+        })
+    }
+    fn mesh(node: &CubeNode) -> SectionMesh {
+        let mut mesh = SectionMesh::default();
+        mesh_voxels(node, AIR, material, &mut mesh);
+        mesh
+    }
+    fn quads(vertices: &[TerrainVertex]) -> Vec<[TerrainVertex; 4]> {
+        vertices.as_chunks::<4>().0.to_vec()
+    }
+    fn centre(q: &[TerrainVertex; 4]) -> glam::Vec3 {
+        q.iter()
+            .map(|v| glam::Vec3::from(v.pos))
+            .sum::<glam::Vec3>()
+            / 4.0
+    }
+    fn normal(q: &[TerrainVertex; 4]) -> glam::Vec3 {
+        let p = |i: usize| glam::Vec3::from(q[i].pos);
+        (p(1) - p(0)).cross(p(2) - p(0))
+    }
+    fn extent(q: &[TerrainVertex; 4]) -> ([f32; 3], [f32; 3]) {
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for v in q {
+            for i in 0..3 {
+                lo[i] = lo[i].min(v.pos[i]);
+                hi[i] = hi[i].max(v.pos[i]);
+            }
+        }
+        (lo, hi)
+    }
+    fn flat_at(q: &[TerrainVertex; 4], axis: usize, at: f32) -> bool {
+        let (lo, hi) = extent(q);
+        lo[axis] == at && hi[axis] == at
+    }
+
+    #[test]
+    fn a_lone_voxel_is_six_faces_scaled_by_its_level() {
+        for level in [0_u8, 3, 12] {
+            let scale = (1 << level) as f32;
+            let mesh = mesh(&node(level, &[([5, 6, 7], STONE)]));
+            let quads = quads(&mesh.solid);
+            assert_eq!(quads.len(), 6, "level {level}");
+            assert!(mesh.translucent.is_empty());
+            let middle = glam::Vec3::new(5.5, 6.5, 7.5) * scale;
+            let mut dirs = Vec::new();
+            for q in &quads {
+                let (lo, hi) = extent(q);
+                let wide: Vec<f32> = (0..3).map(|i| hi[i] - lo[i]).collect();
+                assert_eq!(wide.iter().filter(|&&w| w == scale).count(), 2, "{wide:?}");
+                assert_eq!(wide.iter().filter(|&&w| w == 0.0).count(), 1);
+                for c in lo {
+                    assert_eq!(c % scale, 0.0, "on the voxel grid");
+                }
+                assert!(normal(q).dot(centre(q) - middle) > 0.0, "faces outward");
+                dirs.push(normal(q).normalize().to_array().map(f32::round));
+            }
+            dirs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            dirs.dedup();
+            assert_eq!(dirs.len(), 6, "one face per direction");
+        }
+    }
+
+    #[test]
+    fn a_full_node_is_six_merged_faces_of_its_whole_size() {
+        assert!(mesh(&node(2, &[])).solid.is_empty(), "air draws nothing");
+        let full = CubeNode::uniform(CubeKey::new(2, 0, 0, 0), voxel(STONE));
+        let mesh = mesh(&full);
+        let quads = quads(&mesh.solid);
+        assert_eq!(quads.len(), 6);
+        for q in &quads {
+            let (lo, hi) = extent(q);
+            let wide: Vec<f32> = (0..3).map(|i| hi[i] - lo[i]).collect();
+            assert_eq!(wide.iter().filter(|&&w| w == 64.0).count(), 2, "{wide:?}");
+            assert!(normal(q).dot(centre(q) - glam::Vec3::splat(32.0)) > 0.0);
+        }
+    }
+
+    #[test]
+    fn touching_voxels_share_no_inner_face() {
+        // Two stones side by side: one merged face on every side, none between.
+        let pair = node(1, &[([3, 3, 3], STONE), ([4, 3, 3], STONE)]);
+        let q = quads(&mesh(&pair).solid);
+        assert_eq!(q.len(), 6);
+        assert!(q.iter().all(|q| !flat_at(q, 0, 8.0)), "a face between them");
+        assert_eq!(q.iter().filter(|q| flat_at(q, 0, 6.0)).count(), 1);
+        assert_eq!(q.iter().filter(|q| flat_at(q, 0, 10.0)).count(), 1);
+        // Different opaque blocks: still no inner face, but the tops differ.
+        let pair = node(0, &[([3, 3, 3], STONE), ([4, 3, 3], GRASS)]);
+        let q = quads(&mesh(&pair).solid);
+        assert_eq!(q.len(), 10);
+        assert!(q.iter().all(|q| !flat_at(q, 0, 4.0)));
+        // Stone beside water: its face toward the water stays, the water's
+        // toward the stone goes; water sits in the translucent buffer.
+        let shore = node(0, &[([3, 3, 3], STONE), ([4, 3, 3], WATER)]);
+        let m = mesh(&shore);
+        assert_eq!(quads(&m.solid).len(), 6);
+        assert_eq!(quads(&m.translucent).len(), 5);
+        // Water beside water shares nothing either.
+        let pool = node(0, &[([3, 3, 3], WATER), ([4, 3, 3], WATER)]);
+        assert_eq!(quads(&mesh(&pool).translucent).len(), 6);
+    }
+
+    #[test]
+    fn the_edge_of_a_node_is_a_wall() {
+        // A voxel in every corner of the node: each shows all six faces.
+        let mut put = Vec::new();
+        for x in [0, 15] {
+            for y in [0, 15] {
+                for z in [0, 15] {
+                    put.push(([x, y, z], STONE));
+                }
+            }
+        }
+        assert_eq!(quads(&mesh(&node(0, &put)).solid).len(), 8 * 6);
+        // A sheet along the bottom is one merged floor, one ceiling and four edges.
+        let sheet: Vec<_> = (0..16)
+            .flat_map(|x| (0..16).map(move |z| ([x, 0, z], STONE)))
+            .collect();
+        assert_eq!(quads(&mesh(&node(0, &sheet)).solid).len(), 6);
     }
 }
