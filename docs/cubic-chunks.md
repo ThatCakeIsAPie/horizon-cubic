@@ -109,7 +109,7 @@ level's `LevelShape` (`cubic: true`) is a **window**: 32 cubes (512 blocks) arou
   - A Horizon client joining a cubic level gets `horizon:cubic_window` before its chunks, and both ends
     switch block positions to the wide form (`Pos`'s 12 bits of Y can't hold ±8.4 M).
   - Vanilla clients are refused.
-- **Entities and block entities** outside the window stay saved (per column and per cube) and wait there.
+- **Entities, block entities and scheduled ticks** are saved per cube (a cube record holds the entities whose position is in it, `horizon:entities`), so those outside the window wait in their cubes. Uniform cubes (one block state, nothing else) live in a per-region sidecar `y<cy>/u.<x>.<z>.dat`, not in a region-file sector. POI is not saved: it is rebuilt from blocks.
   Void damage applies only below the cubic range.
 - **Far terrain** is the cube octree LOD (`lod/cube.rs`): nodes of `(16 << level)³` blocks, 16³ voxels
   each, coarser further out. They are sampled from the same generators (and from saved cubes near the
