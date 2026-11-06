@@ -13,6 +13,7 @@
 use super::mesh::{self, Mesher};
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
+    gfx::cube_gen::{GpuBackend, slot_words},
     mesher::SectionMesh,
     streaming::WorkerContext,
 };
@@ -327,6 +328,17 @@ pub trait CubeSampler: Send {
     /// directly: when a level above 3 answers `None`, the node is not built
     /// from its children.
     fn node(&mut self, key: CubeKey) -> Option<CubeNode>;
+    /// As [`CubeSampler::node`] for the GPU path: a sampler that generates on
+    /// the GPU answers [`Resident::Slot`] for a node it left in the GPU pool,
+    /// never read back. Every other answers the node.
+    fn resident(&mut self, key: CubeKey) -> Option<Resident> {
+        self.node(key).map(Resident::Node)
+    }
+    /// The GPU generator behind this sampler (its device, node pool and block
+    /// states), if any: what lets [`CubeLod`] mesh and draw on the GPU.
+    fn gpu(&self) -> Option<GpuBackend> {
+        None
+    }
     /// An independent sampler for another thread, if this one can have one.
     /// Without it the producer runs a single worker.
     fn fork(&self) -> Option<Box<dyn CubeSampler>>;
@@ -335,6 +347,15 @@ pub trait CubeSampler: Send {
     fn changes(&mut self) -> Changes {
         Changes::None
     }
+}
+
+/// A sampled node on the GPU path: its voxels, or a slot of the GPU node pool
+/// (`gfx::cube_gen::NodePool`) they were generated into. The slot's owner
+/// frees it.
+#[derive(Debug)]
+pub enum Resident {
+    Node(CubeNode),
+    Slot(u32),
 }
 
 /// What a [`CubeSampler`] reports as changed (see `CubeLodCache::invalidate`).
@@ -525,9 +546,36 @@ const REPLAN: Duration = Duration::from_millis(250);
 /// How long a node whose sampling failed waits before it is asked again.
 const RETRY: Duration = Duration::from_secs(1);
 
+/// What a worker made of a node: a CPU mesh, or (the GPU path) a node for the
+/// renderer's GPU mesher.
+enum Product {
+    Mesh(SectionMesh),
+    Gpu(GpuNode),
+}
+
 struct Done {
     key: CubeKey,
-    mesh: Option<SectionMesh>,
+    product: Option<Product>,
+}
+
+/// What a node holds on the GPU path.
+#[derive(Clone, Copy, Debug)]
+pub enum GpuContent {
+    /// Every voxel the same, with no cover: it needs no slot and is meshed
+    /// without the GPU (air and fluid draw nothing, rock its six faces).
+    Uniform(Voxel),
+    /// A slot of the GPU node pool (`PoolHandle`) the renderer owns from here:
+    /// it frees the slot once the node is meshed, or when the node goes.
+    Slot(u32),
+}
+
+/// A node handed to the renderer's GPU mesher (`CubeLod::take_gpu_nodes`).
+#[derive(Debug)]
+pub struct GpuNode {
+    pub key: CubeKey,
+    pub content: GpuContent,
+    /// The columns the sky is blocked over (`CubeNode::covered_mask`).
+    pub cover: Option<Box<CoverMask>>,
 }
 
 #[derive(Default)]
@@ -576,6 +624,8 @@ struct Shared {
     wake: Condvar,
     stop: AtomicBool,
     cache: Mutex<Cache>,
+    /// The workers make [`GpuNode`]s (`CubeLod::set_gpu_path`).
+    gpu_path: AtomicBool,
 }
 
 /// The far terrain of a cubic level, built in the background.
@@ -610,6 +660,10 @@ pub struct CubeLod {
     failed: FxHashMap<CubeKey, Instant>,
     planned: Option<(SectionPos, f64, LoadedBox, Instant)>,
     camera: [f64; 3],
+    /// The sampler's GPU generator, when it has one.
+    backend: Option<GpuBackend>,
+    /// Nodes finished for the GPU mesher, not yet taken.
+    gpu_out: Vec<GpuNode>,
 }
 
 impl CubeLod {
@@ -620,6 +674,7 @@ impl CubeLod {
         air: BlockStateId,
     ) -> Self {
         let wanted_threads = (horizon_threads::worker_count() / 2).clamp(2, 4);
+        let backend = sampler.gpu();
         let mut samplers = Vec::new();
         while samplers.len() + 1 < wanted_threads
             && let Some(fork) = sampler.fork()
@@ -632,25 +687,28 @@ impl CubeLod {
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
             cache: Mutex::default(),
+            gpu_path: AtomicBool::new(false),
         });
         let (tx, results) = mpsc::channel();
         let threads = samplers
             .into_iter()
             .map(|sampler| {
                 let (shared, tx, context) = (shared.clone(), tx.clone(), context.clone());
+                let backend = backend.clone();
                 thread::Builder::new()
                     .name("Cube far terrain".into())
-                    .spawn(move || work(shared, tx, context, sampler, air))
+                    .spawn(move || work(shared, tx, context, sampler, air, backend))
                     .expect("spawn a cube far terrain thread")
             })
             .collect();
-        Self::assemble(shared, results, threads)
+        Self::assemble(shared, results, threads, backend)
     }
 
     fn assemble(
         shared: Arc<Shared>,
         results: mpsc::Receiver<Done>,
         threads: Vec<thread::JoinHandle<()>>,
+        backend: Option<GpuBackend>,
     ) -> Self {
         Self {
             shared,
@@ -662,6 +720,47 @@ impl CubeLod {
             failed: FxHashMap::default(),
             planned: None,
             camera: [0.0; 3],
+            backend,
+            gpu_out: Vec::new(),
+        }
+    }
+
+    /// The sampler's GPU generator, if it has one: the device the renderer's
+    /// GPU mesher must run on (`gfx::cube_mesh`) to read its nodes.
+    pub fn gpu_backend(&self) -> Option<&GpuBackend> {
+        self.backend.as_ref()
+    }
+
+    /// Switches between the GPU path (`on`, and the sampler has a GPU
+    /// generator: workers hand out [`GpuNode`]s, `take_gpu_nodes`) and the CPU
+    /// path (meshes from `update`). A change forgets every node handed out, as
+    /// [`CubeLod::clear`]: clear the renderer's too (`clear_cube_lods`).
+    /// Returns whether it changed.
+    pub fn set_gpu_path(&mut self, on: bool) -> bool {
+        let on = on && self.backend.is_some();
+        if self.shared.gpu_path.load(Ordering::Relaxed) == on {
+            return false;
+        }
+        self.shared.gpu_path.store(on, Ordering::Relaxed);
+        self.clear();
+        true
+    }
+
+    /// Whether workers make [`GpuNode`]s.
+    pub fn gpu_path(&self) -> bool {
+        self.shared.gpu_path.load(Ordering::Relaxed)
+    }
+
+    /// The nodes finished for the GPU mesher since the last call (their slots
+    /// are the caller's from here), for the nodes in the plan.
+    pub fn take_gpu_nodes(&mut self) -> Vec<GpuNode> {
+        std::mem::take(&mut self.gpu_out)
+    }
+
+    /// Returns a node's slot to the pool.
+    fn release(&self, node: &GpuNode) {
+        if let (GpuContent::Slot(slot), Some(backend)) = (node.content, &self.backend) {
+            backend.pool.free(slot);
         }
     }
 
@@ -697,12 +796,19 @@ impl CubeLod {
         let mut out = Vec::new();
         while let Ok(done) = self.results.try_recv() {
             if !self.wanted.contains(&done.key) {
+                if let Some(Product::Gpu(node)) = &done.product {
+                    self.release(node);
+                }
                 continue;
             }
-            match done.mesh {
-                Some(mesh) => {
+            match done.product {
+                Some(Product::Mesh(mesh)) => {
                     self.delivered.insert(done.key);
                     out.push((done.key, mesh));
+                }
+                Some(Product::Gpu(node)) => {
+                    self.delivered.insert(done.key);
+                    self.gpu_out.push(node);
                 }
                 None => {
                     self.failed.insert(done.key, now);
@@ -780,7 +886,14 @@ impl CubeLod {
         self.delivered.clear();
         self.failed.clear();
         self.planned = None;
-        while self.results.try_recv().is_ok() {}
+        while let Ok(done) = self.results.try_recv() {
+            if let Some(Product::Gpu(node)) = &done.product {
+                self.release(node);
+            }
+        }
+        for node in std::mem::take(&mut self.gpu_out) {
+            self.release(&node);
+        }
     }
 }
 
@@ -796,6 +909,7 @@ impl Drop for CubeLod {
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
+        self.clear();
     }
 }
 
@@ -827,6 +941,7 @@ fn work(
     context: Arc<WorkerContext>,
     mut sampler: Box<dyn CubeSampler>,
     air: BlockStateId,
+    backend: Option<GpuBackend>,
 ) {
     horizon_threads::behind_server();
     horizon_threads::far_terrain_current();
@@ -851,16 +966,83 @@ fn work(
             Changes::Cubes(cubes) => shared.cache.lock().unwrap().forget(&cubes),
             Changes::All => shared.cache.lock().unwrap().nodes.clear(),
         }
-        let mesh = node(&shared, sampler.as_mut(), key, air, &kind).map(|node| {
-            let mut mesh = SectionMesh::default();
-            mesh::mesh_cube(&mut mesher, &node, air, &context, &mut mesh);
-            mesh.sort_solid();
-            mesh
-        });
+        let gpu = backend
+            .as_ref()
+            .filter(|_| shared.gpu_path.load(Ordering::Relaxed));
+        let product = match gpu {
+            Some(backend) => {
+                gpu_node(&shared, sampler.as_mut(), key, air, &kind, backend).map(Product::Gpu)
+            }
+            None => node(&shared, sampler.as_mut(), key, air, &kind).map(|node| {
+                let mut mesh = SectionMesh::default();
+                mesh::mesh_cube(&mut mesher, &node, air, &context, &mut mesh);
+                mesh.sort_solid();
+                Product::Mesh(mesh)
+            }),
+        };
         shared.queue.lock().unwrap().running.remove(&key);
-        if tx.send(Done { key, mesh }).is_err() {
+        if tx.send(Done { key, product }).is_err() {
             return;
         }
+    }
+}
+
+/// A CPU node as a [`GpuNode`]: uniform and uncovered ones need no slot, the
+/// rest are uploaded into one. `None` when the pool is full.
+fn gpu_from_node(node: &CubeNode, air: BlockStateId, backend: &GpuBackend) -> Option<GpuNode> {
+    let cover = node.covered_mask().map(|mask| Box::new(*mask));
+    let content = match node.as_uniform() {
+        Some(voxel) if cover.is_none() => GpuContent::Uniform(voxel),
+        _ => {
+            let slot = backend.pool.alloc()?;
+            backend
+                .pool
+                .write(&backend.queue, slot, &slot_words(node, air.0));
+            GpuContent::Slot(slot)
+        }
+    };
+    Some(GpuNode {
+        key: node.key,
+        content,
+        cover,
+    })
+}
+
+/// The node at `key` for the GPU path: a slot the GPU generated it into, or a
+/// CPU node (saved cubes, downsampled fine levels, the pre-pass's uniform
+/// ones) uploaded to one.
+fn gpu_node(
+    shared: &Shared,
+    sampler: &mut dyn CubeSampler,
+    key: CubeKey,
+    air: BlockStateId,
+    kind: &impl Fn(BlockStateId) -> Kind,
+    backend: &GpuBackend,
+) -> Option<GpuNode> {
+    let cached = shared.cache.lock().unwrap().get(key);
+    if let Some(node) = cached {
+        return gpu_from_node(&node, air, backend);
+    }
+    if shared.stop.load(Ordering::Relaxed) {
+        return None;
+    }
+    match sampler.resident(key) {
+        Some(Resident::Slot(slot)) => Some(GpuNode {
+            key,
+            content: GpuContent::Slot(slot),
+            cover: None,
+        }),
+        Some(Resident::Node(node)) => {
+            debug_assert_eq!(node.key, key);
+            let node = Arc::new(node);
+            shared.cache.lock().unwrap().insert(node.clone());
+            gpu_from_node(&node, air, backend)
+        }
+        None if (1..=3).contains(&key.level) => {
+            let node = node(shared, sampler, key, air, kind)?;
+            gpu_from_node(&node, air, backend)
+        }
+        None => None,
     }
 }
 

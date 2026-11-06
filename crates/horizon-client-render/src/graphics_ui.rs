@@ -69,6 +69,7 @@ pub enum H {
     Preset,
     LodDistance,
     CubicVertical,
+    GpuFar,
     FarDetail,
     BlueMapAutoDetect,
     BlueMapRadius,
@@ -202,6 +203,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             H::CubicVertical,
                             Medium,
                             "Cubic Chunks worlds: cubes loaded above and below you. Lower is faster.",
+                        ),
+                        h(
+                            H::GpuFar,
+                            Medium,
+                            "Cubic Chunks worlds: Auto meshes and draws far terrain on the GPU. Off uses the CPU.",
                         ),
                         h(H::FarDetail, Medium, far),
                         h(
@@ -827,6 +833,10 @@ impl H {
                 "Vertical Distance",
                 lang::tr("%s cubes", &[&g.cubic_vertical]),
             ),
+            H::GpuFar => labelled(
+                "Far Terrain on GPU",
+                if g.gpu_far { "Auto" } else { "Off" },
+            ),
             H::FarDetail => labelled("Far Detail", g.far_detail.label()),
             H::BlueMapAutoDetect => labelled("Find BlueMap", on_off(g.blue_map.auto_detect)),
             H::BlueMapRadius => labelled(
@@ -1003,6 +1013,7 @@ impl H {
         }
         let g = &mut s.horizon;
         match self {
+            H::GpuFar => g.gpu_far = !g.gpu_far,
             H::FarDetail => {
                 g.far_detail = step(&[FarDetail::Full, FarDetail::Reduced], g.far_detail, back)
             }

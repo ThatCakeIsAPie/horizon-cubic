@@ -670,6 +670,9 @@ pub struct Graphics {
     /// Cubic levels: cubes loaded above and below the player's cube
     /// (`CUBIC_VERTICAL_MIN..=CUBIC_VERTICAL_MAX`), the vertical view distance.
     pub cubic_vertical: u32,
+    /// Cubic levels: far terrain meshed and drawn on the GPU (`gfx::cube_far`) where the
+    /// device can (`Auto`, the default), else on the CPU. `false` is "Off".
+    pub gpu_far: bool,
     /// How finely far terrain is drawn; Full unless the player picks Reduced.
     pub far_detail: FarDetail,
     /// Far terrain from servers' BlueMap web maps; no server has one unless
@@ -790,6 +793,7 @@ impl Default for Graphics {
             preset: Preset::Custom,
             lod_distance: 0,
             cubic_vertical: CUBIC_VERTICAL_DEFAULT,
+            gpu_far: true,
             far_detail: FarDetail::Full,
             blue_map: crate::bluemap::Settings::default(),
             cave_culling: true,
@@ -886,6 +890,13 @@ impl Graphics {
                 "cubicVertical" => {
                     g.cubic_vertical =
                         number(g.cubic_vertical).clamp(CUBIC_VERTICAL_MIN, CUBIC_VERTICAL_MAX)
+                }
+                "gpuFarTerrain" => {
+                    g.gpu_far = match value {
+                        "auto" => true,
+                        "off" => false,
+                        _ => g.gpu_far,
+                    }
                 }
                 "farDetail" => g.far_detail = FarDetail::parse(value),
                 "blueMapRadius" => {
@@ -993,7 +1004,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\ncubicVertical:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\ncubicVertical:{}\ngpuFarTerrain:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -1049,6 +1060,7 @@ impl Graphics {
             bool_text(self.hdr_smooth_gradients),
             bool_text(self.gpu_culling),
             self.cubic_vertical,
+            if self.gpu_far { "auto" } else { "off" },
         );
         text += &self.blue_map.serialize();
         text
@@ -1180,6 +1192,7 @@ mod tests {
             preset: Preset::Balanced,
             lod_distance: 256,
             cubic_vertical: 13,
+            gpu_far: false,
             far_detail: FarDetail::Reduced,
             blue_map: crate::bluemap::Settings {
                 radius: 40,
