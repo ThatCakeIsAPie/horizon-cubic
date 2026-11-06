@@ -626,6 +626,12 @@ impl Game<'_> {
                 "biome": buffet.biome(),
                 "query": buffet.query(),
             }),
+            Mode::CreateCubic { cubic, .. } => json!({
+                "mode": "customize-cubic",
+                "type": cubic.kind().id(),
+                "page": cubic.page(),
+                "pages": cubic.page_count(),
+            }),
             Mode::Edit {
                 world,
                 name,

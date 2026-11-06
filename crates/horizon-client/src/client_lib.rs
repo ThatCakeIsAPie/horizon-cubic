@@ -49,6 +49,7 @@ pub mod creative;
 pub mod cubic;
 pub mod cubic_lod;
 pub mod cubic_prefetch;
+pub mod cubic_settings;
 pub mod cushion;
 pub mod data_cmd;
 pub mod debug_chart;

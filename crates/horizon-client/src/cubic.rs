@@ -1465,13 +1465,16 @@ pub fn saved_window(world_root: &Path) -> Option<(i32, i32)> {
 }
 
 /// Records the bottom and height (blocks) of the window a cubic world's
-/// Overworld holds.
+/// Overworld holds. The world type Create World chose stays (`cubic_settings`).
 pub fn save_window(world_root: &Path, min_y: i32, height: i32) -> std::io::Result<()> {
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "cubic": true,
         "window_min_y": min_y,
         "window_height": height,
     });
+    if let Some(kind) = crate::cubic_settings::stored_type(world_root) {
+        json["type"] = kind.into();
+    }
     let temporary = world_root.join(format!("{WORLD_FILE}.tmp"));
     std::fs::write(&temporary, json.to_string())?;
     std::fs::rename(temporary, world_root.join(WORLD_FILE))

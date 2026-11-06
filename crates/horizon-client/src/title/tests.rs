@@ -1147,13 +1147,20 @@ fn create_world_tabs_follow_vanilla_and_their_choices_reach_the_action() {
     assert_eq!(*focus, 1);
     assert_eq!(options.world_type, crate::save::WorldPreset::Amplified);
     assert!(options.bonus_chest());
-    // Horizon's Cubic Chunks switch, under Bonus Chest, toggles its own option.
-    assert_eq!((world[4].1, world[4].2), (85.0 + 266.0, 38.0 + 121.0));
+    // Horizon's Cubic Chunks button, under Bonus Chest, starts at Off and its
+    // Customize beside it waits for a cubic world type.
+    assert_eq!((world[4].1, world[4].2), (85.0, 38.0 + 121.0));
+    assert_eq!((world[5].1, world[5].2), (85.0 + 160.0, 38.0 + 121.0));
+    assert!(world[4].3 && !world[5].3);
     f.title.click(world[4].1 + 10.0, world[4].2 + 10.0, size);
     let Mode::Create { options, .. } = &f.title.mode else {
         panic!()
     };
-    assert!(options.cubic && options.cubic_allowed() && options.bonus_chest());
+    assert!(
+        options.cubic == Some(crate::cubic_settings::CubicKind::Custom)
+            && options.cubic_allowed()
+            && options.bonus_chest()
+    );
     let Action::Create { options, .. } = f.title.create_action() else {
         panic!()
     };
@@ -2509,4 +2516,144 @@ fn the_multiplayer_screens_have_their_own_ids() {
         .id(),
         "disconnected"
     );
+}
+
+/// The World tab of Create New World, with its buttons by id.
+fn open_world_tab(f: &mut Fixture) -> (f32, f32) {
+    f.click("Singleplayer");
+    let size = (480.0, 262.0);
+    f.title.click(54.0 + 124.0 + 10.0, 10.0, size);
+    size
+}
+fn button_by_id(f: &Fixture, size: (f32, f32), id: u8) -> Button {
+    f.title
+        .buttons(size.0, size.1)
+        .into_iter()
+        .find(|b| b.id == id)
+        .unwrap()
+}
+fn press_id(f: &mut Fixture, size: (f32, f32), id: u8) -> (Action, bool) {
+    let b = button_by_id(f, size, id);
+    f.title.click(b.x + 10.0, b.y + 10.0, size)
+}
+fn cubic_kind(f: &Fixture) -> Option<crate::cubic_settings::CubicKind> {
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!("Create New World is open")
+    };
+    options.cubic
+}
+
+#[test]
+fn the_cubic_world_type_cycles_and_customize_follows_it() {
+    use crate::cubic_settings::CubicKind::{Custom, Flat, Hybrid};
+    let mut f = Fixture::new();
+    let size = open_world_tab(&mut f);
+    assert_eq!(cubic_kind(&f), None);
+    assert!(!button_by_id(&f, size, 37).enabled);
+    for expected in [Some(Custom), Some(Hybrid), Some(Flat), None] {
+        press_id(&mut f, size, 36);
+        assert_eq!(cubic_kind(&f), expected);
+        assert_eq!(button_by_id(&f, size, 37).enabled, expected.is_some());
+    }
+    // The flat and debug presets cannot be cubic, whatever the button says.
+    press_id(&mut f, size, 36);
+    assert!(button_by_id(&f, size, 36).enabled);
+    press_id(&mut f, size, 25);
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!()
+    };
+    assert_eq!(options.world_type, crate::save::WorldPreset::Flat);
+    assert!(!button_by_id(&f, size, 36).enabled);
+    assert!(!button_by_id(&f, size, 37).enabled);
+    assert_eq!(options.cubic_kind(), None);
+}
+
+#[test]
+fn customize_opens_the_cubic_screen_and_done_keeps_its_settings() {
+    use crate::cubic_settings::CubicKind::Hybrid;
+    let mut f = Fixture::new();
+    let size = open_world_tab(&mut f);
+    press_id(&mut f, size, 36);
+    press_id(&mut f, size, 36);
+    assert_eq!(cubic_kind(&f), Some(Hybrid));
+    press_id(&mut f, size, 37);
+    assert_eq!(f.title.mode.id(), "world_create_cubic");
+    let page = |f: &Fixture| {
+        let Mode::CreateCubic { cubic, .. } = &f.title.mode else {
+            panic!("the Customize screen is open")
+        };
+        (cubic.kind(), cubic.page())
+    };
+    assert_eq!(page(&f), (Hybrid, 0));
+    press_id(&mut f, size, 104);
+    assert_eq!(page(&f), (Hybrid, 1));
+    // Done writes the settings back as pretty JSON and returns to Create.
+    press_id(&mut f, size, 100);
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!("Done returns to Create New World")
+    };
+    assert!(options.cubic_json.contains("\"dungeonCount\""));
+    assert!(options.cubic_json.contains('\n'));
+    let saved = options.cubic_json.clone();
+    // Cancel and Escape drop what was changed; the choice stays.
+    press_id(&mut f, size, 37);
+    let Mode::CreateCubic { cubic, .. } = &mut f.title.mode else {
+        panic!()
+    };
+    cubic.settings.dungeon_count = 77;
+    press_id(&mut f, size, 101);
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!()
+    };
+    assert_eq!(options.cubic_json, saved);
+    press_id(&mut f, size, 37);
+    f.title.escape();
+    assert_eq!(f.title.mode.id(), "world_create");
+    // The next screen opens on the saved settings.
+    press_id(&mut f, size, 37);
+    let Mode::CreateCubic { cubic, .. } = &f.title.mode else {
+        panic!()
+    };
+    assert_eq!(cubic.json(), saved);
+    // Create New World carries the type and the JSON to the world's files.
+    f.title.escape();
+    let Action::Create { options, .. } = f.title.create_action() else {
+        panic!()
+    };
+    assert_eq!(options.cubic_kind(), Some(Hybrid));
+    assert_eq!(options.cubic_json, saved);
+}
+
+#[test]
+fn escape_closes_the_presets_overlay_before_the_screen() {
+    let mut f = Fixture::new();
+    let size = open_world_tab(&mut f);
+    press_id(&mut f, size, 36);
+    press_id(&mut f, size, 37);
+    press_id(&mut f, size, 102);
+    assert!(f.title.has_caret_field(), "the JSON box has the keys");
+    f.title.type_text(" ");
+    f.title.escape();
+    assert_eq!(f.title.mode.id(), "world_create_cubic");
+    assert!(!f.title.has_caret_field());
+    f.title.escape();
+    assert_eq!(f.title.mode.id(), "world_create");
+}
+
+#[test]
+fn create_world_button_ids_do_not_collide_on_any_tab() {
+    let mut f = Fixture::new();
+    f.click("Singleplayer");
+    let size = (480.0, 262.0);
+    for tab in 0..3 {
+        f.title.click(54.0 + 124.0 * tab as f32 + 10.0, 10.0, size);
+        let ids: Vec<u8> = f
+            .title
+            .buttons(size.0, size.1)
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        let unique: std::collections::BTreeSet<u8> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "tab {tab} repeats an id: {ids:?}");
+    }
 }
