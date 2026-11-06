@@ -102,6 +102,7 @@ mod creaking;
 mod creative_hotbar;
 mod creatures;
 mod crossbow;
+mod cubic;
 pub(crate) mod cushions;
 mod debug_keys;
 mod debug_lines;

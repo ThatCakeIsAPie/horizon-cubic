@@ -347,6 +347,23 @@ impl Game<'_> {
         self.pickups.clear();
     }
 
+    /// The level in place opened again from the save with its shape as
+    /// `level_shapes` now has it (a cubic level's new window), the clock,
+    /// weather and rules carried over; the old one is dropped. The caller
+    /// saves it first.
+    pub(super) fn reopen_level_in_place(&mut self) -> Result<()> {
+        let mut p = self.open_level(self.dim)?;
+        p.world.game_time = self.world.game_time;
+        p.world.day_time = self.world.day_time;
+        p.world.weather = self.world.weather;
+        p.world.health_rules = self.world.health_rules;
+        p.world.watched = std::mem::take(&mut self.world.watched);
+        self.swap_level(&mut p);
+        drop(p);
+        self.apply_settings();
+        Ok(())
+    }
+
     /// Put `target`'s level in place, opening it first if it is not loaded.
     /// The level that was in place is kept with the others; the shared
     /// clock and weather go with the swap. `host` is the hub when the caller
@@ -548,6 +565,11 @@ impl Game<'_> {
             self.native_lifecycle.cancel_server_tick();
         }
         result?;
+        // A cubic level's window follows its players (game/cubic.rs).
+        if let Err(error) = self.follow_cubic_window() {
+            self.native_lifecycle.cancel_server_tick();
+            return Err(error);
+        }
         if let Err(error) = self.close_idle_levels() {
             self.native_lifecycle.cancel_server_tick();
             return Err(error);

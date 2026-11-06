@@ -295,6 +295,16 @@ impl World {
     pub fn bottom_y(&self) -> i32 {
         self.layout().min_y()
     }
+    /// `getMinY() - 64`, below which an entity takes void damage
+    /// (`Entity.checkBelowWorld`). A cubic level's chunks hold only its
+    /// window, so its void is below the cubic range instead.
+    pub fn void_y(&self) -> i32 {
+        if self.shape.cubic {
+            horizon_world::cubic::MIN_Y - 64
+        } else {
+            self.bottom_y() - 64
+        }
+    }
     /// One above the highest block Y the level's chunks hold.
     pub fn top_y(&self) -> i32 {
         self.layout().max_y()

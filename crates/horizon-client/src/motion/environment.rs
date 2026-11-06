@@ -124,7 +124,7 @@ impl MotionWorld<'_, '_, '_> {
     /// take too) and suffocation (`isInWall`, which the caller decides from
     /// the blocks at the eyes).
     pub fn server_hazards_tick(&mut self, in_wall: bool) -> Result<()> {
-        if self.player.position.y < f64::from(self.scene.bottom_y() - 64) {
+        if self.player.position.y < f64::from(self.scene.void_y()) {
             let id = self
                 .health
                 .damage

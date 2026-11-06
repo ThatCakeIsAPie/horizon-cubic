@@ -1152,7 +1152,7 @@ fn base_tick(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
         }
     }
     // Entity.checkBelowWorld: LivingEntity.onBelowWorld hurts 4 a tick.
-    if m.position.y < f64::from(w.world.bottom_y() - 64) {
+    if m.position.y < f64::from(w.world.void_y()) {
         m.damage(4.0, Damage::of(DamageKind::OutOfWorld));
     }
     m.first_tick = false;
