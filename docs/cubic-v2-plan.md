@@ -219,12 +219,12 @@ Fallback: devices without compute or `MULTI_DRAW_INDIRECT_COUNT` keep v2's CPU p
 
 ### Whole World, then autoresearch
 
-The target is the Meridian LOD mod's whole-world toggle. In the owner's video it took about 20 s to show an LOD of the whole world, on a top gaming CPU. Our first benchmark on this 4-core/8-thread i7 was 25.8 s per hop. The aim was to beat that clearly: under 10 s.
+The target is the Meridian LOD mod's whole-world toggle. From memory of the owner's video, the estimate was about 20 s to show an LOD of the whole world, on a top gaming CPU. Watched frame by frame, the video shows a coarse whole-world picture in 1.5 s, refined over tens of seconds afterwards (see "What the Meridian video shows" below). Our first benchmark on this 4-core/8-thread i7 was 25.8 s per hop. The aim was to beat that clearly: under 10 s.
 
 **Where it stands (2026-11-06): 2.1 s per hop** (`tools/cubic_far_bench.py --hops 3`: 2.4, 2.6 and 1.4 s for about 7,000 planned nodes; 12.6 s at spawn including startup; 93 fps min, 117 fps mean). Two changes got there:
 1. Reads of cubes never saved are answered from an in-memory index, with per-region locks. Before, every read queued behind the store's global locks while the near terrain wrote cubes, at 30–600 ms per read.
 2. Unsaved fine nodes (levels 0–1) are built from whole generated cubes instead of 4,096 point queries.
-The GPU columns, the batched worker requests and the descent each helped less than the noise between runs. The next lever is the spawn fill. In a cubic level, LOD Distance's top step is **Whole World**:
+The GPU columns and the batched worker requests showed no gain beyond the noise between runs (single hops of one build varied by about ±10 s then); the descent was already on in the first benchmark and has never been measured on its own. The next lever is the spawn fill. In a cubic level, LOD Distance's top step is **Whole World**:
 - The octree's root covers vanilla's world border (±30 M blocks) and the whole cube range (±8.4 M blocks).
 - The plan subdivides by distance as usual.
 - Subtrees the 2D pre-pass proves uniform are never requested.
@@ -250,6 +250,35 @@ The owner's order is **speed first, then detail**:
    - the pre-pass bound;
    - CPU worker counts.
 4. **Detail comes after speed:** decorated far terrain (trees, snow) and Hybrid's vanilla band on the GPU.
+
+### What the Meridian video shows (2026-11-06)
+
+The owner downloaded the video and we went through it frame by frame. What it shows:
+- **On joining and after each teleport,** chat prints "Preparing distant terrain data…" and then "Distant terrain ready (1.5 s)". After that the whole world is on screen. From y = 1,000,000 and 2,000,000 it is a flat plane out to the border's edge.
+- **That first picture is coarse.** The whole-world option's tooltip says coarse terrain appears first and is refined progressively. After a teleport to the ground, its F3 shows about 670 builds waiting, done at about 15 builds/s. Full detail therefore arrives over tens of seconds, and trees appear on distant hills seconds after the land.
+- **From high up, the ground is a point-sampled colour field.** It shimmers like static, and the End's islands make moiré rings. Colour is not averaged at the coarse levels.
+- **Its F3** shows:
+  - a native Rust part, about 180 MB off-heap;
+  - 235–430 MB of GPU terrain buffers;
+  - "9 LOD / 2 capture workers";
+  - a terrain memory target of about 2.6 GB;
+  - a build rate limited by the CPU.
+- **Its settings:**
+  - Render the entire world, LOD distance and Detail (Normal/High/Extreme);
+  - Trees, Grass and flowers;
+  - Record seen terrain;
+  - Extended clouds, LOD anti-aliasing and Supersampled LOD;
+  - Horizon fade (start 55 %), Atmospheric haze and Remove vanilla terrain fog.
+
+The two numbers measure different things. Meridian's 1.5 s is a coarse picture of the whole world; its full detail takes tens of seconds. Our 2.1 s is every planned node at its final detail. But nothing shows until the nearest nodes land, and nothing coarse covers the rest in the meantime.
+
+What we take from it:
+1. **Coarse first.** On a teleport, request a coarse whole-world layer first (a few hundred nodes at high levels), draw it, then refine nearest-first. `CubeLod::removed` already keeps a node drawn until everything over its place is delivered. What is missing is asking for the coarse ancestors before the fine leaves. The benchmark should then report two times: the first full-coverage picture, and complete.
+2. **A surface layer for the coarsest levels.** A 16³ node at level 15 has voxels 32,768 blocks tall, while all the terrain lies within a few hundred blocks. So the surface snaps to whole voxels, and the top face can be the stone below the surface. Above some level, nodes should be 2.5D tiles holding, per column, a height, a top block and water, taken from the 2D pre-pass's columns. That is 16 times less work per node, with no vertical snapping.
+3. **Filter colour at the coarse levels.** Average the column colours, as mipmaps do, so the far ground does not shimmer.
+4. **Fog follows the far view.**
+   - Fixed on 2026-11-06: cubic worlds never told the fog that far terrain was on (`FogInputs::distant_terrain` checked only the column LOD). Atmospheric fog therefore stopped at about 1,000 blocks, and from high up the ground faded into the sky.
+   - Later: a horizon fade setting like Meridian's.
 
 ### Where the GPU far view stands
 
