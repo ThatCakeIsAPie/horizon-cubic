@@ -4,9 +4,11 @@
 //! the vanilla generator's far-terrain columns (one grid per node column, kept
 //! for the nodes above and below it); outside, from the cube generator.
 
+use crate::cubic::CubicLevel;
 use crate::lod::Column;
-use crate::lod::cube::{CubeKey, CubeNode, CubeSampler, Voxel};
+use crate::lod::cube::{CubeKey, CubeNode, CubeSampler, Kind, Voxel, downsample};
 use crate::streaming::LodSampler;
+use horizon_core::position::SectionPos;
 use horizon_world::cubic::generator::CubeGenerator;
 use horizon_world::registry::BlockStateId;
 use std::collections::VecDeque;
@@ -20,11 +22,16 @@ const VANILLA: std::ops::Range<i32> = -64..320;
 /// A cubic level's far-terrain sampler (`CubeSampler`), one per far
 /// terrain thread.
 pub struct CubicLodSampler {
+    /// The level's saved cubes: the finest nodes are made of them where
+    /// they are (the player's edits, vanilla's decorated terrain).
+    level: Arc<CubicLevel>,
     generator: Arc<CubeGenerator>,
     vanilla: Box<dyn LodSampler>,
     air: u32,
     stone: u32,
     deepslate: u32,
+    /// The states downsampling counts as fluid (water and lava sources).
+    fluids: Vec<u32>,
     deep_biome: u16,
     sky_biome: u16,
     grids: VecDeque<((u8, i32, i32), Arc<Vec<Column>>)>,
@@ -33,20 +40,24 @@ pub struct CubicLodSampler {
 impl CubicLodSampler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        level: Arc<CubicLevel>,
         generator: Arc<CubeGenerator>,
         vanilla: Box<dyn LodSampler>,
         air: u32,
         stone: u32,
         deepslate: u32,
+        fluids: Vec<u32>,
         deep_biome: u16,
         sky_biome: u16,
     ) -> Self {
         Self {
+            level,
             generator,
             vanilla,
             air,
             stone,
             deepslate,
+            fluids,
             deep_biome,
             sky_biome,
             grids: VecDeque::new(),
@@ -99,8 +110,99 @@ impl CubicLodSampler {
     }
 }
 
+impl CubicLodSampler {
+    /// A level 0 node from its saved cube, if it was saved.
+    fn saved_cube(&self, pos: SectionPos) -> Option<CubeNode> {
+        let section = self.level.saved_section(pos)?;
+        let key = CubeKey::new(0, pos.x, pos.y, pos.z);
+        if let Some(state) = section.blocks.uniform() {
+            let biome = section.biomes.get(0) as u16;
+            return Some(CubeNode::uniform(
+                key,
+                Voxel {
+                    state: BlockStateId(state),
+                    biome,
+                },
+            ));
+        }
+        let mut blocks = [0u32; 4096];
+        section.unpack(&mut blocks);
+        Some(CubeNode::from_fn(key, |x, y, z| Voxel {
+            state: BlockStateId(blocks[y << 8 | z << 4 | x]),
+            biome: section.biomes.get((y >> 2) << 4 | (z >> 2) << 2 | (x >> 2)) as u16,
+        }))
+    }
+
+    /// Air, fluid or solid, as the downsampling counts it.
+    fn kind(&self, state: BlockStateId) -> Kind {
+        if state.0 == self.air {
+            Kind::Air
+        } else if self.fluids.contains(&state.0) {
+            Kind::Fluid
+        } else {
+            Kind::Solid
+        }
+    }
+
+    /// A node of the finest levels made of the saved cubes it holds (the
+    /// others sampled as usual), or `None` when none of them was saved.
+    fn of_saved_cubes(&mut self, key: CubeKey) -> Option<CubeNode> {
+        match key.level {
+            0 => self.saved_cube(SectionPos::new(key.x, key.y, key.z)),
+            1 => {
+                let children = key.children();
+                let saved: Vec<Option<CubeNode>> = children
+                    .iter()
+                    .map(|c| self.saved_cube(SectionPos::new(c.x, c.y, c.z)))
+                    .collect();
+                if saved.iter().all(Option::is_none) {
+                    return None;
+                }
+                let mut nodes = Vec::with_capacity(8);
+                for (child, saved) in children.iter().zip(saved) {
+                    nodes.push(match saved {
+                        Some(node) => node,
+                        None => self.sampled(*child)?,
+                    });
+                }
+                let air = BlockStateId(self.air);
+                let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
+                Some(downsample(refs, air, |s| self.kind(s)))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl CubeSampler for CubicLodSampler {
     fn node(&mut self, key: CubeKey) -> Option<CubeNode> {
+        if key.level <= 1
+            && let Some(node) = self.of_saved_cubes(key)
+        {
+            return Some(node);
+        }
+        self.sampled(key)
+    }
+
+    fn fork(&self) -> Option<Box<dyn CubeSampler>> {
+        Some(Box::new(Self {
+            level: self.level.clone(),
+            generator: self.generator.clone(),
+            vanilla: self.vanilla.fork()?,
+            air: self.air,
+            stone: self.stone,
+            deepslate: self.deepslate,
+            fluids: self.fluids.clone(),
+            deep_biome: self.deep_biome,
+            sky_biome: self.sky_biome,
+            grids: VecDeque::new(),
+        }))
+    }
+}
+
+impl CubicLodSampler {
+    /// A node sampled from the generators at its own resolution.
+    fn sampled(&mut self, key: CubeKey) -> Option<CubeNode> {
         let origin = key.origin();
         let size = key.size();
         let step = 1i32 << key.level;
@@ -146,19 +248,6 @@ impl CubeSampler for CubicLodSampler {
                 state: BlockStateId(if state == 0 { air } else { state }),
                 biome: sky_biome,
             }
-        }))
-    }
-
-    fn fork(&self) -> Option<Box<dyn CubeSampler>> {
-        Some(Box::new(Self {
-            generator: self.generator.clone(),
-            vanilla: self.vanilla.fork()?,
-            air: self.air,
-            stone: self.stone,
-            deepslate: self.deepslate,
-            deep_biome: self.deep_biome,
-            sky_biome: self.sky_biome,
-            grids: VecDeque::new(),
         }))
     }
 }

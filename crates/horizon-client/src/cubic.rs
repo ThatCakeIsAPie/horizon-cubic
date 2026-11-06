@@ -142,6 +142,9 @@ pub struct CubicLevel {
     sky_biome: u16,
     bedrock: Option<u32>,
     deepslate: Option<u32>,
+    /// What cube records are decoded with for the far terrain.
+    registry: &'static BlockRegistry,
+    biomes: Arc<Biomes>,
 }
 
 impl CubicLevel {
@@ -150,8 +153,8 @@ impl CubicLevel {
     pub fn new(
         level_dir: &Path,
         seed: i64,
-        registry: &BlockRegistry,
-        biomes: &Biomes,
+        registry: &'static BlockRegistry,
+        biomes: &Arc<Biomes>,
         window: LevelShape,
     ) -> Result<Arc<Self>, String> {
         let palette = horizon_world::cubic::generator::CubePalette::from_registry(registry)?;
@@ -181,24 +184,41 @@ impl CubicLevel {
             sky_biome: biomes.id("minecraft:plains"),
             bedrock: registry.default_state("minecraft:bedrock").map(|s| s.0),
             deepslate: registry.default_state("minecraft:deepslate").map(|s| s.0),
+            registry,
+            biomes: biomes.clone(),
         });
         Ok(level)
+    }
+
+    /// A saved cube's section (blocks and biomes), for the far terrain:
+    /// `None` when the cube was never saved (the generator's as it is).
+    pub fn saved_section(&self, pos: SectionPos) -> Option<Arc<Section>> {
+        let root = self.read(pos)?;
+        let ctx = Codec {
+            registry: self.registry,
+            biomes: &self.biomes,
+            tables: None,
+        };
+        let cube = ctx.decode(&root, pos.y)?;
+        cube.sections.into_iter().next()
     }
 
     /// A far-terrain sampler of the level (`cubic_lod`), reading inside
     /// vanilla's range from `vanilla`, the vanilla generator's.
     pub fn lod_sampler(
-        &self,
+        self: &Arc<Self>,
         vanilla: Box<dyn crate::streaming::LodSampler>,
         registry: &BlockRegistry,
     ) -> crate::cubic_lod::CubicLodSampler {
         let id = |name: &str| registry.default_state(name).map_or(0, |s| s.0);
         crate::cubic_lod::CubicLodSampler::new(
+            self.clone(),
             self.generator.clone(),
             vanilla,
             id("minecraft:air"),
             id("minecraft:stone"),
             id("minecraft:deepslate"),
+            vec![id("minecraft:water"), id("minecraft:lava")],
             self.deep_biome,
             self.sky_biome,
         )
@@ -369,6 +389,19 @@ impl CubicLevel {
                 continue;
             }
             let pos = SectionPos::new(x, cy, z);
+            self.note_clean(pos, section);
+            // A missing vanilla cube reads as air: the air above the ground
+            // needs no record (the marker always has one).
+            let low = cy * 16;
+            if cy != MARKER_CUBE
+                && section.blocks.uniform() == Some(0)
+                && !vanilla
+                    .block_entities
+                    .iter()
+                    .any(|(p, _)| p.1 >= low && p.1 < low + 16)
+            {
+                continue;
+            }
             let mut root = ctx.encode(&vanilla, s, cy == MARKER_CUBE);
             if cy == MARKER_CUBE
                 && let Tag::Compound(map) = &mut root.tag
@@ -376,7 +409,6 @@ impl CubicLevel {
                 map.insert(SURFACE_KEY.into(), Tag::IntArray(heights.clone()));
             }
             self.write_later(pos, root);
-            self.note_clean(pos, section);
         }
         self.vanilla_done.lock().unwrap().insert((x, z));
         let mut chunk = Chunk::with_layout(x, z, window);

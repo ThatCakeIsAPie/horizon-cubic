@@ -49,11 +49,10 @@ impl Game<'_> {
             window.min_y,
             window.max_y()
         );
-        // Everything of the old window on disk first: the new one reads it.
-        self.save_level(true)?;
-        if let Some(level) = self.save.cubic.get() {
-            level.flush();
-        }
+        // The old window's columns and entities saved. Not waited for: the
+        // new window reads through the same saves, whose queued writes its
+        // loads see.
+        self.save_level(false)?;
         *self.level_shapes.get_mut(self.dim.id()) = window;
         if let Err(e) = cubic::save_window(&self.world_root, window.min_y) {
             log::warn!("Horizon: the cubic window was not recorded: {e}");
