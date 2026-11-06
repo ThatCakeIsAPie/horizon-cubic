@@ -26,6 +26,10 @@ pub struct LevelShape {
     pub height: i32,
     /// `DimensionType.logicalHeight`: how high portals and chorus fruit reach.
     pub logical_height: i32,
+    /// A cubic level (docs/cubic-chunks.md): its height is unbounded, and
+    /// `min_y`..`max_y` is the vertical window of cubes loaded now, which
+    /// moves with the players (`LevelShape::cubic_window`).
+    pub cubic: bool,
 }
 impl LevelShape {
     pub const OVERWORLD: Self = Self {
@@ -34,6 +38,7 @@ impl LevelShape {
         min_y: MIN_Y,
         height: HEIGHT,
         logical_height: HEIGHT,
+        cubic: false,
     };
     pub const NETHER: Self = Self {
         sky_light: false,
@@ -41,6 +46,7 @@ impl LevelShape {
         min_y: 0,
         height: 256,
         logical_height: 128,
+        cubic: false,
     };
     pub const END: Self = Self {
         sky_light: true,
@@ -48,7 +54,23 @@ impl LevelShape {
         min_y: 0,
         height: 256,
         logical_height: 256,
+        cubic: false,
     };
+    /// A cubic level's window of cubes from block `min_y`, `height` blocks
+    /// high (both multiples of 16, inside the cubic range), with `level`'s
+    /// sky and ceiling. Unlike [`LevelShape::new`] it is not held to a
+    /// dimension type's -2032..2031.
+    pub fn cubic_window(level: LevelShape, min_y: i32, height: i32) -> Self {
+        let layout = ColumnLayout::window(min_y, height);
+        Self {
+            sky_light: level.sky_light,
+            has_ceiling: level.has_ceiling,
+            min_y: layout.min_y(),
+            height: layout.height(),
+            logical_height: layout.height(),
+            cubic: true,
+        }
+    }
     /// A dimension type's shape, checked as its codec checks it.
     pub fn new(
         min_y: i32,
@@ -69,6 +91,7 @@ impl LevelShape {
             min_y,
             height,
             logical_height,
+            cubic: false,
         })
     }
     /// One above the highest block (`getMaxY() + 1`).
@@ -88,7 +111,12 @@ impl LevelShape {
     /// The sections a chunk of this level holds: the level's, widened to the
     /// vanilla Overworld's `-64..320` so that vanilla's Nether and End keep
     /// the 24 sections they have always had.
+    ///
+    /// A cubic level's chunks hold exactly its window.
     pub fn column(self) -> ColumnLayout {
+        if self.cubic {
+            return ColumnLayout::window(self.min_y, self.height);
+        }
         ColumnLayout::of_level(self.min_y, self.height)
     }
 }
@@ -202,6 +230,19 @@ impl ColumnLayout {
     /// The minimum block Y of section `index`.
     pub fn section_y(self, index: usize) -> i32 {
         self.min_y + index as i32 * 16
+    }
+    /// A cubic level's window (`LevelShape::cubic_window`): `min_y` rounded
+    /// down and `height` up to whole sections, clamped into the cubic range
+    /// (`horizon_world::cubic`), at least one section and at most a
+    /// `SectionMask`'s.
+    pub fn window(min_y: i32, height: i32) -> Self {
+        use horizon_world::cubic::{MAX_Y, MIN_Y};
+        let sections = (height.max(16) as usize).div_ceil(16).min(crate::section_mask::SectionMask::CAPACITY);
+        let top = MAX_Y + 1 - sections as i32 * 16;
+        Self {
+            min_y: (min_y & !15).clamp(MIN_Y, top),
+            sections,
+        }
     }
 }
 /// `true` for each section of `layout`: what callers that keep no
@@ -525,11 +566,12 @@ pub struct Chunk {
     min_y: i32,
     pub sections: Vec<Arc<Section>>,
     /// `Heightmap.Types.WORLD_SURFACE` per column (`z << 4 | x`): one above
-    /// the highest non-air block, or the column's minimum Y. Built on the first read; a
-    /// `set` that can move a column's surface drops it.
-    surface: OnceLock<Box<[i16; 256]>>,
+    /// the highest non-air block, or the column's minimum Y, as an offset
+    /// from `min_y` (so a cubic level's window far from 0 fits). Built on the
+    /// first read; a `set` that can move a column's surface drops it.
+    surface: OnceLock<Box<[u16; 256]>>,
     /// `Heightmap.Types.MOTION_BLOCKING` per column, kept like `surface`.
-    motion_blocking: OnceLock<Box<[i16; 256]>>,
+    motion_blocking: OnceLock<Box<[u16; 256]>>,
     pub lit: bool,
     /// Light read from a save with `isLightOn`: no light job is needed.
     pub light_loaded: bool,
@@ -555,6 +597,10 @@ pub struct Chunk {
     /// The starts generation made in this chunk (`structures.starts`), saved
     /// with the state their placement has reached by then.
     pub structure_starts: Vec<Arc<horizon_world::worldgen::structure::start::StructureStart>>,
+    /// A cubic level's columns (`z << 4 | x`, a bit each) whose sky is cut
+    /// off above the window: a known block is higher (docs/cubic-chunks.md).
+    /// Light seeds no sky at their top. `None`: every column is open.
+    pub sky_covered: Option<Arc<[u64; 4]>>,
 }
 impl Chunk {
     /// An all-air chunk in the current `layout`.
@@ -583,7 +629,16 @@ impl Chunk {
             postprocess: Vec::new(),
             saved: None,
             entities: Vec::new(),
+            sky_covered: None,
         }
+    }
+    /// Whether column (`x`, `z`, within the chunk) gets no sky at the top
+    /// of its sections (`sky_covered`).
+    pub fn sky_covered_at(&self, x: i32, z: i32) -> bool {
+        let i = column(x, z);
+        self.sky_covered
+            .as_ref()
+            .is_some_and(|bits| bits[i / 64] >> (i % 64) & 1 != 0)
     }
     /// The minimum block Y of the column.
     #[inline]
@@ -644,7 +699,7 @@ impl Chunk {
             for map in [&mut self.surface, &mut self.motion_blocking] {
                 if map
                     .get()
-                    .is_some_and(|heights| y >= i32::from(heights[column(x, z)]) - 1)
+                    .is_some_and(|heights| y >= self.min_y + i32::from(heights[column(x, z)]) - 1)
                 {
                     *map = OnceLock::new();
                 }
@@ -667,7 +722,7 @@ impl Chunk {
     /// Sections must change only through `set` once this has been read.
     pub fn world_surface(&self, x: i32, z: i32, air: impl Fn(u32) -> bool) -> i32 {
         let surface = self.surface.get_or_init(|| self.prime(|v| !air(v)));
-        i32::from(surface[column(x, z)])
+        self.min_y + i32::from(surface[column(x, z)])
     }
     /// `getHeight(Heightmap.Types.MOTION_BLOCKING, x, z)` (`x`, `z` within
     /// the chunk): one above the highest state where `blocks` (a motion
@@ -675,12 +730,12 @@ impl Chunk {
     /// `world_surface` is.
     pub fn motion_blocking(&self, x: i32, z: i32, blocks: impl Fn(u32) -> bool) -> i32 {
         let heights = self.motion_blocking.get_or_init(|| self.prime(blocks));
-        i32::from(heights[column(x, z)])
+        self.min_y + i32::from(heights[column(x, z)])
     }
     /// `Heightmap.primeHeightmaps`: each section from the top, skipping
     /// those of one state that doesn't count, until every column is found.
-    fn prime(&self, counts: impl Fn(u32) -> bool) -> Box<[i16; 256]> {
-        let mut surface = Box::new([self.min_y as i16; 256]);
+    fn prime(&self, counts: impl Fn(u32) -> bool) -> Box<[u16; 256]> {
+        let mut surface = Box::new([0u16; 256]);
         let mut found = [false; 256];
         let mut left = 256;
         let mut values = [0u32; 4096];
@@ -692,13 +747,13 @@ impl Chunk {
                 continue;
             }
             section.unpack(&mut values);
-            let base = self.min_y + s as i32 * 16;
+            let base = s * 16;
             for i in 0..256 {
                 if found[i] {
                     continue;
                 }
                 if let Some(dy) = (0..16).rev().find(|&dy| counts(values[dy << 8 | i])) {
-                    surface[i] = (base + dy as i32 + 1) as i16;
+                    surface[i] = (base + dy + 1) as u16;
                     found[i] = true;
                     left -= 1;
                 }
@@ -743,7 +798,7 @@ impl Chunk {
             .iter()
             .filter(|map| map.get().is_some())
             .count()
-            * std::mem::size_of::<[i16; 256]>();
+            * std::mem::size_of::<[u16; 256]>();
         for section in &self.sections {
             if !seen.insert(Arc::as_ptr(section)) {
                 continue;
@@ -1004,6 +1059,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_cubic_window_is_its_own_column_anywhere_in_the_cubic_range() {
+        let up = LevelShape::cubic_window(LevelShape::OVERWORLD, 1_000_000, 512);
+        assert!(up.cubic && up.sky_light && !up.has_ceiling);
+        assert_eq!((up.min_y, up.max_y(), up.logical_height), (1_000_000, 1_000_512, 512));
+        let column = up.column();
+        assert_eq!((column.min_y(), column.sections()), (1_000_000, 32));
+        assert_eq!(column.section_index(1_000_511), Some(31));
+        assert_eq!(column.section_index(999_999), None);
+        // Not widened to vanilla's -64..320, as a dimension type's column is.
+        let low = LevelShape::cubic_window(LevelShape::OVERWORLD, -5_000_000, 256);
+        assert_eq!(low.column().min_y(), -5_000_000);
+        assert!(!low.has_section(-4));
+        // Rounded to sections and kept inside the cubic range.
+        assert_eq!(ColumnLayout::window(-17, 20).min_y(), -32);
+        assert_eq!(ColumnLayout::window(-17, 20).sections(), 2);
+        let top = ColumnLayout::window(i32::MAX - 100, 512);
+        assert_eq!(top.max_y(), horizon_world::cubic::MAX_Y + 1);
+        let bottom = ColumnLayout::window(i32::MIN, 512);
+        assert_eq!(bottom.min_y(), horizon_world::cubic::MIN_Y);
+        assert!(!LevelShape::new(-64, 384, 384, true, false).unwrap().cubic);
     }
 
     #[test]

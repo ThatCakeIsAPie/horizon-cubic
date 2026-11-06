@@ -200,6 +200,9 @@ impl crate::light::LightWorld for ChunkMap {
     fn layout(&self) -> crate::chunk::ColumnLayout {
         self.columns.layout()
     }
+    fn sky_covered(&self, x: i32, z: i32) -> bool {
+        self.columns.sky_covered(x, z)
+    }
 }
 
 #[cfg(test)]

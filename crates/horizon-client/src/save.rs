@@ -1429,7 +1429,9 @@ pub fn encode_with(
             ));
         }
         let mut entries = vec![
-            ("Y", Tag::Byte(y as i8)),
+            // A byte, as vanilla writes it; an int for a cubic level's
+            // cubes past a byte (docs/cubic-chunks.md).
+            ("Y", i8::try_from(y).map_or(Tag::Int(y), Tag::Byte)),
             ("block_states", Tag::compound(states)),
             ("biomes", Tag::compound(biome_tag)),
         ];

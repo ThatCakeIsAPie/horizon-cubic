@@ -63,6 +63,46 @@ Notes from a survey of `main` on 2026-11-05. Root abbreviations: **R** is `crate
   - `outside_build_height` in placement.
 - **Far terrain.** Tiles of 16 × 16 surface columns with `i16` spans: a surface model.
 
+## v1 architecture: a moving window of cubes
+
+The first playable version keeps Horizon's column `Chunk` and its single layout per level. A cubic
+level's `LevelShape` (`cubic: true`) is a **window**: 32 cubes (512 blocks) around the players
+(`LevelShape::cubic_window`, `ColumnLayout::window`). That layout isn't held to a dimension type's
+±2032.
+
+- **Every index stays relative to one layout.** That covers light regions, `SectionKey`, `DirtySections`,
+  `Streaming`'s keys and the mesher. Inside the window, the game is a 512-high level, and code that reads
+  `bottom_y`/`top_y` sees the window.
+- **Cubes are the unit on disk and in generation.**
+  - A column of the window is assembled from cubes: saved ones (`CubeStore`, `region3d/`), the vanilla
+    generator's for the Overworld's −64..320, and `cubic::generator` outside it.
+  - The vanilla range of a column is generated once, whole, with vanilla's pipeline: surface, carvers,
+    decoration, structures. Its bedrock floor is replaced by deepslate, and it is saved as cubes.
+  - Modified cubes are saved. Unmodified generated cubes outside the vanilla range are not, because the
+    generator makes them again.
+- **Recentring.** When a player comes within 96 blocks of the window's top or bottom, the level gets a
+  new window centred on them.
+  - The server saves every loaded column's cubes, then switches the level to itself with the new window.
+    This is the dimension-change path: save, new `World` and `Streaming`, players held until their
+    terrain has loaded.
+  - The client gets a `horizon:cubic_window` payload and clears its sections. The far LOD stays drawn
+    meanwhile.
+  - This costs a short reload every ~160 blocks of vertical travel. Shifting sections in place, without
+    clearing, is later work.
+- **Sky light.** A column is open to the sky at the window's top only if no known cube above has a block
+  (`ColumnTops::covered_above`, which also counts the vanilla surface). Otherwise its top is dark.
+- **Network.** Single player runs on its server thread over the byte `Pipe`, so the wire matters there
+  too.
+  - A Horizon client joining a cubic level gets `horizon:cubic_window` before its chunks, and both ends
+    switch block positions to the wide form (`Pos`'s 12 bits of Y can't hold ±8.4 M).
+  - Vanilla clients are refused.
+- **Entities and block entities** outside the window stay saved (per column and per cube) and wait there.
+  Void damage applies only below the cubic range.
+- **Far terrain** is the cube octree LOD (`lod/cube.rs`): nodes of `(16 << level)³` blocks, 16³ voxels
+  each, coarser further out. They are sampled from the same generators (and from saved cubes near the
+  player), meshed with the far mesher, and drawn through the far-tile pipeline. The 2D far terrain is off
+  in cubic levels.
+
 ## Phases
 
 Each phase lands as small PRs (AGENTS.md: under ~500 lines), with tests. Vanilla levels stay byte-identical

@@ -411,7 +411,11 @@ fn light_chunk_with_scratch(
     for z in 0..W {
         for x in 0..W {
             let col = z * W + x;
-            if !present[col] || !sky_light {
+            // A cubic level's column with a known block above its window
+            // gets no sky from the top (`Chunk::sky_covered`).
+            let covered = region[z / 16][x / 16]
+                .is_some_and(|c| c.sky_covered_at(x as i32 & 15, z as i32 & 15));
+            if !present[col] || !sky_light || covered {
                 lowest[col] = h as i32;
                 continue;
             }
@@ -696,12 +700,21 @@ pub trait LightWorld {
     fn set_section_light(&mut self, cx: i32, s: usize, cz: i32, light: Light);
     /// The column the world's chunks hold (its level's).
     fn layout(&self) -> ColumnLayout;
+    /// Whether block column (x, z) gets no sky at its top: a cubic level's
+    /// column with a known block above the window (`Chunk::sky_covered`).
+    fn sky_covered(&self, _x: i32, _z: i32) -> bool {
+        false
+    }
 }
 impl<S: std::hash::BuildHasher> LightWorld for HashMap<(i32, i32), Arc<Chunk>, S> {
     fn layout(&self) -> ColumnLayout {
         self.values()
             .next()
             .map_or(ColumnLayout::VANILLA, |c| c.layout())
+    }
+    fn sky_covered(&self, x: i32, z: i32) -> bool {
+        self.get(&(x >> 4, z >> 4))
+            .is_some_and(|c| c.sky_covered_at(x & 15, z & 15))
     }
     fn section(&self, cx: i32, s: usize, cz: i32) -> Option<&Arc<Section>> {
         self.get(&(cx, cz))
@@ -960,6 +973,10 @@ fn set_level(world: &mut Region, sky: bool, p: Pos, value: u8) {
 /// edge in the column (every block at or above it is a sky source).
 fn lowest_sky_source(world: &mut Region, tables: &LightTables, x: i32, z: i32) -> i32 {
     let (min_y, max_y) = (world.layout.min_y(), world.layout.max_y());
+    if world.world.sky_covered(x, z) {
+        // No source in a covered cubic column.
+        return max_y;
+    }
     let mut y = max_y - 1;
     let Some(mut top) = world.state(x, y, z) else {
         return min_y;
