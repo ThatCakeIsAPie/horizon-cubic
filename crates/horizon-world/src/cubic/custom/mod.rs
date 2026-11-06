@@ -55,9 +55,9 @@ pub mod populate;
 pub mod replacers;
 pub mod rng;
 pub mod settings;
-pub mod vegetation;
 #[doc(hidden)]
 pub mod testing;
+pub mod vegetation;
 
 pub use biomes::{BiomeColumns, FixedBiome};
 pub use climate_biomes::ClimateBiomes;

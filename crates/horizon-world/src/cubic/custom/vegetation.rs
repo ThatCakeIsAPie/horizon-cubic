@@ -82,7 +82,11 @@ impl Vegetation {
     fn list(&self, biome: BiomeId) -> Arc<[String]> {
         match self.lists.get(biome.0 as usize) {
             Some(cell) => cell
-                .get_or_init(|| self.features.biome_step_features(biome, VEGETAL_STEP).into())
+                .get_or_init(|| {
+                    self.features
+                        .biome_step_features(biome, VEGETAL_STEP)
+                        .into()
+                })
                 .clone(),
             None => Arc::from(Vec::new()),
         }

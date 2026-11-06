@@ -11,8 +11,7 @@ Status: **v1, playable in single player** (see "v1 architecture" below). How to 
 - **Create World**, World tab: turn on **Cubic Chunks**. Or from the command line:
   `horizon-client --world NAME --cubic`.
 - The Overworld is vanilla between y −64 and 320, with no bedrock floor.
-- Below that are endless deepslate caves, with ores, lava and geodes (`cubic::generator`).
-- Above it is open sky, with floating islands in bands every 1000 blocks from y 600.
+- Custom Cubic worlds (the default) are CubicWorldGen's generator in every cube; Hybrid keeps vanilla's range and uses it outside; Flat is endless layers (`cubic::custom`, `cubic_gen.rs`).
 - The far terrain is the cube octree.
 - Vanilla levels and the Nether and End are unchanged.
 
@@ -88,7 +87,7 @@ level's `LevelShape` (`cubic: true`) is a **window**: `2V + 3` cubes (19 by defa
   `bottom_y`/`top_y` sees the window.
 - **Cubes are the unit on disk and in generation.**
   - A column of the window is assembled from cubes: saved ones (`CubeStore`, `region3d/`), the vanilla
-    generator's for the Overworld's −64..320, and `cubic::generator` outside it.
+    generator's for a Hybrid world's −64..320, and `cubic::custom` (CubicWorldGen's generator, populated 2 x 2 x 2 cubes at a time) elsewhere.
   - The vanilla range of a column is generated once, whole, with vanilla's pipeline: surface, carvers,
     decoration, structures. Its bedrock floor is replaced by deepslate, and it is saved as cubes.
   - Modified cubes are saved. Unmodified generated cubes outside the vanilla range are not, because the

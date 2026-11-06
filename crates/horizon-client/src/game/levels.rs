@@ -450,7 +450,7 @@ impl Game<'_> {
     pub(super) fn cubic_sampler_in(
         &self,
         dim: Dim,
-    ) -> Option<Box<dyn horizon_client::lod::cube::CubeSampler>> {
+    ) -> Option<horizon_client::cubic_lod::CubicLodSampler> {
         let (streaming, save) = if dim == self.dim {
             (&self.streaming, &self.save)
         } else {
@@ -459,9 +459,7 @@ impl Game<'_> {
         };
         let level = save.cubic.get()?;
         let vanilla = streaming.lod_source().sampler();
-        Some(Box::new(
-            level.lod_sampler(vanilla, self.pack.assets.registry),
-        ))
+        Some(level.lod_sampler(vanilla, self.pack.assets.registry))
     }
 
     /// Put `dim`'s level in place for a command whose source is there

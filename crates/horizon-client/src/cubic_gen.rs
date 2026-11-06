@@ -23,6 +23,7 @@
 
 use crate::biome::Biomes;
 use crate::chunk::{BIOME_STRATEGY, Section};
+pub use crate::cubic_settings::CubicKind;
 use horizon_core::paletted::PalettedContainer;
 use horizon_core::position::SectionPos;
 use horizon_world::cubic::custom::populate::CubeWorld;
@@ -49,36 +50,6 @@ pub const PARTIAL: u8 = 2;
 /// The cube Ys vanilla's Overworld generator makes (-64..320): Hybrid's band.
 pub const VANILLA_CUBES: std::ops::RangeInclusive<i32> = -4..=19;
 
-/// A cubic world's type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CubicKind {
-    /// CubicWorldGen's Custom Cubic everywhere.
-    Custom,
-    /// Vanilla between -64 and 320, Custom Cubic outside.
-    Hybrid,
-    /// CubicWorldGen's Flat Cubic.
-    Flat,
-}
-
-impl CubicKind {
-    /// The `"type"` of `horizon_cubic.json`.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Custom => "custom",
-            Self::Hybrid => "hybrid",
-            Self::Flat => "flat",
-        }
-    }
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "custom" => Some(Self::Custom),
-            "hybrid" => Some(Self::Hybrid),
-            "flat" => Some(Self::Flat),
-            _ => None,
-        }
-    }
-}
-
 /// A world's choice of generator: its type and the settings JSON
 /// (`cubicgen.json`; empty means the type's defaults).
 #[derive(Clone, Debug)]
@@ -96,12 +67,18 @@ impl Default for CubicGeneration {
     }
 }
 
-/// The settings a world of `kind` starts from when it has no JSON.
-pub fn default_settings_json(kind: CubicKind) -> String {
-    match kind {
-        CubicKind::Custom => CustomGeneratorSettings::defaults().to_json_pretty(),
-        CubicKind::Hybrid => CustomGeneratorSettings::defaults_without_structures().to_json_pretty(),
-        CubicKind::Flat => FlatGeneratorSettings::default().to_json_pretty(),
+impl CubicGeneration {
+    /// What a world folder says: its type and `cubicgen.json`
+    /// (`cubic_settings::load_world_generation`), Hybrid with the default
+    /// settings for a world that says nothing.
+    pub fn of_world(dir: &std::path::Path) -> Self {
+        match crate::cubic_settings::load_world_generation(dir) {
+            Some((kind, settings_json)) => Self {
+                kind,
+                settings_json,
+            },
+            None => Self::default(),
+        }
     }
 }
 
@@ -148,12 +125,13 @@ impl Generation {
         data: Option<&Arc<GeneratorData>>,
     ) -> Result<Self, String> {
         let text = if choice.settings_json.trim().is_empty() {
-            default_settings_json(choice.kind)
+            crate::cubic_settings::default_json(choice.kind)
         } else {
             choice.settings_json.clone()
         };
         if choice.kind == CubicKind::Flat {
-            let generator = CustomCubicGenerator::flat(&FlatGeneratorSettings::from_json(&text)?, registry)?;
+            let generator =
+                CustomCubicGenerator::flat(&FlatGeneratorSettings::from_json(&text)?, registry)?;
             return Ok(Self {
                 kind: choice.kind,
                 generator: Arc::new(generator),
@@ -372,8 +350,7 @@ impl Population {
     }
 
     fn stripe(pos: SectionPos) -> usize {
-        let h = (pos.x as u32 as u64)
-            .wrapping_mul(0x9E37_79B1_85EB_CA87)
+        let h = (pos.x as u32 as u64).wrapping_mul(0x9E37_79B1_85EB_CA87)
             ^ (pos.y as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
             ^ (pos.z as u32 as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
         ((h ^ h >> 29) % STRIPES as u64) as usize
@@ -489,7 +466,10 @@ mod tests {
 
     #[test]
     fn flags_round_trip_through_a_record() {
-        let mut root = NamedTag::new("", Tag::compound([("a", Tag::Int(1))]));
+        let mut root = NamedTag {
+            name: "".into(),
+            tag: Tag::compound([("a", Tag::Int(1))]),
+        };
         assert_eq!(root_flags(&root), 0);
         set_root_flags(&mut root, POPULATED | PARTIAL);
         assert_eq!(root_flags(&root), 3);
@@ -527,7 +507,7 @@ mod tests {
         assert_eq!(region.block([2 * 16, -2 * 16 + 5, 4 * 16]), 3);
         assert_eq!(region.block([0, 0, 0]), 0, "outside reads as air");
         region.set_block([3 * 16 + 1, -3 * 16 + 1, 5 * 16 + 1], 99);
-        assert_eq!(region.dirty()[5], true);
+        assert!(region.dirty()[5]);
         assert_eq!(region.dirty().iter().filter(|d| **d).count(), 1);
         region.set_block([0, 0, 0], 7);
         assert_eq!(region.dirty().iter().filter(|d| **d).count(), 1);

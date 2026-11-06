@@ -41,7 +41,12 @@ impl ClimateBiomes {
     /// `scale` is [`super::CustomGeneratorSettings::biome_scale`].
     pub fn new(data: &Arc<GeneratorData>, seed: i64, scale: f64) -> Result<Self, GeneratorError> {
         let climate = data.overworld_climate(seed)?;
-        Ok(Self::from_parts(data, climate.climate, climate.index, scale))
+        Ok(Self::from_parts(
+            data,
+            climate.climate,
+            climate.index,
+            scale,
+        ))
     }
 
     pub fn from_parts(

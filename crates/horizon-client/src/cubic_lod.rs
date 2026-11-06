@@ -139,7 +139,12 @@ pub fn far_setup(level: &CubicLevel, registry: &BlockRegistry) -> Option<FarSetu
         .map(|n| horizon_world::cubic::custom::biomes::biome_info(n))
         .collect();
     let params = CubeGenParams {
-        noises: [desc(&tables[0]), desc(&tables[1]), desc(&tables[2]), desc(&tables[3])],
+        noises: [
+            desc(&tables[0]),
+            desc(&tables[1]),
+            desc(&tables[2]),
+            desc(&tables[3]),
+        ],
         height_factor: shape[0],
         height_offset: shape[1],
         height_variation_factor: shape[2],
@@ -169,7 +174,10 @@ pub fn far_setup(level: &CubicLevel, registry: &BlockRegistry) -> Option<FarSetu
             height_variation: i.height_variation,
         })
         .collect();
-    let columns: ColumnFn = match (&wg.climate, scale == 1.0 && wg.settings.as_ref().is_some_and(|s| s.biome.is_empty())) {
+    let columns: ColumnFn = match (
+        &wg.climate,
+        scale == 1.0 && wg.settings.as_ref().is_some_and(|s| s.biome.is_empty()),
+    ) {
         (Some(climate), true) => {
             // The climate's biome ids are the generator data's: the index
             // maps them to the client's by name.
@@ -178,9 +186,18 @@ pub fn far_setup(level: &CubicLevel, registry: &BlockRegistry) -> Option<FarSetu
                 .index()
                 .entries()
                 .iter()
-                .map(|(point, id)| (*point, u32::from(biomes.id(data.biome_name(horizon_world::worldgen::biome::BiomeId(*id))))))
+                .map(|(point, id)| {
+                    (
+                        *point,
+                        u32::from(
+                            biomes
+                                .id(data.biome_name(horizon_world::worldgen::biome::BiomeId(*id))),
+                        ),
+                    )
+                })
                 .collect();
-            let index = Arc::new(horizon_world::worldgen::climate::ClimateIndex::new(entries).ok()?);
+            let index =
+                Arc::new(horizon_world::worldgen::climate::ClimateIndex::new(entries).ok()?);
             Arc::new(CpuBiomes::new(climate.climate().clone(), index, terrain)).column_fn()
         }
         _ => generator_columns(wg.clone(), biomes.clone()),
@@ -222,7 +239,8 @@ impl CubicLodSampler {
         let level_plains = level.client_biomes().id("minecraft:plains");
         let far_setup = far_setup(&level, registry);
         let far: Option<Box<dyn CubeSampler>> = far_setup.as_ref().map(|f| {
-            Box::new(GpuCubeSampler::cpu(f.params.clone(), f.columns.clone())) as Box<dyn CubeSampler>
+            Box::new(GpuCubeSampler::cpu(f.params.clone(), f.columns.clone()))
+                as Box<dyn CubeSampler>
         });
         Self {
             wg: level.generation().clone(),
@@ -267,7 +285,6 @@ impl CubicLodSampler {
     fn far_makes(&self, key: CubeKey) -> bool {
         self.far.is_some() && key.level >= 2 && !self.in_band(key)
     }
-
 }
 
 impl CubicLodSampler {

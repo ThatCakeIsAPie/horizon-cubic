@@ -31,11 +31,11 @@
 //! never read), so a loaded cube has its POIs again.
 
 use crate::biome::Biomes;
+use crate::chunk::{Chunk, ColumnLayout, LevelShape, Section, block_strategy};
 use crate::cubic_gen::{
-    CubicGeneration, CubicKind, FLAGS_KEY, Generation, PARTIAL, POPULATED, PopRegion, Population,
+    CubicGeneration, CubicKind, Generation, PARTIAL, POPULATED, PopRegion, Population,
     needs_population, root_flags, set_root_flags,
 };
-use crate::chunk::{BIOME_STRATEGY, Chunk, ColumnLayout, LevelShape, Section, block_strategy};
 use crate::save::{ChunkExtras, Persistent, SaveTables, decode_with, encode_with};
 use crate::streaming::{ChunkGenerator, Proto};
 use horizon_core::paletted::PalettedContainer;
@@ -372,7 +372,13 @@ impl CubicLevel {
             biomes: biomes.clone(),
             lod_cache: crate::lod::cube_cache::CubeLodCache::open(
                 &level_dir.join("horizon_cube_lod"),
-                &crate::lod::cube_cache::fingerprint(seed, registry.len()),
+                &format!(
+                    "{}generator {} {:016x}
+",
+                    crate::lod::cube_cache::fingerprint(seed, registry.len()),
+                    generation.kind.id(),
+                    settings_hash(&generation.settings_json)
+                ),
             ),
             ring: crate::cubic_prefetch::Ring::new(),
             surfaces: Mutex::default(),
@@ -407,6 +413,43 @@ impl CubicLevel {
             registry,
             self.lod_cache.clone(),
         )
+    }
+
+    /// Where a new world's spawn search starts (`game/initial_spawn.rs`): the
+    /// chunk and the height to stand at, for a world that is not Hybrid. A
+    /// Flat world's is the origin; a Custom world's, the first chunk of a
+    /// spiral round it whose surface is above the sea (land).
+    pub fn spawn_origin(&self) -> Option<((i32, i32), i32)> {
+        let generator = &self.wg.generator;
+        match self.wg.kind {
+            CubicKind::Hybrid => None,
+            CubicKind::Flat => {
+                let y = generator.surface_y(8, 8, 320).unwrap_or(0);
+                Some(((0, 0), y + 1))
+            }
+            CubicKind::Custom => {
+                let sea = generator.sea_level();
+                let mut best: Option<((i32, i32), i32)> = None;
+                for radius in 0..24i32 {
+                    for dz in -radius..=radius {
+                        for dx in -radius..=radius {
+                            if dx.abs().max(dz.abs()) != radius {
+                                continue;
+                            }
+                            let (cx, cz) = (dx * 2, dz * 2);
+                            let Some(y) = generator.surface_y(cx * 16 + 8, cz * 16 + 8, 320) else {
+                                continue;
+                            };
+                            if y > sea {
+                                return Some(((cx, cz), y + 1));
+                            }
+                            best.get_or_insert(((cx, cz), y + 1));
+                        }
+                    }
+                }
+                best.or(Some(((0, 0), sea + 1)))
+            }
+        }
     }
 
     /// The client's biome table (the ids sections and far nodes carry).
@@ -697,9 +740,8 @@ impl CubicLevel {
             let known = self.pop.flags(q).unwrap_or(0);
             let flags = if own {
                 (known | POPULATED) & !PARTIAL
-            } else if known & POPULATED != 0 || known & PARTIAL != 0 {
-                known
-            } else if loaded[d].1 && self.read(q).is_some() {
+            } else if known & (POPULATED | PARTIAL) != 0 || (loaded[d].1 && self.read(q).is_some())
+            {
                 known
             } else {
                 known | PARTIAL
@@ -707,7 +749,10 @@ impl CubicLevel {
             self.pop.set_flags(q, flags);
             let mut one = Chunk::with_layout(q.x, q.z, ColumnLayout::window(q.y * 16, 16));
             one.sections[0] = section.clone();
-            let entities = self.read(q).map(|old| record_entities(&old)).unwrap_or_default();
+            let entities = self
+                .read(q)
+                .map(|old| record_entities(&old))
+                .unwrap_or_default();
             let root = ctx.encode(&one, 0, false, &entities);
             self.write_later(q, root);
             self.pop.keep(q, section);
@@ -831,8 +876,7 @@ impl CubicLevel {
     /// vanilla's range of a column whose vanilla generation has not run
     /// (that column goes the normal way), nor before the save tables are set.
     pub fn can_make_cube(&self, pos: SectionPos) -> bool {
-        self.tables.get().is_some()
-            && (!self.is_vanilla(pos.y) || self.has_vanilla(pos.x, pos.z))
+        self.tables.get().is_some() && (!self.is_vanilla(pos.y) || self.has_vanilla(pos.x, pos.z))
     }
 
     /// Cube `pos` from its record, else the generator's, else air (a cube of
@@ -1364,6 +1408,14 @@ impl Codec<'_> {
     }
 }
 
+/// A hash of the settings text a level generates with (the far terrain cache
+/// is keyed by it).
+fn settings_hash(text: &str) -> u64 {
+    text.bytes().fold(0xCBF2_9CE4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+    })
+}
+
 /// The vanilla surface heights a marker cube keeps (256, `z << 4 | x`).
 fn surface_heights(root: &NamedTag) -> Option<Vec<i32>> {
     match root.tag.get(SURFACE_KEY)? {
@@ -1598,9 +1650,9 @@ impl<G: ChunkGenerator> ChunkGenerator for CubicTerrain<G> {
         // A window that doesn't reach vanilla's range needs no vanilla
         // column: its cubes are saved ones and the generator's.
         let base = window.min_y() >> 4;
-        let reaches_vanilla = VANILLA_CUBES
-            .clone()
-            .any(|cy| self.level.is_vanilla(cy) && (base..base + window.sections() as i32).contains(&cy));
+        let reaches_vanilla = VANILLA_CUBES.clone().any(|cy| {
+            self.level.is_vanilla(cy) && (base..base + window.sections() as i32).contains(&cy)
+        });
         if reaches_vanilla && !self.level.has_vanilla(x, z) {
             return None;
         }
@@ -1897,9 +1949,24 @@ mod tests {
             })
         }
         fn level(&self) -> Arc<CubicLevel> {
+            self.level_of(CubicKind::Hybrid)
+        }
+        fn level_of(&self, kind: CubicKind) -> Arc<CubicLevel> {
             let window = LevelShape::cubic_window(LevelShape::OVERWORLD, -192, 512);
-            let level = CubicLevel::new(&self.dir, 1, self.assets.registry, &self.biomes, window)
-                .expect("level");
+            let generation = CubicGeneration {
+                kind,
+                settings_json: String::new(),
+            };
+            let level = CubicLevel::new(
+                &self.dir,
+                1,
+                self.assets.registry,
+                &self.biomes,
+                window,
+                &generation,
+                None,
+            )
+            .expect("level");
             level.set_tables(self.tables.clone());
             level
         }
@@ -1917,7 +1984,7 @@ mod tests {
             Arc::new(Section {
                 blocks: PalettedContainer::new(block_strategy(), self.state(name)),
                 biomes: PalettedContainer::new(
-                    BIOME_STRATEGY,
+                    crate::chunk::BIOME_STRATEGY,
                     u32::from(self.biomes.id("minecraft:plains")),
                 ),
                 ..Section::default()
@@ -2331,5 +2398,119 @@ mod tests {
         let poi = crate::save::encode_poi(&loaded, &f.tables).expect("the bell is a POI");
         let again = crate::save::encode_poi(&one, &f.tables).unwrap();
         assert_eq!(poi, again);
+    }
+
+    /// Every block of a cube, by position in the cube.
+    fn blocks_of(cube: &LoadedCube) -> Vec<u32> {
+        let mut values = [0u32; 4096];
+        cube.section.unpack(&mut values);
+        values.to_vec()
+    }
+
+    #[test]
+    fn custom_columns_load_without_vanilla() {
+        let Some(f) = Fixture::new("custom-columns") else {
+            return;
+        };
+        let level = f.level_of(CubicKind::Custom);
+        assert!(level.has_vanilla(5, 5), "nothing to wait for");
+        assert!(level.can_make_cube(SectionPos::new(5, 4, 5)));
+        let column = level.assemble(5, 5, level.window(), &f.codec());
+        // The surface (y 64-ish) is in the window: some cube has stone.
+        assert!(column.sections.iter().any(|s| !s.is_uniform(0)));
+        // Every cube a column holds has its populations behind it.
+        for cy in -12..20 {
+            for d in 0..8 {
+                let p = SectionPos::new(5 - (d & 1), cy - (d >> 1 & 1), 5 - (d >> 2 & 1));
+                assert!(level.is_populated(p), "{p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_population_runs_once_whatever_the_order() {
+        let (Some(a), Some(b)) = (Fixture::new("order-a"), Fixture::new("order-b")) else {
+            return;
+        };
+        let (one, two) = (a.level_of(CubicKind::Custom), b.level_of(CubicKind::Custom));
+        let cubes: Vec<SectionPos> = (0..3)
+            .flat_map(|y| {
+                (0..3).flat_map(move |z| (0..3).map(move |x| SectionPos::new(x, y + 2, z)))
+            })
+            .collect();
+        let forward: Vec<LoadedCube> = cubes.iter().map(|&p| one.make_cube(p)).collect();
+        let backward: Vec<LoadedCube> = cubes.iter().rev().map(|&p| two.make_cube(p)).collect();
+        // The populations that touch the 3 x 3 x 3 block: 4 x 4 x 4 of them, each once.
+        assert_eq!(one.population_stats().populations, 64);
+        assert_eq!(two.population_stats().populations, 64);
+        // Overlapping veins can differ by who went first; nearly every block agrees.
+        let (mut same, mut total) = (0usize, 0usize);
+        for (x, y) in forward.iter().zip(backward.iter().rev()) {
+            let (bx, by) = (blocks_of(x), blocks_of(y));
+            same += bx.iter().zip(&by).filter(|(p, q)| p == q).count();
+            total += bx.len();
+        }
+        assert!(same * 1000 >= total * 995, "{same}/{total}");
+    }
+
+    #[test]
+    fn populated_flags_survive_a_reopen() {
+        let Some(f) = Fixture::new("flags") else {
+            return;
+        };
+        let pos = SectionPos::new(1, 3, 1);
+        let level = f.level_of(CubicKind::Custom);
+        let before = blocks_of(&level.make_cube(pos));
+        let runs = level.population_stats().populations;
+        assert_eq!(runs, 8);
+        level.flush();
+        drop(level);
+        let again = f.level_of(CubicKind::Custom);
+        for d in 0..8 {
+            let p = SectionPos::new(1 - (d & 1), 3 - (d >> 1 & 1), 1 - (d >> 2 & 1));
+            assert!(again.is_populated(p), "{p:?} was populated");
+        }
+        let after = blocks_of(&again.make_cube(pos));
+        assert_eq!(again.population_stats().populations, 0, "none run again");
+        assert_eq!(before, after);
+        // A cube only a neighbour's population wrote into is partial.
+        let partial = again
+            .read(SectionPos::new(2, 4, 2))
+            .map_or(0, |r| root_flags(&r));
+        assert_eq!(partial & POPULATED, 0);
+    }
+
+    #[test]
+    fn the_far_generators_parameters_come_from_the_generator() {
+        let Some(f) = Fixture::new("far") else {
+            return;
+        };
+        let level = f.level_of(CubicKind::Custom);
+        let setup = crate::cubic_lod::far_setup(&level, f.assets.registry).expect("terrain world");
+        let tables = level.generation().generator.noise_tables().unwrap();
+        for (desc, table) in setup.params.noises.iter().zip(&tables) {
+            assert_eq!(desc.octaves.len(), table.octaves.len());
+            assert_eq!(desc.factor, table.factor);
+            assert_eq!(desc.frequency, table.frequency);
+        }
+        let shape = level.generation().generator.density_shape().unwrap();
+        assert_eq!(setup.params.height_factor, shape[0]);
+        assert_eq!(setup.params.height_variation_offset, shape[3]);
+        assert_eq!(
+            setup.params.sea_level,
+            level.generation().generator.sea_level()
+        );
+        assert_eq!(setup.params.stone, f.state("minecraft:stone"));
+        assert_eq!(setup.params.deepslate, f.state("minecraft:deepslate"));
+        // The grass biome tops are grass.
+        let plains = usize::from(f.biomes.id("minecraft:plains"));
+        assert_eq!(
+            setup.params.biomes[plains].top,
+            f.state("minecraft:grass_block")
+        );
+        // A Flat world has nothing to evaluate.
+        assert!(
+            crate::cubic_lod::far_setup(&f.level_of(CubicKind::Flat), f.assets.registry).is_none()
+        );
     }
 }
