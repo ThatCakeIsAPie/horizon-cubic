@@ -45,22 +45,23 @@ Every feature below must earn its place against the budgets in "Budgets". The pl
 
 ## Architecture
 
-### Residency: loaded cube ranges per column
+### Residency: a window that slides one cube at a time, in vertical shards
 
-v1 has a single 512-block window shared by every column. When the player nears its edge, everything near the player reloads. v2 removes the window.
+v1 has a single 512-block window shared by every column. When the player nears its edge, everything near the player reloads.
 
-- **Each column holds its own contiguous range of cubes.**
-  - `Chunk` already has its own `min_y` and a dense `Vec<Arc<Section>>`. The range grows or shrinks one cube at a time at either end, through the relayout primitive from the in-place shift work.
-  - `LevelShape` keeps only the absolute limits (±2¹⁹ cubes) and the flag that the level is cubic.
-  - Code that indexes sections through the level's shape instead of the chunk's own layout must change. About 540 `.sections` uses in 72 files are to audit.
-- **What a column holds** is the union, over players who see it horizontally, of `[player cube − V, player cube + V]`. V is the vertical view distance, a new setting. There is one cube of hysteresis, so a player at a cube boundary doesn't thrash.
-  - Players far apart vertically in the same area are rare. The union is capped at 256 cubes per column. Beyond the cap, the player who came first keeps the range, and this is documented.
-  - A gap inside the range costs one `Arc<Section>` of uniform air, about 100 bytes.
-- **Moving vertically** adds a layer of cubes at one end of each column in view and drops one at the other. This happens once per 16 blocks of travel, so there is no reload and no blink.
-- **The wire** carries cubes, not windows:
-  - `horizon:cubes {x, z, cubes: [(cy, section | uniform id, light)]}`;
-  - `horizon:cube_range {x, z, min_cy, max_cy}`, which drops cubes outside the range.
-  - Vanilla's column packet stays in use for vanilla levels only.
+v2 keeps a window per World, but makes it as small and as cheap to move as per-cube loading:
+- **The window's size.** It is `2V + 1` cubes tall plus one cube of hysteresis, where V is the vertical view distance, a new setting.
+- **Moving vertically.** The window shifts by one cube layer at a time, in place (`World::relayout`, from the shift-client branch). This happens once per 16 blocks of travel. Every column drops one layer and gains one. Sections that stay keep their `Arc`, their mesh, their GPU slot and their light.
+- **Why a window.** A window per World costs the same as per-cube loading for the cubes the players need. It keeps every system's section indexing as it is. Ranges per column would mean auditing about 540 `.sections` uses in 72 files.
+- **Multiplayer uses vertical shards.** Players whose windows overlap share one World, whose window is the union of theirs.
+  - A player whose window stops overlapping the others splits off into a shard of its own: another World with its own window and Streaming, in the same dimension, backed by the same `CubicLevel`.
+  - Shards merge when their windows meet.
+  - Shards never hold the same cube, so nothing is simulated twice. Entities leaving a window are saved with their cube, as at a window's edge today.
+  - The server's map of levels goes from one World per dimension to a list of shards per dimension. A player belongs to one shard.
+- **The wire** carries cubes, not whole columns, once a window has moved:
+  - `horizon:cubic_window {min_y, height}` relays out the client's window in place.
+  - `horizon:cubes {x, z, cubes: [(cy, section | uniform id, light)]}` sends only the entering layer.
+  - Vanilla's column packet carries the first full columns only.
 - **Sky light** follows Cubic Chunks' rule:
   - Each column's top comes from `ColumnTops`, which is persisted per column and covers unloaded cubes.
   - A cube above the top is uniform sky light 15.
@@ -139,6 +140,33 @@ The store2 branch adds:
 - The far-terrain gap at the edge of loaded cubes is filled by the octree's loaded-box test.
 - Uploads per frame have a budget, as Horizon's uploads already do.
 
+## North star: a Voxy-class far view, entirely on the GPU
+
+The owner's end goal is the look of Voxy on Java: full blocks out to the horizon, at distances of thousands of chunks. The Rust rebuild should beat it. The owner also pointed to the unreleased Meridian LOD mod, shown filling a whole world in seconds: far terrain has to appear almost at once, not trickle in.
+
+v2 lays the ground for this. v3 finishes it with the far-terrain path running on the GPU end to end:
+1. **Generate on the GPU** (`gfx/cube_gen`, v2). A node's 16³ voxels are written into a slot of a GPU-resident node pool. Reading them back to the CPU is optional, and only v2's CPU mesher uses it.
+2. **Biomes on the GPU.**
+   - Port 26.3's climate sampler (six normal noises) to WGSL.
+   - Flatten the biome parameter tree into a buffer.
+   - The CPU then gives far nodes nothing at all.
+3. **Mesh on the GPU.**
+   - A compute pass turns pool slots into compact quads of 8 bytes each (position in node, size, face, block texture id, light and tint) in a GPU geometry arena.
+   - Faces are merged greedily per block texture, so the far view keeps block textures, tints and block-scale UVs, as `mesh_cube` does today.
+4. **Select and draw on the GPU.**
+   - A compute traversal of the octree picks nodes by screen-space error.
+   - It culls them against the frustum and the previous frame's Hi-Z, reusing `gpu_occlusion.wgsl` from near-terrain GPU culling.
+   - It writes the indirect calls for one `multi_draw_indexed_indirect_count`. The vertex shader pulls quads from storage, with no vertex buffers.
+5. **What the player has seen** overrides generated terrain:
+   - Saved cubes are downsampled (levels 0–1, v2) and uploaded into the same pool.
+   - An edited cube re-uploads its nodes only.
+6. **Light.**
+   - Sky light comes from a per-column top kept on the GPU.
+   - Block light comes from emitters baked per voxel when downsampled.
+   - Near and far should not show a seam in brightness.
+
+Fallback: devices without compute or `MULTI_DRAW_INDIRECT_COUNT` keep v2's CPU path. This is the same split `gfx/gpu_culling.rs` makes today.
+
 ## Budgets
 
 Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertical distance 8 and far terrain 128 chunks, with Custom Cubic defaults:
@@ -167,7 +195,7 @@ Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertica
    - `cubic/gpu-lod`: the GPU far nodes.
 2. **Integration** (the lead, in this checkout):
    1. Merge all five branches.
-   2. Per-column cube ranges and the vertical view distance setting. Delete the window-move path.
+   2. The window slides one layer at a time, in place, on the server too, with `horizon:cubes` for the entering layer. Add the vertical view distance setting. Delete the reload path for window moves.
    3. CubicWorldGen integration: the cube streamer (generate, populate on the checkerboard, attach); the biome source adapter; vegetation through 26.3's features; the world types; the far-terrain sampler on the CPU and GPU; density bounds in the generator and the planner.
 3. **UI and tools:**
    - The Customize screen, with CubicWorldGen's five pages (Basic, Ores, Lakes, Caves, Advanced terrain) and Presets for JSON import and export.
@@ -176,8 +204,8 @@ Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertica
    - The perf script in the repo.
    - Vanilla to cubic world conversion: vanilla columns are written as cubes and the world gets the marker.
 4. **Multiplayer:**
-   - Per-player ranges, as the union with the cap described above.
-   - Tracking in the hub per player and per cube.
+   - Vertical shards, as described under "Residency".
+   - Tracking in the hub per player and per shard.
    - A trial on a dedicated server.
 5. **Finish:**
    - One combined `cargo test`. Not before: the owner's rule.
