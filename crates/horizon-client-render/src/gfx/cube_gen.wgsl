@@ -43,61 +43,7 @@ struct Header {
 @group(0) @binding(4) var<storage, read> biomes: array<u32>;
 @group(0) @binding(5) var<storage, read_write> out: array<u32>;
 
-var<private> GRAD: array<vec3<f32>, 16> = array<vec3<f32>, 16>(
-    vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(-1.0, 1.0, 0.0),
-    vec3<f32>(1.0, -1.0, 0.0), vec3<f32>(-1.0, -1.0, 0.0),
-    vec3<f32>(1.0, 0.0, 1.0), vec3<f32>(-1.0, 0.0, 1.0),
-    vec3<f32>(1.0, 0.0, -1.0), vec3<f32>(-1.0, 0.0, -1.0),
-    vec3<f32>(0.0, 1.0, 1.0), vec3<f32>(0.0, -1.0, 1.0),
-    vec3<f32>(0.0, 1.0, -1.0), vec3<f32>(0.0, -1.0, -1.0),
-    vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 1.0),
-    vec3<f32>(-1.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, -1.0),
-);
-
-fn perm(table: u32, i: i32) -> i32 {
-    let idx = u32(i) & 255u;
-    let word = perms[table * 64u + (idx >> 2u)];
-    return i32((word >> ((idx & 3u) * 8u)) & 255u);
-}
-
-fn lerp(d: f32, a: f32, b: f32) -> f32 {
-    return a + d * (b - a);
-}
-
-fn fade(v: f32) -> f32 {
-    return v * v * v * (v * (v * 6.0 - 15.0) + 10.0);
-}
-
-fn corner(table: u32, row: i32, cz: i32, d: vec3<f32>) -> f32 {
-    let g = GRAD[u32(perm(table, row + cz)) & 15u];
-    return dot(g, d);
-}
-
-// Vanilla ImprovedNoise at a lattice cell and a fraction within it.
-fn perlin(table: u32, cell: vec3<i32>, f: vec3<f32>) -> f32 {
-    let p = perm(table, cell.x);
-    let q = perm(table, cell.x + 1);
-    let lo = perm(table, p + cell.y);
-    let up = perm(table, p + cell.y + 1);
-    let lox = perm(table, q + cell.y);
-    let upx = perm(table, q + cell.y + 1);
-    let z0 = cell.z;
-    let z1 = cell.z + 1;
-    let v0 = corner(table, lo, z0, vec3<f32>(f.x, f.y, f.z));
-    let v1 = corner(table, lox, z0, vec3<f32>(f.x - 1.0, f.y, f.z));
-    let v2 = corner(table, up, z0, vec3<f32>(f.x, f.y - 1.0, f.z));
-    let v3 = corner(table, upx, z0, vec3<f32>(f.x - 1.0, f.y - 1.0, f.z));
-    let v4 = corner(table, lo, z1, vec3<f32>(f.x, f.y, f.z - 1.0));
-    let v5 = corner(table, lox, z1, vec3<f32>(f.x - 1.0, f.y, f.z - 1.0));
-    let v6 = corner(table, up, z1, vec3<f32>(f.x, f.y - 1.0, f.z - 1.0));
-    let v7 = corner(table, upx, z1, vec3<f32>(f.x - 1.0, f.y - 1.0, f.z - 1.0));
-    let a = fade(f.x);
-    let b = fade(f.y);
-    let c = fade(f.z);
-    let l0 = lerp(b, lerp(a, v0, v1), lerp(a, v2, v3));
-    let l1 = lerp(b, lerp(a, v4, v5), lerp(a, v6, v7));
-    return lerp(c, l0, l1);
-}
+// GRAD, perm and perlin: cwg_noise.wgsl, which this file is appended to.
 
 // The weighted octave sum of noise `n` at `local` blocks from the node origin.
 fn noise_value(node: u32, n: u32, local: vec3<f32>) -> f32 {

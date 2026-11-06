@@ -111,6 +111,13 @@ use std::{
     time::Duration,
 };
 
+/// The generation shader: the shared noise (`cwg_noise.wgsl`), then
+/// `cube_gen.wgsl`.
+pub(crate) const SHADER: &str = concat!(
+    include_str!("cwg_noise.wgsl"),
+    include_str!("cube_gen.wgsl")
+);
+
 /// Nodes one [`CubeGen`] dispatch can hold.
 pub const MAX_BATCH: usize = 512;
 /// Nodes the [`GpuCubeSampler`]'s GPU thread takes per dispatch: small enough
@@ -375,7 +382,7 @@ const PERLIN_BOUND: f64 = 1.05;
 const SURFACE_SLACK: f64 = 1.0;
 
 /// The range of a noise from its octave weights and offset.
-fn noise_bounds(p: &CubeGenParams, n: usize, used: usize) -> (f64, f64) {
+pub(crate) fn noise_bounds(p: &CubeGenParams, n: usize, used: usize) -> (f64, f64) {
     let amplitude: f64 = octave_terms(&p.noises[n], n == DEPTH)
         .iter()
         .take(used)
@@ -564,7 +571,7 @@ const GRADIENTS: [[f32; 3]; 16] = [
 ];
 
 /// Vanilla `ImprovedNoise` at a lattice cell and a fraction within it.
-fn perlin(perm: &[u8; 256], cell: [i32; 3], f: [f32; 3]) -> f32 {
+pub(crate) fn perlin(perm: &[u8; 256], cell: [i32; 3], f: [f32; 3]) -> f32 {
     let at = |i: i32| i32::from(perm[(i & 255) as usize]);
     let p = at(cell[0]);
     let q = at(cell[0].wrapping_add(1));
@@ -904,7 +911,7 @@ impl CubeGen {
         let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Cube generation"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("cube_gen.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Cube generation"),
@@ -1381,6 +1388,11 @@ pub struct GpuBackend {
     /// Every block state id the generator writes (air, rock, water, and each
     /// biome's top and filler).
     pub states: Vec<u32>,
+    /// What the generator makes the nodes from, for other far-terrain passes
+    /// on the same device (`gfx::surface_tile`).
+    pub params: Arc<CubeGenParams>,
+    /// The GPU biome pass's inputs, once `GpuCubeSampler::with_biomes` set it.
+    pub biome_params: Option<Arc<BiomeGenParams>>,
 }
 
 /// A [`CubeSampler`] generating levels [`MIN_LEVEL`] and up on the GPU. Every
@@ -1432,6 +1444,8 @@ impl GpuCubeSampler {
                 queue,
                 pool: generator.pool.handle(),
                 states,
+                params: params.clone(),
+                biome_params: None,
             });
             let (tx, rx) = mpsc::channel::<Work>();
             std::thread::Builder::new()
@@ -1505,15 +1519,19 @@ impl GpuCubeSampler {
         let (Some(backend), Some(gpu)) = (&self.backend, &self.gpu) else {
             return self;
         };
+        let params = Arc::new(params);
         let Some(biomes) = BiomeGen::new(
             backend.device.clone(),
             backend.queue.clone(),
-            Arc::new(params),
+            params.clone(),
         ) else {
             return self;
         };
         if gpu.send(Work::Biomes(Box::new(biomes))).is_ok() {
             self.gpu_columns = true;
+            if let Some(backend) = &mut self.backend {
+                backend.biome_params = Some(params);
+            }
         }
         self
     }
@@ -1873,7 +1891,7 @@ mod tests {
 
     #[test]
     fn shader_validates() {
-        let module = naga::front::wgsl::parse_str(include_str!("cube_gen.wgsl")).unwrap();
+        let module = naga::front::wgsl::parse_str(SHADER).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),

@@ -58,7 +58,10 @@
 //! * **Coarser voxels (level 4 and up)**: the blend radius (8 blocks) is
 //!   below one voxel, so the column takes its own biome's terrain unblended
 //!   (one climate evaluation per column). The reported biome is the column
-//!   centre's.
+//!   centre's, or with [`BiomeGenParams::jittered`] that of a hashed quart
+//!   of the column ([`column_jitter`], seeded by the node key's `y`), which
+//!   the surface tiles (`gfx::surface_tile`) use so coarse samples do not
+//!   line up with the noise lattices.
 //!
 //! # Precision at large coordinates
 //!
@@ -131,6 +134,13 @@ use horizon_world::worldgen::{
 };
 use std::{borrow::Cow, collections::HashMap, sync::Arc, sync::mpsc, time::Duration};
 
+/// The biome pass's shader: the shared noise (`cwg_noise.wgsl`), then
+/// `biome_gen.wgsl`.
+pub(crate) const SHADER: &str = concat!(
+    include_str!("cwg_noise.wgsl"),
+    include_str!("biome_gen.wgsl")
+);
+
 /// Nodes one dispatch can hold.
 pub const MAX_BATCH: usize = 1024;
 /// Layers kept per noise. Overworld continents need 18.
@@ -144,6 +154,11 @@ const SLOTS: usize = GROUPS * MAX_LAYERS;
 pub const BLEND_MAX_LEVEL: u8 = 3;
 /// A layer is skipped when its wavelength is below `voxel * OCTAVE_CUT`.
 pub const OCTAVE_CUT: f64 = 1.0;
+/// With [`BiomeGenParams::jittered`], a coarse column is one point, not an
+/// average over the column: it keeps the layers of a voxel this level
+/// (256 blocks) at most, so its climate (and biome) is the point's, not a
+/// smoothed one whose values crowd the middle of the parameter space.
+pub const JITTER_DETAIL_LEVEL: u8 = 8;
 /// The quart y of sea level (block 63): the climate point's y. The fields are
 /// 2D, so it only documents the sample.
 pub const SEA_LEVEL_QUART_Y: i32 = 63 >> 2;
@@ -326,6 +341,40 @@ pub struct BiomeGenParams {
     data: Vec<u32>,
     entries: usize,
     table: usize,
+    /// Coarse columns (levels above [`BLEND_MAX_LEVEL`]) sampled at a hashed
+    /// quart ([`column_jitter`]) instead of their centre.
+    jitter: bool,
+}
+
+fn jitter_mix(v: u32) -> u32 {
+    let mut h = v;
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7FEB_352D);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846C_A68B);
+    h ^= h >> 16;
+    h
+}
+
+/// Where a column of `1 << level` blocks is sampled when the pass jitters
+/// (`cwg_noise.wgsl`'s `column_jitter`, the same hash): an offset in blocks from
+/// the column's lowest corner, a whole number of quarts below the column's
+/// width. `cx`, `cz` are the column's index at `level` (block coordinate >>
+/// level) and `seed` tells several samples of one column apart.
+///
+/// The centres of power-of-two columns are themselves spaced by a power of
+/// two, which lines up with the noises' lattices (whose permutation repeats
+/// every 256 cells): from high up every coarse column then read the same
+/// value, a regular tile pattern. A hashed point inside each column breaks
+/// that, at no cost.
+pub fn column_jitter(cx: i32, cz: i32, level: u8, seed: u32) -> [i32; 2] {
+    let quarts = ((1u32 << level) >> 2).max(1);
+    let h = jitter_mix(
+        (cx as u32).wrapping_mul(0x9E37_79B1)
+            ^ jitter_mix((cz as u32) ^ (u32::from(level) << 24) ^ seed.wrapping_mul(0x85EB_CA77)),
+    );
+    let g = jitter_mix(h ^ 0x68E3_1DA4);
+    [(h & (quarts - 1)) as i32 * 4, (g & (quarts - 1)) as i32 * 4]
 }
 
 impl BiomeGenParams {
@@ -367,12 +416,40 @@ impl BiomeGenParams {
             data,
             entries,
             table: table.len(),
+            jitter: false,
         })
+    }
+
+    /// The same parameters with coarse columns (levels above
+    /// [`BLEND_MAX_LEVEL`]) sampled at a jittered quart, [`column_jitter`] with
+    /// the node key's `y` as the seed, instead of their centre. The far cube
+    /// nodes keep the centres; the surface tiles (`gfx::surface_tile`) jitter.
+    pub fn jittered(mut self) -> Self {
+        self.jitter = true;
+        self
+    }
+
+    /// The biome terrain table's entry for `biome` as a column's height and
+    /// volatility (CubicWorldGen's conversion, unblended): what a coarse
+    /// column of the pass holds.
+    pub fn column_terrain(&self, biome: u32) -> (f32, f32) {
+        let i = (biome as usize).min(self.table - 1);
+        let h = f32::from_bits(self.data[self.entries + i * 2]);
+        let v = f32::from_bits(self.data[self.entries + i * 2 + 1]);
+        (
+            h * HEIGHT_SCALE + HEIGHT_OFFSET,
+            v * VOLATILITY_SCALE + VOLATILITY_OFFSET,
+        )
     }
 
     /// The layers kept for group `g` at `level`.
     fn kept(&self, g: usize, level: u8) -> usize {
         let layers = &self.noises.group(g).layers;
+        let level = if self.jitter {
+            level.min(JITTER_DETAIL_LEVEL)
+        } else {
+            level
+        };
         let voxel = f64::from(1u32 << level) * OCTAVE_CUT;
         layers
             .iter()
@@ -387,6 +464,7 @@ impl BiomeGenParams {
         let mut w = vec![0u32; 8 + SLOTS * 4];
         w[0] = self.table as u32;
         w[1] = self.entries as u32;
+        w[2] = u32::from(self.jitter);
         w[4] = (self.noises.xz_scale as f32).to_bits();
         for g in 0..GROUPS {
             for (k, l) in self
@@ -509,7 +587,7 @@ impl BiomeGen {
         let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Biome columns"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("biome_gen.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Biome columns"),
@@ -721,6 +799,19 @@ impl CpuBiomes {
             .ok()
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The unblended column at block `(x, z)` (read at its quart): the biome
+    /// id there and its terrain as a column's height and volatility. What the
+    /// pass gives a coarse column whose sample point is that block.
+    pub fn column_at(&self, context: &mut SamplerContext, x: i32, z: i32) -> (f32, f32, u32) {
+        let biome = self.biome_at_quart(context, x >> 2, z >> 2);
+        let t = terrain_of(&self.table, biome);
+        (
+            t.base_height * HEIGHT_SCALE + HEIGHT_OFFSET,
+            t.height_variation * VOLATILITY_SCALE + VOLATILITY_OFFSET,
+            biome,
+        )
     }
 
     /// The columns of a node (see the module docs), with every octave.
@@ -958,7 +1049,7 @@ mod tests {
 
     #[test]
     fn shader_validates() {
-        let module = naga::front::wgsl::parse_str(include_str!("biome_gen.wgsl")).unwrap();
+        let module = naga::front::wgsl::parse_str(SHADER).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
@@ -1119,6 +1210,67 @@ mod tests {
         for (key, g) in keys.iter().zip(&gpu) {
             let (b, h) = agreement(g, &reference_columns(&f.cpu, *key));
             assert!(b >= 253 && h >= 245, "{key:?}: biomes {b}, terrain {h}");
+        }
+    }
+
+    #[test]
+    fn jitter_stays_in_the_column_on_whole_quarts() {
+        for level in [2u8, 4, 9, 16, 22] {
+            let width = 1i32 << level;
+            let mut seen = std::collections::HashSet::new();
+            for c in -20..20 {
+                for seed in 0..4 {
+                    let [jx, jz] = column_jitter(c * 7, -c * 3 + 1, level, seed);
+                    assert!((0..width).contains(&jx) && (0..width).contains(&jz));
+                    assert!(jx % 4 == 0 && jz % 4 == 0, "{level}: {jx} {jz}");
+                    seen.insert((jx, jz));
+                }
+            }
+            // Spread over the column, not one point repeated.
+            let combos = ((width / 4).max(1) as usize).pow(2);
+            assert!(
+                seen.len() >= (combos.min(20) / 2).max(1),
+                "{level}: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_columns_take_the_hashed_quart() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let f = fixture(21);
+        let params = Arc::new((*f.params).clone().jittered());
+        let Some(gen_) = BiomeGen::new(device, queue, params.clone()) else {
+            return;
+        };
+        let keys: Vec<CubeKey> = (0..4)
+            .flat_map(|seed| [CubeKey::new(6, 3, seed, -2), CubeKey::new(10, -1, seed, 4)])
+            .collect();
+        let gpu = gen_.compute_columns(&keys).expect("columns");
+        let mut context = SamplerContext::cached();
+        for (key, g) in keys.iter().zip(&gpu) {
+            let o = key.origin();
+            let mut agree = 0;
+            for z in 0..16i32 {
+                for x in 0..16i32 {
+                    let [jx, jz] = column_jitter(
+                        (o[0] >> key.level) + x,
+                        (o[2] >> key.level) + z,
+                        key.level,
+                        key.y as u32,
+                    );
+                    let px = o[0] + (x << key.level) + jx;
+                    let pz = o[2] + (z << key.level) + jz;
+                    let (h, v, b) = f.cpu.column_at(&mut context, px, pz);
+                    let i = (z * 16 + x) as usize;
+                    assert_eq!(params.column_terrain(b), (h, v));
+                    agree += usize::from(u32::from(g.biome[i]) == b);
+                }
+            }
+            // The octave cut moves a few biome edges.
+            assert!(agree >= 220, "{key:?}: {agree}/256");
         }
     }
 

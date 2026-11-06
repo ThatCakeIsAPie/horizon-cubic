@@ -80,6 +80,20 @@ fn cf_shade(dir: u32) -> f32 {
     }
     let uv = vec2<f32>(av - u0, v1 - bv);
 
+    let f = cf_face(state, dir, overlay, biome);
+    let light = vec2<u32>(select(240u, 64u, shaded == 1u), 0u);
+    return terrain_vertex(position, uv, f.layer, unorm8x4(f.color), light, instance.xyz, instance.w);
+}
+
+struct CfFace {
+    layer: u32,
+    // RGBA8: the tint shaded for the direction; alpha the HDR and fluid code.
+    color: u32,
+}
+
+// A block face's sprite layer and vertex colour from the material table and
+// the biome colours: shared with the surface tiles (surface_draw.wgsl).
+fn cf_face(state: u32, dir: u32, overlay: u32, biome: u32) -> CfFace {
     let header = cf_materials[state * 32u];
     let face = 1u + 2u * (dir * 2u + overlay);
     let word = cf_materials[state * 32u + face];
@@ -106,7 +120,5 @@ fn cf_shade(dir: u32) -> f32 {
         high = (8u | dir) << 4u;
     }
     let alpha = high | (15u - code);
-    let color = r | (g << 8u) | (bl << 16u) | (alpha << 24u);
-    let light = vec2<u32>(select(240u, 64u, shaded == 1u), 0u);
-    return terrain_vertex(position, uv, layer, unorm8x4(color), light, instance.xyz, instance.w);
+    return CfFace(layer, r | (g << 8u) | (bl << 16u) | (alpha << 24u));
 }

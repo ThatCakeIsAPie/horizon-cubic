@@ -97,79 +97,9 @@ struct ListOut {
 @group(1) @binding(0) var<storage, read> in_list: ListIn;
 @group(1) @binding(1) var<storage, read_write> next_list: ListOut;
 
-var<private> GRAD: array<vec3<f32>, 16> = array<vec3<f32>, 16>(
-    vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(-1.0, 1.0, 0.0),
-    vec3<f32>(1.0, -1.0, 0.0), vec3<f32>(-1.0, -1.0, 0.0),
-    vec3<f32>(1.0, 0.0, 1.0), vec3<f32>(-1.0, 0.0, 1.0),
-    vec3<f32>(1.0, 0.0, -1.0), vec3<f32>(-1.0, 0.0, -1.0),
-    vec3<f32>(0.0, 1.0, 1.0), vec3<f32>(0.0, -1.0, 1.0),
-    vec3<f32>(0.0, 1.0, -1.0), vec3<f32>(0.0, -1.0, -1.0),
-    vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 1.0),
-    vec3<f32>(-1.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, -1.0),
-);
-
 // ------------------------------------------------------------- the noise
 
-fn perm(table: u32, i: i32) -> i32 {
-    let idx = u32(i) & 255u;
-    let word = perms[table * 64u + (idx >> 2u)];
-    return i32((word >> ((idx & 3u) * 8u)) & 255u);
-}
-
-fn lerp(d: f32, a: f32, b: f32) -> f32 {
-    return a + d * (b - a);
-}
-
-fn fade(v: f32) -> f32 {
-    return v * v * v * (v * (v * 6.0 - 15.0) + 10.0);
-}
-
-fn corner(table: u32, row: i32, cz: i32, d: vec3<f32>) -> f32 {
-    let g = GRAD[u32(perm(table, row + cz)) & 15u];
-    return dot(g, d);
-}
-
-// Vanilla ImprovedNoise at a lattice cell and a fraction within it (the same
-// function as cube_gen.wgsl's).
-fn perlin(table: u32, cell: vec3<i32>, f: vec3<f32>) -> f32 {
-    let p = perm(table, cell.x);
-    let q = perm(table, cell.x + 1);
-    let lo = perm(table, p + cell.y);
-    let up = perm(table, p + cell.y + 1);
-    let lox = perm(table, q + cell.y);
-    let upx = perm(table, q + cell.y + 1);
-    let z0 = cell.z;
-    let z1 = cell.z + 1;
-    let v0 = corner(table, lo, z0, vec3<f32>(f.x, f.y, f.z));
-    let v1 = corner(table, lox, z0, vec3<f32>(f.x - 1.0, f.y, f.z));
-    let v2 = corner(table, up, z0, vec3<f32>(f.x, f.y - 1.0, f.z));
-    let v3 = corner(table, upx, z0, vec3<f32>(f.x - 1.0, f.y - 1.0, f.z));
-    let v4 = corner(table, lo, z1, vec3<f32>(f.x, f.y, f.z - 1.0));
-    let v5 = corner(table, lox, z1, vec3<f32>(f.x - 1.0, f.y, f.z - 1.0));
-    let v6 = corner(table, up, z1, vec3<f32>(f.x, f.y - 1.0, f.z - 1.0));
-    let v7 = corner(table, upx, z1, vec3<f32>(f.x - 1.0, f.y - 1.0, f.z - 1.0));
-    let a = fade(f.x);
-    let b = fade(f.y);
-    let c = fade(f.z);
-    let l0 = lerp(b, lerp(a, v0, v1), lerp(a, v2, v3));
-    let l1 = lerp(b, lerp(a, v4, v5), lerp(a, v6, v7));
-    return lerp(c, l0, l1);
-}
-
-// The octave's input at block coordinate `c`, `c * scale + offset` modulo 256
-// (the permutation table's period), in 2^-24 cells, exactly enough for any
-// block coordinate: `scale * 2^24 = kint + kfrac / 2^16` (mod 2^32) and
-// `c = ch * 8192 + cl`, so every product fits 32 bits and the sum wraps
-// modulo 2^32 = 256 cells. This replaces the f64 origin split of cube_gen's
-// headers (the children of a node are made on the GPU, with no CPU turn to
-// split them). The error is below 2^-16 * 2^-24 cells per block of |c|.
-fn phase(c: i32, kint: u32, kfrac: u32, off: u32) -> u32 {
-    let cl = u32(c & 8191);
-    let ch = c >> 13u;
-    let t2 = (cl * kfrac) >> 16u;
-    let t1 = (ch * i32(kfrac)) >> 3u;
-    return bitcast<u32>(c) * kint + bitcast<u32>(t1) + t2 + off;
-}
+// GRAD, perm, perlin and phase: cwg_noise.wgsl, which this file is appended to.
 
 fn octave_value(slot: u32, c: vec3<i32>) -> f32 {
     let ki = tables.kint[slot];
@@ -227,19 +157,7 @@ fn noise_range(n: u32, c: vec3<i32>, h: vec3<f32>, lv: u32) -> vec2<f32> {
     return vec2<f32>(lo - skip + off, hi + skip + off);
 }
 
-fn depth_transform(raw: f32) -> f32 {
-    var d = raw;
-    if d < 0.0 {
-        d = d * -0.3;
-    }
-    d = clamp(d * 3.0 - 2.0, -2.0, 1.0);
-    if d < 0.0 {
-        d = d / 5.6;
-    } else if d > 0.0 {
-        d = d / 8.0;
-    }
-    return d * (0.2 * 17.0 / 64.0);
-}
+// depth_transform: cwg_noise.wgsl.
 
 fn depth_range(a: f32, b: f32) -> vec2<f32> {
     let ta = depth_transform(a);

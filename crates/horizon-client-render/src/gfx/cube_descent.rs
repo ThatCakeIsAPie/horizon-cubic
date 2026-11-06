@@ -113,6 +113,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The descent shader: the shared noise (`cwg_noise.wgsl`), then
+/// `cube_descent.wgsl`.
+pub(crate) const SHADER: &str = concat!(
+    include_str!("cwg_noise.wgsl"),
+    include_str!("cube_descent.wgsl")
+);
+
 /// Nodes one level's list holds.
 pub const LIST_CAP: u32 = 1 << 17;
 /// Entries of the output list.
@@ -368,7 +375,7 @@ impl GpuDescent {
         let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Cube descent"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("cube_descent.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
         });
         let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
@@ -789,7 +796,7 @@ mod tests {
 
     #[test]
     fn shader_validates() {
-        let module = naga::front::wgsl::parse_str(include_str!("cube_descent.wgsl")).unwrap();
+        let module = naga::front::wgsl::parse_str(SHADER).unwrap();
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
