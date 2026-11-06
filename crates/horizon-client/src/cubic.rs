@@ -139,10 +139,9 @@ pub fn wanted_cubes(cube: i32, vertical: u8) -> (i32, i32) {
 /// the middle of the union when it is taller) and kept in the cubic range;
 /// `None` for no players.
 pub fn union_cubes(ranges: impl IntoIterator<Item = (i32, i32)>) -> Option<(i32, i32)> {
-    // TODO(shards): players whose windows do not overlap get shards of
-    // their own (docs/cubic-v2-plan.md, "Residency"); until then the level
-    // holds one window for all of them, and a union taller than the cap
-    // leaves the outermost players on its edge.
+    // Players whose ranges do not meet are in shards of their own
+    // (`cubic_shards`), so a union is of ranges that overlap; one taller than
+    // the cap is a chain of them, and the outermost players stay on its edge.
     let (lo, hi) = ranges
         .into_iter()
         .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))?;
@@ -587,13 +586,15 @@ impl CubicLevel {
         if let Some(cache) = &self.lod_cache {
             cache.invalidate(pos);
         }
-        // A cube read before this write is older than its record.
-        self.ring.invalidate(pos);
         if self.is_marker(pos.y) {
             self.surfaces.lock().unwrap().remove(&(pos.x, pos.z));
         }
         let tag = Arc::new(tag);
         self.io.pending.lock().unwrap().insert(pos, tag.clone());
+        // A cube read before this write is older than its record. Dropped
+        // once the record can be read, so the ring (one for every shard) does
+        // not read the old one again in between.
+        self.ring.invalidate(pos);
         *self.io.queued.0.lock().unwrap() += 1;
         let sent = self
             .send

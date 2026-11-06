@@ -40,6 +40,11 @@ use std::{
 /// once no ticket holds them; the Overworld stays loaded).
 const IDLE_TICKS: u32 = 300;
 
+/// Server ticks a shard of the Overworld stays loaded with no player in it
+/// before it is saved and closed: long enough for the events of a player
+/// leaving to run in it, short enough to give its cubes back.
+const SHARD_IDLE_TICKS: u32 = 40;
+
 /// A level: a dimension and, in a cubic one, the vertical shard. Without a
 /// shard it means the shard in place when the dimension is the one in place,
 /// else the dimension's primary.
@@ -564,6 +569,19 @@ impl Game<'_> {
             }
         });
         let target = target.dim;
+        // A shard that closed since a player was told it: the dimension's primary.
+        let shard = if shard != 0
+            && !self.shard_exists(target, shard)
+            && !self.levels.parked.contains_key(&(target, shard))
+        {
+            log::warn!(
+                "Horizon: {} has no shard {shard}; using the primary",
+                target.id()
+            );
+            self.levels.primary_shard(target)
+        } else {
+            shard
+        };
         if (target, shard) != (self.dim, self.shard) {
             let (mut p, opened) = match self.levels.parked.remove(&(target, shard)) {
                 Some(p) => (p, false),
@@ -982,16 +1000,24 @@ impl Game<'_> {
             .filter(|d| self.vehicle_waits_in(*d))
             .collect();
         let mut closing = Vec::new();
+        let mut closing_shards = Vec::new();
         for (key, p) in &mut self.levels.parked {
             if occupied.contains(key) || waiting.contains(&key.0) {
                 p.idle = 0;
                 continue;
             }
             p.idle += 1;
-            // The Overworld's shards close with `close_idle_shards`, when they
-            // are empty.
             if key.0 != Dim::Overworld && p.idle >= IDLE_TICKS {
                 closing.push(*key);
+            } else if key.0 == Dim::Overworld && key.1 != 0 && p.idle >= SHARD_IDLE_TICKS {
+                // A shard of the Overworld nobody is in any more (the Overworld
+                // itself stays loaded): a leaving player's last events have run.
+                closing_shards.push(key.1);
+            }
+        }
+        for shard in closing_shards {
+            if let Err(e) = self.close_shard(shard) {
+                log::error!("Horizon: cubic shard {shard} did not close: {e}");
             }
         }
         if closing.is_empty() {

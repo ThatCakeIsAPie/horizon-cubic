@@ -126,15 +126,24 @@ impl Game<'_> {
         let planned = cubic_shards::plan(&members, &existing);
         let groups = cubic_shards::settle(planned.groups, &members, &existing);
         let back = self.here();
-        let result = self.carry_out_shards(&groups, &viewers, existing);
-        let restored = self.enter_level(None, back);
-        result.and(restored)
+        // A shard that cannot be carried out this tick is tried again the next
+        // (the plan is made from where the players are): it never stops the server.
+        if let Err(e) = self.carry_out_shards(&groups, &viewers, existing) {
+            log::error!("Horizon: the cubic shards could not follow their players: {e}");
+        }
+        // The level that was in place may have closed (a merge).
+        let back = match back.shard {
+            Some(shard) if !self.shard_exists(back.dim, shard) => LevelId::shard(back.dim, 0),
+            _ => back,
+        };
+        self.enter_level(None, back)
     }
 
     /// Carries out the groups: in order, the merges (the shard that closes is
     /// saved whole, its survivor slides over it), every other existing shard
     /// sliding towards its window, the new shards, the players moving to
-    /// their shard, and the shards left without players closing.
+    /// their shard. Shards left without players close after a few ticks
+    /// (`close_idle_levels`).
     fn carry_out_shards(
         &mut self,
         groups: &[Group],
@@ -157,6 +166,9 @@ impl Game<'_> {
         // 2. Every shard that stays slides towards its window.
         for g in groups.iter().filter(|g| g.shard.is_some()) {
             let shard = g.shard.unwrap_or_default();
+            if !self.shard_exists(Dim::Overworld, shard) {
+                continue;
+            }
             let incoming = g
                 .members
                 .iter()
@@ -223,16 +235,6 @@ impl Game<'_> {
             {
                 self.move_guest_to_shard(v.conn, to);
             }
-        }
-        // 5. A shard without players closes (the primary stays).
-        let occupied: HashSet<u16> = target.values().copied().collect();
-        let empty: Vec<u16> = windows
-            .keys()
-            .copied()
-            .filter(|id| *id != cubic_shards::PRIMARY && !occupied.contains(id))
-            .collect();
-        for id in empty {
-            self.close_shard(id)?;
         }
         Ok(())
     }
@@ -472,7 +474,7 @@ impl Game<'_> {
 
     /// Saves everything shard `id` holds (blocks, entities, block entities and
     /// ticks go to the cubes' records) and closes it. The primary never closes.
-    fn close_shard(&mut self, id: u16) -> horizon_client::Result<()> {
+    pub(super) fn close_shard(&mut self, id: u16) -> horizon_client::Result<()> {
         if id == cubic_shards::PRIMARY || !self.shard_exists(Dim::Overworld, id) {
             return Ok(());
         }

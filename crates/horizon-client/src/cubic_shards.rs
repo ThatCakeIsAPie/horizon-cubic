@@ -118,7 +118,7 @@ fn cut_to_cap(members: &[Member]) -> Vec<Vec<Member>> {
             let lo = run.iter().map(|r| r.range.0).min().unwrap_or(m.range.0);
             let hi = run.iter().map(|r| r.range.1).max().unwrap_or(m.range.1);
             let same_cube = run.last().is_some_and(|r| r.cube == m.cube);
-            if same_cube || hi.max(m.range.1) - lo.min(m.range.0) + 1 <= MAX_WINDOW_CUBES {
+            if same_cube || hi.max(m.range.1) - lo.min(m.range.0) < MAX_WINDOW_CUBES {
                 run.push(*m);
                 continue;
             }
@@ -354,7 +354,7 @@ fn combine(groups: Vec<Group>, members: &[Member]) -> Vec<Group> {
                 let (lo, hi) = ranges
                     .iter()
                     .fold((i32::MAX, i32::MIN), |(l, h), r| (l.min(r.0), h.max(r.1)));
-                if hi - lo + 1 <= MAX_WINDOW_CUBES {
+                if hi - lo < MAX_WINDOW_CUBES {
                     o.window = union_cubes(ranges).unwrap_or(o.window);
                 }
             }
@@ -657,5 +657,82 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(settled.len(), 3, "{settled:?}");
         assert!(settled.iter().all(|g| g.absorbed.is_empty()));
+    }
+
+    /// Whatever the players do, a plan puts each of them in exactly one group, keeps a shard
+    /// for one group only, closes no shard that another group keeps, and (shards that do not
+    /// meet to begin with) gives its groups windows that do not meet.
+    #[test]
+    fn plans_of_random_players_keep_every_rule() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        for _ in 0..600 {
+            let count = 1 + next(6) as usize;
+            let spread = [30, 200, 3000][next(3) as usize];
+            let shard_count = 1 + next(3) as u16;
+            let members: Vec<Member> = (0..count)
+                .map(|k| {
+                    let cube = next(spread) as i32 - spread as i32 / 2;
+                    Member {
+                        key: k as u32,
+                        cube,
+                        range: wanted_cubes(cube, 2 + next(20) as u8),
+                        shard: next(u64::from(shard_count)) as u16,
+                    }
+                })
+                .collect();
+            // The shards that exist hold windows that do not meet: bands a thousand
+            // cubes apart.
+            let shards: Vec<Existing> = (0..shard_count)
+                .map(|id| Existing {
+                    id,
+                    window: (i32::from(id) * 1000, i32::from(id) * 1000 + 40),
+                })
+                .collect();
+            let planned = plan(&members, &shards);
+            let tall = |g: &Group| {
+                let (lo, hi) = g
+                    .members
+                    .iter()
+                    .filter_map(|k| members.iter().find(|m| m.key == *k))
+                    .map(|m| m.range)
+                    .fold((i32::MAX, i32::MIN), |(l, h), r| (l.min(r.0), h.max(r.1)));
+                hi - lo + 1 > MAX_WINDOW_CUBES
+            };
+            for pair in planned.groups.windows(2) {
+                if !tall(&pair[0]) && !tall(&pair[1]) {
+                    assert!(
+                        !overlaps(pair[0].window, pair[1].window),
+                        "windows meet: {members:?} {:?}",
+                        planned.groups
+                    );
+                }
+            }
+            let groups = settle(planned.groups, &members, &shards);
+            let mut seen: Vec<u32> = groups.iter().flat_map(|g| g.members.clone()).collect();
+            seen.sort_unstable();
+            assert_eq!(
+                seen,
+                (0..count as u32).collect::<Vec<_>>(),
+                "{members:?} {groups:?}"
+            );
+            let mut kept: Vec<u16> = groups.iter().filter_map(|g| g.shard).collect();
+            kept.sort_unstable();
+            let before = kept.len();
+            kept.dedup();
+            assert_eq!(kept.len(), before, "a shard serves two groups: {groups:?}");
+            for g in &groups {
+                assert!(
+                    g.absorbed.iter().all(|a| !kept.contains(a)),
+                    "an absorbed shard is kept: {groups:?}"
+                );
+                assert!(g.window.1 - g.window.0 < MAX_WINDOW_CUBES, "{g:?}");
+            }
+        }
     }
 }
