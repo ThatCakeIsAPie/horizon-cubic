@@ -21,7 +21,7 @@ struct StFrame {
     cam_frac: vec4<f32>,
     // now (ms), slots, unused, unused
     info: vec4<u32>,
-    // sea level, lowest y, highest y, unused
+    // sea level, lowest y, highest y, deepslate below this y
     world: vec4<i32>,
     // water, stone, deepslate, unused
     ids: vec4<u32>,
@@ -190,6 +190,13 @@ fn st_ground(base: u32, nx: i32, nz: i32, fallback: i32) -> i32 {
         }
         if ya >= yb {
             return left_out();
+        }
+        // A step no steeper than a slope of one stands for a slope under the
+        // top block; a steeper one is a cliff of rock, as the far cube
+        // nodes' stone below the surface.
+        if yb - ya > (1i << level) {
+            let deep = (ya + (yb - ya) / 2) < st_frame.world.w;
+            state = select(st_frame.ids.y, st_frame.ids.z, deep);
         }
     }
     let width = f32(1u << level);

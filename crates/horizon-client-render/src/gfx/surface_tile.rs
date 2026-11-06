@@ -45,12 +45,12 @@
 //!
 //! [`SAMPLES`] points per column with the highest top kept is supported (a
 //! peak narrower than a column then shows when any point lands on it) but set
-//! to one: measured, four points made a batch about four times dearer in the
-//! climate pass, and at the coarse levels, where the points of a column are
-//! unrelated, the highest of four is land almost wherever one point is, so the
-//! oceans all but vanished and mountain biomes took over. With one point a
-//! mountain shows in proportion to its area at the coarsest levels, and whole
-//! once the plan refines to narrower columns.
+//! to one: four points made 289 level-15 tiles take 18 ms of GPU time instead
+//! of 7, and at the coarse levels, where the points of a column are unrelated,
+//! the highest of four is land almost wherever one point is, so the oceans all
+//! but vanished from y = 1,000,000. With one point a mountain shows in
+//! proportion to its area at the coarsest levels, and whole once the plan
+//! refines to narrower columns.
 //!
 //! The biome, height and volatility at a point come from the GPU climate pass
 //! (`biome_gen`, its unblended coarse columns, [`BiomeGenParams::jittered`]):
@@ -119,8 +119,11 @@
 //! the ground) and four walls, coloured by its block's face from the far
 //! material table (`cube_far`'s `cf_face`: the sprite, sampled at the level its
 //! screen size gives, which is its smallest mip far away, tinted by biome).
-//! Walls use the top block's side faces, as a cube node's one tall top voxel
-//! would. A span under another is lit as roofed over. Water is a flat quad at
+//! Walls use the top block's side faces where the step between two columns is
+//! no steeper than a slope of one (at these widths it stands for a slope
+//! under the top block: plains stay green from the side), and stone (or
+//! deepslate low down) where it is steeper: a cliff, as the far cube nodes'
+//! rock below the surface. A span under another is lit as roofed over. Water is a flat quad at
 //! the sea's top plane, in the translucent pass.
 //!
 //! * **No cracks.** The ground's walls go down to the neighbouring column's
@@ -138,6 +141,15 @@
 //! * **Large coordinates.** Tile origins are `i32` blocks minus the camera's
 //!   integer part; heights are `i32` minus the camera's integer `y`; only then
 //!   `f32`.
+//!
+//! # Cost (GTX 1070 Ti, Custom Cubic defaults)
+//!
+//! A batch of 256 level-14 tiles takes 4.7 ms of GPU time (3.2 ms the climate
+//! pass, 1.5 ms the surface pass); 1,089 of them (a 33 × 33 square, 8.6 M
+//! blocks across) are generated and their headers read back 31 ms after the
+//! request. Taller terrain marches longer: with `heightFactor` 30,000 a batch
+//! of level-9 tiles takes about 18 ms. A tile is 13,376 bytes in the pool,
+//! plus 64 bytes of draw state.
 //!
 //! # API
 //!
@@ -1798,7 +1810,12 @@ impl SurfaceTiles {
                 0.0,
             ],
             info: [self.now_ms(), self.high_water, 0, 0],
-            world: [p.sea_level, MIN_Y, MAX_Y, 0],
+            world: [
+                p.sea_level,
+                MIN_Y,
+                MAX_Y,
+                ((p.deepslate_from + p.deepslate_to) / 2.0).floor() as i32,
+            ],
             ids: [p.water, p.stone, p.deepslate, 0],
         };
         self.queue

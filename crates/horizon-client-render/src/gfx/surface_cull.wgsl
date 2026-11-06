@@ -17,7 +17,7 @@ struct Frame {
     cam_frac: vec4<f32>,
     // now (ms), slots, unused, unused
     info: vec4<u32>,
-    // sea level, lowest y, highest y, unused
+    // sea level, lowest y, highest y, deepslate below this y
     world: vec4<i32>,
     // water, stone, deepslate, unused
     ids: vec4<u32>,
