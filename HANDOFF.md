@@ -27,11 +27,16 @@ is `git show 58fc487fa:HANDOFF.md`.
 
 > Pick up `main` of ThatCakeIsAPie/horizon-cubic. Read `HANDOFF.md`, then `docs/cubic-v2-plan.md`,
 > which is the plan, the budgets and what is done. Cubic Chunks v2 is playable in single player.
-> The owner's order is speed first, then detail. Next:
-> 1. Shorten far-terrain fill time (`tools/cubic_far_bench.py` is the metric), then run autoresearch loops on it.
-> 2. Vertical shards for multiplayer.
-> 3. Vanilla-to-cubic conversion.
-> Follow AGENTS.md. Run tests once after a batch of changes, not after each one.
+> The owner's order is speed first, then detail. The far view was reworked on 2026-11-06 (see "Far view
+> rework" below). The next steps are in `docs/cubic-v2-plan.md` › "Order of work" item 6:
+> - the remaining measurements;
+> - far views of the player's builds;
+> - occlusion-driven refinement;
+> - far block light;
+> - structures filling in;
+> - the thin-feature flex.
+> Then run autoresearch on fill rate. Follow AGENTS.md. Run tests once after a batch of changes, not
+> after each one.
 
 ## Cubic Chunks v2 (2026-11-06)
 
@@ -99,8 +104,40 @@ the original alone. Design, what is and is not carried over, and the options are
   - First benchmark run, before the batching fix: spawn 30.1 s, hops 33.2 s and 18.4 s (**mean 25.8 s**), about 7,500 planned nodes, fps min 100 and mean 119.
   - After `cubic/store-reads` (an in-memory index of saved cubes, per-region locks, and fine nodes from whole generated cubes): **2.1 s mean per hop** (2.4 / 2.6 / 1.4 s) and 12.6 s at spawn, at 93–117 fps. The owner's reference, the Meridian LOD mod, took about 20 s on a top CPU.
 
+### Far view rework (2026-11-06, `cubic/far-detail` + `cubic/far-surface`, merged)
+
+The design, the measurements and the owner's decisions are in `docs/cubic-v2-plan.md`:
+- "What the Meridian video shows";
+- "Far view: the owner's decisions and later work";
+- "Detail by size on screen, coverage first".
+
+What was built:
+- **Detail by size on screen.** The FOV and the spyglass are taken into account.
+- **Cubic Far Detail** in Video Settings › Distance: Low, Normal, **High (default)**, Ultra, Extreme.
+- **A node budget.** Past it, the plan coarsens what is smallest on screen first.
+- **A coarse-first coverage layer,** and refinement of what is on screen first.
+- **Layered height-map tiles** for the coarsest levels in Custom worlds (`gfx/surface_tile.rs`):
+  - exact block heights, with up to 4 spans per column;
+  - complex tiles go 3D sooner.
+- **Far faces lit from the cell in front of them.** Tall walls used to draw near-black.
+- **The fog follows the far view** in cubic worlds.
+
+Tools:
+- `tools/cubic_far_bench.py` reports `cover_s` and `far_fill_s`, with `--detail` and `--budget`.
+- `tools/cubic_far_check.py` covers `--hitch`, `--views`, `--tall`, `--spyglass` and `--cavern`.
+
+Tested:
+- **One full test pass:** every target passed except one tile-agent test with a threshold too strict for coarse columns. It was fixed and rerun.
+- **Measured at High with tiles:** a teleport is covered in 0.18 s and complete in 19 s, at 120 fps, with a 48 ms longest frame. The spyglass refines what it looks at. Caverns at y −2,000 show no holes.
+
 ### Known gaps
 
+- **Far view, not measured yet:**
+  - `SURFACE_LEVEL` 10/14;
+  - Low/Normal/Extreme with tiles;
+  - true 1 px.
+- **Ultra is slower with tiles than without** (72 s against 48 s to complete, 103 fps against 120). The first suspect is tile draw compaction.
+- **Far terrain doesn't show the player's builds** beyond the disk cache's limits; see the plan.
 - **Vertical shards (branch `cubic/shards`).** LAN guests are grouped into shards by their vertical ranges (`cubic_shards.rs`); see `docs/cubic-v2-plan.md`, "Residency", "As built". Not done: vehicles carried across shards, mod API calls (`native_*` by dimension name) reach the shard in place only, and no trial on a long-running dedicated server yet.
 - **No structures in Custom Cubic,** as in CubicWorldGen. The structure toggles are marked `*`.
 - **Not generated yet:** snow and ice layers, dungeons and Bryce pillars.
