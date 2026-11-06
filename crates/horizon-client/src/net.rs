@@ -1170,8 +1170,20 @@ fn fill_known_entries(r: &mut cfg::RegistryData, resources: &Path) {
     }
 }
 
+thread_local! {
+    /// Wide block positions (`horizon_protocol::cubic`) while this network thread's
+    /// connection is to a server with a cubic level; dropped with the thread.
+    static WIDE_POSITIONS: std::cell::RefCell<Option<horizon_protocol::buf::WideHold>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn receive_brand(payload: &cfg::CustomPayload, send: &Sender<Event>) {
-    if payload.channel == "minecraft:brand"
+    if payload.channel == horizon_protocol::cubic::MODE_CHANNEL {
+        // Before the first play packet: the network thread decodes them.
+        WIDE_POSITIONS.with_borrow_mut(|hold| {
+            hold.get_or_insert_with(horizon_protocol::buf::hold_wide_positions);
+        });
+    } else if payload.channel == "minecraft:brand"
         && let Ok(brand) = horizon_protocol::buf::Reader::new(&payload.data).string(32767)
     {
         let _ = send.send(Event::Brand(brand));

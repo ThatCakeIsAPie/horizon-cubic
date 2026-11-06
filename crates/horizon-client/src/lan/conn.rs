@@ -983,6 +983,38 @@ fn login_and_configure(
         lost(shared, &format!("{name} ({})", uuid_string(uuid)), text);
         return Ok(None);
     }
+    // A cubic world's block positions do not fit vanilla's: only Horizon clients, which
+    // switch to wide positions on this payload (before any play packet), can join.
+    if shared.cubic() {
+        if brand != "horizon" {
+            let text =
+                |t: &str| horizon_world::nbt::Tag::String(horizon_world::nbt::JavaString::from(t));
+            let reason = horizon_world::nbt::Tag::compound(vec![
+                ("translate", text(super::CUBIC_REFUSED_KEY)),
+                ("fallback", text(super::CUBIC_REFUSED_FALLBACK)),
+            ]);
+            let _ = send(c, cfg::Clientbound::Disconnect(cfg::Disconnect { reason }));
+            if let Some(log) = &shared.config.log {
+                let line = format!(
+                    "Disconnecting {name}: its client is \"{brand}\", and the world is cubic"
+                );
+                (log.write)("Server thread", "INFO", &line);
+            }
+            lost(
+                shared,
+                &format!("{name} ({})", uuid_string(uuid)),
+                super::CUBIC_REFUSED_FALLBACK,
+            );
+            return Ok(None);
+        }
+        send(
+            c,
+            cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                channel: horizon_protocol::cubic::MODE_CHANNEL.into(),
+                data: Vec::new(),
+            }),
+        )?;
+    }
     // A Horizon client hears that this server runs its mods' quiet commands
     // (horizon_protocol::quiet); a vanilla one is told nothing.
     if brand == "horizon" {

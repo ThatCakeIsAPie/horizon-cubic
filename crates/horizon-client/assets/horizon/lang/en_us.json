@@ -798,6 +798,7 @@
   "horizon.pvp.weather.clear": "Clear",
   "horizon.pvp.weather.rain": "Rain",
   "horizon.pvp.weather.thunder": "Thunder",
+  "horizon.cubic.vanilla_refused": "This world has no height limit and needs the Horizon client: playhorizon.dev",
   "horizon.chat.timestamp": "[%s] ",
   "horizon.chat.repeats": " (x%s)",
   "horizon.pvp.header.chat": "Chat",

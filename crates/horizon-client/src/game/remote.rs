@@ -2344,6 +2344,59 @@ impl Game<'_> {
         self.apply_settings();
     }
 
+    /// `horizon:cubic_window` (docs/cubic-chunks.md): the level the player is in is now the
+    /// window of cubes from `window.min_y`. The level is laid out again in place, as a
+    /// dimension change lays out a new one, minus what outlives the window: the entities, the
+    /// player, the far terrain (`clear_lod` is not called) and the sounds. Every loaded column
+    /// goes (the server sends them all again, nearest first), with the meshes and what
+    /// streaming keeps per section; the chunk format changes, so a column still decoding for
+    /// the old window is decoded again. Until the player's column is lit again the local
+    /// player does not move (`tick_remote_player` waits for `Streaming::is_lit`).
+    pub(super) fn remote_cubic_window(&mut self, window: horizon_protocol::cubic::Window) {
+        let shape = horizon_client::chunk::LevelShape::cubic_window(
+            self.world.shape,
+            window.min_y,
+            window.height,
+        );
+        let Some(r) = self.remote.as_mut() else {
+            return;
+        };
+        r.chunk_format = Arc::new(r.chunk_format.with_window(shape));
+        // The attachments of columns and block entities that are gone; entities keep theirs.
+        r.attachments
+            .retain(|holder, _| !matches!(holder, Holder::Chunk(_) | Holder::BlockEntity(_)));
+        let mut streaming = Streaming::new(
+            Arc::new(NoTerrain),
+            self.worker_context(),
+            self.res.threads(),
+        );
+        streaming.remote = true;
+        streaming.radius = self.streaming.radius;
+        streaming.center = self.streaming.center;
+        streaming.sky_light = self.streaming.sky_light;
+        streaming.nether_shading = self.streaming.nether_shading;
+        streaming.biome_zoom = self.streaming.biome_zoom;
+        self.streaming = streaming;
+        let fresh = World::new(self.res.facts().air, 0);
+        let old = std::mem::replace(&mut self.world, fresh);
+        let world = &mut self.world;
+        world.random = old.random;
+        world.health_rules = old.health_rules;
+        world.fast_lava = old.fast_lava;
+        world.revision = old.revision;
+        world.game_time = old.game_time;
+        world.day_time = old.day_time;
+        world.weather = old.weather;
+        world.shape = shape;
+        let count = old.chunks.len();
+        horizon_client::chunk::free_columns(old.chunks, count);
+        self.pending_uploads.clear();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_sections(self.world.layout());
+        }
+        self.apply_settings();
+    }
+
     /// `ClientChunkCache.Storage.inRange`: within the storage around the
     /// view centre, `calculateStorageRange` (the server's radius, at least
     /// two, plus three) chunks each way.
@@ -3204,6 +3257,13 @@ impl Game<'_> {
                         }
                     }
                     Err(e) => log::debug!("Horizon: a bad menu extra payload: {e}"),
+                }
+            }
+            // A cubic level's window moved, or is set for the first time.
+            C::CustomPayload(p) if p.channel == horizon_protocol::cubic::WINDOW_CHANNEL => {
+                match horizon_protocol::cubic::Window::decode(&p.data) {
+                    Ok(window) => self.remote_cubic_window(window),
+                    Err(e) => log::warn!("Horizon: a bad cubic window payload: {e}"),
                 }
             }
             // The server's recipes its native mods asked to send.

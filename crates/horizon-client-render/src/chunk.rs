@@ -237,7 +237,9 @@ impl ColumnLayout {
     /// `SectionMask`'s.
     pub fn window(min_y: i32, height: i32) -> Self {
         use horizon_world::cubic::{MAX_Y, MIN_Y};
-        let sections = (height.max(16) as usize).div_ceil(16).min(crate::section_mask::SectionMask::CAPACITY);
+        let sections = (height.max(16) as usize)
+            .div_ceil(16)
+            .min(crate::section_mask::SectionMask::CAPACITY);
         let top = MAX_Y + 1 - sections as i32 * 16;
         Self {
             min_y: (min_y & !15).clamp(MIN_Y, top),
@@ -1065,7 +1067,10 @@ mod tests {
     fn a_cubic_window_is_its_own_column_anywhere_in_the_cubic_range() {
         let up = LevelShape::cubic_window(LevelShape::OVERWORLD, 1_000_000, 512);
         assert!(up.cubic && up.sky_light && !up.has_ceiling);
-        assert_eq!((up.min_y, up.max_y(), up.logical_height), (1_000_000, 1_000_512, 512));
+        assert_eq!(
+            (up.min_y, up.max_y(), up.logical_height),
+            (1_000_000, 1_000_512, 512)
+        );
         let column = up.column();
         assert_eq!((column.min_y(), column.sections()), (1_000_000, 32));
         assert_eq!(column.section_index(1_000_511), Some(31));

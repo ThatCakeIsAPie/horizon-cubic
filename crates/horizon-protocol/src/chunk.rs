@@ -269,7 +269,7 @@ packet!(
     /// ClientboundLevelChunkPacketData.BlockEntityInfo.
     BlockEntityInfo {
         packed_xz: i8 => crate::buf::Byte,
-        y: i16 => crate::buf::Short,
+        y: i32 => crate::buf::BlockEntityY,
         kind: i32 => VarInt,
         tag: Tag => crate::buf::Nbt,
     }

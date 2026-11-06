@@ -60,6 +60,17 @@ pub fn take_changed() -> Vec<Arc<Chunk>> {
     }
 }
 
+/// Forget every offer and every unsent bulk change: the level was swapped for one with
+/// another window (`Hub::cubic_window_changed`), and the old columns are not the new level's.
+pub fn forget_all() {
+    if let Ok(mut offered) = OFFERED.lock() {
+        *offered = None;
+    }
+    if let Ok(mut changed) = CHANGED.lock() {
+        *changed = None;
+    }
+}
+
 /// The server sends `chunk` to a player on its memory connection.
 pub fn offer(chunk: &Chunk) {
     let Ok(mut offered) = OFFERED.lock() else {
@@ -147,6 +158,30 @@ mod tests {
         assert_eq!(edited.get(1, MIN_Y + 3, 2), 6);
         // Taken once: a second decode of the column has nothing to take.
         assert_eq!(take(&mut column(901)), 0);
+    }
+
+    /// A window far from the origin: sections pair by absolute Y, so a window that moved
+    /// since the offer shares only the heights both hold.
+    #[test]
+    fn sections_pair_by_absolute_height_across_windows() {
+        use crate::chunk::LevelShape;
+        let shape = |min_y| LevelShape::cubic_window(LevelShape::OVERWORLD, min_y, 128).column();
+        let mut server = Chunk::with_layout(905, 7, shape(1_000_000));
+        server.set(1, 1_000_040, 2, 5);
+        offer(&server);
+        // The window moved up two sections: the server's third section is its first.
+        let mut window = Chunk::with_layout(905, 7, shape(1_000_032));
+        window.set(1, 1_000_040, 2, 5);
+        assert_eq!(take(&mut window), 1);
+        assert!(Arc::ptr_eq(&window.sections[0], &server.sections[2]));
+        // A different block at that height is not shared.
+        offer(&server);
+        let mut other = Chunk::with_layout(905, 7, shape(1_000_032));
+        other.set(1, 1_000_040, 2, 6);
+        assert_eq!(take(&mut other), 0);
+        assert_eq!(other.get(1, 1_000_040, 2), 6);
+        forget_all();
+        assert_eq!(take(&mut window), 0);
     }
 
     #[test]
