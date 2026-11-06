@@ -305,6 +305,15 @@ Done: generate, mesh and draw (stages 1, 3 and most of 4) run on the GPU for a c
 
 Not done: node selection on the GPU (traversal by screen-space error), Hi-Z occlusion of far nodes, wiring the GPU biome columns (`gfx/biome_gen.rs`, landed separately) into this path, remeshing a node when its neighbours change (so no border culling), GPU far water in OIT or shader-pack frames, the swamp's grass noise across a biome, and sorting far water.
 
+**Surface tiles** (`gfx/surface_tile.rs`, branch `cubic/far-surface`; points 2, 3 and 6 of the Meridian list; not wired into the plan yet):
+- A `TileKey { level, x, z }` covers a `CubeKey`'s footprint, all Y, as 16 × 16 columns. Each column holds up to 4 solid spans (top, bottom, top block; the ground's bottom is open), exact `i32` block heights with no fixed range, and water over the highest span when it lies below the sea. More spans: the rest merge into the last and the tile counts the column as complex (`TileInfo::complex`), for the planner to prefer cube nodes there.
+- Generated on the GPU in batches of 256 (`surface_gen.wgsl`): the climate pass (`biome_gen`, jittered) gives each column one sample point at a hashed quart, with the climate's layers down to 256 blocks and the density's octaves down to 64 (a point, not a column average); that line is marched (column-wide steps, at most 64 blocks) and bisected to the block. No colour blending (the owner's call); the jitter is what removes the regular tile pattern from high up. Several points per column with the highest kept is a constant away (`SAMPLES`), but four took 2.5 times the GPU time and, at coarse levels, turned the oceans into land.
+- Measured (GTX 1070 Ti, defaults): 256 level-14 tiles in 4.7 ms of GPU time (climate 3.2 + surface 1.5); 1,089 tiles generated and read back 31 ms after the request. 13,376 bytes a tile.
+- Drawn by vertex pulling through `terrain.wgsl` and `cube_far.wgsl`'s material lookup (`cf_face`): blocky span boxes, skirts at tile edges down to the tile's lowest possible ground minus its relief, water at the sea's plane; culled per tile into indirect draws.
+- The noise maths of the four far-terrain compute shaders now lives once, in `gfx/cwg_noise.wgsl`.
+- `HORIZON_SURFACE_TILES_DEBUG=<level|auto>[,<radius>]` draws a square of tiles around the camera in place of the cube nodes and logs the timings (temporary).
+- To wire: decide `SURFACE_LEVEL` in the plan, `request` the tile of every planned node at or above it (instead of the node), show it when `ready`, `retire` it when the plan drops it, refine complex tiles into cube nodes; build `SurfaceTiles` beside `CubeFar` (`GpuBackend::params`, `biome_params`, `CubeFar::material_buffer`, `biome_buffer`), call `update` and `prepare` with `CubeFar::prepare`, and `draw` next to `CubeFar::draw`.
+
 
 ## Budgets
 
