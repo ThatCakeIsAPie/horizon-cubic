@@ -169,6 +169,35 @@ v2 lays the ground for this. v3 finishes it with the far-terrain path running on
 
 Fallback: devices without compute or `MULTI_DRAW_INDIRECT_COUNT` keep v2's CPU path. This is the same split `gfx/gpu_culling.rs` makes today.
 
+### Whole World, then autoresearch
+
+The target is the Meridian LOD mod's whole-world toggle. In a cubic level, LOD Distance's top step is **Whole World**:
+- The octree's root covers vanilla's world border (±30 M blocks) and the whole cube range (±8.4 M blocks).
+- The plan subdivides by distance as usual.
+- Subtrees the 2D pre-pass proves uniform are never requested.
+
+The owner's order is **speed first, then detail**:
+1. **Now: the medium and large changes** that decide how fast distant terrain can load:
+   - GPU generation in huge batches;
+   - the 2D surface pre-pass;
+   - GPU meshing and drawing;
+   - GPU biomes;
+   - Whole World.
+2. **Then: a benchmark that gives one number:**
+   - It launches a cubic world offscreen at Whole World, and teleports far away.
+   - It times **until the plan is complete**, meaning every planned node is drawn or known empty, from `CubeLodStats`.
+   - It also reports frame time p99 meanwhile.
+3. **Then: autoresearch loops** (the `autoresearch` skill) over the small knobs, with that number as the metric:
+   - batch sizes;
+   - the octave cut-off;
+   - `DETAIL` and the merge factor;
+   - the pool and arena sizes;
+   - workgroup sizes;
+   - upload budgets;
+   - the pre-pass bound;
+   - CPU worker counts.
+4. **Detail comes after speed:** decorated far terrain (trees, snow) and Hybrid's vanilla band on the GPU.
+
 ## Budgets
 
 Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertical distance 8 and far terrain 128 chunks, with Custom Cubic defaults:
