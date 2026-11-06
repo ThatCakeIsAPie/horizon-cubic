@@ -307,9 +307,21 @@ These came from the owner while reviewing the Meridian video. They are recorded 
    - It is not refined until the player can see it. Hi-Z or occlusion-query results from earlier frames feed the planner's priority: a hidden node keeps its coarse level, and a node that becomes visible goes to the front of the refine queue.
    - This matters most underground, where most far terrain is behind rock.
 3. **Far views of the player's own builds, updated in the background.** *Later; the next job after the far-view rework.*
-   - Today only the finest far levels (0–1) read saved cubes. Coarser levels come from the generator, so a build you fly away from turns back into natural terrain.
-   - When a cube is edited, mark its far nodes dirty all the way up the levels. Rebuild them in the background at low priority, coalescing many edits (downsample from the cube, then from children). Upload only the changed nodes, so the player sees their build's LOD update while they build.
-   - The height-map tiles take player edits the same way: rebuild the affected columns' spans.
+   - **What exists** (`cubic/far2`): a disk cache of far nodes, `lod::cube_cache` in `<dimension>/horizon_cube_lod/`.
+     - It holds levels 1–8 (nodes up to 4,096 blocks wide).
+     - A level-1 node made from saved cubes (the player's edits included) is kept. A coarser node is built from its eight kept children and kept too. Kept nodes come before the GPU generator.
+     - Saving a cube erases the kept nodes over it (`CubeLodCache::invalidate`). They are rebuilt the next time the plan asks.
+   - **Where it falls short:**
+     - A parent is built from its children only when all eight are kept. Otherwise the generator makes it fresh and the build vanishes at that level. So a build shows in the far view only where the player has been close enough for the surrounding area to be kept.
+     - Above level 8 nothing is kept, so builds never show beyond nodes 4,096 blocks wide.
+     - Rebuilding is lazy, on the plan's request, not in the background as the player builds.
+   - **The fix** (the owner's idea):
+     - When a cube is edited, mark its far nodes dirty all the way up the levels.
+     - Rebuild them in the background at low priority, coalescing many edits.
+     - A parent with only some children kept takes the rest from the generator, CPU or GPU, and merges them, so it never drops the build.
+     - Keep every level (or the edited columns' spans) on disk, so builds survive a reopen.
+     - Upload only the changed nodes, so the player sees their build's LOD update while they build.
+   - The height-map tiles take edits the same way: rebuild the affected columns' spans, and keep edited tiles in the disk cache.
 4. **Structures fill in over time, in the background.** *Later; Custom Cubic has no structures yet.*
    - Structureless terrain is generated first, as now.
    - A low-priority CPU job runs structure placement (structure starts and piece layout, not full chunk generation) over the regions the far view covers, nearest and on-screen first.
