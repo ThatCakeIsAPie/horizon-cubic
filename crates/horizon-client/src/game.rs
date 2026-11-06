@@ -17460,8 +17460,16 @@ impl Game<'_> {
             });
             if let Some(sampler) = sampler {
                 let air = self.res.facts().air;
+                // Levels 2 and up generate on the renderer's own device, so
+                // the GPU mesher can read the nodes where they were made.
+                let sampler = match &self.renderer {
+                    Some(renderer) => {
+                        sampler.with_device(renderer.device.clone(), (*renderer.queue).clone())
+                    }
+                    None => sampler,
+                };
                 self.cube_lod = Some(horizon_client::lod::cube::CubeLod::new(
-                    sampler,
+                    Box::new(sampler),
                     self.worker_context(),
                     air,
                 ));

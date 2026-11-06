@@ -103,6 +103,12 @@ impl Game<'_> {
         {
             return Ok(((0, 0), flat.spawn_height()));
         }
+        // A cubic world's own generator knows where its land is.
+        if self.world.shape.cubic
+            && let Some(origin) = self.save.cubic.get().and_then(|level| level.spawn_origin())
+        {
+            return Ok(origin);
+        }
         if self.options.test_terrain {
             return Ok(((0, 0), 64));
         }

@@ -105,6 +105,7 @@ mod buckets;
 mod creaking;
 mod falling;
 mod feature_world;
+pub use feature_world::place_biome_feature;
 mod fluids;
 mod growth;
 mod hooks;

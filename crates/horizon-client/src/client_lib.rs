@@ -47,6 +47,7 @@ pub mod control;
 pub mod crafting;
 pub mod creative;
 pub mod cubic;
+pub mod cubic_gen;
 pub mod cubic_lod;
 pub mod cubic_prefetch;
 pub mod cubic_settings;

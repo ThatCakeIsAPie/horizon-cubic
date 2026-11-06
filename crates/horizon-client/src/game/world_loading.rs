@@ -872,6 +872,7 @@ pub(super) fn make_streaming(
             }));
         }
         locator = Some(inner.clone());
+        let inner_data = inner.generator_data().clone();
         let persistent = Arc::new(Persistent {
             inner,
             save: save.clone(),
@@ -880,12 +881,34 @@ pub(super) fn make_streaming(
         });
         if shape.cubic {
             // A cubic level: its window's columns from cubes (docs/cubic-chunks.md).
+            let generation = horizon_client::cubic_gen::CubicGeneration::of_world(world_root);
+            // A world always records its generator: the settings it opened
+            // with are saved when it had none.
+            if !world_root
+                .join(horizon_client::cubic_settings::SETTINGS_FILE)
+                .is_file()
+            {
+                let text = if generation.settings_json.trim().is_empty() {
+                    horizon_client::cubic_settings::default_json(generation.kind)
+                } else {
+                    generation.settings_json.clone()
+                };
+                if let Err(e) = horizon_client::cubic_settings::save_world_generation(
+                    world_root,
+                    generation.kind,
+                    &text,
+                ) {
+                    log::warn!("Horizon: cubicgen.json not saved: {e}");
+                }
+            }
             let level = horizon_client::cubic::CubicLevel::new(
                 &save.root,
                 seed,
                 pack.assets.registry,
                 &biomes,
                 shape,
+                &generation,
+                Some(&inner_data),
             )?;
             let _ = save.cubic.set(level.clone());
             let terrain = Arc::new(horizon_client::cubic::CubicTerrain {

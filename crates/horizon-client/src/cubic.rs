@@ -31,13 +31,16 @@
 //! never read), so a loaded cube has its POIs again.
 
 use crate::biome::Biomes;
-use crate::chunk::{BIOME_STRATEGY, Chunk, ColumnLayout, LevelShape, Section, block_strategy};
+use crate::chunk::{Chunk, ColumnLayout, LevelShape, Section, block_strategy};
+use crate::cubic_gen::{
+    CubicGeneration, CubicKind, Generation, PARTIAL, POPULATED, PopRegion, Population,
+    needs_population, root_flags, set_root_flags,
+};
 use crate::save::{ChunkExtras, Persistent, SaveTables, decode_with, encode_with};
 use crate::streaming::{ChunkGenerator, Proto};
 use horizon_core::paletted::PalettedContainer;
 use horizon_core::position::SectionPos;
 use horizon_core::ticks::SavedTick;
-use horizon_world::cubic::generator::CubeGenerator;
 use horizon_world::cubic::store::CubeStore;
 use horizon_world::cubic::{MAX_CUBE_Y, MIN_CUBE_Y};
 use horizon_world::nbt::{NamedTag, Tag};
@@ -47,8 +50,9 @@ use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// The cube Ys vanilla's Overworld generator makes (-64..320).
-pub const VANILLA_CUBES: std::ops::RangeInclusive<i32> = -4..=19;
+/// The cube Ys vanilla's Overworld generator makes (-64..320), in a Hybrid
+/// world.
+pub use crate::cubic_gen::VANILLA_CUBES;
 /// The cube whose record says the column's vanilla range was generated and
 /// holds the column's own data (structure starts and references, the
 /// surface heights).
@@ -285,7 +289,9 @@ pub struct CubicLevel {
     send: Mutex<Option<Sender<(SectionPos, Arc<NamedTag>)>>>,
     /// Columns whose vanilla range is known to be generated (`has_vanilla`).
     vanilla_done: Mutex<std::collections::HashSet<(i32, i32)>>,
-    generator: Arc<CubeGenerator>,
+    wg: Arc<Generation>,
+    /// Population state: flags, cubes in flight, the striped locks.
+    pop: Population,
     /// The window the level's chunks hold now.
     window: Mutex<ColumnLayout>,
     /// A hash of each cube's blocks as last loaded, generated or saved: a
@@ -305,9 +311,6 @@ pub struct CubicLevel {
     uniform: Mutex<HashMap<(u32, u16), Arc<Section>>>,
     /// The air section of a generated vanilla range's missing cubes.
     air: std::sync::OnceLock<Arc<Section>>,
-    /// The biomes of the generator's cubes below and above vanilla's range.
-    deep_biome: u16,
-    sky_biome: u16,
     bedrock: Option<u32>,
     deepslate: Option<u32>,
     /// What cube records are decoded with for the far terrain.
@@ -326,16 +329,19 @@ pub struct CubicLevel {
 
 impl CubicLevel {
     /// The cubic level saved in `level_dir` (its `region3d/`), generating
-    /// with `seed`, its chunks holding `window`.
+    /// with `seed` as `generation` says, its chunks holding `window`. `data`
+    /// is the generator data of 26.3 (its biomes and features); without it
+    /// the level has plains everywhere and no vegetation.
     pub fn new(
         level_dir: &Path,
         seed: i64,
         registry: &'static BlockRegistry,
         biomes: &Arc<Biomes>,
         window: LevelShape,
+        generation: &CubicGeneration,
+        data: Option<&Arc<horizon_world::worldgen::generator::GeneratorData>>,
     ) -> Result<Arc<Self>, String> {
-        let palette = horizon_world::cubic::generator::CubePalette::from_registry(registry)?;
-        let generator = Arc::new(CubeGenerator::new(seed, palette));
+        let wg = Arc::new(Generation::new(generation, seed, registry, data)?);
         let io = Arc::new(CubeIo {
             store: CubeStore::new(level_dir),
             pending: Mutex::default(),
@@ -351,7 +357,8 @@ impl CubicLevel {
             io,
             send: Mutex::new(Some(send)),
             vanilla_done: Mutex::default(),
-            generator,
+            wg,
+            pop: Population::new(),
             window: Mutex::new(window.column()),
             clean: Mutex::default(),
             with_entities: Mutex::default(),
@@ -359,15 +366,19 @@ impl CubicLevel {
             tables: std::sync::OnceLock::new(),
             uniform: Mutex::default(),
             air: std::sync::OnceLock::new(),
-            deep_biome: biomes.id("minecraft:deep_dark"),
-            sky_biome: biomes.id("minecraft:plains"),
             bedrock: registry.default_state("minecraft:bedrock").map(|s| s.0),
             deepslate: registry.default_state("minecraft:deepslate").map(|s| s.0),
             registry,
             biomes: biomes.clone(),
             lod_cache: crate::lod::cube_cache::CubeLodCache::open(
                 &level_dir.join("horizon_cube_lod"),
-                &crate::lod::cube_cache::fingerprint(seed, registry.len()),
+                &format!(
+                    "{}generator {} {:016x}
+",
+                    crate::lod::cube_cache::fingerprint(seed, registry.len()),
+                    generation.kind.id(),
+                    settings_hash(&generation.settings_json)
+                ),
             ),
             ring: crate::cubic_prefetch::Ring::new(),
             surfaces: Mutex::default(),
@@ -389,26 +400,68 @@ impl CubicLevel {
         cube.sections.into_iter().next()
     }
 
-    /// A far-terrain sampler of the level (`cubic_lod`), reading inside
-    /// vanilla's range from `vanilla`, the vanilla generator's.
+    /// A far-terrain sampler of the level (`cubic_lod`), reading a Hybrid
+    /// world's vanilla band from `vanilla`, the vanilla generator's.
     pub fn lod_sampler(
         self: &Arc<Self>,
         vanilla: Box<dyn crate::streaming::LodSampler>,
         registry: &BlockRegistry,
     ) -> crate::cubic_lod::CubicLodSampler {
-        let id = |name: &str| registry.default_state(name).map_or(0, |s| s.0);
         crate::cubic_lod::CubicLodSampler::new(
             self.clone(),
-            self.generator.clone(),
             vanilla,
-            id("minecraft:air"),
-            id("minecraft:stone"),
-            id("minecraft:deepslate"),
-            vec![id("minecraft:water"), id("minecraft:lava")],
-            self.deep_biome,
-            self.sky_biome,
+            registry,
             self.lod_cache.clone(),
         )
+    }
+
+    /// Where a new world's spawn search starts (`game/initial_spawn.rs`): the
+    /// chunk and the height to stand at, for a world that is not Hybrid. A
+    /// Flat world's is the origin; a Custom world's, the first chunk of a
+    /// spiral round it whose surface is above the sea (land).
+    pub fn spawn_origin(&self) -> Option<((i32, i32), i32)> {
+        let generator = &self.wg.generator;
+        match self.wg.kind {
+            CubicKind::Hybrid => None,
+            CubicKind::Flat => {
+                let y = generator.surface_y(8, 8, 320).unwrap_or(0);
+                Some(((0, 0), y + 1))
+            }
+            CubicKind::Custom => {
+                let sea = generator.sea_level();
+                let mut best: Option<((i32, i32), i32)> = None;
+                for radius in 0..24i32 {
+                    for dz in -radius..=radius {
+                        for dx in -radius..=radius {
+                            if dx.abs().max(dz.abs()) != radius {
+                                continue;
+                            }
+                            let (cx, cz) = (dx * 2, dz * 2);
+                            let Some(y) = generator.surface_y(cx * 16 + 8, cz * 16 + 8, 320) else {
+                                continue;
+                            };
+                            if y > sea {
+                                return Some(((cx, cz), y + 1));
+                            }
+                            best.get_or_insert(((cx, cz), y + 1));
+                        }
+                    }
+                }
+                best.or(Some(((0, 0), sea + 1)))
+            }
+        }
+    }
+
+    /// The client's biome table (the ids sections and far nodes carry).
+    pub fn client_biomes(&self) -> &Arc<Biomes> {
+        &self.biomes
+    }
+
+    /// The client biome id of the block column (`x`, `z`) in the biome
+    /// source.
+    pub fn biome_id_at(&self, x: i32, z: i32) -> u16 {
+        let id = self.wg.columns.biome(x >> 2, z >> 2);
+        self.biomes.id(self.wg.columns.biome_name(id))
     }
 
     /// The window the level's chunks hold.
@@ -451,13 +504,24 @@ impl CubicLevel {
         self.io.read(pos)
     }
 
-    fn write_later(&self, pos: SectionPos, tag: NamedTag) {
+    fn write_later(&self, pos: SectionPos, mut tag: NamedTag) {
+        // The record keeps its population flags whoever writes it.
+        let flags = match self.pop.flags(pos) {
+            Some(flags) => flags,
+            None => {
+                let flags = self.read(pos).map_or(0, |old| root_flags(&old));
+                self.pop.learn_flags(pos, flags);
+                flags
+            }
+        };
+        set_root_flags(&mut tag, flags);
+        self.pop.forget(pos);
         if let Some(cache) = &self.lod_cache {
             cache.invalidate(pos);
         }
         // A cube read before this write is older than its record.
         self.ring.invalidate(pos);
-        if pos.y == MARKER_CUBE {
+        if self.is_marker(pos.y) {
             self.surfaces.lock().unwrap().remove(&(pos.x, pos.z));
         }
         let tag = Arc::new(tag);
@@ -483,6 +547,9 @@ impl CubicLevel {
     /// Whether column (x, z)'s vanilla range was generated (its marker cube
     /// is saved).
     pub fn has_vanilla(&self, x: i32, z: i32) -> bool {
+        if self.wg.kind != CubicKind::Hybrid {
+            return true;
+        }
         if self.vanilla_done.lock().unwrap().contains(&(x, z)) {
             return true;
         }
@@ -493,39 +560,210 @@ impl CubicLevel {
         done
     }
 
-    /// The generator's cube `pos`, uniform cubes shared.
-    pub fn generate(&self, pos: SectionPos) -> Arc<Section> {
+    /// The level's world type.
+    pub fn kind(&self) -> CubicKind {
+        self.wg.kind
+    }
+
+    /// The generator and what hangs off it (far terrain, spawn).
+    pub fn generation(&self) -> &Arc<Generation> {
+        &self.wg
+    }
+
+    /// Whether cube Y `cy` is vanilla's (a Hybrid world's band).
+    pub fn is_vanilla(&self, cy: i32) -> bool {
+        crate::cubic_gen::is_vanilla_cube(self.wg.kind, cy)
+    }
+
+    /// Whether `cy` is the cube that holds a Hybrid column's own data.
+    fn is_marker(&self, cy: i32) -> bool {
+        self.wg.kind == CubicKind::Hybrid && cy == MARKER_CUBE
+    }
+
+    /// Population counters (cubes generated and populated, mean times).
+    pub fn population_stats(&self) -> crate::cubic_gen::PopulationStats {
+        self.pop.stats()
+    }
+
+    /// The generator's terrain for cube `pos` (before population), uniform
+    /// cubes shared, with the biomes of the biome source.
+    fn generate(&self, pos: SectionPos) -> Arc<Section> {
+        if !horizon_world::cubic::has_cube(pos) {
+            return self.air.get_or_init(Default::default).clone();
+        }
+        let start = std::time::Instant::now();
         let mut values = Box::new([0u32; 4096]);
-        let biome = if pos.y < *VANILLA_CUBES.start() {
-            self.deep_biome
-        } else {
-            self.sky_biome
-        };
-        let section = match self.generator.generate(pos, &mut values) {
-            Some(state) => {
-                let mut uniform = self.uniform.lock().unwrap();
-                return uniform
-                    .entry((state, biome))
+        let uniform = self.wg.generator.generate(pos, &mut values);
+        let biomes = self.wg.biome_container(&self.biomes, pos.x, pos.z);
+        let section = match (uniform, biomes.uniform()) {
+            (Some(state), Some(biome)) => {
+                let mut shared = self.uniform.lock().unwrap();
+                shared
+                    .entry((state, biome as u16))
                     .or_insert_with(|| {
                         Arc::new(Section {
                             blocks: PalettedContainer::new(block_strategy(), state),
-                            biomes: PalettedContainer::new(BIOME_STRATEGY, u32::from(biome)),
+                            biomes: biomes.clone(),
                             ..Section::default()
                         })
                     })
-                    .clone();
+                    .clone()
             }
-            None => {
+            (Some(state), None) => Arc::new(Section {
+                blocks: PalettedContainer::new(block_strategy(), state),
+                biomes,
+                ..Section::default()
+            }),
+            (None, _) => {
                 let mut section = Section {
                     blocks: Section::from_blocks(&values),
-                    biomes: PalettedContainer::new(BIOME_STRATEGY, u32::from(biome)),
+                    biomes,
                     ..Section::default()
                 };
                 section.compact();
-                section
+                Arc::new(section)
             }
         };
-        Arc::new(section)
+        self.pop
+            .generated
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pop.generate_nanos.fetch_add(
+            start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        section
+    }
+
+    /// Cube `pos` as terrain, with whatever population wrote into it so far:
+    /// a cube in flight, else its record, else the generator's. Whether it
+    /// came from a record or a cube in flight is the second answer.
+    fn terrain_section(&self, pos: SectionPos) -> (Arc<Section>, bool) {
+        if let Some(section) = self.pop.cached(pos) {
+            return (section, true);
+        }
+        if let Some(root) = self.read(pos) {
+            self.pop.learn_flags(pos, root_flags(&root));
+            if let Some(cube) = self.codec().decode(&root, pos.y)
+                && let Some(section) = cube.sections.into_iter().next()
+            {
+                self.pop.keep(pos, section.clone());
+                return (section, true);
+            }
+        }
+        let section = self.generate(pos);
+        self.pop.keep(pos, section.clone());
+        (section, false)
+    }
+
+    /// Terrain of cube `pos` for a light view (no population).
+    pub fn terrain(&self, pos: SectionPos) -> Arc<Section> {
+        self.terrain_section(pos).0
+    }
+
+    /// Whether the population of `p` ran (its record's flag).
+    fn is_populated(&self, p: SectionPos) -> bool {
+        let flags = match self.pop.flags(p) {
+            Some(flags) => flags,
+            None => {
+                let flags = self.read(p).map_or(0, |root| root_flags(&root));
+                self.pop.learn_flags(p, flags);
+                flags
+            }
+        };
+        flags & POPULATED != 0
+    }
+
+    /// Runs the eight populations that touch `pos` that have not run
+    /// (`c - d` for `d` in 0 or 1 on each axis), so the cube is final.
+    fn ensure_populated_around(&self, pos: SectionPos) {
+        for d in 0..8 {
+            let p = SectionPos::new(pos.x - (d & 1), pos.y - (d >> 1 & 1), pos.z - (d >> 2 & 1));
+            if needs_population(self.wg.kind, p)
+                && horizon_world::cubic::has_cube_y(p.y)
+                && !self.is_populated(p)
+            {
+                self.populate(p);
+            }
+        }
+    }
+
+    /// CubicWorldGen's population of cube `p`: its 2 x 2 x 2 region (terrain
+    /// from the records that exist, else the generator) gets ores, lakes,
+    /// vegetation and springs, and the cubes it changed are written, `p`'s
+    /// record flagged populated. Regions that overlap are serialised by the
+    /// striped locks, which every population takes in the same order.
+    fn populate(&self, p: SectionPos) {
+        let _locks = self.pop.lock_region(p);
+        if self.is_populated(p) {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let at = |d: usize| {
+            SectionPos::new(
+                p.x + (d & 1) as i32,
+                p.y + (d >> 1 & 1) as i32,
+                p.z + (d >> 2 & 1) as i32,
+            )
+        };
+        let loaded: [(Arc<Section>, bool); 8] =
+            std::array::from_fn(|d| self.terrain_section(at(d)));
+        let sections: [Arc<Section>; 8] = std::array::from_fn(|d| loaded[d].0.clone());
+        let mut region = PopRegion::new(
+            p,
+            &sections,
+            self.wg.columns.clone(),
+            self.wg.vegetation.clone(),
+        );
+        self.wg.generator.populate(p, &mut region);
+        let dirty = region.dirty();
+        let ctx = self.codec();
+        for d in 0..8 {
+            let q = at(d);
+            if !horizon_world::cubic::has_cube(q) {
+                continue;
+            }
+            let own = d == 0;
+            if !own && !dirty[d] {
+                continue;
+            }
+            let section = if dirty[d] {
+                let mut section = Section {
+                    blocks: Section::from_blocks(region.blocks(d)),
+                    biomes: sections[d].biomes.clone(),
+                    ..Section::default()
+                };
+                section.compact();
+                Arc::new(section)
+            } else {
+                sections[d].clone()
+            };
+            let known = self.pop.flags(q).unwrap_or(0);
+            let flags = if own {
+                (known | POPULATED) & !PARTIAL
+            } else if known & (POPULATED | PARTIAL) != 0 || (loaded[d].1 && self.read(q).is_some())
+            {
+                known
+            } else {
+                known | PARTIAL
+            };
+            self.pop.set_flags(q, flags);
+            let mut one = Chunk::with_layout(q.x, q.z, ColumnLayout::window(q.y * 16, 16));
+            one.sections[0] = section.clone();
+            let entities = self
+                .read(q)
+                .map(|old| record_entities(&old))
+                .unwrap_or_default();
+            let root = ctx.encode(&one, 0, false, &entities);
+            self.write_later(q, root);
+            self.pop.keep(q, section);
+        }
+        self.pop
+            .populations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pop.populate_nanos.fetch_add(
+            start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     fn note_clean(
@@ -588,15 +826,21 @@ impl CubicLevel {
     /// Cube `pos` as it is now, changing nothing in the level's books (so
     /// the ring's thread may call it): `load_cube`'s answer.
     fn read_cube(&self, pos: SectionPos, ctx: &Codec) -> Option<LoadedCube> {
+        // A cube outside vanilla's band is final once the eight populations
+        // that touch it have run.
+        if !self.is_vanilla(pos.y) {
+            self.ensure_populated_around(pos);
+        }
         if let Some(root) = self.read(pos)
             && let Some(mut cube) = ctx.decode(&root, pos.y)
         {
+            self.pop.learn_flags(pos, root_flags(&root));
             let entities = record_entities(&root);
             let saved = cube.saved.take();
             let (block_ticks, fluid_ticks) = saved
                 .map(|e| (e.block_ticks.clone(), e.fluid_ticks.clone()))
                 .unwrap_or_default();
-            let marker = pos.y == MARKER_CUBE;
+            let marker = self.is_marker(pos.y);
             let section = cube.sections[0].clone();
             return Some(LoadedCube {
                 pos,
@@ -620,10 +864,10 @@ impl CubicLevel {
                 generated: false,
             });
         }
-        if VANILLA_CUBES.contains(&pos.y) {
+        if self.is_vanilla(pos.y) {
             return None;
         }
-        let mut cube = LoadedCube::empty(pos, self.generate(pos));
+        let mut cube = LoadedCube::empty(pos, self.terrain_section(pos).0);
         cube.generated = true;
         Some(cube)
     }
@@ -632,8 +876,7 @@ impl CubicLevel {
     /// vanilla's range of a column whose vanilla generation has not run
     /// (that column goes the normal way), nor before the save tables are set.
     pub fn can_make_cube(&self, pos: SectionPos) -> bool {
-        self.tables.get().is_some()
-            && (!VANILLA_CUBES.contains(&pos.y) || self.has_vanilla(pos.x, pos.z))
+        self.tables.get().is_some() && (!self.is_vanilla(pos.y) || self.has_vanilla(pos.x, pos.z))
     }
 
     /// Cube `pos` from its record, else the generator's, else air (a cube of
@@ -689,7 +932,7 @@ impl CubicLevel {
             chunk.entities.extend(cube.entities);
             block_ticks.extend(cube.block_ticks);
             fluid_ticks.extend(cube.fluid_ticks);
-            if cy == MARKER_CUBE {
+            if self.is_marker(cy) {
                 chunk.structure_refs = cube.structure_refs;
                 chunk.structure_starts = cube.structure_starts;
                 surface = cube.surface;
@@ -702,8 +945,12 @@ impl CubicLevel {
                 ..ChunkExtras::default()
             }));
         }
+        if self.wg.kind != CubicKind::Hybrid {
+            chunk.sky_covered = self.sky_cover(x, z, window);
+            return chunk;
+        }
         if surface.is_none()
-            && !VANILLA_CUBES.contains(&base)
+            && !self.is_vanilla(base)
             && let Some(root) = self.read(SectionPos::new(x, MARKER_CUBE, z))
         {
             surface = surface_heights(&root);
@@ -733,7 +980,7 @@ impl CubicLevel {
         let entities = split_by_cube(std::mem::take(&mut vanilla.entities));
         for (s, section) in vanilla.sections.iter().enumerate() {
             let cy = vanilla_base + s as i32;
-            if !VANILLA_CUBES.contains(&cy) {
+            if !self.is_vanilla(cy) {
                 continue;
             }
             let pos = SectionPos::new(x, cy, z);
@@ -742,7 +989,7 @@ impl CubicLevel {
             // A missing vanilla cube reads as air: the air above the ground
             // needs no record (the marker always has one).
             let low = cy * 16;
-            if cy != MARKER_CUBE
+            if !self.is_marker(cy)
                 && section.blocks.uniform() == Some(0)
                 && block_ticks.is_empty()
                 && fluid_ticks.is_empty()
@@ -756,8 +1003,8 @@ impl CubicLevel {
             }
             let here = entities.get(&cy).map_or(&[][..], |e| &e[..]);
             self.note_entities(pos, !here.is_empty());
-            let mut root = ctx.encode(&vanilla, s, cy == MARKER_CUBE, here);
-            if cy == MARKER_CUBE
+            let mut root = ctx.encode(&vanilla, s, self.is_marker(cy), here);
+            if self.is_marker(cy)
                 && let Tag::Compound(map) = &mut root.tag
             {
                 map.insert(SURFACE_KEY.into(), Tag::IntArray(heights.clone()));
@@ -772,12 +1019,17 @@ impl CubicLevel {
             let pos = SectionPos::new(x, cy, z);
             let y = cy * 16;
             if let Some(i) = vanilla.section_index(y)
-                && VANILLA_CUBES.contains(&cy)
+                && self.is_vanilla(cy)
             {
                 chunk.sections[s] = vanilla.sections[i].clone();
-            } else if !VANILLA_CUBES.contains(&cy) {
-                chunk.sections[s] = self.generate(pos);
-                self.note_clean(pos, &chunk.sections[s], &[], &[]);
+            } else if !self.is_vanilla(cy) {
+                // Outside the band: terrain with the populations around it run.
+                if let Some(cube) = self.load_cube_with(pos, ctx) {
+                    chunk.sections[s] = cube.section;
+                    chunk.block_entities.extend(cube.block_entities);
+                    chunk.block_names.extend(cube.block_names);
+                    chunk.entities.extend(cube.entities);
+                }
             }
         }
         let inside = |y: i32| y >= window.min_y() && y < window.max_y();
@@ -833,16 +1085,20 @@ impl CubicLevel {
     }
 
     /// The columns whose sky is cut off above `window` at column (`x`, `z`)
-    /// (`Chunk::sky_covered`), from the column's vanilla surface (cached).
+    /// (`Chunk::sky_covered`): from a Hybrid column's vanilla surface (its
+    /// marker cube's), from the generator's surface elsewhere (cached).
     pub fn sky_cover(&self, x: i32, z: i32, window: ColumnLayout) -> Option<Arc<[u64; 4]>> {
         let cached = self.surfaces.lock().unwrap().get(&(x, z)).cloned();
         let surface = match cached {
             Some(surface) => surface,
             None => {
-                let surface = self
-                    .read(SectionPos::new(x, MARKER_CUBE, z))
-                    .and_then(|root| surface_heights(&root))
-                    .map(Arc::new);
+                let surface = if self.wg.kind == CubicKind::Hybrid {
+                    self.read(SectionPos::new(x, MARKER_CUBE, z))
+                        .and_then(|root| surface_heights(&root))
+                        .map(Arc::new)
+                } else {
+                    Some(Arc::new(self.generated_surface(x, z)))
+                };
                 let mut surfaces = self.surfaces.lock().unwrap();
                 if surfaces.len() >= 1 << 16 {
                     surfaces.clear();
@@ -852,6 +1108,29 @@ impl CubicLevel {
             }
         };
         sky_covered(surface.as_deref().map(Vec::as_slice), window)
+    }
+
+    /// One above the generator's surface of each block column of cube column
+    /// (`x`, `z`) (`z << 4 | x`), looked at once per 8 x 8 blocks from y 320
+    /// (columns with no surface read as far below).
+    fn generated_surface(&self, x: i32, z: i32) -> Vec<i32> {
+        let mut heights = vec![i32::MIN / 2; 256];
+        let mut sample = [[0i32; 2]; 2];
+        for (qz, row) in sample.iter_mut().enumerate() {
+            for (qx, cell) in row.iter_mut().enumerate() {
+                let (bx, bz) = (x * 16 + qx as i32 * 8 + 4, z * 16 + qz as i32 * 8 + 4);
+                *cell = self
+                    .wg
+                    .generator
+                    .surface_y(bx, bz, 320)
+                    .map_or(i32::MIN / 2, |y| y + 1);
+            }
+        }
+        for (i, h) in heights.iter_mut().enumerate() {
+            let (bx, bz) = (i & 15, i >> 4);
+            *h = sample[bz / 8][bx / 8];
+        }
+        heights
     }
 
     /// Saves the `entities` of column (`x`, `z`) in cubes `cubes` (those
@@ -947,10 +1226,10 @@ impl CubicLevel {
 
     /// A record of cube `pos` as the generator makes it.
     fn blank_record(&self, pos: SectionPos, ctx: &Codec) -> NamedTag {
-        let section = if VANILLA_CUBES.contains(&pos.y) {
+        let section = if self.is_vanilla(pos.y) {
             Arc::new(Section::default())
         } else {
-            self.generate(pos)
+            self.terrain_section(pos).0
         };
         let mut one = Chunk::with_layout(pos.x, pos.z, ColumnLayout::window(pos.y * 16, 16));
         one.sections[0] = section;
@@ -1022,7 +1301,7 @@ impl CubicLevel {
         if !changed && !has_block_entities {
             return false;
         }
-        let marker = cy == MARKER_CUBE;
+        let marker = self.is_marker(cy);
         let _edit = self.edit.lock().unwrap();
         let known = self.with_entities.lock().unwrap().contains(&pos);
         let old = (marker || known).then(|| self.read(pos)).flatten();
@@ -1127,6 +1406,14 @@ impl Codec<'_> {
             ColumnLayout::window(cy * 16, 16),
         )
     }
+}
+
+/// A hash of the settings text a level generates with (the far terrain cache
+/// is keyed by it).
+fn settings_hash(text: &str) -> u64 {
+    text.bytes().fold(0xCBF2_9CE4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+    })
 }
 
 /// The vanilla surface heights a marker cube keeps (256, `z << 4 | x`).
@@ -1331,14 +1618,14 @@ impl<G: ChunkGenerator> CubicTerrain<G> {
         let base = window.min_y() >> 4;
         for s in 0..window.sections() {
             let cy = base + s as i32;
-            if VANILLA_CUBES.contains(&cy) {
+            if self.level.is_vanilla(cy) {
                 if let Some(i) = vanilla.section_index(cy * 16) {
                     chunk.sections[s] = vanilla.sections[i].clone();
                 }
             } else {
                 chunk.sections[s] = self
                     .level
-                    .generate(SectionPos::new(vanilla.x, cy, vanilla.z));
+                    .terrain(SectionPos::new(vanilla.x, cy, vanilla.z));
             }
         }
         chunk
@@ -1350,7 +1637,7 @@ impl<G: ChunkGenerator> ChunkGenerator for CubicTerrain<G> {
     fn worker(&self) -> G::Worker {
         self.inner.worker()
     }
-    /// The vanilla generator's far terrain (vanilla's range of the cubic
+    /// The vanilla generator's far terrain (a Hybrid world's band of the cubic
     /// far terrain, `cubic_lod`).
     fn lod_sampler(self: Arc<Self>) -> Box<dyn crate::streaming::LodSampler> {
         ChunkGenerator::lod_sampler(self.inner.clone())
@@ -1363,9 +1650,9 @@ impl<G: ChunkGenerator> ChunkGenerator for CubicTerrain<G> {
         // A window that doesn't reach vanilla's range needs no vanilla
         // column: its cubes are saved ones and the generator's.
         let base = window.min_y() >> 4;
-        let reaches_vanilla = VANILLA_CUBES
-            .clone()
-            .any(|cy| (base..base + window.sections() as i32).contains(&cy));
+        let reaches_vanilla = VANILLA_CUBES.clone().any(|cy| {
+            self.level.is_vanilla(cy) && (base..base + window.sections() as i32).contains(&cy)
+        });
         if reaches_vanilla && !self.level.has_vanilla(x, z) {
             return None;
         }
@@ -1662,9 +1949,24 @@ mod tests {
             })
         }
         fn level(&self) -> Arc<CubicLevel> {
+            self.level_of(CubicKind::Hybrid)
+        }
+        fn level_of(&self, kind: CubicKind) -> Arc<CubicLevel> {
             let window = LevelShape::cubic_window(LevelShape::OVERWORLD, -192, 512);
-            let level = CubicLevel::new(&self.dir, 1, self.assets.registry, &self.biomes, window)
-                .expect("level");
+            let generation = CubicGeneration {
+                kind,
+                settings_json: String::new(),
+            };
+            let level = CubicLevel::new(
+                &self.dir,
+                1,
+                self.assets.registry,
+                &self.biomes,
+                window,
+                &generation,
+                None,
+            )
+            .expect("level");
             level.set_tables(self.tables.clone());
             level
         }
@@ -1682,7 +1984,7 @@ mod tests {
             Arc::new(Section {
                 blocks: PalettedContainer::new(block_strategy(), self.state(name)),
                 biomes: PalettedContainer::new(
-                    BIOME_STRATEGY,
+                    crate::chunk::BIOME_STRATEGY,
                     u32::from(self.biomes.id("minecraft:plains")),
                 ),
                 ..Section::default()
@@ -2096,5 +2398,119 @@ mod tests {
         let poi = crate::save::encode_poi(&loaded, &f.tables).expect("the bell is a POI");
         let again = crate::save::encode_poi(&one, &f.tables).unwrap();
         assert_eq!(poi, again);
+    }
+
+    /// Every block of a cube, by position in the cube.
+    fn blocks_of(cube: &LoadedCube) -> Vec<u32> {
+        let mut values = [0u32; 4096];
+        cube.section.unpack(&mut values);
+        values.to_vec()
+    }
+
+    #[test]
+    fn custom_columns_load_without_vanilla() {
+        let Some(f) = Fixture::new("custom-columns") else {
+            return;
+        };
+        let level = f.level_of(CubicKind::Custom);
+        assert!(level.has_vanilla(5, 5), "nothing to wait for");
+        assert!(level.can_make_cube(SectionPos::new(5, 4, 5)));
+        let column = level.assemble(5, 5, level.window(), &f.codec());
+        // The surface (y 64-ish) is in the window: some cube has stone.
+        assert!(column.sections.iter().any(|s| !s.is_uniform(0)));
+        // Every cube a column holds has its populations behind it.
+        for cy in -12..20 {
+            for d in 0..8 {
+                let p = SectionPos::new(5 - (d & 1), cy - (d >> 1 & 1), 5 - (d >> 2 & 1));
+                assert!(level.is_populated(p), "{p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_population_runs_once_whatever_the_order() {
+        let (Some(a), Some(b)) = (Fixture::new("order-a"), Fixture::new("order-b")) else {
+            return;
+        };
+        let (one, two) = (a.level_of(CubicKind::Custom), b.level_of(CubicKind::Custom));
+        let cubes: Vec<SectionPos> = (0..3)
+            .flat_map(|y| {
+                (0..3).flat_map(move |z| (0..3).map(move |x| SectionPos::new(x, y + 2, z)))
+            })
+            .collect();
+        let forward: Vec<LoadedCube> = cubes.iter().map(|&p| one.make_cube(p)).collect();
+        let backward: Vec<LoadedCube> = cubes.iter().rev().map(|&p| two.make_cube(p)).collect();
+        // The populations that touch the 3 x 3 x 3 block: 4 x 4 x 4 of them, each once.
+        assert_eq!(one.population_stats().populations, 64);
+        assert_eq!(two.population_stats().populations, 64);
+        // Overlapping veins can differ by who went first; nearly every block agrees.
+        let (mut same, mut total) = (0usize, 0usize);
+        for (x, y) in forward.iter().zip(backward.iter().rev()) {
+            let (bx, by) = (blocks_of(x), blocks_of(y));
+            same += bx.iter().zip(&by).filter(|(p, q)| p == q).count();
+            total += bx.len();
+        }
+        assert!(same * 1000 >= total * 995, "{same}/{total}");
+    }
+
+    #[test]
+    fn populated_flags_survive_a_reopen() {
+        let Some(f) = Fixture::new("flags") else {
+            return;
+        };
+        let pos = SectionPos::new(1, 3, 1);
+        let level = f.level_of(CubicKind::Custom);
+        let before = blocks_of(&level.make_cube(pos));
+        let runs = level.population_stats().populations;
+        assert_eq!(runs, 8);
+        level.flush();
+        drop(level);
+        let again = f.level_of(CubicKind::Custom);
+        for d in 0..8 {
+            let p = SectionPos::new(1 - (d & 1), 3 - (d >> 1 & 1), 1 - (d >> 2 & 1));
+            assert!(again.is_populated(p), "{p:?} was populated");
+        }
+        let after = blocks_of(&again.make_cube(pos));
+        assert_eq!(again.population_stats().populations, 0, "none run again");
+        assert_eq!(before, after);
+        // A cube only a neighbour's population wrote into is partial.
+        let partial = again
+            .read(SectionPos::new(2, 4, 2))
+            .map_or(0, |r| root_flags(&r));
+        assert_eq!(partial & POPULATED, 0);
+    }
+
+    #[test]
+    fn the_far_generators_parameters_come_from_the_generator() {
+        let Some(f) = Fixture::new("far") else {
+            return;
+        };
+        let level = f.level_of(CubicKind::Custom);
+        let setup = crate::cubic_lod::far_setup(&level, f.assets.registry).expect("terrain world");
+        let tables = level.generation().generator.noise_tables().unwrap();
+        for (desc, table) in setup.params.noises.iter().zip(&tables) {
+            assert_eq!(desc.octaves.len(), table.octaves.len());
+            assert_eq!(desc.factor, table.factor);
+            assert_eq!(desc.frequency, table.frequency);
+        }
+        let shape = level.generation().generator.density_shape().unwrap();
+        assert_eq!(setup.params.height_factor, shape[0]);
+        assert_eq!(setup.params.height_variation_offset, shape[3]);
+        assert_eq!(
+            setup.params.sea_level,
+            level.generation().generator.sea_level()
+        );
+        assert_eq!(setup.params.stone, f.state("minecraft:stone"));
+        assert_eq!(setup.params.deepslate, f.state("minecraft:deepslate"));
+        // The grass biome tops are grass.
+        let plains = usize::from(f.biomes.id("minecraft:plains"));
+        assert_eq!(
+            setup.params.biomes[plains].top,
+            f.state("minecraft:grass_block")
+        );
+        // A Flat world has nothing to evaluate.
+        assert!(
+            crate::cubic_lod::far_setup(&f.level_of(CubicKind::Flat), f.assets.registry).is_none()
+        );
     }
 }

@@ -320,6 +320,48 @@ impl LiveFeatures {
             }
         }
     }
+    /// `PlacedFeature.place` of a biome's root feature: the `biome` modifier
+    /// asks the world whether the biome at a position has `identity`.
+    pub fn place_placed_with_biome_check<W: FeatureWorld + PlacementContext>(
+        &self,
+        name: &str,
+        identity: super::feature_sort::FeatureIdentity,
+        world: &mut W,
+        random: &mut impl RandomSource,
+        origin: [i32; 3],
+    ) -> bool
+    where
+        W::Error: std::fmt::Display,
+    {
+        let Some(feature) = self.placed(name) else {
+            return false;
+        };
+        feature
+            .place_with_biome_check(world, random, origin, identity, self.blocks)
+            .unwrap_or(false)
+    }
+    /// The placed features of a biome's decoration step `step`, in the
+    /// biome's order (tags expanded); empty for an unknown biome.
+    pub fn biome_step_features(&self, biome: BiomeId, step: usize) -> Vec<String> {
+        if biome.0 as usize >= self.data.biome_names().len() {
+            return Vec::new();
+        }
+        let Ok(json) = serde_json::from_str::<Value>(self.data.biome_json(biome)) else {
+            return Vec::new();
+        };
+        let mut list = Vec::new();
+        let Some(step) = json["features"].get(step) else {
+            return list;
+        };
+        for entry in step.as_array().into_iter().flatten() {
+            if let Some(name) = entry.as_str()
+                && let Ok(name) = super::tags::identifier(name)
+            {
+                list.push(name);
+            }
+        }
+        list
+    }
     /// Temperature settings of a biome.
     pub fn biome_temperature(
         &self,

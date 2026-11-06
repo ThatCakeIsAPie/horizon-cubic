@@ -23,6 +23,12 @@ pub(crate) struct LevelFeatureWorld<'s, 'a, L: LevelAccess + ?Sized> {
     /// The entities a structure template placed (`add_entity`), for the caller
     /// to spawn.
     pub entities: Vec<crate::nbt::Compound>,
+    /// Population of a cube (`cubic::custom::vegetation`): whether the biome
+    /// at a position has the root feature being placed (the `biome`
+    /// placement modifier), and the surface blocks' Y range a heightmap may
+    /// answer with (`[low, high)`, so each surface belongs to one population).
+    pub gate: Option<&'s dyn Fn([i32; 3]) -> bool>,
+    pub surface: Option<(i32, i32)>,
 }
 
 fn pos([x, y, z]: [i32; 3]) -> BlockPos {
@@ -279,6 +285,17 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
         let stone = self.sim.b.default_of(self.sim.b.named.stone);
         Ok(self.sim.level.is_unobstructed(pos(position), stone))
     }
+    fn top_feature(&self) -> Option<crate::worldgen::feature_sort::FeatureIdentity> {
+        self.gate
+            .map(|_| crate::worldgen::feature_sort::FeatureIdentity(0))
+    }
+    fn biome_allows_feature(
+        &mut self,
+        position: [i32; 3],
+        _: crate::worldgen::feature_sort::FeatureIdentity,
+    ) -> Result<bool, PlacementQueryError> {
+        Ok(self.gate.is_some_and(|gate| gate(position)))
+    }
     fn biome_identity(&mut self, position: [i32; 3]) -> Result<BiomeId, PlacementQueryError> {
         self.sim
             .level
@@ -342,9 +359,48 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
                 }
             };
             if matches {
+                // A surface outside the population's range is another
+                // population's: nothing can be placed on it from here.
+                if let Some((low, high)) = self.surface
+                    && !(low..high).contains(&y)
+                {
+                    return Ok(min);
+                }
                 return Ok(y + 1);
             }
         }
         Ok(min)
     }
+}
+
+/// Places a biome's root placed feature on `level` for the population of a
+/// cube (`cubic::custom::vegetation`): the `biome` modifier asks `gate`, and
+/// heightmaps answer only for surface blocks with Y in `surface`.
+#[allow(clippy::too_many_arguments)]
+pub fn place_biome_feature<L: LevelAccess + ?Sized>(
+    behaviours: &super::Behaviours,
+    features: &LiveFeatures,
+    level: &mut L,
+    name: &str,
+    origin: [i32; 3],
+    random: &mut impl RandomSource,
+    gate: &dyn Fn([i32; 3]) -> bool,
+    surface: (i32, i32),
+) -> bool {
+    let mut ticks = super::Ticks::new(0);
+    let mut sim = behaviours.sim(level, &mut ticks);
+    let mut world = LevelFeatureWorld {
+        sim: &mut sim,
+        features,
+        entities: Vec::new(),
+        gate: Some(gate),
+        surface: Some(surface),
+    };
+    features.place_placed_with_biome_check(
+        name,
+        crate::worldgen::feature_sort::FeatureIdentity(0),
+        &mut world,
+        random,
+        origin,
+    )
 }

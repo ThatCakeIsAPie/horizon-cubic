@@ -1,8 +1,23 @@
 //! What a cubic level's far terrain is sampled from (docs/cubic-chunks.md):
 //! the cube octree (`lod::cube`) asks for a node of 16³ voxels, each
-//! `1 << level` blocks wide. Inside vanilla's -64..320 a voxel is read from
-//! the vanilla generator's far-terrain columns (one grid per node column, kept
-//! for the nodes above and below it); outside, from the cube generator.
+//! `1 << level` blocks wide.
+//!
+//! - Levels 0 and 1 come from saved cubes (what the player saw and built),
+//!   else from CubicWorldGen's density and replacers (`block_at`, no caves
+//!   or population).
+//! - Levels 2 and up come from `GpuCubeSampler` (`far`, built from the
+//!   generator's noise tables: [`far_setup`]), on the renderer's device when
+//!   [`CubicLodSampler::with_device`] gave it one, else its CPU reference.
+//!   Its 2D input, the node's columns, is made on the calling worker with
+//!   the CPU biome pass (`CpuBiomes`, the reference of `gfx/biome_gen`) when
+//!   the biome size is the default, else from the generator's own blend. The
+//!   GPU biome pass is not used: it cannot feed the 2D pre-pass (`classify`),
+//!   which settles most far nodes without any 3D noise, and the columns run on
+//!   the workers in parallel anyway.
+//! - A Hybrid world's vanilla band (-64..320) is read from the vanilla
+//!   generator's far-terrain columns (one grid per node column, kept for the
+//!   nodes above and below it); a node straddling the band's edge is sampled
+//!   per voxel from both.
 //!
 //! What was seen is kept (`lod::cube_cache`, `<dimension>/horizon_cube_lod/`):
 //! a node of level 1 made of saved cubes (the player's edits, vanilla's
@@ -14,20 +29,27 @@
 //! a cube) erases the stored nodes over a cube.
 //!
 //! Nodes also carry which columns have something solid over them
-//! (`CubeNode::column_covered`): the level's terrain over a node below its
-//! surface, the generator's islands over anything under them. The mesher
-//! darkens those voxels.
+//! (`CubeNode::column_covered`): terrain, overhangs or floating land over a
+//! node (probed with the generator's `block_at` at a few heights above it).
+//! The mesher darkens those voxels. Nodes generated on the GPU into pool
+//! slots carry none.
 
 use crate::cubic::CubicLevel;
+use crate::cubic_gen::{CubicKind, Generation};
+use crate::gfx::biome_gen::{BiomeTerrain, CpuBiomes};
+use crate::gfx::cube_gen::{
+    BiomeBlocks, ColumnFn, CubeGenParams, GpuBackend, GpuCubeSampler, NodeColumns, NoiseDesc,
+    OctaveDesc,
+};
 use crate::lod::Column;
 use crate::lod::cube::{
-    Changes, CoverMask, CubeKey, CubeNode, CubeSampler, Kind, Voxel, downsample,
+    Changes, CoverMask, CubeKey, CubeNode, CubeSampler, Kind, NodeClass, Resident, Voxel,
+    downsample,
 };
 use crate::lod::cube_cache::{CubeLodCache, MAX_CACHED_LEVEL};
 use crate::streaming::LodSampler;
 use horizon_core::position::SectionPos;
-use horizon_world::cubic::generator::CubeGenerator;
-use horizon_world::registry::BlockStateId;
+use horizon_world::registry::{BlockRegistry, BlockStateId};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -38,10 +60,10 @@ const VANILLA: std::ops::Range<i32> = -64..320;
 /// Nodes this level or finer get their sky cover worked out; coarser ones
 /// are drawn lit.
 const COVER_LEVEL: u8 = 8;
-/// How far above a node the islands that shade it are looked for, and the
-/// vertical spacing of the looks (an island is tens of blocks thick).
-const COVER_REACH: i32 = 1200;
-const COVER_STEP: i32 = 24;
+/// How far above a node's top the land that shades it is looked for: a few
+/// looks, spread wider the higher they go (a mountain's slope, an overhang,
+/// floating land).
+const COVER_LOOKS: [i32; 6] = [2, 12, 36, 100, 260, 600];
 
 /// A cubic level's far-terrain sampler (`CubeSampler`), one per far
 /// terrain thread.
@@ -49,52 +71,223 @@ pub struct CubicLodSampler {
     /// The level's saved cubes: the finest nodes are made of them where
     /// they are (the player's edits, vanilla's decorated terrain).
     level: Arc<CubicLevel>,
-    generator: Arc<CubeGenerator>,
+    wg: Arc<Generation>,
     vanilla: Box<dyn LodSampler>,
     air: u32,
     stone: u32,
     deepslate: u32,
     /// The states downsampling counts as fluid (water and lava sources).
     fluids: Vec<u32>,
-    deep_biome: u16,
-    sky_biome: u16,
     grids: VecDeque<((u8, i32, i32), Arc<Vec<Column>>)>,
     /// The level's kept nodes, shared by every sampler and the saves.
     cache: Option<Arc<CubeLodCache>>,
     /// How far this sampler has read the cache's changes.
     cursor: u64,
+    /// Levels 2 and up outside a Hybrid band: the GPU sampler (or its CPU
+    /// reference); `None` for a Flat world.
+    far: Option<Box<dyn CubeSampler>>,
+    /// What `far` is made of, to remake it on a device ([`Self::with_device`]).
+    far_setup: Option<FarSetup>,
+    /// The biome of air with no column to say (plains).
+    plains: u16,
+}
+
+/// The inputs of the far generator: parameters and the node columns.
+#[derive(Clone)]
+pub struct FarSetup {
+    pub params: CubeGenParams,
+    pub columns: ColumnFn,
+}
+
+/// The block state a name gives, air when unknown.
+fn state_of(registry: &BlockRegistry, name: &str) -> u32 {
+    registry.default_state(name).map_or(0, |s| s.0)
+}
+
+/// `CubeGenParams` and the column function of the level's generator, for
+/// `GpuCubeSampler`. `None` for a Flat world (nothing to evaluate). The
+/// per-biome tables are indexed by the client's biome ids (the ids nodes
+/// carry), mapped by name from the generator data's.
+pub fn far_setup(level: &CubicLevel, registry: &BlockRegistry) -> Option<FarSetup> {
+    let wg = level.generation();
+    let tables = wg.generator.noise_tables()?;
+    let shape = wg.generator.density_shape()?;
+    let desc = |t: &horizon_world::cubic::custom::NoiseTable| NoiseDesc {
+        factor: t.factor,
+        offset: t.offset,
+        frequency: t.frequency,
+        octaves: t
+            .octaves
+            .iter()
+            .map(|o| OctaveDesc {
+                permutations: o.permutations,
+                offsets: o.offsets,
+            })
+            .collect(),
+    };
+    let biomes = level.client_biomes();
+    // The client's biome names by id.
+    let mut names: Vec<&str> = vec!["minecraft:plains"; 256];
+    for (name, &id) in &biomes.index {
+        if let Some(slot) = names.get_mut(usize::from(id)) {
+            *slot = name;
+        }
+    }
+    let top = |name: &str| state_of(registry, &format!("minecraft:{name}"));
+    let infos: Vec<horizon_world::cubic::custom::biomes::BiomeInfo> = names
+        .iter()
+        .map(|n| horizon_world::cubic::custom::biomes::biome_info(n))
+        .collect();
+    let params = CubeGenParams {
+        noises: [
+            desc(&tables[0]),
+            desc(&tables[1]),
+            desc(&tables[2]),
+            desc(&tables[3]),
+        ],
+        height_factor: shape[0],
+        height_offset: shape[1],
+        height_variation_factor: shape[2],
+        height_variation_offset: shape[3],
+        below_average_factor: shape[4],
+        sea_level: wg.generator.sea_level(),
+        air: state_of(registry, "minecraft:air"),
+        stone: state_of(registry, "minecraft:stone"),
+        deepslate: state_of(registry, "minecraft:deepslate"),
+        water: state_of(registry, "minecraft:water"),
+        biomes: infos
+            .iter()
+            .map(|i| BiomeBlocks {
+                top: top(i.top),
+                filler: top(i.filler),
+            })
+            .collect(),
+        filler_depth: 3.0,
+        deepslate_from: 0.0,
+        deepslate_to: 8.0,
+    };
+    let scale = wg.settings.as_ref().map_or(1.0, |s| s.biome_scale());
+    let terrain: Vec<BiomeTerrain> = infos
+        .iter()
+        .map(|i| BiomeTerrain {
+            base_height: i.base_height,
+            height_variation: i.height_variation,
+        })
+        .collect();
+    let columns: ColumnFn = match (
+        &wg.climate,
+        scale == 1.0 && wg.settings.as_ref().is_some_and(|s| s.biome.is_empty()),
+    ) {
+        (Some(climate), true) => {
+            // The climate's biome ids are the generator data's: the index
+            // maps them to the client's by name.
+            let data = climate.data();
+            let entries = climate
+                .index()
+                .entries()
+                .iter()
+                .map(|(point, id)| {
+                    (
+                        *point,
+                        u32::from(
+                            biomes
+                                .id(data.biome_name(horizon_world::worldgen::biome::BiomeId(*id))),
+                        ),
+                    )
+                })
+                .collect();
+            let index =
+                Arc::new(horizon_world::worldgen::climate::ClimateIndex::new(entries).ok()?);
+            Arc::new(CpuBiomes::new(climate.climate().clone(), index, terrain)).column_fn()
+        }
+        _ => generator_columns(wg.clone(), biomes.clone()),
+    };
+    Some(FarSetup { params, columns })
+}
+
+/// A node's columns from the generator's own blend (`column_terrain`) and
+/// biome source, for worlds whose biomes the GPU pass does not reproduce
+/// (another biome size, a single biome).
+fn generator_columns(wg: Arc<Generation>, biomes: Arc<crate::biome::Biomes>) -> ColumnFn {
+    Arc::new(move |key: CubeKey| {
+        let origin = key.origin();
+        let step = 1i32 << key.level;
+        let mut columns = NodeColumns::flat(0.0, 0.0, 0);
+        for z in 0..16usize {
+            for x in 0..16usize {
+                let wx = origin[0] + x as i32 * step + step / 2;
+                let wz = origin[2] + z as i32 * step + step / 2;
+                let (h, v) = wg.generator.column_terrain(wx, wz).unwrap_or((0.0, 0.0));
+                columns.height[z * 16 + x] = h as f32;
+                columns.volatility[z * 16 + x] = v as f32;
+                let id = wg.columns.biome(wx >> 2, wz >> 2);
+                columns.biome[z * 16 + x] = biomes.id(wg.columns.biome_name(id));
+            }
+        }
+        columns
+    })
 }
 
 impl CubicLodSampler {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         level: Arc<CubicLevel>,
-        generator: Arc<CubeGenerator>,
         vanilla: Box<dyn LodSampler>,
-        air: u32,
-        stone: u32,
-        deepslate: u32,
-        fluids: Vec<u32>,
-        deep_biome: u16,
-        sky_biome: u16,
+        registry: &BlockRegistry,
         cache: Option<Arc<CubeLodCache>>,
     ) -> Self {
+        let id = |name: &str| state_of(registry, name);
+        let level_plains = level.client_biomes().id("minecraft:plains");
+        let far_setup = far_setup(&level, registry);
+        let far: Option<Box<dyn CubeSampler>> = far_setup.as_ref().map(|f| {
+            Box::new(GpuCubeSampler::cpu(f.params.clone(), f.columns.clone()))
+                as Box<dyn CubeSampler>
+        });
         Self {
+            wg: level.generation().clone(),
             level,
-            generator,
             vanilla,
-            air,
-            stone,
-            deepslate,
-            fluids,
-            deep_biome,
-            sky_biome,
+            air: id("minecraft:air"),
+            stone: id("minecraft:stone"),
+            deepslate: id("minecraft:deepslate"),
+            fluids: vec![id("minecraft:water"), id("minecraft:lava")],
             grids: VecDeque::new(),
             cursor: cache.as_ref().map_or(0, |c| c.cursor()),
             cache,
+            far,
+            far_setup,
+            plains: level_plains,
         }
     }
 
+    /// The far generator on the renderer's device and queue (levels 2 and up
+    /// then generate there, and the renderer can mesh and draw the nodes
+    /// without reading them back). Without compute shaders there it stays
+    /// the CPU reference.
+    pub fn with_device(mut self, device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        if let Some(f) = &self.far_setup {
+            self.far = Some(Box::new(GpuCubeSampler::new(
+                device,
+                queue,
+                f.params.clone(),
+                f.columns.clone(),
+            )));
+        }
+        self
+    }
+
+    /// Whether node `key` overlaps a Hybrid world's vanilla band.
+    fn in_band(&self, key: CubeKey) -> bool {
+        self.wg.kind == CubicKind::Hybrid && in_vanilla(key)
+    }
+
+    /// Whether the far generator makes node `key`: level 2 or up, and none
+    /// of it vanilla's.
+    fn far_makes(&self, key: CubeKey) -> bool {
+        self.far.is_some() && key.level >= 2 && !self.in_band(key)
+    }
+}
+
+impl CubicLodSampler {
     /// The vanilla far columns under node column (`level`, `x`, `z`): 16 x 16,
     /// one at each voxel's centre.
     fn grid(&mut self, key: CubeKey) -> Arc<Vec<Column>> {
@@ -133,7 +326,7 @@ impl CubicLodSampler {
         }
         Voxel {
             state: BlockStateId(self.air),
-            biome: column.surface.map_or(self.sky_biome, |s| s.biome),
+            biome: column.surface.map_or(self.plains, |s| s.biome),
         }
     }
 }
@@ -204,7 +397,7 @@ impl CubicLodSampler {
                 let (cover, exact) = self.cover_of(key);
                 // Inside vanilla's range, cubes not saved yet are the far
                 // columns' guess: the node waits until they are.
-                let keep = exact && (all_saved || !in_vanilla(key));
+                let keep = exact && (all_saved || !self.in_band(key));
                 Some((node.with_covered(cover), keep))
             }
             _ => None,
@@ -220,15 +413,17 @@ impl CubicLodSampler {
     /// Which columns of node `key` have something solid over the node, and
     /// whether that is certain (vanilla's far columns can be missing yet).
     ///
-    /// Below vanilla's range everything is under its terrain. Inside it a
-    /// column is covered when the vanilla far column rises above the node.
-    /// From the node's top (or vanilla's top) upward the generator is asked
-    /// for blocks a few dozen blocks apart for [`COVER_REACH`] blocks: its
-    /// islands. Coarse nodes are not shaded.
+    /// In a Hybrid world, below the vanilla band everything is under its
+    /// terrain, and inside it a column is covered when the vanilla far
+    /// column rises above the node. From the node's top (or the band's top)
+    /// upward the generator is asked for blocks at a few heights
+    /// ([`COVER_LOOKS`]): terrain, overhangs, floating land. Coarse nodes
+    /// are not shaded.
     fn cover_of(&mut self, key: CubeKey) -> (Option<Box<CoverMask>>, bool) {
+        let hybrid = self.wg.kind == CubicKind::Hybrid;
         let origin = key.origin();
         let top = origin[1].saturating_add(key.size());
-        if top <= VANILLA.start {
+        if hybrid && top <= VANILLA.start {
             return (Some(Box::new([u64::MAX; 4])), true);
         }
         if key.level > COVER_LEVEL {
@@ -236,7 +431,7 @@ impl CubicLodSampler {
         }
         let mut mask = Box::new([0u64; 4]);
         let mut exact = true;
-        if origin[1] < VANILLA.end {
+        if hybrid && origin[1] < VANILLA.end {
             let grid = self.grid(key);
             if grid.len() == 256 {
                 for (i, column) in grid.iter().enumerate() {
@@ -248,18 +443,14 @@ impl CubicLodSampler {
                 exact = false;
             }
         }
-        let generator = self.generator.clone();
-        let air = self.air;
-        cover_columns(
-            origin,
-            key.level,
-            top.max(VANILLA.end),
-            &mut mask,
-            |x, y, z| {
-                let state = generator.block_at(x, y, z);
-                state != 0 && state != air
-            },
-        );
+        let generator = self.wg.generator.clone();
+        let (air, fluids) = (self.air, self.fluids.clone());
+        let resolution = 1i32 << key.level;
+        let start = if hybrid { top.max(VANILLA.end) } else { top };
+        cover_columns(origin, key.level, start, &mut mask, |x, y, z| {
+            let state = generator.block_at(x, y, z, resolution);
+            state != 0 && state != air && !fluids.contains(&state)
+        });
         (Some(mask), exact)
     }
 
@@ -304,7 +495,7 @@ impl CubicLodSampler {
     }
 }
 
-/// Whether node `key` lies within vanilla's generated range.
+/// Whether node `key` overlaps vanilla's generated range (-64..320).
 fn in_vanilla(key: CubeKey) -> bool {
     let low = key.origin()[1];
     low.saturating_add(key.size()) > VANILLA.start && low < VANILLA.end
@@ -321,9 +512,9 @@ fn unchanged(cache: &CubeLodCache, key: CubeKey, since: u64) -> bool {
 }
 
 /// Sets the bit of each column of the node at `origin` (`16 << level` blocks
-/// wide) that has a solid block (`solid(x, y, z)`) somewhere over `start`,
-/// looking every [`COVER_STEP`] blocks up to [`COVER_REACH`]. A voxel wider
-/// than 32 blocks is looked at in its four quarters.
+/// wide) that has a solid block (`solid(x, y, z)`) at one of the
+/// [`COVER_LOOKS`] heights over `start`. A voxel wider than 32 blocks is
+/// looked at in its four quarters.
 fn cover_columns(
     origin: [i32; 3],
     level: u8,
@@ -345,8 +536,9 @@ fn cover_columns(
                 offsets.iter().any(|&dx| {
                     let wx = origin[0] + x as i32 * step + dx;
                     let wz = origin[2] + z as i32 * step + dz;
-                    (0..COVER_REACH / COVER_STEP)
-                        .any(|k| solid(wx, start + COVER_STEP / 3 + k * COVER_STEP, wz))
+                    COVER_LOOKS
+                        .iter()
+                        .any(|&up| solid(wx, start.saturating_add(up), wz))
                 })
             });
             if covered {
@@ -374,11 +566,43 @@ impl CubeSampler for CubicLodSampler {
             return Some(node);
         }
         let node = self.sampled(key)?;
-        // The generator is exact outside vanilla's range.
-        if key.level == 1 && !in_vanilla(key) {
+        // The generator is exact outside a Hybrid world's band (and
+        // everywhere in the others).
+        if key.level == 1 && !self.in_band(key) {
             self.keep(&node, since);
         }
         Some(node)
+    }
+
+    /// Levels 2 and up outside the band stay in the GPU pool when the far
+    /// generator runs on the renderer's device; saved cubes and kept nodes
+    /// still come first.
+    fn resident(&mut self, key: CubeKey) -> Option<Resident> {
+        if self.far_makes(key) {
+            let since = self.cache.as_ref().map_or(0, |c| c.cursor());
+            if let Some(node) = self.cache.as_ref().and_then(|c| c.get(key)) {
+                return Some(Resident::Node(node));
+            }
+            if let Some(node) = self.of_cached_children(key, since) {
+                return Some(Resident::Node(node));
+            }
+            return self.far.as_mut()?.resident(key);
+        }
+        self.node(key).map(Resident::Node)
+    }
+
+    fn classify(&mut self, key: CubeKey) -> NodeClass {
+        if self.far_makes(key) {
+            return self
+                .far
+                .as_mut()
+                .map_or(NodeClass::Mixed, |far| far.classify(key));
+        }
+        NodeClass::Mixed
+    }
+
+    fn gpu(&self) -> Option<GpuBackend> {
+        self.far.as_ref()?.gpu()
     }
 
     fn changes(&mut self) -> Changes {
@@ -391,17 +615,21 @@ impl CubeSampler for CubicLodSampler {
     fn fork(&self) -> Option<Box<dyn CubeSampler>> {
         Some(Box::new(Self {
             level: self.level.clone(),
-            generator: self.generator.clone(),
+            wg: self.wg.clone(),
             vanilla: self.vanilla.fork()?,
             air: self.air,
             stone: self.stone,
             deepslate: self.deepslate,
             fluids: self.fluids.clone(),
-            deep_biome: self.deep_biome,
-            sky_biome: self.sky_biome,
             grids: VecDeque::new(),
             cursor: self.cache.as_ref().map_or(0, |c| c.cursor()),
             cache: self.cache.clone(),
+            far: match &self.far {
+                Some(far) => Some(far.fork()?),
+                None => None,
+            },
+            far_setup: self.far_setup.clone(),
+            plains: self.plains,
         }))
     }
 }
@@ -409,24 +637,29 @@ impl CubeSampler for CubicLodSampler {
 impl CubicLodSampler {
     /// A node sampled from the generators at its own resolution.
     fn sampled(&mut self, key: CubeKey) -> Option<CubeNode> {
+        // Levels 2 and up outside the band: the far generator.
+        if self.far_makes(key)
+            && let Some(node) = self.far.as_mut().and_then(|far| far.node(key))
+        {
+            return Some(self.covered(node));
+        }
         let origin = key.origin();
         let size = key.size();
         let step = 1i32 << key.level;
         let half = step / 2;
         let low = origin[1];
         let high = origin[1].saturating_add(size);
-        // A node wholly above the sky's first islands' band or in the deep
-        // with nothing but deepslate around: one voxel.
-        let grid = (high > VANILLA.start && low < VANILLA.end).then(|| self.grid(key));
+        let band = self.wg.kind == CubicKind::Hybrid;
+        let grid = (band && high > VANILLA.start && low < VANILLA.end).then(|| self.grid(key));
         if let Some(grid) = &grid
             && grid.len() < 256
         {
             // The vanilla columns aren't ready: try again later.
             return None;
         }
-        let generator = self.generator.clone();
-        let (air, deepslate) = (self.air, self.deepslate);
-        let (deep_biome, sky_biome) = (self.deep_biome, self.sky_biome);
+        let generator = self.wg.generator.clone();
+        let air = self.air;
+        let level = self.level.clone();
         let node = CubeNode::from_fn(key, |x, y, z| {
             let wy = low + y as i32 * step + half;
             if let Some(grid) = &grid
@@ -436,23 +669,10 @@ impl CubicLodSampler {
             }
             let wx = origin[0] + x as i32 * step + half;
             let wz = origin[2] + z as i32 * step + half;
-            if wy < VANILLA.start {
-                // Coarse deep voxels are solid: caves there are never seen
-                // from afar, and each would be faces to draw.
-                let state = if step >= 4 {
-                    deepslate
-                } else {
-                    generator.block_at(wx, wy, wz)
-                };
-                return Voxel {
-                    state: BlockStateId(state),
-                    biome: deep_biome,
-                };
-            }
-            let state = generator.block_at(wx, wy, wz);
+            let state = generator.block_at(wx, wy, wz, step);
             Voxel {
                 state: BlockStateId(if state == 0 { air } else { state }),
-                biome: sky_biome,
+                biome: level.biome_id_at(wx, wz),
             }
         });
         Some(self.covered(node))
@@ -469,10 +689,10 @@ mod tests {
     }
 
     #[test]
-    fn an_island_shades_the_columns_under_it() {
-        // A slab of rock over x, z 40..80, 500 blocks above the node.
+    fn land_over_a_node_shades_the_columns_under_it() {
+        // A thick slab over x, z 40..80, 90 to 400 blocks over the node's top.
         let slab = |x: i32, y: i32, z: i32| {
-            (40..80).contains(&x) && (40..80).contains(&z) && (500..510).contains(&y)
+            (40..80).contains(&x) && (40..80).contains(&z) && (154..464).contains(&y)
         };
         // Level 2: voxels 4 blocks wide, the node 64 blocks, top at 64.
         let mut mask = [0u64; 4];
@@ -488,20 +708,20 @@ mod tests {
         let mut mask = [0u64; 4];
         cover_columns([0, 0, 0], 2, 600, &mut mask, slab);
         assert_eq!(mask, [0; 4]);
-        // Beyond the reach nothing counts.
+        // Beyond the looks' reach nothing counts.
         let mut mask = [0u64; 4];
-        let far = |_: i32, y: i32, _: i32| y > 64 + COVER_REACH + 100;
+        let far = |_: i32, y: i32, _: i32| y > 64 + COVER_LOOKS[5] + 100;
         cover_columns([0, 0, 0], 2, 64, &mut mask, far);
         assert_eq!(mask, [0; 4]);
     }
 
     #[test]
-    fn a_wide_voxel_is_shaded_by_an_island_over_part_of_it() {
+    fn a_wide_voxel_is_shaded_by_land_over_part_of_it() {
         // Level 6: voxels 64 blocks wide, looked at in quarters (16 and 48).
         let pillar =
             |x: i32, y: i32, z: i32| (10..20).contains(&x) && (10..20).contains(&z) && y > 1000;
         let mut mask = [0u64; 4];
-        cover_columns([0, 0, 0], 6, 1024, &mut mask, pillar);
+        cover_columns([0, 0, 0], 6, 1024 - 3, &mut mask, pillar);
         assert!(covered(&mask, 0, 0));
         assert!(!covered(&mask, 1, 0));
     }

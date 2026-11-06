@@ -14,7 +14,7 @@
 //! (`Hub::cubic_window_changed`).
 use super::persist::EntityScope;
 use super::{Dim, Game};
-use horizon_client::cubic::{self, LoadedCube, VANILLA_CUBES};
+use horizon_client::cubic::{self, LoadedCube};
 use horizon_client::fast_hash::FxHashSet;
 use horizon_core::position::{BlockPos, ChunkPos, SectionPos};
 use horizon_core::ticks::TickArea;
@@ -151,7 +151,7 @@ impl Game<'_> {
 
         // 1. Columns without their vanilla range cannot get its cubes from the
         // ring or the generator: they go through the streaming again.
-        let redo: HashSet<(i32, i32)> = if entering.iter().any(|cy| VANILLA_CUBES.contains(cy)) {
+        let redo: HashSet<(i32, i32)> = if entering.iter().any(|&cy| level.is_vanilla(cy)) {
             columns
                 .iter()
                 .copied()
