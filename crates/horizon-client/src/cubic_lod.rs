@@ -73,11 +73,8 @@ impl CubicLodSampler {
         }
         let origin = key.origin();
         let step = 1i32 << key.level;
-        let half = step / 2;
-        let grid = Arc::new(
-            self.vanilla
-                .grid(origin[0] + half, origin[2] + half, step, 16),
-        );
+        // The sampler takes each cell's corner and samples its centre.
+        let grid = Arc::new(self.vanilla.grid(origin[0], origin[2], step, 16));
         if self.grids.len() >= KEPT_GRIDS {
             self.grids.pop_front();
         }

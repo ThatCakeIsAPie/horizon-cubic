@@ -800,6 +800,17 @@ fn mesh_voxels(
                                 continue;
                             }
                         }
+                    } else {
+                        // A fluid's faces on the node's edge are inside the
+                        // water the next node goes on with: drawn, they show
+                        // through it as a grid.
+                        let (_, own_fluid) = *hiding.entry(voxel.state.0).or_insert_with(|| {
+                            let m = material(&own, Direction::Up, at);
+                            (m.opaque, m.fluid)
+                        });
+                        if own_fluid != 0 {
+                            continue;
+                        }
                     }
                     let (a, b, plane) = match direction {
                         Direction::Up => (x, z, y + 1),
@@ -2098,5 +2109,8 @@ mod cube_tests {
             .flat_map(|x| (0..16).map(move |z| ([x, 0, z], STONE)))
             .collect();
         assert_eq!(quads(&mesh(&node(0, &sheet)).solid).len(), 6);
+        // Water is not walled in at the edge: the next node's water goes on.
+        let corner = node(0, &[([0, 0, 0], WATER)]);
+        assert_eq!(quads(&mesh(&corner).translucent).len(), 3);
     }
 }
