@@ -47,6 +47,8 @@ impl Behaviours {
                 sim: &mut sim,
                 features,
                 entities: Vec::new(),
+            gate: None,
+            surface: None,
             };
             let unbounded =
                 crate::worldgen::structure::BoundingBox::new([i32::MIN; 3], [i32::MAX; 3]);
@@ -108,6 +110,8 @@ impl Behaviours {
                 sim: &mut sim,
                 features,
                 entities: Vec::new(),
+            gate: None,
+            surface: None,
             };
             let mut place_feature =
                 |w: &mut LevelFeatureWorld<'_, '_, L>,
@@ -278,6 +282,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 sim: self,
                 features,
                 entities: Vec::new(),
+            gate: None,
+            surface: None,
             };
             features.place_configured(name, &mut world, &mut random, [pos.x, pos.y, pos.z])
         };
@@ -296,6 +302,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 sim: self,
                 features,
                 entities: Vec::new(),
+            gate: None,
+            surface: None,
             };
             features.place_placed(name, &mut world, &mut random, [pos.x, pos.y, pos.z])
         };

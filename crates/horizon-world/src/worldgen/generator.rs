@@ -653,6 +653,11 @@ impl GeneratorData {
     pub fn registry(&self) -> &'static BlockRegistry {
         self.registry
     }
+    /// The block behaviours the bundle came with (`block-behaviours.json`),
+    /// when it had them.
+    pub fn behaviours(&self) -> Option<&Arc<crate::level::Behaviours>> {
+        self.behaviours.as_ref()
+    }
     /// What loading the data packs' entries left out (tags naming what is
     /// missing), for the log.
     pub fn warnings(&self) -> &[String] {
@@ -4106,6 +4111,9 @@ impl GeneratorWorker {
         state.heights = HashMap::new();
     }
 }
+
+mod overworld_climate;
+pub use overworld_climate::OverworldClimate;
 
 #[cfg(test)]
 mod tests {

@@ -48,16 +48,19 @@ use crate::registry::BlockRegistry;
 
 pub mod biomes;
 pub mod carvers;
+pub mod climate_biomes;
 pub mod density;
 pub mod flat;
 pub mod populate;
 pub mod replacers;
 pub mod rng;
 pub mod settings;
+pub mod vegetation;
 #[doc(hidden)]
 pub mod testing;
 
 pub use biomes::{BiomeColumns, FixedBiome};
+pub use climate_biomes::ClimateBiomes;
 pub use density::{NoiseTable, OctaveTable};
 pub use populate::CubeWorld;
 pub use settings::{CustomGeneratorSettings, FlatGeneratorSettings};

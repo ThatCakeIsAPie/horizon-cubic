@@ -156,6 +156,8 @@ impl Behaviours {
             sim: &mut sim,
             features,
             entities: Vec::new(),
+            gate: None,
+            surface: None,
         };
         let at = [pos.x, pos.y, pos.z];
         let placed = place_in_world(

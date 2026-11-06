@@ -261,6 +261,30 @@ impl PlacedFeatureDefinition {
             },
         )
     }
+    /// As [`Self::place`] for a root feature of a biome's list: the `biome`
+    /// placement modifier asks the world `biome_allows_feature` for `identity`.
+    pub fn place_with_biome_check<W: FeatureWorld + PlacementContext>(
+        &self,
+        world: &mut W,
+        random: &mut impl RandomSource,
+        origin: [i32; 3],
+        identity: super::feature_sort::FeatureIdentity,
+        blocks: FeatureBlocks,
+    ) -> Result<bool, FeatureExecutionError<W::Error>> {
+        let run = Run {
+            blocks,
+            depth: Cell::new(0),
+            remaining: Cell::new(65536),
+        };
+        Ok(FeaturePlacer::new().place_with_biome_check(
+            &self.placement,
+            world,
+            random,
+            origin,
+            identity,
+            |world, random, p| self.feature.place_inner(world, random, p, &run),
+        )?)
+    }
     fn place_in<W: FeatureWorld + PlacementContext>(
         &self,
         placer: &mut FeaturePlacer,
