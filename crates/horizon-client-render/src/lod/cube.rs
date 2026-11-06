@@ -338,6 +338,12 @@ pub trait CubeSampler: Send {
     fn resident(&mut self, key: CubeKey) -> Option<Resident> {
         self.node(key).map(Resident::Node)
     }
+    /// [`CubeSampler::resident`] for many nodes at once, in order. A sampler
+    /// whose generator batches (the GPU's) answers them in one request, so a
+    /// worker keeps the GPU's batches full instead of waiting on one node.
+    fn resident_many(&mut self, keys: &[CubeKey]) -> Vec<Option<Resident>> {
+        keys.iter().map(|&key| self.resident(key)).collect()
+    }
     /// What the sampler knows of the whole node without sampling it (the GPU
     /// generator's 2D pre-pass): lets the planner leave out subtrees of air
     /// and stop at rock. Called on a background thread; the default knows
@@ -1456,15 +1462,27 @@ fn work(
     let mut mesher = Mesher::default();
     let kind = classifier(&context, air);
     loop {
-        let key = {
+        let gpu = backend
+            .as_ref()
+            .filter(|_| shared.gpu_path.load(Ordering::Relaxed));
+        // On the GPU path a worker takes a batch of the nearest jobs and asks
+        // the sampler for them at once (`resident_many`); on the CPU path one.
+        let take = if gpu.is_some() { GPU_BATCH } else { 1 };
+        let keys: Vec<CubeKey> = {
             let mut queue = shared.queue.lock().unwrap();
             loop {
                 if shared.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                if let Some(key) = queue.jobs.pop_front() {
-                    queue.running.insert(key);
-                    break key;
+                if !queue.jobs.is_empty() {
+                    let mut keys = Vec::with_capacity(take.min(queue.jobs.len()));
+                    while keys.len() < take
+                        && let Some(key) = queue.jobs.pop_front()
+                    {
+                        queue.running.insert(key);
+                        keys.push(key);
+                    }
+                    break keys;
                 }
                 queue = shared.wake.wait(queue).unwrap();
             }
@@ -1474,26 +1492,49 @@ fn work(
             Changes::Cubes(cubes) => shared.cache.lock().unwrap().forget(&cubes),
             Changes::All => shared.cache.lock().unwrap().nodes.clear(),
         }
-        let gpu = backend
-            .as_ref()
-            .filter(|_| shared.gpu_path.load(Ordering::Relaxed));
-        let product = match gpu {
-            Some(backend) => {
-                gpu_node(&shared, sampler.as_mut(), key, air, &kind, backend).map(Product::Gpu)
+        let mut fetched: FxHashMap<CubeKey, Option<Resident>> = FxHashMap::default();
+        if gpu.is_some() && !shared.stop.load(Ordering::Relaxed) {
+            let uncached: Vec<CubeKey> = {
+                let mut cache = shared.cache.lock().unwrap();
+                keys.iter()
+                    .copied()
+                    .filter(|&k| cache.get(k).is_none())
+                    .collect()
+            };
+            if !uncached.is_empty() {
+                let answers = sampler.resident_many(&uncached);
+                fetched.extend(uncached.into_iter().zip(answers));
             }
-            None => node(&shared, sampler.as_mut(), key, air, &kind).map(|node| {
-                let mut mesh = SectionMesh::default();
-                mesh::mesh_cube(&mut mesher, &node, air, &context, &mut mesh);
-                mesh.sort_solid();
-                Product::Mesh(mesh)
-            }),
-        };
-        shared.queue.lock().unwrap().running.remove(&key);
-        if tx.send(Done { key, product }).is_err() {
-            return;
+        }
+        for key in keys {
+            let product = match gpu {
+                Some(backend) => gpu_node(
+                    &shared,
+                    sampler.as_mut(),
+                    key,
+                    air,
+                    &kind,
+                    backend,
+                    fetched.remove(&key),
+                )
+                .map(Product::Gpu),
+                None => node(&shared, sampler.as_mut(), key, air, &kind).map(|node| {
+                    let mut mesh = SectionMesh::default();
+                    mesh::mesh_cube(&mut mesher, &node, air, &context, &mut mesh);
+                    mesh.sort_solid();
+                    Product::Mesh(mesh)
+                }),
+            };
+            shared.queue.lock().unwrap().running.remove(&key);
+            if tx.send(Done { key, product }).is_err() {
+                return;
+            }
         }
     }
 }
+
+/// Jobs a worker on the GPU path takes and asks for at once.
+const GPU_BATCH: usize = 64;
 
 /// A CPU node as a [`GpuNode`]: uniform and uncovered ones need no slot, the
 /// rest are uploaded into one. `None` when the pool is full.
@@ -1529,6 +1570,8 @@ fn gpu_from_node(node: &CubeNode, air: BlockStateId, backend: &GpuBackend) -> Op
 /// The node at `key` for the GPU path: a slot the GPU generated it into, or a
 /// CPU node (saved cubes, downsampled fine levels, the pre-pass's uniform
 /// ones) uploaded to one.
+/// `fetched` is the sampler's answer when the worker already asked for it in
+/// a batch (`Some`, which may be `None`); otherwise it is asked here.
 fn gpu_node(
     shared: &Shared,
     sampler: &mut dyn CubeSampler,
@@ -1536,15 +1579,26 @@ fn gpu_node(
     air: BlockStateId,
     kind: &impl Fn(BlockStateId) -> Kind,
     backend: &GpuBackend,
+    fetched: Option<Option<Resident>>,
 ) -> Option<GpuNode> {
     let cached = shared.cache.lock().unwrap().get(key);
     if let Some(node) = cached {
+        if let Some(Some(Resident::Slot(slot))) = fetched {
+            backend.pool.free(slot);
+        }
         return gpu_from_node(&node, air, backend);
     }
     if shared.stop.load(Ordering::Relaxed) {
+        if let Some(Some(Resident::Slot(slot))) = fetched {
+            backend.pool.free(slot);
+        }
         return None;
     }
-    match sampler.resident(key) {
+    let answer = match fetched {
+        Some(answer) => answer,
+        None => sampler.resident(key),
+    };
+    match answer {
         Some(Resident::Slot(slot)) => Some(GpuNode {
             key,
             content: GpuContent::Slot(slot),

@@ -1542,6 +1542,10 @@ impl CubeSampler for GpuCubeSampler {
         self.request_resident(&[key], true).pop().flatten()
     }
 
+    fn resident_many(&mut self, keys: &[CubeKey]) -> Vec<Option<Resident>> {
+        self.request_resident(keys, true)
+    }
+
     fn gpu(&self) -> Option<GpuBackend> {
         self.backend.clone()
     }

@@ -594,6 +594,37 @@ impl CubeSampler for CubicLodSampler {
         self.node(key).map(Resident::Node)
     }
 
+    /// The far generator's nodes in one request (it batches them on the
+    /// GPU); kept nodes, saved cubes and the rest one by one, as `resident`.
+    fn resident_many(&mut self, keys: &[CubeKey]) -> Vec<Option<Resident>> {
+        let mut out: Vec<Option<Resident>> = (0..keys.len()).map(|_| None).collect();
+        let mut far_keys = Vec::new();
+        let mut far_places = Vec::new();
+        for (i, &key) in keys.iter().enumerate() {
+            if self.far_makes(key) {
+                let since = self.cache.as_ref().map_or(0, |c| c.cursor());
+                if let Some(node) = self.cache.as_ref().and_then(|c| c.get(key)) {
+                    out[i] = Some(Resident::Node(node));
+                } else if let Some(node) = self.of_cached_children(key, since) {
+                    out[i] = Some(Resident::Node(node));
+                } else {
+                    far_keys.push(key);
+                    far_places.push(i);
+                }
+            } else {
+                out[i] = self.node(key).map(Resident::Node);
+            }
+        }
+        if !far_keys.is_empty()
+            && let Some(far) = self.far.as_mut()
+        {
+            for (i, answer) in far_places.into_iter().zip(far.resident_many(&far_keys)) {
+                out[i] = answer;
+            }
+        }
+        out
+    }
+
     fn classify(&mut self, key: CubeKey) -> NodeClass {
         if self.far_makes(key) {
             return self

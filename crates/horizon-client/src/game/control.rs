@@ -1513,6 +1513,11 @@ impl Game<'_> {
                     "pool_bytes": s.pool_bytes,
                     "complete": s.complete,
                     "gpu_path": lod.on_gpu_path(),
+                "descent_runs": s.descent_runs,
+                "descent_uniform": s.descent_uniform,
+                "descent_leaves": s.descent_leaves,
+                "descent_ms": s.descent_ms,
+                "descent_overflow": s.descent_overflow,
                     "plan_changed_ago_s": ago(s.plan_changed),
                     "plan_complete_ago_s": ago(s.plan_complete),
                     "fill_s": match (s.plan_changed, s.plan_complete) {
