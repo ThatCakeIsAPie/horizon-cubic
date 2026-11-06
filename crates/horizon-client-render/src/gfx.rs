@@ -1270,6 +1270,10 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     sections: resident::Resident<SectionGpu>,
     lods: HashMap<crate::lod::TileKey, lod::Tile>,
+    /// Far terrain of a cubic level (`lod::cube`): octree nodes drawn like `lods`.
+    lod_cubes: HashMap<crate::lod::cube::CubeKey, lod::Tile>,
+    /// Finished node meshes `upload_cube_lods` has yet to upload.
+    cube_pending: Option<lod::CubePending>,
     /// Far tiles' occlusion culling slots (`lod::Tile::cull_slot`): those
     /// free, and the next never used.
     lod_cull_free: Vec<u32>,
@@ -2301,6 +2305,7 @@ impl Renderer {
     pub fn lod_quads(&self) -> u64 {
         self.lods
             .values()
+            .chain(self.lod_cubes.values())
             .map(|tile| u64::from(tile.mesh.solid + tile.mesh.translucent))
             .sum()
     }
@@ -2325,6 +2330,7 @@ impl Renderer {
             .sections
             .values()
             .chain(self.lods.values().map(|tile| &tile.mesh))
+            .chain(self.lod_cubes.values().map(|tile| &tile.mesh))
             .map(|s| s.solid_slots + u64::from(s.translucent) * 4)
             .sum();
         let translucent = self.translucent_arena.as_ref();
@@ -2353,7 +2359,11 @@ impl Renderer {
             ),
             (
                 "far_tile_vertices",
-                self.lods.values().map(|tile| used(&tile.mesh)).sum(),
+                self.lods
+                    .values()
+                    .chain(self.lod_cubes.values())
+                    .map(|tile| used(&tile.mesh))
+                    .sum(),
             ),
             ("quad_indices", self.indices.size()),
             ("block_sprites", textures(&self.sprite_textures)),
@@ -4659,6 +4669,8 @@ impl Renderer {
             depth,
             sections: resident::Resident::default(),
             lods: HashMap::new(),
+            lod_cubes: HashMap::new(),
+            cube_pending: None,
             lod_cull_free: Vec::new(),
             lod_cull_next: 0,
             lod_cutout: Default::default(),
@@ -5619,7 +5631,12 @@ impl Renderer {
         let meshes = self
             .sections
             .values_mut()
-            .chain(self.lods.values_mut().flat_map(|tile| tile.meshes_mut()));
+            .chain(self.lods.values_mut().flat_map(|tile| tile.meshes_mut()))
+            .chain(
+                self.lod_cubes
+                    .values_mut()
+                    .flat_map(|tile| tile.meshes_mut()),
+            );
         let flat = self
             .flat
             .as_mut()
@@ -5662,7 +5679,12 @@ impl Renderer {
                 let meshes = self
                     .sections
                     .values_mut()
-                    .chain(self.lods.values_mut().flat_map(|tile| tile.meshes_mut()));
+                    .chain(self.lods.values_mut().flat_map(|tile| tile.meshes_mut()))
+                    .chain(
+                        self.lod_cubes
+                            .values_mut()
+                            .flat_map(|tile| tile.meshes_mut()),
+                    );
                 match begin_shrink(arena, &self.device, meshes, *part) {
                     Some(true) => break,
                     Some(false) => wait = SHRINK_RETRY, // the other arena may still go
@@ -5686,7 +5708,12 @@ impl Renderer {
         let meshes = self
             .sections
             .values_mut()
-            .chain(self.lods.values_mut().flat_map(|tile| tile.meshes_mut()));
+            .chain(self.lods.values_mut().flat_map(|tile| tile.meshes_mut()))
+            .chain(
+                self.lod_cubes
+                    .values_mut()
+                    .flat_map(|tile| tile.meshes_mut()),
+            );
         // As many quads a frame either way: a quad's indices are a quarter of its bytes.
         let cap = match part {
             Part::Indices => COMPACT_BUDGET / 4,
@@ -5835,6 +5862,8 @@ impl Renderer {
         self.block_entity_revision = next_block_entity_revision();
         self.sections.clear();
         self.lods.clear();
+        self.lod_cubes.clear();
+        self.cube_pending = None;
         self.lod_cutout.clear();
         self.lod_retiring.clear();
         self.lod_leaving.clear();
@@ -5881,8 +5910,11 @@ impl Renderer {
         if split == self.translucent_arena.is_some() {
             return;
         }
-        self.sections_dropped |=
-            self.sections.len() > 0 || !self.lods.is_empty() || self.lod_pending.is_some();
+        self.sections_dropped |= self.sections.len() > 0
+            || !self.lods.is_empty()
+            || !self.lod_cubes.is_empty()
+            || self.lod_pending.is_some()
+            || self.cube_pending.is_some();
         self.clear_sections(self.layout);
         (self.sorted_indices, self.translucent_arena) = arena::Arena::translucent_arenas(
             &self.device,
@@ -7624,11 +7656,12 @@ impl Renderer {
         if frame.title {
             visible.clear();
         } else {
-            visible_lods.extend(
-                self.lods
-                    .iter()
-                    .filter_map(|(&key, tile)| tile.visible(key, camera, &view, now)),
-            );
+            visible_lods.extend(self.lods.iter().filter_map(|(&key, tile)| {
+                tile.visible(lod::FarKey::Tile(key), camera, &view, now)
+            }));
+            visible_lods.extend(self.lod_cubes.iter().filter_map(|(&key, tile)| {
+                tile.visible(lod::FarKey::Cube(key), camera, &view, now)
+            }));
             visible_lods.sort_unstable_by_key(|v| (v.distance, v.key));
         }
         let mut shadow_visible = std::mem::take(&mut self.shadow_visible);
@@ -7702,7 +7735,7 @@ impl Renderer {
                 }
             }
             for v in &visible_lods {
-                if let Some(tile) = self.lods.get(&v.key) {
+                if let Some(tile) = lod::far_tile(&self.lods, &self.lod_cubes, v.key) {
                     for &layer in &*tile.drawn().animated_layers {
                         let layer = layer as usize;
                         self.active_animated_layers[layer / u64::BITS as usize] |=
@@ -7925,7 +7958,8 @@ impl Renderer {
         // Distant terrain tiles are occlusion tested as sections are, with their meshes'
         // bounds, but for those fading or with a stand-in (`lod::Tile::cull_bounds`).
         for (i, v) in visible_lods.iter().enumerate() {
-            let tile = &self.lods[&v.key];
+            let tile =
+                lod::far_tile(&self.lods, &self.lod_cubes, v.key).expect("visible resident tile");
             let s = tile.drawn();
             let index = visible.len() + i;
             let tested = cull.as_ref().and(tile.cull_bounds(v.fade));
@@ -8060,7 +8094,8 @@ impl Renderer {
         let section_translucent = self.translucent_draws.len();
         for (i, v) in visible_lods.iter().enumerate() {
             let instance = visible.len() + i;
-            let tile = self.lods.get_mut(&v.key).expect("visible resident tile");
+            let tile = lod::far_tile_mut(&mut self.lods, &mut self.lod_cubes, v.key)
+                .expect("visible resident tile");
             let s = tile.drawn_mut();
             if let Some((index_page, index_start)) = s.sorted_indices {
                 let scheduled = (instance + count - self.translucency_cursor) % count < budget;
@@ -8760,6 +8795,7 @@ impl Renderer {
                     && self.native.as_ref().is_none_or(|n| n.material.is_none());
                 let sections = &self.sections;
                 let lods = &self.lods;
+                let lod_cubes = &self.lod_cubes;
                 let sorted = &self.sorted_indices;
                 let phase2 = self.cull.as_ref().filter(|_| culling).map(|c| &c.phase2);
                 crate::spans::time("flatten", || {
@@ -8787,7 +8823,7 @@ impl Renderer {
                                 ))
                             })
                             .chain(visible_lods.iter().filter_map(|v| {
-                                let id = lods[&v.key].drawn().flat_id?;
+                                let id = lod::far_tile(lods, lod_cubes, v.key)?.drawn().flat_id?;
                                 Some((id, lod::instance(v.origin, v.fade)))
                             })),
                         |page| sorted.buffer(page).clone(),

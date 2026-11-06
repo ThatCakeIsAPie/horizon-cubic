@@ -3,7 +3,7 @@
 use super::{Frustum, Renderer, SectionGpu};
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
-    lod::{MAX_LEVEL, TileKey},
+    lod::{MAX_LEVEL, TileKey, cube::CubeKey},
     mesher::SectionMesh,
 };
 use glam::{DVec3, Vec3};
@@ -46,6 +46,76 @@ impl Pending {
         }
         if cutout.is_some() {
             self.cutout = cutout;
+        }
+    }
+}
+
+/// A far tile of either kind: a column tile of the surface model, or a node of
+/// a cubic level's octree (`lod::cube`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum FarKey {
+    Tile(TileKey),
+    Cube(CubeKey),
+}
+
+impl FarKey {
+    pub fn level(self) -> u8 {
+        match self {
+            Self::Tile(key) => key.level,
+            Self::Cube(key) => key.level,
+        }
+    }
+    pub fn origin(self) -> [i32; 3] {
+        match self {
+            Self::Tile(key) => key.origin(),
+            Self::Cube(key) => key.origin(),
+        }
+    }
+}
+
+pub(super) fn far_tile<'a>(
+    tiles: &'a std::collections::HashMap<TileKey, Tile>,
+    cubes: &'a std::collections::HashMap<CubeKey, Tile>,
+    key: FarKey,
+) -> Option<&'a Tile> {
+    match key {
+        FarKey::Tile(key) => tiles.get(&key),
+        FarKey::Cube(key) => cubes.get(&key),
+    }
+}
+
+pub(super) fn far_tile_mut<'a>(
+    tiles: &'a mut std::collections::HashMap<TileKey, Tile>,
+    cubes: &'a mut std::collections::HashMap<CubeKey, Tile>,
+    key: FarKey,
+) -> Option<&'a mut Tile> {
+    match key {
+        FarKey::Tile(key) => tiles.get_mut(&key),
+        FarKey::Cube(key) => cubes.get_mut(&key),
+    }
+}
+
+/// Finished node meshes not uploaded yet and the nodes to retire once they are in.
+#[derive(Default)]
+pub(super) struct CubePending {
+    meshes: FxHashMap<CubeKey, SectionMesh>,
+    order: VecDeque<CubeKey>,
+    removed: FxHashSet<CubeKey>,
+}
+
+impl CubePending {
+    /// As [`Pending::add`]: newer meshes replace waiting ones, nodes meshed
+    /// again are not removed, nodes removed drop their waiting meshes.
+    fn add(&mut self, meshes: Vec<(CubeKey, SectionMesh)>, removed: Vec<CubeKey>) {
+        for (key, mesh) in meshes {
+            self.removed.remove(&key);
+            if self.meshes.insert(key, mesh).is_none() {
+                self.order.push_back(key);
+            }
+        }
+        for key in removed {
+            self.meshes.remove(&key);
+            self.removed.insert(key);
         }
     }
 }
@@ -142,7 +212,7 @@ pub(super) fn instance(origin: [f32; 3], fade: u32) -> [f32; 4] {
 }
 
 pub(super) struct Visible {
-    pub key: TileKey,
+    pub key: FarKey,
     pub distance: u64,
     pub origin: [f32; 3],
     pub fade: u32,
@@ -181,14 +251,14 @@ impl Tile {
     }
     pub fn visible(
         &self,
-        key: TileKey,
+        key: FarKey,
         camera: DVec3,
         frustum: &Frustum,
         now: Instant,
     ) -> Option<Visible> {
         let fade = match self.dying {
-            Some(since) if self.alone => fade_out_code(since, key.level, now),
-            _ => fade_code(self.shown, key.level, now)?,
+            Some(since) if self.alone => fade_out_code(since, key.level(), now),
+            _ => fade_code(self.shown, key.level(), now)?,
         };
         let origin = DVec3::from(key.origin().map(f64::from)) - camera;
         Some(Visible {
@@ -291,12 +361,124 @@ impl Renderer {
                 self.release_section(key);
             }
         }
+        // Cube tiles share the culling slots: they keep theirs.
+        let slots: Vec<u32> = self.lods.values().map(|tile| tile.cull_slot).collect();
         for (_, tile) in std::mem::take(&mut self.lods) {
             self.release_tile(tile);
         }
-        self.lod_cull_free.clear();
-        self.lod_cull_next = 0;
+        if self.lod_cubes.is_empty() {
+            self.lod_cull_free.clear();
+            self.lod_cull_next = 0;
+        } else {
+            self.lod_cull_free.extend(slots);
+        }
         self.set_lod_cutout(Default::default());
+    }
+
+    /// A node meshed again keeps its slot and fade; a new one waits for the
+    /// rest of its job (`upload_cube_lods`) before it fades in.
+    fn upload_cube_lod(&mut self, key: CubeKey, mesh: &SectionMesh) {
+        let (old_slot, shown) = match self.lod_cubes.remove(&key) {
+            Some(old) => {
+                let kept = (old.cull_slot, old.shown.filter(|_| old.dying.is_none()));
+                self.release_tile(old);
+                (Some(kept.0), kept.1)
+            }
+            None => (None, None),
+        };
+        match Bounds::mesh(mesh).zip(self.upload_mesh(mesh)) {
+            Some((bounds, mesh)) => {
+                let cull_slot = old_slot.unwrap_or_else(|| {
+                    self.lod_cull_free.pop().unwrap_or_else(|| {
+                        self.lod_cull_next += 1;
+                        self.lod_cull_next - 1
+                    })
+                });
+                self.lod_cubes.insert(
+                    key,
+                    Tile {
+                        mesh,
+                        bounds,
+                        shown,
+                        dying: None,
+                        alone: false,
+                        previous: None,
+                        cull_slot,
+                    },
+                );
+            }
+            None => self.lod_cull_free.extend(old_slot),
+        }
+    }
+
+    pub fn remove_cube_lod(&mut self, key: CubeKey) {
+        if let Some(tile) = self.lod_cubes.remove(&key) {
+            self.lod_cull_free.push(tile.cull_slot);
+            self.release_tile(tile);
+        }
+    }
+
+    /// Drops every cube tile and what waits to upload.
+    pub fn clear_cube_lods(&mut self) {
+        self.cube_pending = None;
+        for (_, tile) in std::mem::take(&mut self.lod_cubes) {
+            self.lod_cull_free.push(tile.cull_slot);
+            self.release_tile(tile);
+        }
+        if self.lods.is_empty() {
+            self.lod_cull_free.clear();
+            self.lod_cull_next = 0;
+        }
+    }
+
+    /// Queues what `CubeLod::update` and `CubeLod::removed` returned for
+    /// `upload_cube_lods`, joining a job still uploading.
+    pub fn queue_cube_lods(&mut self, meshes: Vec<(CubeKey, SectionMesh)>, removed: Vec<CubeKey>) {
+        if meshes.is_empty() && removed.is_empty() {
+            return;
+        }
+        self.cube_pending
+            .get_or_insert_default()
+            .add(meshes, removed);
+    }
+
+    /// Uploads queued node meshes for about `budget` (at least one). Once all
+    /// are in they fade in together, and the nodes they replace stand whole
+    /// for `FADE` and go: nothing opens a hole while the new ones come in.
+    pub fn upload_cube_lods(&mut self, budget: Duration) {
+        let start = Instant::now();
+        let faded: Vec<_> = self
+            .lod_cubes
+            .iter()
+            .filter(|(_, tile)| tile.dying.is_some_and(|d| start - d >= FADE))
+            .map(|(&key, _)| key)
+            .collect();
+        for key in faded {
+            self.remove_cube_lod(key);
+        }
+        while let Some(pending) = &mut self.cube_pending {
+            let next = std::iter::from_fn(|| pending.order.pop_front())
+                .find(|key| pending.meshes.contains_key(key));
+            let Some(key) = next else {
+                let pending = self.cube_pending.take().expect("pending nodes");
+                for tile in self.lod_cubes.values_mut() {
+                    tile.shown.get_or_insert(start);
+                }
+                for key in pending.removed {
+                    if let Some(tile) = self.lod_cubes.get_mut(&key)
+                        && tile.dying.is_none()
+                    {
+                        tile.dying = Some(start);
+                    }
+                }
+                return;
+            };
+            let mesh = pending.meshes.remove(&key).expect("pending node");
+            self.upload_cube_lod(key, &mesh);
+            if start.elapsed() >= budget {
+                return;
+            }
+        }
     }
 
     /// Queues a finished mesh job (`Lod::update`, `Lod::removed`,
