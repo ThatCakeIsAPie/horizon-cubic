@@ -1,9 +1,21 @@
-use super::{DensityError, DensityVolume, NanRange, PerlinNoise, SimplexNoise, SmearedPerlinNoise};
+use super::{
+    DensityError, DensityVolume, GradientTable, NanRange, PerlinNoise, SimplexNoise,
+    SmearedPerlinNoise,
+};
 use std::sync::Arc;
 
 /// Immutable noise sampling. Implementations may override the default scalar
 /// volume traversal when vanilla has a distinct bulk arithmetic path.
 pub trait Noise: std::fmt::Debug + Send + Sync {
+    /// The lattice tables when this noise is one plain [`PerlinNoise`] (read
+    /// by the GPU ports, which upload them).
+    fn gradient_table(&self) -> Option<&GradientTable> {
+        None
+    }
+    /// This noise as a stack of weighted octaves, if it is one.
+    fn as_stack(&self) -> Option<&NoiseStack> {
+        None
+    }
     fn range(&self) -> Result<[f32; 2], NanRange>;
     fn get2(&self, x: f64, z: f64) -> f32;
     fn get3(&self, x: f64, y: f64, z: f64) -> f32;
@@ -44,6 +56,9 @@ pub trait Noise: std::fmt::Debug + Send + Sync {
 }
 
 impl Noise for PerlinNoise {
+    fn gradient_table(&self) -> Option<&GradientTable> {
+        Some(PerlinNoise::table(self))
+    }
     fn range(&self) -> Result<[f32; 2], NanRange> {
         Ok(PerlinNoise::range(self))
     }
@@ -125,6 +140,9 @@ impl NoiseStack {
     }
 }
 impl Noise for NoiseStack {
+    fn as_stack(&self) -> Option<&NoiseStack> {
+        Some(self)
+    }
     fn range(&self) -> Result<[f32; 2], NanRange> {
         Ok(self.range)
     }

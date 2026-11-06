@@ -76,6 +76,17 @@
 //! Pre-classified nodes use no pool slot (`CubeGen::generate_to_pool` only
 //! places nodes the caller found [`Class::Mixed`]).
 //!
+//! # Columns from the GPU
+//!
+//! The CPU column closure is the last per-node CPU cost. `gfx/biome_gen` makes
+//! the same [`NodeColumns`] with a compute pass; [`CubeGen::generate_to_pool_gpu`]
+//! (and `generate_gpu_columns`, which reads the nodes back) takes a `fill`
+//! callback that records that pass into the same command encoder, writing
+//! straight into the buffers this shader reads ([`ColumnTargets`]). The
+//! encoder runs it before the generation pass, so nothing is uploaded or read
+//! back. The 2D pre-pass ([`classify`]) needs the columns on the CPU and so
+//! does not run on this path: every node takes the 3D pass.
+//!
 //! # Wiring (for the integrator)
 //!
 //! 1. Fill a [`CubeGenParams`] from the CPU generator: the four noises (octave
@@ -188,6 +199,21 @@ impl NodeColumns {
 
 /// Makes a node's columns; called on the worker thread that asked.
 pub type ColumnFn = Arc<dyn Fn(CubeKey) -> NodeColumns + Send + Sync>;
+
+/// The two buffers the shader reads a batch's columns from, for a GPU pass to
+/// fill (see [`CubeGen::generate_to_pool_gpu`]). Node `i` of the batch is the
+/// `i`th key:
+///
+/// * `columns`: `f32`s, 512 per node: the 256 column heights (`z * 16 + x`),
+///   then the 256 volatilities (`NodeColumns::height`, `volatility`);
+/// * `biomes`: `u32`s, 256 per node: the column biome ids.
+///
+/// Both have storage usage and hold [`MAX_BATCH`] nodes.
+#[derive(Clone, Copy)]
+pub struct ColumnTargets<'a> {
+    pub columns: &'a wgpu::Buffer,
+    pub biomes: &'a wgpu::Buffer,
+}
 
 // ------------------------------------------------------------ GPU layouts
 
@@ -916,6 +942,87 @@ impl CubeGen {
         }
         self.queue.submit([encoder.finish()]);
         Some(slots)
+    }
+
+    /// [`Self::generate_to_pool`] with the columns made on the GPU: `fill`
+    /// records the pass that writes them into the [`ColumnTargets`] (for the
+    /// `keys`, in order) into the encoder, ahead of the generation pass. Nothing
+    /// is uploaded. Same slots, same `None` when the pool is short. `fill`
+    /// must not submit; one call per submission if it writes buffers with the
+    /// queue.
+    pub fn generate_to_pool_gpu(
+        &mut self,
+        keys: &[CubeKey],
+        fill: impl FnOnce(&mut wgpu::CommandEncoder, ColumnTargets<'_>),
+    ) -> Option<Vec<u32>> {
+        let n = keys.len();
+        assert!(n <= MAX_BATCH);
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        if self.pool.free_slots() < n {
+            return None;
+        }
+        let slots: Vec<u32> = (0..n).map(|_| self.pool.alloc().unwrap()).collect();
+        let headers: Vec<GpuHeader> = keys
+            .iter()
+            .zip(&slots)
+            .map(|(key, &slot)| GpuHeader::new(&self.params, *key, slot))
+            .collect();
+        self.queue
+            .write_buffer(&self.headers, 0, bytemuck::cast_slice(&headers));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Cube generation (GPU columns)"),
+            });
+        fill(
+            &mut encoder,
+            ColumnTargets {
+                columns: &self.heights,
+                biomes: &self.biomes,
+            },
+        );
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Cube generation"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.dispatch_workgroups(n as u32, 1, 1);
+        }
+        self.queue.submit([encoder.finish()]);
+        Some(slots)
+    }
+
+    /// The nodes of `keys` (at most [`MAX_BATCH`]) with GPU-made columns,
+    /// read back and freed again (biomes come from the slots); `None` on
+    /// failure.
+    pub fn generate_gpu_columns(
+        &mut self,
+        keys: &[CubeKey],
+        fill: impl FnOnce(&mut wgpu::CommandEncoder, ColumnTargets<'_>),
+    ) -> Option<Vec<CubeNode>> {
+        let slots = self.generate_to_pool_gpu(keys, fill)?;
+        let words = self.read_back(&slots);
+        for &slot in &slots {
+            self.pool.free(slot);
+        }
+        let words = words?;
+        Some(
+            keys.iter()
+                .enumerate()
+                .map(|(i, key)| {
+                    let at = i * SLOT_WORDS;
+                    let slot = &words[at..at + SLOT_WORDS];
+                    CubeNode::from_fn(*key, |x, y, z| Voxel {
+                        state: BlockStateId(slot[CubeNode::index(x, y, z)]),
+                        biome: slot[SLOT_STATES + z * 16 + x] as u16,
+                    })
+                })
+                .collect(),
+        )
     }
 
     /// Copies `slots` (at most [`MAX_BATCH`]) to the staging buffer and reads

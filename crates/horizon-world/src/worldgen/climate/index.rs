@@ -259,6 +259,12 @@ impl<T> ClimateIndex<T> {
     pub fn entries(&self) -> &[(ParameterPoint, T)] {
         &self.entries
     }
+    /// The search tree, breadth first with the root at 0 (read-only, for
+    /// GPU ports): each node's parameter space, and its first child and
+    /// child count, or its entry index and 0 for a leaf.
+    pub fn tree(&self) -> (&[[Parameter; 7]], &[(u32, u32)]) {
+        (&self.spaces, &self.links)
+    }
     pub fn searcher(&self) -> ClimateSearch<'_, T> {
         ClimateSearch {
             index: self,
