@@ -214,7 +214,7 @@ Fallback: devices without compute or `MULTI_DRAW_INDIRECT_COUNT` keep v2's CPU p
 
 ### Whole World, then autoresearch
 
-The target is the Meridian LOD mod's whole-world toggle. In a cubic level, LOD Distance's top step is **Whole World**:
+The target is the Meridian LOD mod's whole-world toggle. In the owner's video it took about 20 s to show an LOD of the whole world, on a top gaming CPU. Our first benchmark on this 4-core/8-thread i7 was 25.8 s per hop. The aim is to beat that clearly: under 10 s. In a cubic level, LOD Distance's top step is **Whole World**:
 - The octree's root covers vanilla's world border (±30 M blocks) and the whole cube range (±8.4 M blocks).
 - The plan subdivides by distance as usual.
 - Subtrees the 2D pre-pass proves uniform are never requested.
