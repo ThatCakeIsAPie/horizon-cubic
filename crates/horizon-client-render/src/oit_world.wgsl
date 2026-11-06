@@ -1,9 +1,9 @@
 // Improved transparency's terrain stages and its screen passes (oit.wgsl
 // has the shared maths), appended to terrain.wgsl after oit.wgsl.
 // The terrain's translucent layer, once per stage.
+// Whole as its chunk fades in, as terrain.wgsl's `fs_translucent`.
 fn oit_terrain_color(in: TerrainOut) -> vec4<f32> {
-    var color = sprite(in.uv, in.layer & 0x7fffu) * in.color;
-    color = mix(globals.fog_color * vec4(1.0, 1.0, 1.0, color.a), color, in.visibility);
+    let color = sprite(in.uv, in.layer & 0x7fffu) * in.color;
     if color.a < OIT_ALPHA_CUTOUT { discard; }
     return color;
 }

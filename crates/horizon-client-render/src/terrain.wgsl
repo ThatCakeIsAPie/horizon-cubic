@@ -235,7 +235,12 @@ fn faded(code: u32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> bool {
     h = (h ^ (h >> 13u)) * 0x5bd1e995u;
     let start = f32((h ^ (h >> 15u)) & 1023u) / 2048.0;
     let ramp = clamp((progress - start) * 2.0, 0.0, 1.0);
-    let shown = select(ramp, 1.0 - ramp, out);
+    return dithered_out(select(ramp, 1.0 - ramp, out), local, dx, dy);
+}
+// Whether a face `shown` of the way in leaves this pixel out: a 4x4 ordered
+// pattern in the face's plane, its unit the power of two of a block nearest 1.5
+// pixels, so it stays on the terrain as the camera moves.
+fn dithered_out(shown: f32, local: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> bool {
     let n = abs(cross(dx, dy));
     var plane = local.xy;
     if n.x >= n.y && n.x >= n.z {
@@ -641,11 +646,12 @@ fn solid_color(in: TerrainOut) -> vec4<f32> {
         hdr_normal = normalize(cross(dy, dx));
     }
     if faded(in.fade, in.local, dx, dy) { discard; }
+    // The chunk fade-in (terrain.fsh mixes toward the fog colour, a flash of sky
+    // where a chunk comes in): dithered in, as far terrain fades.
+    if in.visibility < 1.0 && dithered_out(in.visibility, in.local, dx, dy) { discard; }
     // Bit 15 of the layer marks opaque leaves (forceOpaque): no alpha cutout.
     let texel = sprite(in.uv, in.layer & 0x7fffu);
-    var color = texel * in.color;
-    // terrain.fsh: the fade-in mixes toward the fog colour.
-    color = mix(globals.fog_color * vec4(1.0, 1.0, 1.0, color.a), color, in.visibility);
+    let color = texel * in.color;
     if color.a < 0.5 && (in.layer & 0x8000u) == 0u { discard; }
     return solid_finish(in, texel, color);
 }
@@ -711,9 +717,9 @@ fn solid_finish_at(in: TerrainOut, texel: vec4<f32>, color: vec4<f32>, du: vec2<
 // Water, glass and other see-through faces draw whole as they fade in, the
 // layer drawn first in front (gfx.rs's water tiers): dithered, the faded-out
 // pixels showed the layer behind through the one in front, twice the water.
+// The chunk fade-in leaves them whole too (`solid_color` dithers the rest).
 @fragment fn fs_translucent(in: TerrainOut) -> @location(0) vec4<f32> {
-    var color = sprite(in.uv, in.layer & 0x7fffu) * in.color;
-    color = mix(globals.fog_color * vec4(1.0, 1.0, 1.0, color.a), color, in.visibility);
+    let color = sprite(in.uv, in.layer & 0x7fffu) * in.color;
     if color.a < 0.01 { discard; }
     return apply_fog(color, in.spherical, in.cylindrical);
 }
