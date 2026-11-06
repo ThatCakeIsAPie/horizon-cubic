@@ -1521,6 +1521,7 @@ impl Game<'_> {
                     // Detail by size on screen, the budget and the coverage layer.
                     "target_px": s.target_px,
                     "voxel_px": s.voxel_px,
+                    "fov_deg": s.fov_deg,
                     "budget": s.budget,
                     "limited": s.limited,
                     "plan_ms": s.plan_ms,

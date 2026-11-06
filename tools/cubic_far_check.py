@@ -186,14 +186,21 @@ def main():
             ctl_run('command', 'give @s spyglass')
             ctl_run('select', 'spyglass')
             before = (status().get('cube_lod') or {}).get('planned')
-            holder = threading.Thread(target=lambda: ctl_run('use-item', '--hold', 30, timeout=90))
+            # Held for longer than the zoomed view can take to settle, so the
+            # counters and the screenshot are taken while still looking through it.
+            hold = int(args.timeout) + 30
+            started = time.monotonic()
+            holder = threading.Thread(
+                target=lambda: ctl_run('use-item', '--hold', hold, timeout=hold + 60))
             holder.start()
-            t = time.monotonic()
             time.sleep(1.5)
-            lod = settle('spyglass', t)
-            print(f'spyglass: planned {before} -> {lod.get("planned")}', flush=True)
-            time.sleep(1)
-            ctl_run('screenshot', scratch / 'spyglass_zoomed.png')
+            fov = (status().get('cube_lod') or {}).get('fov_deg')
+            lod = settle('spyglass', time.monotonic())
+            print(f'spyglass: planned {before} -> {lod.get("planned")} (fov {fov})', flush=True)
+            if time.monotonic() - started < hold - 2:
+                ctl_run('screenshot', scratch / 'spyglass_zoomed.png')
+            else:
+                print('spyglass: the hold ended before the view settled; no zoomed shot', flush=True)
             holder.join()
             t = time.monotonic()
             time.sleep(1.0)

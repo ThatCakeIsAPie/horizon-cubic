@@ -120,7 +120,18 @@ fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
         }
     }
     let col = (p.z << 4u) | p.x;
-    let shaded = 1u - ((lit[col] >> p.y) & 1u);
+    // A face takes the light of the cell in front of it, as in Minecraft: a cliff's wall
+    // is in the sun when the air beside it sees the sky, not only its top voxel. Past
+    // the node's edge (no light known there), it takes its own column's light at the
+    // node's top: open unless the column is covered above the node.
+    var front = (lit[col] >> 15u) & 1u;
+    if inside {
+        front = (lit[(u32(q.z) << 4u) | u32(q.x)] >> u32(q.y)) & 1u;
+    } else if dir == 0u {
+        // The underside at the node's bottom: shaded, as under an overhang.
+        front = 0u;
+    }
+    let shaded = 1u - front;
     var biome = 0u;
     if ((fw >> 16u) & 7u) != 0u {
         biome = min(pool[slot * SLOT_WORDS + BIOMES + col] & 255u, 255u);

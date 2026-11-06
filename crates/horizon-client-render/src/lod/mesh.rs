@@ -888,12 +888,25 @@ fn mesh_voxels(
                         u1: (a + 1) as f32 * scale,
                         v1: (b + 1) as f32 * scale,
                     };
+                    // A face takes the light of the cell in front of it, as in
+                    // Minecraft: a cliff's wall is in the sun when the air
+                    // beside it sees the sky, not only its top voxel. Past the
+                    // node's edge it takes its own column's light at the node's
+                    // top; an underside there is shaded, as under an overhang.
+                    let front_lit = if inside {
+                        lit[CubeNode::index(nx as usize, ny as usize, nz as usize)]
+                    } else if matches!(direction, Direction::Down) {
+                        false
+                    } else {
+                        !node.column_covered(x, z)
+                    };
+                    let face = span(voxel, if front_lit { SUNLIT } else { SHADED });
                     add_face(
                         &mut faces,
                         direction,
                         plane as f32 * scale,
                         rect,
-                        material(&own, direction, at),
+                        material(&face, direction, at),
                     );
                 }
             }
@@ -2164,6 +2177,38 @@ mod cube_tests {
                 (q[0].light, lo, hi)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_cliff_wall_beside_open_air_is_in_the_sun() {
+        // A pillar two voxels wide and twelve high on a floor: its east wall
+        // faces open air, so the whole wall is lit, not only its top voxel.
+        let node = CubeNode::from_fn(CubeKey::new(0, 0, 0, 0), |x, y, z| {
+            voxel(if y == 0 || (y < 12 && x < 2 && z < 2) {
+                STONE
+            } else {
+                AIR
+            })
+        });
+        let wall = lights_at(&mesh(&node), 0, 2.0);
+        assert!(!wall.is_empty());
+        assert!(wall.iter().all(|w| w.0 == 240), "{wall:?}");
+        // Under an overhang the wall's light is the air's: a wall under a roof
+        // is shaded.
+        let roofed = CubeNode::from_fn(CubeKey::new(0, 0, 0, 0), |x, y, z| {
+            voxel(
+                if y == 0 || (y < 12 && x < 2 && z < 2) || (y == 12 && x < 6) {
+                    STONE
+                } else {
+                    AIR
+                },
+            )
+        });
+        let wall = lights_at(&mesh(&roofed), 0, 2.0);
+        assert!(
+            !wall.is_empty() && wall.iter().all(|w| w.0 == 0x40),
+            "{wall:?}"
+        );
     }
 
     #[test]

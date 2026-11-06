@@ -1501,6 +1501,9 @@ pub struct CubeLodStats {
     /// reaches (bigger when the budget binds).
     pub target_px: f32,
     pub voxel_px: f32,
+    /// The vertical field of view of the last update, in degrees (the spyglass
+    /// narrows it).
+    pub fov_deg: f32,
     /// The planner's time for the last plan, in milliseconds.
     pub plan_ms: f32,
     /// Surface tiles in the plan (counted in `planned` too), and of them
@@ -2767,6 +2770,7 @@ impl CubeLod {
         self.face(view.forward);
         let rule = view.rule(self.budget());
         self.stats.target_px = view.target_px as f32;
+        self.stats.fov_deg = view.fov_y.to_degrees() as f32;
         // A plan the planner finished goes in.
         let done = self.shared.planner.lock().unwrap().done.take();
         if let Some(done) = done {
