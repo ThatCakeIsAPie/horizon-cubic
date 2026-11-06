@@ -115,6 +115,28 @@ For a column the density is
   2. The far-terrain planner skips whole octree subtrees that are uniform air, or uniform solid and covered. This makes the far terrain O(surface) instead of O(volume).
   3. The GPU never sees a uniform node.
 
+### Sparse descent: the 3D test that replaces the 2D bound
+
+The owner suggested this, after Houdini's sparse solving for smoke and fire:
+- Divide the world into coarse cells.
+- Test each cell for "anything in here". Stop where the answer is no, and subdivide where it is yes.
+- Far away, stop at the LOD level that distance needs. Close by, keep subdividing down to blocks.
+
+**Why the 2D bound is not enough.** The 2D pre-pass is conservative: it never marks a node wrongly. But it assumes one surface band per column. In a world tuned for 3D noise (spaghetti, floating islands, huge overhangs, or a small height factor with large noise factors), that band covers almost every height, so the pass skips almost nothing.
+
+**The 3D test** uses a Lipschitz bound on the density. Each octave `i` changes by at most `min(2·amp_i, amp_i · freq_i · G · r)` within distance `r` of a point:
+- `G` is the gradient bound of one ImprovedNoise octave.
+- Summed over the four noises, through the selector's clamp, the depth transform and the `height − y` term, this gives `L(r)`.
+- One sample at a node's centre decides the node:
+  - `|density(centre)| > L(half-diagonal)` means the node is uniform: all solid or all air, with water up to sea level.
+  - Otherwise subdivide.
+- Octaves the node's resolution skips are bounded by their amplitude alone.
+
+**Uses:**
+- **GPU far terrain.** The descent runs level by level as compute passes over a compacted list of undecided nodes. The descent stops at the level the distance plan wants. Work then scales with surface area in any world, islands and spaghetti included.
+- **CPU cubes.** One density sample, plus the 2D biome terms, decides whether a cube is uniform before the 75-sample lattice runs. Carvers still run where a cave walk reaches.
+- **The planner** never requests a subtree the descent proved uniform.
+
 ### Far terrain
 
 - The octree, with voxels merged 2×2×2 per level, stays as built in v1.
