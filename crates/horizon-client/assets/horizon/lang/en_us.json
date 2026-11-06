@@ -205,6 +205,7 @@
   "The graphics device was lost: off until the next start.": "The graphics device was lost: off until the next start.",
   "Not on DirectX 12 yet: try the Vulkan graphics API.": "Not on DirectX 12 yet: try the Vulkan graphics API.",
   "%s chunks": "%s chunks",
+  "%s cubes": "%s cubes",
   "%s per frame": "%s per frame",
   "%s MiB/frame": "%s MiB/frame",
   "%s KiB/frame": "%s KiB/frame",

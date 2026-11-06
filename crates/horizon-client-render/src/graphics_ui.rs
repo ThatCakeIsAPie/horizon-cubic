@@ -6,8 +6,9 @@
 //! looks comes from `graphics_style`.
 use crate::{
     graphics::{
-        EntityCullingMode, FarDetail, FrameGeneration, GraphicsApi, LeafCullingMode, Overlay,
-        Pacing, ParticleCullingMode, PresentMode, Preset, Upscaling,
+        CUBIC_VERTICAL_MAX, CUBIC_VERTICAL_MIN, EntityCullingMode, FarDetail, FrameGeneration,
+        GraphicsApi, LeafCullingMode, Overlay, Pacing, ParticleCullingMode, PresentMode, Preset,
+        Upscaling,
     },
     graphics_style::{self as style, Cost},
     hud::{HudAtlas, HudBatch},
@@ -67,6 +68,7 @@ impl Page {
 pub enum H {
     Preset,
     LodDistance,
+    CubicVertical,
     FarDetail,
     BlueMapAutoDetect,
     BlueMapRadius,
@@ -195,6 +197,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             H::LodDistance,
                             Medium,
                             "Coarse distant terrain in local worlds. Integrated GPUs stop at 128 chunks.",
+                        ),
+                        h(
+                            H::CubicVertical,
+                            Medium,
+                            "Cubic Chunks worlds: cubes loaded above and below you. Lower is faster.",
                         ),
                         h(H::FarDetail, Medium, far),
                         h(
@@ -776,6 +783,10 @@ impl H {
                 Some(i as f32 / (LOD_STEPS.len() - 1) as f32)
             }
             H::Workers => Some(g.workers as f32 / max_workers() as f32),
+            H::CubicVertical => Some(
+                (g.cubic_vertical - CUBIC_VERTICAL_MIN) as f32
+                    / (CUBIC_VERTICAL_MAX - CUBIC_VERTICAL_MIN) as f32,
+            ),
             H::ResolutionScale => Some((g.resolution_scale as f32 - 50.0) / 150.0),
             // Auto, then 10..480 by 10.
             H::HdrPaperWhite => Some(g.hdr_paper_white as f32 / 480.0),
@@ -794,6 +805,7 @@ impl H {
             H::ChunkUpdates => Some(64),
             H::EntityCullingPrecheck => Some(32),
             H::UploadBudget => Some((UPLOAD_STEPS.len() - 1) as u32),
+            H::CubicVertical => Some(CUBIC_VERTICAL_MAX - CUBIC_VERTICAL_MIN),
             H::Workers => Some(max_workers()),
             H::ResolutionScale => Some(30),
             H::HdrPaperWhite => Some(41),
@@ -811,6 +823,10 @@ impl H {
                 0 => labelled("LOD Distance", "Off"),
                 n => labelled("LOD Distance", lang::tr("%s chunks", &[&n])),
             },
+            H::CubicVertical => labelled(
+                "Vertical Distance",
+                lang::tr("%s cubes", &[&g.cubic_vertical]),
+            ),
             H::FarDetail => labelled("Far Detail", g.far_detail.label()),
             H::BlueMapAutoDetect => labelled("Find BlueMap", on_off(g.blue_map.auto_detect)),
             H::BlueMapRadius => labelled(
@@ -956,6 +972,10 @@ impl H {
                 g.lod_distance = LOD_STEPS[(v * (LOD_STEPS.len() - 1) as f32).round() as usize]
             }
             H::Workers => g.workers = (v * max_workers() as f32).round() as u32,
+            H::CubicVertical => {
+                g.cubic_vertical = CUBIC_VERTICAL_MIN
+                    + (v * (CUBIC_VERTICAL_MAX - CUBIC_VERTICAL_MIN) as f32).round() as u32
+            }
             H::ResolutionScale => g.resolution_scale = (50.0 + (v * 30.0).round() * 5.0) as u32,
             H::HdrPaperWhite => g.hdr_paper_white = (v * 48.0).round() as u32 * 10,
             H::HdrPeak => {
@@ -3202,6 +3222,7 @@ mod tests {
         let options = [
             H::ChunkUpdates,
             H::UploadBudget,
+            H::CubicVertical,
             H::Workers,
             H::ResolutionScale,
             H::HdrPaperWhite,

@@ -150,6 +150,7 @@
   "Turn HDR on to use it.": "Ative o HDR para usá-lo.",
   "Your GPU or graphics API doesn't support it.": "Sua GPU ou API gráfica não oferece suporte.",
   "%s chunks": "%s pedaços",
+  "%s cubes": "%s cubos",
   "%s per frame": "%s por quadro",
   "%s MiB/frame": "%s MiB/quadro",
   "%s KiB/frame": "%s KiB/quadro",

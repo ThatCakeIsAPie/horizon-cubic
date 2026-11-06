@@ -657,11 +657,19 @@ impl Graphics {
         }
     }
 }
+/// The vertical view distance of a cubic level, in cubes each way.
+pub const CUBIC_VERTICAL_MIN: u32 = 2;
+pub const CUBIC_VERTICAL_MAX: u32 = 32;
+pub const CUBIC_VERTICAL_DEFAULT: u32 = 8;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Graphics {
     pub preset: Preset,
     /// Distant surface terrain range, in chunks; 0 disables LODs.
     pub lod_distance: u32,
+    /// Cubic levels: cubes loaded above and below the player's cube
+    /// (`CUBIC_VERTICAL_MIN..=CUBIC_VERTICAL_MAX`), the vertical view distance.
+    pub cubic_vertical: u32,
     /// How finely far terrain is drawn; Full unless the player picks Reduced.
     pub far_detail: FarDetail,
     /// Far terrain from servers' BlueMap web maps; no server has one unless
@@ -781,6 +789,7 @@ impl Default for Graphics {
         Self {
             preset: Preset::Custom,
             lod_distance: 0,
+            cubic_vertical: CUBIC_VERTICAL_DEFAULT,
             far_detail: FarDetail::Full,
             blue_map: crate::bluemap::Settings::default(),
             cave_culling: true,
@@ -873,6 +882,10 @@ impl Graphics {
                 "preset" => g.preset = Preset::parse(value),
                 "lodDistance" => {
                     g.lod_distance = number(g.lod_distance).min(crate::lod::MAX_CHUNKS)
+                }
+                "cubicVertical" => {
+                    g.cubic_vertical =
+                        number(g.cubic_vertical).clamp(CUBIC_VERTICAL_MIN, CUBIC_VERTICAL_MAX)
                 }
                 "farDetail" => g.far_detail = FarDetail::parse(value),
                 "blueMapRadius" => {
@@ -980,7 +993,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\ncubicVertical:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -1035,6 +1048,7 @@ impl Graphics {
             bool_text(self.translucent_batching),
             bool_text(self.hdr_smooth_gradients),
             bool_text(self.gpu_culling),
+            self.cubic_vertical,
         );
         text += &self.blue_map.serialize();
         text
@@ -1165,6 +1179,7 @@ mod tests {
         let g = Graphics {
             preset: Preset::Balanced,
             lod_distance: 256,
+            cubic_vertical: 13,
             far_detail: FarDetail::Reduced,
             blue_map: crate::bluemap::Settings {
                 radius: 40,
