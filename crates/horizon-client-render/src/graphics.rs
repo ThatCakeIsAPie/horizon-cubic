@@ -1187,6 +1187,41 @@ mod tests {
     }
 
     #[test]
+    fn the_gpu_far_terrain_setting_parses_and_saves() {
+        assert!(Graphics::default().gpu_far);
+        assert!(
+            !Graphics::parse(
+                "gpuFarTerrain:off
+"
+            )
+            .gpu_far
+        );
+        assert!(
+            Graphics::parse(
+                "gpuFarTerrain:auto
+"
+            )
+            .gpu_far
+        );
+        assert!(
+            Graphics::parse(
+                "gpuFarTerrain:nonsense
+"
+            )
+            .gpu_far
+        );
+        let off = Graphics {
+            gpu_far: false,
+            ..Graphics::default()
+        };
+        assert!(off.serialize().contains(
+            "gpuFarTerrain:off
+"
+        ));
+        assert!(!Graphics::parse(&off.serialize()).gpu_far);
+    }
+
+    #[test]
     fn round_trips() {
         let g = Graphics {
             preset: Preset::Balanced,

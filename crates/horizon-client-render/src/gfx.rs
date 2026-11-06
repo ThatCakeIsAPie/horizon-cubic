@@ -159,7 +159,9 @@ mod arena;
 pub mod capture;
 pub mod compositor;
 pub(crate) mod core_lines;
+pub mod cube_far;
 pub mod cube_gen;
+pub mod cube_mesh;
 mod cull;
 mod end_sky;
 pub mod entity_skin;
@@ -1275,6 +1277,8 @@ pub struct Renderer {
     lod_cubes: HashMap<crate::lod::cube::CubeKey, lod::Tile>,
     /// Finished node meshes `upload_cube_lods` has yet to upload.
     cube_pending: Option<lod::CubePending>,
+    /// Far cube terrain meshed and drawn on the GPU (`cube_far`), once a GPU sampler asked.
+    cube_far: Option<cube_far::CubeFar>,
     /// Far tiles' occlusion culling slots (`lod::Tile::cull_slot`): those
     /// free, and the next never used.
     lod_cull_free: Vec<u32>,
@@ -4672,6 +4676,7 @@ impl Renderer {
             lods: HashMap::new(),
             lod_cubes: HashMap::new(),
             cube_pending: None,
+            cube_far: None,
             lod_cull_free: Vec::new(),
             lod_cull_next: 0,
             lod_cutout: Default::default(),
@@ -7697,6 +7702,11 @@ impl Renderer {
             }
         }
         self.gpu_frame = gpu_frame;
+        if !frame.title
+            && let Some(far) = &mut self.cube_far
+        {
+            far.prepare(&mut encoder, camera, view.planes);
+        }
         let reachable = &self.occlusion;
         let cutout = &self.lod_cutout;
         // Sections fading out (`leave_section`) are past the render distance:
@@ -9829,6 +9839,14 @@ impl Renderer {
                     }
                 }
             }
+            if !frame.title
+                && !pack_draws_terrain
+                && material.is_none()
+                && let Some(far) = &self.cube_far
+            {
+                pass.set_bind_group(0, &self.group, &[]);
+                far.draw(&mut pass, false);
+            }
             // `[displacement]`'s grid over the flat quads it took over, writing its depth.
             if let Some(n) = self
                 .native
@@ -10280,6 +10298,17 @@ impl Renderer {
                     );
                     self.mark_translucent_terrain(&mut pass, None, solid_draws, translucent_draws);
                 }
+            }
+            if !frame.title
+                && oit.is_none()
+                && !pack_draws_water
+                && material.is_none()
+                && let Some(far) = &self.cube_far
+            {
+                pass.set_bind_group(0, &self.group, &[]);
+                far.draw(&mut pass, true);
+                pass.set_bind_group(0, &self.group, &[]);
+                pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
             }
             // LevelRenderer.executeTranslucentAfterTerrain: vanilla's
             // translucent particle layer draws after translucent terrain —

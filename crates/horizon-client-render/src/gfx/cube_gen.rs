@@ -88,7 +88,7 @@
 //! 3. Make the sampler with `GpuCubeSampler::new(device, queue, params,
 //!    columns)` (the renderer's device, or `with_own_device`) and hand it to
 //!    the cube LOD producer; `fork()` gives each worker a handle.
-use crate::lod::cube::{CubeKey, CubeNode, CubeSampler, Resident, SIDE, VOLUME, Voxel};
+use crate::lod::cube::{CubeKey, CubeNode, CubeSampler, NodeClass, Resident, SIDE, VOLUME, Voxel};
 use bytemuck::Zeroable;
 use horizon_core::noise::wrap;
 use horizon_world::registry::BlockStateId;
@@ -448,6 +448,30 @@ fn rock_block(p: &CubeGenParams, key: CubeKey, x: usize, jj: i32, z: usize) -> u
     }
 }
 
+/// What the 2D pre-pass says of the whole node, for the planner
+/// (`CubeSampler::classify`): uniform air or water draws nothing, uniform rock
+/// is a closed shell, the rest needs sampling.
+pub fn node_class(p: &CubeGenParams, key: CubeKey, columns: &NodeColumns) -> NodeClass {
+    match classify(p, key, columns) {
+        Class::Mixed => NodeClass::Mixed,
+        Class::Solid => NodeClass::Rock,
+        Class::Empty => {
+            // Water below the sea, air above it: uniform unless the sea level
+            // crosses the node.
+            let s = f64::from(1u32 << key.level);
+            let y = key.origin()[1] as f32;
+            let sea = (p.sea_level + 1) as f32;
+            let low = (y + (0.5 * s) as f32) < sea;
+            let high = (y + (15.5 * s) as f32) < sea;
+            if low == high {
+                NodeClass::Air
+            } else {
+                NodeClass::Mixed
+            }
+        }
+    }
+}
+
 /// The node of a classified key, filled on the CPU (`None` for
 /// [`Class::Mixed`]).
 pub fn fill_class(
@@ -741,7 +765,11 @@ impl PoolHandle {
     /// submissions see it).
     pub fn write(&self, queue: &wgpu::Queue, slot: u32, words: &[u32]) {
         debug_assert_eq!(words.len(), SLOT_WORDS);
-        queue.write_buffer(&self.buffer, SLOT_BYTES * u64::from(slot), bytemuck::cast_slice(words));
+        queue.write_buffer(
+            &self.buffer,
+            SLOT_BYTES * u64::from(slot),
+            bytemuck::cast_slice(words),
+        );
     }
 }
 
@@ -1387,6 +1415,14 @@ impl CubeSampler for GpuCubeSampler {
 
     fn gpu(&self) -> Option<GpuBackend> {
         self.backend.clone()
+    }
+
+    fn classify(&mut self, key: CubeKey) -> NodeClass {
+        if key.level < MIN_LEVEL {
+            return NodeClass::Mixed;
+        }
+        let columns = (self.columns)(key);
+        node_class(&self.params, key, &columns)
     }
 
     fn fork(&self) -> Option<Box<dyn CubeSampler>> {

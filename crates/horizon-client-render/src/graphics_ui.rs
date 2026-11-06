@@ -827,16 +827,16 @@ impl H {
             H::Preset => labelled("Preset", g.preset.label()),
             H::LodDistance => match g.lod_distance {
                 0 => labelled("LOD Distance", "Off"),
+                // The top step reaches past the world border (cubic levels draw the
+                // whole world's far terrain).
+                n if n >= crate::lod::MAX_CHUNKS => labelled("LOD Distance", "Whole World"),
                 n => labelled("LOD Distance", lang::tr("%s chunks", &[&n])),
             },
             H::CubicVertical => labelled(
                 "Vertical Distance",
                 lang::tr("%s cubes", &[&g.cubic_vertical]),
             ),
-            H::GpuFar => labelled(
-                "Far Terrain on GPU",
-                if g.gpu_far { "Auto" } else { "Off" },
-            ),
+            H::GpuFar => labelled("Far Terrain on GPU", if g.gpu_far { "Auto" } else { "Off" }),
             H::FarDetail => labelled("Far Detail", g.far_detail.label()),
             H::BlueMapAutoDetect => labelled("Find BlueMap", on_off(g.blue_map.auto_detect)),
             H::BlueMapRadius => labelled(
@@ -2719,10 +2719,7 @@ mod tests {
         assert_eq!(s.horizon.lod_distance, 0);
         item.set_slider(&mut s, 1.0);
         assert_eq!(s.horizon.lod_distance, crate::lod::MAX_CHUNKS);
-        assert_eq!(
-            item.label(&s).plain(),
-            format!("LOD Distance: {} chunks", crate::lod::MAX_CHUNKS)
-        );
+        assert_eq!(item.label(&s).plain(), "LOD Distance: Whole World");
         item.set_slider(&mut s, 5.0 / 17.0);
         assert_eq!(s.horizon.lod_distance, 1024);
         assert_eq!(item.label(&s).plain(), "LOD Distance: 1024 chunks");
@@ -3223,6 +3220,19 @@ mod tests {
         );
         assert_eq!(s.horizon.leaf_culling, LeafCullingMode::Hidden);
         assert_eq!(s.horizon.preset, Preset::Custom);
+    }
+
+    #[test]
+    fn far_terrain_on_gpu_cycles_between_auto_and_off() {
+        let mut s = Settings::default();
+        let item = Item::Horizon(H::GpuFar);
+        assert!(s.horizon.gpu_far, "Auto by default");
+        assert_eq!(item.label(&s).plain(), "Far Terrain on GPU: Auto");
+        H::GpuFar.cycle(&mut s, false);
+        assert!(!s.horizon.gpu_far);
+        assert_eq!(item.label(&s).plain(), "Far Terrain on GPU: Off");
+        H::GpuFar.cycle(&mut s, true);
+        assert!(s.horizon.gpu_far);
     }
 
     #[test]

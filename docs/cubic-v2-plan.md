@@ -169,6 +169,23 @@ v2 lays the ground for this. v3 finishes it with the far-terrain path running on
 
 Fallback: devices without compute or `MULTI_DRAW_INDIRECT_COUNT` keep v2's CPU path. This is the same split `gfx/gpu_culling.rs` makes today.
 
+### Where it stands (branch `cubic/gpu-mesh`)
+
+Done: generate, mesh and draw (stages 1, 3 and most of 4) run on the GPU for a cubic level's far nodes; the CPU only chooses which nodes exist.
+- **Material table** (`gfx/cube_mesh.rs`): a storage buffer of 32 words per block state (layer, tint kind, translucency, constant tint, opaque, fluid, HDR tier for each direction and overlay). It is built from `lod::mesh::far_style`, the one lookup the CPU mesher uses too.
+- **Compute mesher** (`cube_mesh.wgsl`): one workgroup per (node, direction) walks the 16 slices. Faces follow `mesh_cube`'s rules (a different fluid or a transparent neighbour exposes one; a node's edge is a wall, a fluid's edge is left out). Runs along one axis are merged, then identical runs of the rows after, so a merged quad tiles its texture once per block.
+  - A count pass gives each node's quads per (direction, solid/water). The CPU reads those 48 bytes back, takes one range per node from the arena's first-fit allocator (`RangeAlloc`), and the emit pass writes the quads there. Voxels never leave the GPU.
+  - Quads are 8 bytes: x, y, z, w-1, h-1, direction, shaded and overlay in word 0, state id and biome in word 1 (layout in the module docs). Texture, tint and emission are looked up at draw time.
+  - Neighbour slots are part of a job (`MeshJob::neighbours`) and the shader hides border faces behind them, but `CubeFar` passes none yet: borders stay walls, which is what keeps levels crack-free until a node's neighbours are remeshed when they change.
+  - Uniform nodes from the pre-pass take no slot: air and fluid draw nothing, rock gets its six faces written by the CPU.
+- **Draw** (`gfx/cube_far.rs`, `cube_far.wgsl`, `cube_cull.wgsl`): a vertex-pulling pipeline appended to `terrain.wgsl`, so the fragment stage, fog, light, fade dither and emission are the far tiles'. A culling compute pass tests each node against the frustum and the camera's side of each direction, writes the instance data and compacts one indirect draw per (node, direction, pass), drawn with `multi_draw_indirect_count` (or `multi_draw_indirect` over a cleared tail where counts are unavailable, DX12 included). Node origins are `i32` blocks minus the camera's integer part, so positions stay exact at 30,000,000 blocks. The Hi-Z test of `gpu_occlusion.wgsl` has a marked hook in `cube_cull.wgsl`.
+- **`CubeLod` switches paths** with `set_gpu_path` (the sampler must have a GPU generator on the renderer's device and the "Far Terrain on GPU" setting must be Auto). On the GPU path workers hand out slots (`GpuNode`) instead of meshes; CPU-sampled nodes (saved cubes, downsampled fine levels) are written into pool slots with `write_buffer`. The renderer frees a slot once its emit pass is submitted, and a node's arena range and table entry when the plan drops it.
+- **Whole World**: the octree root is level 22, the LOD Distance slider's top step reads "Whole World", and the planner leaves out nodes outside the world border and cube range. A classifier thread asks the sampler's 2D pre-pass (`node_class`) about nodes: uniform air or fluid subtrees are left out, uniform rock stays one closed leaf.
+- **Progress**: `CubeLod::stats()` (`CubeLodStats`) counts planned, ready, pending and uniform-skipped nodes, GPU nodes generated and meshed, arena and pool bytes, and stamps when the plan changed and when it last became complete (every planned node drawn or known empty, nothing waiting in the mesher).
+
+Not done: node selection on the GPU (traversal by screen-space error), Hi-Z occlusion of far nodes, biomes on the GPU, remeshing a node when its neighbours change (so no border culling), GPU far water in OIT or shader-pack frames, the swamp's grass noise across a biome, and sorting far water.
+
+
 ## Budgets
 
 Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertical distance 8 and far terrain 128 chunks, with Custom Cubic defaults:

@@ -17838,7 +17838,21 @@ impl Game<'_> {
                             })
                     })
                 });
+                // Far terrain meshed and drawn on the GPU where the sampler generates there
+                // and the setting allows (`CubeLod::set_gpu_path`).
+                let facts = self.res.facts();
+                let gpu = self.settings.horizon.gpu_far
+                    && cube_lod.gpu_backend().is_some_and(|backend| {
+                        renderer.use_gpu_cube_lods(backend, facts.states.len(), facts.air.0)
+                    });
+                if cube_lod.set_gpu_path(gpu) {
+                    renderer.clear_cube_lods();
+                }
                 renderer.queue_cube_lods(meshes, cube_lod.removed());
+                if cube_lod.gpu_path() {
+                    renderer.queue_gpu_cube_lods(cube_lod.take_gpu_nodes());
+                }
+                cube_lod.set_render_stats(renderer.cube_far_stats());
                 horizon_client::spans::time("cube_lod_upload", || {
                     renderer.upload_cube_lods(std::time::Duration::from_millis(2))
                 });

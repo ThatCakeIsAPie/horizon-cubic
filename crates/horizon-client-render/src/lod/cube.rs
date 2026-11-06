@@ -31,8 +31,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The coarsest level: a node 65,536 blocks wide.
-pub const MAX_CUBE_LEVEL: u8 = 12;
+/// The coarsest level: a node 67,108,864 blocks wide, wider than the world
+/// (vanilla's border, +-30,000,000 blocks) and than the cube range vertically.
+pub const MAX_CUBE_LEVEL: u8 = 22;
 /// Voxels along one side of a node.
 pub const SIDE: usize = 16;
 /// Voxels in a node.
@@ -334,6 +335,13 @@ pub trait CubeSampler: Send {
     fn resident(&mut self, key: CubeKey) -> Option<Resident> {
         self.node(key).map(Resident::Node)
     }
+    /// What the sampler knows of the whole node without sampling it (the GPU
+    /// generator's 2D pre-pass): lets the planner leave out subtrees of air
+    /// and stop at rock. Called on a background thread; the default knows
+    /// nothing.
+    fn classify(&mut self, _key: CubeKey) -> NodeClass {
+        NodeClass::Mixed
+    }
     /// The GPU generator behind this sampler (its device, node pool and block
     /// states), if any: what lets [`CubeLod`] mesh and draw on the GPU.
     fn gpu(&self) -> Option<GpuBackend> {
@@ -419,6 +427,57 @@ pub fn plan_from(
     is_loaded: &dyn Fn(SectionPos) -> bool,
     previous: &[CubeKey],
 ) -> Vec<CubeKey> {
+    plan_classified(camera, max_distance, loaded, is_loaded, previous, &|_| {
+        NodeClass::Mixed
+    })
+    .0
+}
+
+/// Vanilla's world border, in blocks each way from the origin.
+pub const WORLD_BORDER: i64 = 30_000_000;
+
+/// Whether any of the node lies inside the world: within the border
+/// horizontally and the cube range vertically. Overflow-safe at any level.
+pub fn in_world(node: CubeKey) -> bool {
+    let size = i64::from(node.size());
+    let within = |c: i32, lo: i64, hi: i64| {
+        let at = i64::from(c) * size;
+        at <= hi && at + size > lo
+    };
+    within(node.x, -WORLD_BORDER, WORLD_BORDER)
+        && within(node.z, -WORLD_BORDER, WORLD_BORDER)
+        && within(
+            node.y,
+            i64::from(horizon_world::cubic::MIN_Y),
+            i64::from(horizon_world::cubic::MAX_Y),
+        )
+}
+
+/// What the 2D pre-pass knows of a whole node (`CubeSampler::classify`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeClass {
+    /// Unknown, or the surface may cross it.
+    Mixed,
+    /// Every voxel is air or every voxel is fluid: it draws nothing, and nor
+    /// does anything inside it.
+    Air,
+    /// Every voxel is rock: it is a leaf however near, a closed shell.
+    Rock,
+}
+
+/// [`plan_from`] with what is known of nodes' contents: a node `class` calls
+/// [`NodeClass::Air`] is left out with its whole subtree, one it calls
+/// [`NodeClass::Rock`] stays a leaf (nothing inside shows), unless it holds
+/// loaded cubes. Also returns how many nodes were left out as air.
+pub fn plan_classified(
+    camera: [f64; 3],
+    max_distance: f64,
+    loaded: LoadedBox,
+    is_loaded: &dyn Fn(SectionPos) -> bool,
+    previous: &[CubeKey],
+    class: &dyn Fn(CubeKey) -> NodeClass,
+) -> (Vec<CubeKey>, usize) {
+    let mut pruned = 0;
     // The nodes holding a leaf of the last plan: the ones it split.
     let mut was_split = FxHashSet::<CubeKey>::default();
     for &leaf in previous {
@@ -441,14 +500,12 @@ pub fn plan_from(
             ((c + max_distance) / size).floor() as i32,
         )
     };
-    // Whole nodes only: the cube range of a level is a power of two.
-    let y_limit = 1_i32 << (19 - top);
     let mut stack = Vec::new();
     let (x0, x1) = span(camera[0]);
     let (y0, y1) = span(camera[1]);
     let (z0, z1) = span(camera[2]);
     for x in x0..=x1 {
-        for y in y0.max(-y_limit)..=y1.min(y_limit - 1) {
+        for y in y0..=y1 {
             for z in z0..=z1 {
                 stack.push(CubeKey::new(top, x, y, z));
             }
@@ -456,11 +513,28 @@ pub fn plan_from(
     }
     let mut leaves = Vec::new();
     while let Some(node) = stack.pop() {
+        if !in_world(node) {
+            continue;
+        }
         let distance = node.distance(camera);
         if distance > max_distance {
             continue;
         }
-        match loaded_state(node, center, loaded, is_loaded) {
+        let state = loaded_state(node, center, loaded, is_loaded);
+        if matches!(state, Loaded::None) {
+            match class(node) {
+                NodeClass::Air => {
+                    pruned += 1;
+                    continue;
+                }
+                NodeClass::Rock => {
+                    leaves.push((distance, node));
+                    continue;
+                }
+                NodeClass::Mixed => {}
+            }
+        }
+        match state {
             Loaded::All => continue,
             Loaded::Some => {}
             Loaded::None
@@ -481,7 +555,7 @@ pub fn plan_from(
         stack.extend(node.children());
     }
     leaves.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    leaves.into_iter().map(|(_, node)| node).collect()
+    (leaves.into_iter().map(|(_, node)| node).collect(), pruned)
 }
 
 enum Loaded {
@@ -546,6 +620,37 @@ const REPLAN: Duration = Duration::from_millis(250);
 /// How long a node whose sampling failed waits before it is asked again.
 const RETRY: Duration = Duration::from_secs(1);
 
+/// Progress of the far terrain, for the overlay and benchmarks
+/// (`CubeLod::stats`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CubeLodStats {
+    /// Nodes in the current plan.
+    pub planned: usize,
+    /// Planned nodes handed out and drawn (or, with nothing to draw, known
+    /// empty: see `uniform_skipped`).
+    pub ready: usize,
+    /// Planned nodes still to sample, mesh or upload.
+    pub pending: usize,
+    /// Planned nodes that are uniform and draw nothing (air, fluid), and
+    /// nodes the planner left out because the 2D pre-pass proved their whole
+    /// subtree uniform air or fluid (never requested).
+    pub uniform_skipped: usize,
+    /// Nodes generated on the GPU, ever.
+    pub gpu_generated: u64,
+    /// Nodes meshed on the GPU, ever (the renderer's count).
+    pub gpu_meshed: u64,
+    /// Bytes of the quad arena and the node pool in use.
+    pub arena_bytes: u64,
+    pub pool_bytes: u64,
+    /// Every planned node is drawn or known empty, and the GPU mesher has
+    /// nothing waiting.
+    pub complete: bool,
+    /// When the plan last changed.
+    pub plan_changed: Option<Instant>,
+    /// When the current plan last became complete; none while it is not.
+    pub plan_complete: Option<Instant>,
+}
+
 /// What a worker made of a node: a CPU mesh, or (the GPU path) a node for the
 /// renderer's GPU mesher.
 enum Product {
@@ -576,6 +681,20 @@ pub struct GpuNode {
     pub content: GpuContent,
     /// The columns the sky is blocked over (`CubeNode::covered_mask`).
     pub cover: Option<Box<CoverMask>>,
+    /// The distinct block states of a CPU node (empty for a generated one:
+    /// the generator's states are known from the start).
+    pub states: Vec<u32>,
+}
+
+/// What `CubeLod::take_gpu_nodes` hands the renderer.
+#[derive(Debug, Default)]
+pub struct GpuBatch {
+    pub nodes: Vec<GpuNode>,
+    /// Material records for block states the renderer has not seen
+    /// (`gfx::cube_mesh::material_record`).
+    pub materials: Vec<(u32, [u32; crate::gfx::cube_mesh::MATERIAL_STRIDE])>,
+    /// The biome colour table, the first time.
+    pub biomes: Option<Vec<u32>>,
 }
 
 #[derive(Default)]
@@ -619,7 +738,34 @@ impl Cache {
     }
 }
 
+/// What the classifier thread has found of nodes, and what it is to look at.
+#[derive(Default)]
+struct Classes {
+    known: FxHashMap<CubeKey, NodeClass>,
+    queue: VecDeque<CubeKey>,
+    queued: FxHashSet<CubeKey>,
+}
+
+/// Classes kept at most (a plan asks for a few thousand).
+const CLASS_NODES: usize = 1 << 18;
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            classes: Mutex::default(),
+            classes_wake: Condvar::new(),
+            queue: Mutex::default(),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            cache: Mutex::default(),
+            gpu_path: AtomicBool::new(false),
+        }
+    }
+}
+
 struct Shared {
+    classes: Mutex<Classes>,
+    classes_wake: Condvar,
     queue: Mutex<Queue>,
     wake: Condvar,
     stop: AtomicBool,
@@ -664,6 +810,17 @@ pub struct CubeLod {
     backend: Option<GpuBackend>,
     /// Nodes finished for the GPU mesher, not yet taken.
     gpu_out: Vec<GpuNode>,
+    context: Option<Arc<WorkerContext>>,
+    /// Block states the renderer has material records for.
+    known_states: FxHashSet<u32>,
+    biomes_sent: bool,
+    air: BlockStateId,
+    stats: CubeLodStats,
+    /// Delivered nodes that draw nothing.
+    empty: FxHashSet<CubeKey>,
+    /// Nodes the planner left out as uniform, from the class cache.
+    pruned: usize,
+    render: Option<crate::gfx::cube_far::FarStats>,
 }
 
 impl CubeLod {
@@ -675,6 +832,8 @@ impl CubeLod {
     ) -> Self {
         let wanted_threads = (horizon_threads::worker_count() / 2).clamp(2, 4);
         let backend = sampler.gpu();
+        // One more fork classifies nodes for the planner, on a thread of its own.
+        let classifier = backend.is_some().then(|| sampler.fork()).flatten();
         let mut samplers = Vec::new();
         while samplers.len() + 1 < wanted_threads
             && let Some(fork) = sampler.fork()
@@ -682,26 +841,27 @@ impl CubeLod {
             samplers.push(fork);
         }
         samplers.push(sampler);
-        let shared = Arc::new(Shared {
-            queue: Mutex::default(),
-            wake: Condvar::new(),
-            stop: AtomicBool::new(false),
-            cache: Mutex::default(),
-            gpu_path: AtomicBool::new(false),
-        });
+        let shared = Arc::new(Shared::new());
         let (tx, results) = mpsc::channel();
-        let threads = samplers
-            .into_iter()
-            .map(|sampler| {
-                let (shared, tx, context) = (shared.clone(), tx.clone(), context.clone());
-                let backend = backend.clone();
+        let mut threads: Vec<thread::JoinHandle<()>> = classifier
+            .map(|mut sampler| {
+                let shared = shared.clone();
                 thread::Builder::new()
-                    .name("Cube far terrain".into())
-                    .spawn(move || work(shared, tx, context, sampler, air, backend))
-                    .expect("spawn a cube far terrain thread")
+                    .name("Cube far classes".into())
+                    .spawn(move || classify_loop(&shared, sampler.as_mut()))
+                    .expect("spawn the cube classifier thread")
             })
+            .into_iter()
             .collect();
-        Self::assemble(shared, results, threads, backend)
+        threads.extend(samplers.into_iter().map(|sampler| {
+            let (shared, tx, context) = (shared.clone(), tx.clone(), context.clone());
+            let backend = backend.clone();
+            thread::Builder::new()
+                .name("Cube far terrain".into())
+                .spawn(move || work(shared, tx, context, sampler, air, backend))
+                .expect("spawn a cube far terrain thread")
+        }));
+        Self::assemble(shared, results, threads, backend, Some(context), air)
     }
 
     fn assemble(
@@ -709,6 +869,8 @@ impl CubeLod {
         results: mpsc::Receiver<Done>,
         threads: Vec<thread::JoinHandle<()>>,
         backend: Option<GpuBackend>,
+        context: Option<Arc<WorkerContext>>,
+        air: BlockStateId,
     ) -> Self {
         Self {
             shared,
@@ -722,6 +884,60 @@ impl CubeLod {
             camera: [0.0; 3],
             backend,
             gpu_out: Vec::new(),
+            context,
+            known_states: FxHashSet::default(),
+            biomes_sent: false,
+            air,
+            stats: CubeLodStats::default(),
+            empty: FxHashSet::default(),
+            pruned: 0,
+            render: None,
+        }
+    }
+
+    /// The renderer's GPU far terrain counters (`Renderer::cube_far_stats`),
+    /// for [`CubeLod::stats`].
+    pub fn set_render_stats(&mut self, stats: Option<crate::gfx::cube_far::FarStats>) {
+        self.render = stats;
+    }
+
+    /// Progress of the plan. `complete` is exact: every planned node was
+    /// handed out (a mesh, or a GPU node) and, on the GPU path, the renderer
+    /// holds no node still waiting for its mesh; nodes that draw nothing count
+    /// as ready.
+    pub fn stats(&self) -> CubeLodStats {
+        let ready = self
+            .plan
+            .iter()
+            .filter(|k| self.delivered.contains(k))
+            .count();
+        let mut out = self.stats;
+        out.planned = self.plan.len();
+        out.ready = ready;
+        out.pending = self.plan.len() - ready;
+        out.uniform_skipped =
+            self.pruned + self.plan.iter().filter(|k| self.empty.contains(k)).count();
+        if let Some(render) = self.render {
+            out.gpu_meshed = render.meshed + render.uniform;
+            out.arena_bytes = render.arena_bytes;
+            out.pool_bytes = render.pool_bytes;
+        }
+        out.complete = self.is_complete();
+        out
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.plan.is_empty()
+            && self.plan.iter().all(|k| self.delivered.contains(k))
+            && self.gpu_out.is_empty()
+            && (!self.gpu_path() || self.render.is_some_and(|r| r.pending == 0 && !r.meshing))
+    }
+
+    fn track_completion(&mut self, now: Instant) {
+        match (self.is_complete(), self.stats.plan_complete) {
+            (true, None) => self.stats.plan_complete = Some(now),
+            (false, Some(_)) => self.stats.plan_complete = None,
+            _ => {}
         }
     }
 
@@ -753,8 +969,44 @@ impl CubeLod {
 
     /// The nodes finished for the GPU mesher since the last call (their slots
     /// are the caller's from here), for the nodes in the plan.
-    pub fn take_gpu_nodes(&mut self) -> Vec<GpuNode> {
-        std::mem::take(&mut self.gpu_out)
+    pub fn take_gpu_nodes(&mut self) -> GpuBatch {
+        let nodes = std::mem::take(&mut self.gpu_out);
+        let mut wanted: Vec<u32> = Vec::new();
+        if let Some(backend) = &self.backend {
+            wanted.extend(&backend.states);
+        }
+        for node in &nodes {
+            if let GpuContent::Uniform(voxel) = node.content {
+                wanted.push(voxel.state.0);
+            }
+            wanted.extend(&node.states);
+        }
+        let mut materials = Vec::new();
+        for state in wanted.into_iter().filter(|_| self.context.is_some()) {
+            let context = self.context.as_ref().expect("a context");
+            if state != self.air.0
+                && state <= crate::gfx::cube_mesh::MAX_STATE
+                && self.known_states.insert(state)
+            {
+                materials.push((
+                    state,
+                    crate::gfx::cube_mesh::material_record(context, state),
+                ));
+            }
+        }
+        let biomes = self
+            .context
+            .as_ref()
+            .filter(|_| !self.biomes_sent)
+            .map(|context| {
+                self.biomes_sent = true;
+                crate::gfx::cube_mesh::biome_table(context)
+            });
+        GpuBatch {
+            nodes,
+            materials,
+            biomes,
+        }
     }
 
     /// Returns a node's slot to the pool.
@@ -785,7 +1037,15 @@ impl CubeLod {
             None => true,
         };
         if stale {
-            let next = plan_from(camera, max_distance, loaded, &is_loaded, &self.plan);
+            let shared = self.shared.clone();
+            let class = move |key: CubeKey| classify_cached(&shared, key);
+            let (next, pruned) =
+                plan_classified(camera, max_distance, loaded, &is_loaded, &self.plan, &class);
+            self.pruned = pruned;
+            if next != self.plan {
+                self.stats.plan_changed = Some(now);
+                self.stats.plan_complete = None;
+            }
             self.plan = next;
             self.wanted = self.plan.iter().copied().collect();
             self.planned = Some((cube, max_distance, loaded, now));
@@ -808,6 +1068,15 @@ impl CubeLod {
                 }
                 Some(Product::Gpu(node)) => {
                     self.delivered.insert(done.key);
+                    match node.content {
+                        GpuContent::Uniform(voxel) if voxel.state == self.air => {
+                            self.empty.insert(done.key);
+                        }
+                        GpuContent::Slot(_) if node.states.is_empty() => {
+                            self.stats.gpu_generated += 1;
+                        }
+                        _ => {}
+                    }
                     self.gpu_out.push(node);
                 }
                 None => {
@@ -815,6 +1084,7 @@ impl CubeLod {
                 }
             }
         }
+        self.track_completion(now);
         out
     }
 
@@ -885,6 +1155,9 @@ impl CubeLod {
         self.wanted.clear();
         self.delivered.clear();
         self.failed.clear();
+        self.empty.clear();
+        self.stats.plan_changed = None;
+        self.stats.plan_complete = None;
         self.planned = None;
         while let Ok(done) = self.results.try_recv() {
             if let Some(Product::Gpu(node)) = &done.product {
@@ -906,10 +1179,56 @@ impl Drop for CubeLod {
             self.shared.stop.store(true, Ordering::Relaxed);
         }
         self.shared.wake.notify_all();
+        {
+            let _classes = self.shared.classes.lock();
+            self.shared.classes_wake.notify_all();
+        }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
         self.clear();
+    }
+}
+
+/// What is known of `key`; unknown nodes are queued for the classifier thread
+/// and count as mixed until it has looked.
+fn classify_cached(shared: &Shared, key: CubeKey) -> NodeClass {
+    if key.level < 2 {
+        return NodeClass::Mixed;
+    }
+    let mut classes = shared.classes.lock().unwrap();
+    if let Some(&class) = classes.known.get(&key) {
+        return class;
+    }
+    if classes.queued.insert(key) {
+        classes.queue.push_back(key);
+        drop(classes);
+        shared.classes_wake.notify_one();
+    }
+    NodeClass::Mixed
+}
+
+fn classify_loop(shared: &Shared, sampler: &mut dyn CubeSampler) {
+    loop {
+        let key = {
+            let mut classes = shared.classes.lock().unwrap();
+            loop {
+                if shared.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(key) = classes.queue.pop_front() {
+                    break key;
+                }
+                classes = shared.classes_wake.wait(classes).unwrap();
+            }
+        };
+        let class = sampler.classify(key);
+        let mut classes = shared.classes.lock().unwrap();
+        classes.queued.remove(&key);
+        if classes.known.len() >= CLASS_NODES {
+            classes.known.clear();
+        }
+        classes.known.insert(key, class);
     }
 }
 
@@ -991,6 +1310,15 @@ fn work(
 /// rest are uploaded into one. `None` when the pool is full.
 fn gpu_from_node(node: &CubeNode, air: BlockStateId, backend: &GpuBackend) -> Option<GpuNode> {
     let cover = node.covered_mask().map(|mask| Box::new(*mask));
+    let mut states = Vec::new();
+    if node.as_uniform().is_none() {
+        let mut seen = FxHashSet::<u32>::default();
+        for i in 0..VOLUME {
+            if seen.insert(node.at(i).state.0) {
+                states.push(node.at(i).state.0);
+            }
+        }
+    }
     let content = match node.as_uniform() {
         Some(voxel) if cover.is_none() => GpuContent::Uniform(voxel),
         _ => {
@@ -1005,6 +1333,7 @@ fn gpu_from_node(node: &CubeNode, air: BlockStateId, backend: &GpuBackend) -> Op
         key: node.key,
         content,
         cover,
+        states,
     })
 }
 
@@ -1031,6 +1360,7 @@ fn gpu_node(
             key,
             content: GpuContent::Slot(slot),
             cover: None,
+            states: Vec::new(),
         }),
         Some(Resident::Node(node)) => {
             debug_assert_eq!(node.key, key);
@@ -1563,12 +1893,7 @@ mod tests {
                 None
             }
         }
-        let shared = Shared {
-            queue: Mutex::default(),
-            wake: Condvar::new(),
-            stop: AtomicBool::new(false),
-            cache: Mutex::default(),
-        };
+        let shared = Shared::new();
         let k = key(2, 0, 0, 0);
         let built = node(&shared, &mut OnlyCubes, k, AIR, &kind).unwrap();
         let direct = Flat.node(k).unwrap();
@@ -1582,14 +1907,9 @@ mod tests {
     }
 
     fn lod_for_test() -> CubeLod {
-        let shared = Arc::new(Shared {
-            queue: Mutex::default(),
-            wake: Condvar::new(),
-            stop: AtomicBool::new(false),
-            cache: Mutex::default(),
-        });
+        let shared = Arc::new(Shared::new());
         let (_tx, results) = mpsc::channel();
-        CubeLod::assemble(shared, results, Vec::new())
+        CubeLod::assemble(shared, results, Vec::new(), None, None, AIR)
     }
 
     #[test]
@@ -1630,5 +1950,110 @@ mod tests {
         lod.clear();
         assert!(lod.plan.is_empty() && lod.delivered.is_empty());
         assert!(lod.removed().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod whole_world_tests {
+    use super::*;
+
+    const NONE: LoadedBox = LoadedBox {
+        horizontal: 0,
+        vertical: 0,
+    };
+    const WORLD: f64 = 67_108_864.0;
+
+    fn disjoint(plan: &[CubeKey]) {
+        let set: FxHashSet<CubeKey> = plan.iter().copied().collect();
+        for &leaf in plan {
+            let mut up = leaf;
+            while up.level < MAX_CUBE_LEVEL {
+                up = up.parent();
+                assert!(!set.contains(&up), "{leaf:?} lies inside {up:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn keys_stay_exact_at_the_top_level() {
+        let top = CubeKey::new(MAX_CUBE_LEVEL, -1, -1, 0);
+        assert_eq!(top.size(), 1 << 26);
+        assert_eq!(top.origin(), [-(1 << 26), -(1 << 26), 0]);
+        assert_eq!(top.children()[7].level, MAX_CUBE_LEVEL - 1);
+        assert!(top.contains(top.children()[3]));
+        assert!(in_world(CubeKey::new(MAX_CUBE_LEVEL, 0, 0, 0)));
+        // The border: the last node inside it, and one wholly past it.
+        let edge = 30_000_000 / 16;
+        assert!(in_world(CubeKey::new(0, edge - 1, 0, 0)));
+        assert!(!in_world(CubeKey::new(0, edge, 0, 0)));
+        assert!(!in_world(CubeKey::new(0, 0, 1 << 19, 0)));
+        assert!(in_world(CubeKey::new(0, 0, -(1 << 19), 0)));
+    }
+
+    #[test]
+    fn the_whole_world_plan_is_bounded_disjoint_and_inside_the_world() {
+        let (plan, pruned) =
+            plan_classified([0.0, 100.0, 0.0], WORLD, NONE, &|_| false, &[], &|_| {
+                NodeClass::Mixed
+            });
+        assert_eq!(pruned, 0);
+        assert!(!plan.is_empty() && plan.len() < 100_000, "{}", plan.len());
+        assert!(plan.iter().all(|k| in_world(*k)));
+        assert!(plan.iter().any(|k| k.level >= 18), "coarse nodes far out");
+        assert!(plan.iter().any(|k| k.level == 0), "fine ones near");
+        disjoint(&plan);
+    }
+
+    #[test]
+    fn nodes_known_uniform_are_left_out_or_stay_whole() {
+        let camera = [0.0, 100.0, 0.0];
+        let all = |_: SectionPos| false;
+        let (mixed, _) = plan_classified(camera, WORLD, NONE, &all, &[], &|_| NodeClass::Mixed);
+        // Everything above y = 1000 is air, everything below y = -1000 rock.
+        let class = |k: CubeKey| {
+            let [_, y, _] = k.origin();
+            if i64::from(y) > 1000 {
+                NodeClass::Air
+            } else if i64::from(y) + i64::from(k.size()) < -1000 {
+                NodeClass::Rock
+            } else {
+                NodeClass::Mixed
+            }
+        };
+        let (plan, pruned) = plan_classified(camera, WORLD, NONE, &all, &[], &class);
+        assert!(pruned > 0);
+        assert!(
+            plan.len() < mixed.len() / 2,
+            "{} of {}",
+            plan.len(),
+            mixed.len()
+        );
+        assert!(plan.iter().all(|k| class(*k) != NodeClass::Air));
+        // A rock node is a leaf however near the camera: none of its parts is planned.
+        for k in plan.iter().filter(|k| class(**k) == NodeClass::Rock) {
+            assert!(!plan.iter().any(|o| o != k && k.contains(*o)));
+        }
+        disjoint(&plan);
+    }
+
+    #[test]
+    fn a_node_with_loaded_cubes_still_splits_around_them() {
+        let loaded = LoadedBox {
+            horizontal: 2,
+            vertical: 2,
+        };
+        let (plan, _) = plan_classified([8.0, 8.0, 8.0], 4096.0, loaded, &|_| true, &[], &|_| {
+            NodeClass::Rock
+        });
+        // Every cube around the camera is drawn by the near renderer: none planned inside.
+        for k in &plan {
+            for dy in -2..=2 {
+                for dz in -2..=2 {
+                    for dx in -2..=2 {
+                        assert!(!k.contains_cube(SectionPos::new(dx, dy, dz)), "{k:?}");
+                    }
+                }
+            }
+        }
     }
 }

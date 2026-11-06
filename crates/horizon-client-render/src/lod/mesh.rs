@@ -164,9 +164,7 @@ pub(crate) fn far_style(
             translucent: face.translucent && !leaves,
         });
         // Grass's tinted side overlay must follow its untinted base.
-        if name != "minecraft:grass_block"
-            || matches!(direction, Direction::Up | Direction::Down)
-        {
+        if name != "minecraft:grass_block" || matches!(direction, Direction::Up | Direction::Down) {
             break;
         }
     }
