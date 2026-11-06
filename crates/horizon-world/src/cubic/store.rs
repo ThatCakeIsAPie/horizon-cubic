@@ -612,9 +612,10 @@ impl CubeStore {
             self.open_files.fetch_add(1, Ordering::AcqRel);
             opened = true;
         }
-        region
-            .used
-            .store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        region.used.store(
+            self.clock.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         let result = f(guard.as_mut().expect("opened above"));
         drop(guard);
         if opened {
@@ -642,9 +643,10 @@ impl CubeStore {
                 Err(TryLockError::Poisoned(e)) => oldest.close(&mut e.into_inner()),
                 // In use: it counts as recent.
                 Err(TryLockError::WouldBlock) => {
-                    oldest
-                        .used
-                        .store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+                    oldest.used.store(
+                        self.clock.fetch_add(1, Ordering::Relaxed),
+                        Ordering::Relaxed,
+                    );
                 }
             }
         }
