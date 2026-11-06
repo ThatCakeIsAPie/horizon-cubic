@@ -14,6 +14,10 @@ its own HORIZON_HOME and control socket in --out) and prints `status`'s `cube_lo
 - `--cavern`: spectator at y -2,000 inside rock (screenshots four ways), then inside an open space: a
   natural one if a 96-block box around holds one, else a room carved with /fill. Prints the counters
   (no holes, complete) and the log's errors.
+- `--views Y:PITCH ...`: at x --x, each height in turn, waits for the fill and screenshots
+  (`view_y<Y>_p<PITCH>.png`), e.g. `--views 300:0 1000:60 10000:60 100000:60 1000000:60 5000000:60`.
+- `--tall`: the world's CubicWorldGen heights raised (heightFactor 30,000, heightVariationFactor
+  1,000: peaks of several thousand blocks) before the checks, as the tiles' own test did.
 Screenshots go to --out.
 """
 import argparse
@@ -41,6 +45,8 @@ def main():
     ap.add_argument('--hitch', action='store_true')
     ap.add_argument('--spyglass', action='store_true')
     ap.add_argument('--cavern', action='store_true')
+    ap.add_argument('--views', nargs='*', default=[], help='Y:PITCH views to screenshot after each fill')
+    ap.add_argument('--tall', action='store_true', help='raise the terrain to peaks of thousands of blocks')
     ap.add_argument('--timeout', type=float, default=180.0, help='seconds a fill may take')
     args = ap.parse_args()
     bins = Path(args.bin_dir)
@@ -73,7 +79,8 @@ def main():
 
     def counters(lod):
         keys = ['planned', 'ready', 'pending', 'holes', 'covering', 'complete', 'target_px', 'voxel_px',
-                'limited', 'budget', 'cover_nodes', 'plan_ms', 'arena_bytes']
+                'limited', 'budget', 'cover_nodes', 'plan_ms', 'arena_bytes', 'surface', 'tiles', 'tiles_ready',
+                'tiles_complex', 'tile_bytes']
         return ' '.join(f'{k}={lod.get(k)}' for k in keys)
 
     def settle(label, since, moved=True):
@@ -128,13 +135,33 @@ def main():
                             best = (air, free)
         return best
 
-    print(ctl_run('launch', '--game', game, '--world', 'FarCheck', '--seed', args.seed, '--creative',
-                  '--offscreen', '--wait', '--cubic', '--resources', args.resources, '--game-dir', game_dir,
-                  '--width', 1280, '--height', 720, timeout=600)[:120], flush=True)
+    def launch():
+        print(ctl_run('launch', '--game', game, '--world', 'FarCheck', '--seed', args.seed, '--creative',
+                      '--offscreen', '--wait', '--cubic', '--resources', args.resources, '--game-dir', game_dir,
+                      '--width', 1280, '--height', 720, timeout=600)[:120], flush=True)
+
+    launch()
+    if args.tall:
+        ctl_run('quit')
+        time.sleep(3)
+        settings = game_dir / 'saves' / 'FarCheck' / 'cubicgen.json'
+        data = json.loads(settings.read_text())
+        data['heightFactor'] = 30000.0
+        data['heightVariationFactor'] = 1000.0
+        settings.write_text(json.dumps(data, indent=2))
+        print('cubicgen.json: heightFactor 30000, heightVariationFactor 1000', flush=True)
+        launch()
     try:
         ctl_run('command', 'gamemode spectator')
         ctl_run('look', 0, 0)
         settle('spawn', time.monotonic())
+        for view in args.views:
+            y, pitch = (float(v) for v in view.split(':'))
+            ctl_run('tp', args.x, y, 0)
+            ctl_run('look', 0, pitch)
+            settle(f'view y {y:.0f}, pitch {pitch:.0f}', time.monotonic())
+            time.sleep(1)
+            ctl_run('screenshot', scratch / f'view_y{y:.0f}_p{pitch:.0f}.png')
         if args.hitch:
             for i in range(2):
                 ctl_run('stats', 'reset')

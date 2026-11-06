@@ -62,6 +62,8 @@ def main():
     ap.add_argument('--budget', type=int, help='the most far nodes a plan holds (HORIZON_FAR_NODES)')
     ap.add_argument('--steady', type=float, default=3.0, help='seconds of fps sampled after the last fill')
     ap.add_argument('--shots', action='store_true', help='also take the comparison screenshots into --out')
+    ap.add_argument('--shot-heights', type=int, nargs='*', default=[],
+                    help='more heights for --shots, looking down at 60 degrees (e.g. 100000 1000000 5000000)')
     args = ap.parse_args()
 
     bins = Path(args.bin_dir)
@@ -99,7 +101,7 @@ def main():
         except (json.JSONDecodeError, subprocess.TimeoutExpired):
             return {}
 
-    peak = {'arena': 0, 'pool': 0}
+    peak = {'arena': 0, 'pool': 0, 'tiles': 0}
 
     def wait_fill(label, since, moved=True):
         """Seconds from `since` until the far terrain is first covered, and until it is complete again,
@@ -115,6 +117,7 @@ def main():
                 print(f'  t={time.monotonic() - since:5.1f} ' + ' '.join(f'{k}={v}' for k, v in lod.items() if not isinstance(v, (dict, list))), flush=True)
             peak['arena'] = max(peak['arena'], lod.get('arena_bytes') or 0)
             peak['pool'] = max(peak['pool'], lod.get('pool_bytes') or 0)
+            peak['tiles'] = max(peak['tiles'], lod.get('tile_bytes') or 0)
             # The plan changed after the teleport: this is the new view's fill.
             changed_ago = lod.get('plan_changed_ago_s')
             complete_ago = lod.get('plan_complete_ago_s')
@@ -128,8 +131,9 @@ def main():
                 if cover is None:
                     cover = done
                 limited = ' (budget)' if lod.get('limited') else ''
+                tiles = f', {lod.get("tiles")} of them tiles' if lod.get('surface') else ''
                 print(f'{label}: covered in {cover:.2f}s, complete in {done:.2f}s, {lod.get("planned")} nodes '
-                      f'planned, {lod.get("uniform_skipped")} uniform, {lod.get("voxel_px")} px{limited}, '
+                      f'planned{tiles}, {lod.get("uniform_skipped")} uniform, {lod.get("voxel_px")} px{limited}, '
                       f'gpu={lod.get("gpu_path")}', flush=True)
                 return done, cover, fps, lod
             time.sleep(0.1)
@@ -176,15 +180,18 @@ def main():
                 steady.append(float(s['fps']))
             time.sleep(0.2)
         result['fps_steady'] = statistics.median(steady) if steady else None
-        for key in ('planned', 'gpu_path', 'target_px', 'voxel_px', 'budget', 'limited', 'plan_ms'):
+        for key in ('planned', 'gpu_path', 'target_px', 'voxel_px', 'budget', 'limited', 'plan_ms', 'surface',
+                    'tiles', 'tiles_resident', 'tiles_complex', 'tiles_limited'):
             result[key] = lod.get(key)
         result['detail'] = args.detail
         result['arena_mb'] = (lod.get('arena_bytes', 0) + lod.get('pool_bytes', 0)) / 2**20
         result['peak_arena_mb'] = peak['arena'] / 2**20
         result['peak_pool_mb'] = peak['pool'] / 2**20
+        result['peak_tile_mb'] = peak['tiles'] / 2**20
         if args.shots:
             x = args.hops * args.hop
-            for name, y, pitch in [('horizon_y300', 300, 0), ('down_y1000', 1000, 60), ('down_y10000', 10000, 60)]:
+            for name, y, pitch in [('horizon_y300', 300, 0), ('down_y1000', 1000, 60), ('down_y10000', 10000, 60)] + [
+                    (f'down_y{y}', y, 60) for y in args.shot_heights]:
                 ctl_run('tp', x, y, 0)
                 ctl_run('look', 0, pitch)
                 wait_fill(name, time.monotonic(), moved=False)

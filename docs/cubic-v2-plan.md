@@ -300,7 +300,14 @@ Points 1 and 5 above are built (`lod/cube.rs`):
 - **Coverage first.** When a quarter of a new plan has nothing drawn over it (a teleport, joining), only the coverage layer is queued: the plan for voxels 8 times bigger, at most 768 nodes, one node over each hole, and the planned nodes that hold the last plan's (so those can go). Once it is in and shown, the rest is queued; `removed` keeps the coverage nodes until the nodes under them are in. `status`'s `cube_lod.plan_covered_ago_s` stamps when the plan last had no hole.
 - **On screen first.** The queue is holes first, then the plan by direction from the camera (48 sectors and the nodes around the camera), the sectors the camera faces first, nearest first in each. Turning only reorders the sectors.
 - **The planner runs on its own thread**, and hands the game thread the change from the last plan: little while moving, the whole plan once after a teleport.
-- **Seam for the 2D tiles:** `node_kind(key, view, tile)` and `SURFACE_LEVEL`. It answers `Cube` until the tile module gives tile information.
+- **Surface tiles in the plan** (after merging `cubic/far-surface`; Custom worlds without `cubeAreas`, on the GPU path; Hybrid, Flat and the CPU path keep cube nodes everywhere):
+  - From `SURFACE_LEVEL` (12) up, the plan is first a quadtree of tiles over X and Z (`plan_tiles`). A tile splits into its four children by the same screen-space rule, measured to the nearest point of the box its terrain fills (its header's skirt to its highest top; before it is generated, 64 below to 192 above the sea), so tall mountains and sky islands refine as near as they reach. Its own budget: `TILE_BUDGET` (3,584 tiles; the renderer's pool holds `TILE_CAPACITY`, 8,192, about 110 MB).
+  - `node_kind(key, view, tile)` decides per footprint: a tile from `SURFACE_LEVEL` up, cube nodes below; a tile whose header counts complex columns turns into cube nodes `COMPLEX_LIFT` (3) levels sooner. A tile is generated first (it is the fastest coverage) and planned again as cube nodes once known to be complex.
+  - The cube octree then fills the footprints the quadtree left to cube nodes: a node under a tile is left out, a node partly under one splits (rock partly under one is left out: the tiles' skirts close the ground). No cube node and tile share a footprint, at any height.
+  - The footprints meeting the loaded cubes, the camera's own included, are always cube nodes (at the surface level's size): from a cavern deep down, the tiles elsewhere still draw the surface far above and the rock hides it.
+  - The renderer makes the tiles itself (`Renderer::use_surface_tiles`, `queue_surface_tiles`): they are asked for as soon as they are planned, coverage tiles first, and count as delivered once their header is read back (`CubeLod::surface_feedback`). A tile is faded out (`SurfaceTiles::retire`) once everything planned in or over its footprint is in; a node under a planned tile stays until the tile is in. The coverage layer is tiles where it reaches them.
+  - `status`'s `cube_lod` has `surface`, `tiles`, `tiles_ready`, `tiles_resident`, `tile_bytes`, `tiles_complex`; `planned`, `ready`, `cover_s` and `far_fill_s` count tiles as nodes.
+  - `SURFACE_LEVEL` is a guess to measure: with exact heights, tiles may look right lower down.
 
 **Measured** (`tools/cubic_far_bench.py --detail <step>`, Whole World, 1280 x 720 offscreen, 4-core i7 and GTX 1070 Ti; medians of 2 runs x 3 hops of 5,000,000 blocks; nodes and MB at the last hop):
 
@@ -317,7 +324,7 @@ Points 1 and 5 above are built (`lod/cube.rs`):
 - The node budget (120,000) stops Ultra and Extreme at about 2.5 px at 720 pixels; it grows with the viewport's height squared, so at 1440 pixels High meets it too. True 1 px at 720 pixels needs about 700,000 nodes by the counts above (nodes grow with the square of the detail): about 700 MB of arena and a fill of four to five minutes at the measured ~2,600 nodes/s. Not measured yet: it needs a build with a bigger node table.
 - Teleport hitch, measured before `RELEASE_BATCH`: the longest frame after a teleport was 17–81 ms on main, 117–131 ms at High and 235–281 ms at Ultra. The renderer retires each released node with buffer writes of its own (`CubeFar::upload`), and a teleport released the whole last plan in one frame; `removed` now hands out 4,096 at a time. To re-measure.
 - Fill rate (~2,600 planned nodes/s, ~1,700 generated on the GPU) is the next lever, for the autoresearch loops: GPU batch sizes, the pool, the mesher's batch.
-- Not run yet (`tools/cubic_far_check.py`): the spyglass (`--spyglass`), a cavern at y -2,000 (`--cavern`), the teleport hitch after `RELEASE_BATCH` (`--hitch`).
+- Not run yet (`tools/cubic_far_check.py`): the spyglass (`--spyglass`), a cavern at y -2,000 (`--cavern`), the teleport hitch after `RELEASE_BATCH` (`--hitch`). Nothing with surface tiles in the plan has been run either: views from y 300 to 5,000,000 (`--views`), the tall-mountain world (`--tall`), `SURFACE_LEVEL` 10, 12 and 14, and the benchmark's numbers with tiles.
 
 ### Where the GPU far view stands
 
@@ -341,8 +348,7 @@ Not done: node selection on the GPU (traversal by screen-space error), Hi-Z occl
 - Measured (GTX 1070 Ti, defaults): 256 level-14 tiles in 4.7 ms of GPU time (climate 3.2 + surface 1.5); 1,089 tiles generated and read back 31 ms after the request. 13,376 bytes a tile.
 - Drawn by vertex pulling through `terrain.wgsl` and `cube_far.wgsl`'s material lookup (`cf_face`): blocky span boxes, skirts at tile edges down to the tile's lowest possible ground minus its relief, water at the sea's plane; culled per tile into indirect draws.
 - The noise maths of the four far-terrain compute shaders now lives once, in `gfx/cwg_noise.wgsl`.
-- `HORIZON_SURFACE_TILES_DEBUG=<level|auto>[,<radius>]` draws a square of tiles around the camera in place of the cube nodes and logs the timings (temporary).
-- To wire: decide `SURFACE_LEVEL` in the plan, `request` the tile of every planned node at or above it (instead of the node), show it when `ready`, `retire` it when the plan drops it, refine complex tiles into cube nodes; build `SurfaceTiles` beside `CubeFar` (`GpuBackend::params`, `biome_params`, `CubeFar::material_buffer`, `biome_buffer`), call `update` and `prepare` with `CubeFar::prepare`, and `draw` next to `CubeFar::draw`.
+- Wired into the plan (see "Detail by size on screen, coverage first" above): `SurfaceTiles` is built beside `CubeFar` (`GpuBackend::params`, `biome_params`, `CubeFar::material_buffer`, `biome_buffer`), `update` and `prepare` run with `CubeFar::prepare`, `draw` next to `CubeFar::draw`. The temporary debug view is gone.
 
 
 ## Budgets
