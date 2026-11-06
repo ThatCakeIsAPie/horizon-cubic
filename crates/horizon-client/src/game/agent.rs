@@ -656,6 +656,12 @@ impl Game<'_> {
             Mode::Optimize { world } => {
                 json!({ "mode": "optimize-world", "folder": world.folder, "name": world.name })
             }
+            Mode::ConvertConfirm { world, .. } => {
+                json!({ "mode": "convert-cubic-confirm", "folder": world.folder, "name": world.name })
+            }
+            Mode::Converting { world } => {
+                json!({ "mode": "converting-cubic", "folder": world.folder, "name": world.name })
+            }
             Mode::LowDiskSpace { world } => {
                 json!({ "mode": "low-disk-space", "folder": world.folder, "name": world.name })
             }
