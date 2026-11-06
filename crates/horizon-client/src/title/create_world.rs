@@ -236,7 +236,7 @@ impl WorldOptions {
             }
             27 => self.structures = !self.structures,
             28 => self.bonus_chest = !self.bonus_chest,
-            29 => self.cubic = !self.cubic,
+            36 => self.cubic = !self.cubic,
             _ => {}
         }
     }
@@ -456,7 +456,7 @@ pub(super) fn buttons(w: f32, h: f32, creative: bool, o: &WorldOptions) -> Vec<B
                 44.0,
                 on_off(o.cubic && o.cubic_allowed()),
                 o.cubic_allowed(),
-                29,
+                36,
             ),
         ],
         // The More tab, as vanilla lays it out: Game Rules, Experiments
@@ -566,7 +566,7 @@ pub(super) fn button_narration(
             o.structures,
         ),
         28 => switch("selectWorld.bonusItems", None, o.bonus_chest()),
-        29 => switch(
+        36 => switch(
             "horizon.cubic.world",
             Some("horizon.cubic.world.info"),
             o.cubic && o.cubic_allowed(),

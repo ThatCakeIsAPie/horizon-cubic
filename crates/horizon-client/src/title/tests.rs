@@ -1147,6 +1147,13 @@ fn create_world_tabs_follow_vanilla_and_their_choices_reach_the_action() {
     assert_eq!(*focus, 1);
     assert_eq!(options.world_type, crate::save::WorldPreset::Amplified);
     assert!(options.bonus_chest());
+    // Horizon's Cubic Chunks switch, under Bonus Chest, toggles its own option.
+    assert_eq!((world[4].1, world[4].2), (85.0 + 266.0, 38.0 + 121.0));
+    f.title.click(world[4].1 + 10.0, world[4].2 + 10.0, size);
+    let Mode::Create { options, .. } = &f.title.mode else {
+        panic!()
+    };
+    assert!(options.cubic && options.cubic_allowed() && options.bonus_chest());
     let Action::Create { options, .. } = f.title.create_action() else {
         panic!()
     };

@@ -220,7 +220,7 @@ impl WorldRequest {
         }
         // A cubic world (`--cubic`, or Create World's choice): its Overworld
         // is unbounded (docs/cubic-chunks.md).
-        if created && (options.cubic || create.is_some_and(|o| o.cubic)) {
+        if created && (options.cubic || create.is_some_and(|o| o.cubic && o.cubic_allowed())) {
             horizon_client::cubic::mark_cubic_world(&save_root)?;
         }
         if let Some(d) = &options.dimension {
