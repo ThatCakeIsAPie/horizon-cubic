@@ -419,7 +419,7 @@ impl CubicLodSampler {
                 for (child, saved) in children.iter().zip(saved) {
                     nodes.push(match saved {
                         Some(node) => node,
-                        None => self.sampled(*child)?,
+                        None => self.sampled_plain(*child)?,
                     });
                 }
                 let air = BlockStateId(self.air);
@@ -478,7 +478,26 @@ impl CubicLodSampler {
         let (air, fluids) = (self.air, self.fluids.clone());
         let resolution = 1i32 << key.level;
         let start = if hybrid { top.max(VANILLA.end) } else { top };
+        // The density bound proves most tiles of 4 x 4 columns free of land
+        // at every look: no probe is made over those.
+        let tile = 4 * resolution;
+        let (low, high) = (
+            start.saturating_add(COVER_LOOKS[0]),
+            start.saturating_add(COVER_LOOKS[COVER_LOOKS.len() - 1]),
+        );
+        let mut open = [false; 16];
+        for (i, open) in open.iter_mut().enumerate() {
+            let x = origin[0] + (i as i32 & 3) * tile;
+            let z = origin[2] + (i as i32 >> 2) * tile;
+            *open = generator.classify_box([x, low, z], [x + tile - 1, high, z + tile - 1])
+                != horizon_world::cubic::custom::BoxClass::Air;
+        }
         cover_columns(origin, key.level, start, &mut mask, |x, y, z| {
+            let tx = ((x - origin[0]) / tile).clamp(0, 3);
+            let tz = ((z - origin[2]) / tile).clamp(0, 3);
+            if !open[(tz * 4 + tx) as usize] {
+                return false;
+            }
             let state = generator.block_at(x, y, z, resolution);
             state != 0 && state != air && !fluids.contains(&state)
         });
@@ -701,13 +720,43 @@ impl CubeSampler for CubicLodSampler {
 }
 
 impl CubicLodSampler {
-    /// A node sampled from the generators at its own resolution.
+    /// A node sampled from the generators at its own resolution, with its
+    /// sky cover.
     fn sampled(&mut self, key: CubeKey) -> Option<CubeNode> {
+        let node = self.sampled_plain(key)?;
+        Some(self.covered(node))
+    }
+
+    /// Cube `key` (level 0) as the generator makes it whole: terrain and
+    /// carvers (`generate`, on its lattice), not 4,096 point queries.
+    fn generated_cube(&self, key: CubeKey) -> CubeNode {
+        let mut blocks = Box::new([0u32; 4096]);
+        let pos = SectionPos::new(key.x, key.y, key.z);
+        self.wg.generator.generate(pos, &mut blocks);
+        // Biomes vary by 4 x 4 columns.
+        let mut biomes = [0u16; 16];
+        for (i, biome) in biomes.iter_mut().enumerate() {
+            let x = key.x * 16 + (i as i32 & 3) * 4;
+            let z = key.z * 16 + (i as i32 >> 2) * 4;
+            *biome = self.level.biome_id_at(x, z);
+        }
+        let air = self.air;
+        CubeNode::from_fn(key, |x, y, z| {
+            let state = blocks[y << 8 | z << 4 | x];
+            Voxel {
+                state: BlockStateId(if state == 0 { air } else { state }),
+                biome: biomes[(z >> 2) << 2 | (x >> 2)],
+            }
+        })
+    }
+
+    /// [`Self::sampled`] without the sky cover.
+    fn sampled_plain(&mut self, key: CubeKey) -> Option<CubeNode> {
         // Levels 2 and up outside the band: the far generator.
         if self.far_makes(key)
             && let Some(node) = self.far.as_mut().and_then(|far| far.node(key))
         {
-            return Some(self.covered(node));
+            return Some(node);
         }
         let origin = key.origin();
         let size = key.size();
@@ -722,6 +771,21 @@ impl CubicLodSampler {
         {
             // The vanilla columns aren't ready: try again later.
             return None;
+        }
+        // Outside a Hybrid band the finest nodes are whole cubes (level 1:
+        // its eight, downsampled).
+        if grid.is_none() && key.level == 0 {
+            return Some(self.generated_cube(key));
+        }
+        if grid.is_none() && key.level == 1 {
+            let nodes: Vec<CubeNode> = key
+                .children()
+                .iter()
+                .map(|c| self.generated_cube(*c))
+                .collect();
+            let air = BlockStateId(self.air);
+            let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
+            return Some(downsample(refs, air, |s| self.kind(s)));
         }
         let generator = self.wg.generator.clone();
         let air = self.air;
@@ -741,7 +805,7 @@ impl CubicLodSampler {
                 biome: level.biome_id_at(wx, wz),
             }
         });
-        Some(self.covered(node))
+        Some(node)
     }
 }
 
