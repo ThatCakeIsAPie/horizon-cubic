@@ -21,6 +21,7 @@ use crate::{
     gfx::{
         cube_descent::{DescentRequest, GpuDescent},
         cube_gen::{GpuBackend, MIN_LEVEL, slot_words},
+        surface_tile::{TileInfo, TileKey},
     },
     mesher::SectionMesh,
     streaming::WorkerContext,
@@ -371,6 +372,12 @@ pub trait CubeSampler: Send {
     /// An independent sampler for another thread, if this one can have one.
     /// Without it the producer runs a single worker.
     fn fork(&self) -> Option<Box<dyn CubeSampler>>;
+    /// Whether the far terrain can be drawn as surface tiles at the coarse
+    /// levels (`gfx::surface_tile`): a world whose terrain the tiles' generator
+    /// reproduces (a Custom world without `cubeAreas`). False by default.
+    fn surface(&self) -> bool {
+        false
+    }
     /// Cubes that changed since this was last asked (the producer drops the
     /// nodes it kept in memory over them). Nothing by default.
     fn changes(&mut self) -> Changes {
@@ -574,6 +581,13 @@ impl Rule {
             _ => self.out_of_view,
         }
     }
+    /// The factor for a box of blocks `lo..hi` (a surface tile's terrain).
+    pub fn factor_box(&self, camera: [f64; 3], lo: [f64; 3], hi: [f64; 3]) -> f64 {
+        match &self.cone {
+            Some(cone) if cone.meets_box(camera, lo, hi) => self.in_view,
+            _ => self.out_of_view,
+        }
+    }
 }
 
 /// A cone of directions from the camera: the view, widened.
@@ -606,10 +620,15 @@ impl Cone {
     /// widens the cone, so a node straddling the edge counts in.
     pub fn meets(&self, camera: [f64; 3], node: CubeKey) -> bool {
         let size = f64::from(node.size());
-        let o = node.origin();
-        let d = [0, 1, 2].map(|a| f64::from(o[a]) + size / 2.0 - camera[a]);
+        let lo = node.origin().map(f64::from);
+        self.meets_box(camera, lo, lo.map(|v| v + size))
+    }
+    /// [`Cone::meets`] for a box of blocks `lo..hi`.
+    pub fn meets_box(&self, camera: [f64; 3], lo: [f64; 3], hi: [f64; 3]) -> bool {
+        let d = [0, 1, 2].map(|a| (lo[a] + hi[a]) / 2.0 - camera[a]);
         let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let radius = size * 0.866_025_403_784_438_6;
+        let e = [0, 1, 2].map(|a| (hi[a] - lo[a]) / 2.0);
+        let radius = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
         if len <= radius {
             return true;
         }
@@ -734,11 +753,14 @@ pub fn root_nodes(camera: [f64; 3], max_distance: f64) -> Vec<CubeKey> {
     roots
 }
 
-/// What [`plan_classified`] chose.
+/// What [`plan_far`] chose.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Plan {
-    /// The leaves: non-overlapping, nearest first.
+    /// The cube leaves: non-overlapping, nearest first.
     pub leaves: Vec<CubeKey>,
+    /// The surface tiles (with [`PlanInput::surface`]), nearest first. No cube
+    /// leaf lies in a tile's footprint, at any height.
+    pub tiles: Vec<TileKey>,
     /// Nodes left out as uniform air or fluid, with their whole subtrees.
     pub pruned: usize,
     /// The budget kept some nodes whole that the rule would have split.
@@ -747,16 +769,61 @@ pub struct Plan {
     /// (its voxels' size on screen over the target; 1 when the budget did
     /// not bind): the plan reaches about `target * coarsened`.
     pub coarsened: f64,
+    /// The tile budget kept some tiles whole.
+    pub tiles_limited: bool,
+}
+
+/// What the plan needs to draw the coarse far terrain as surface tiles
+/// (`gfx::surface_tile`): from [`SURFACE_LEVEL`] up, a quadtree of tiles over
+/// X and Z, each standing for the whole height of its footprint.
+#[derive(Clone, Copy)]
+pub struct Surface<'a> {
+    /// The headers of the tiles generated so far: complex columns, heights.
+    pub info: &'a dyn Fn(TileKey) -> Option<TileInfo>,
+    /// Where a tile not generated yet is taken to have its terrain.
+    pub sea_level: i32,
+    /// The most tiles a plan holds.
+    pub budget: usize,
+    /// The last plan's tiles, for the hysteresis.
+    pub previous: &'a [TileKey],
+}
+
+/// Everything [`plan_far`] plans from.
+#[derive(Clone, Copy)]
+pub struct PlanInput<'a> {
+    pub camera: [f64; 3],
+    pub max_distance: f64,
+    pub rule: &'a Rule,
+    pub loaded: LoadedBox,
+    pub is_loaded: &'a dyn Fn(SectionPos) -> bool,
+    /// The last plan's cube leaves, for the hysteresis.
+    pub previous: &'a [CubeKey],
+    pub class: &'a dyn Fn(CubeKey) -> NodeClass,
+    /// Surface tiles at the coarse levels; `None`: cube nodes everywhere.
+    pub surface: Option<Surface<'a>>,
+}
+
+/// Where a cube node's footprint lies with respect to the tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Region {
+    /// All of it is planned as cube nodes (or no tile plan reaches it).
+    Cubes,
+    /// All of it is under one tile: the tile draws it.
+    Tiles,
+    /// Both: the node splits until each part is one or the other.
+    Split,
 }
 
 /// A node the plan may split, by how far over the target its voxels are.
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
-    /// It meets the loaded cubes: it splits whatever the budget.
+    /// It meets the loaded cubes, or both tiles and cube nodes: it splits
+    /// whatever the budget.
     forced: bool,
     ratio: f64,
     distance: f64,
     key: CubeKey,
+    region: Region,
 }
 
 impl PartialEq for Candidate {
@@ -781,7 +848,7 @@ impl Ord for Candidate {
 
 /// What becomes of a node the plan reaches.
 enum Fate {
-    /// Outside the world or the range, or all loaded: nothing.
+    /// Outside the world or the range, all loaded, or under a tile: nothing.
     Out,
     /// Uniform air or fluid: left out with its subtree.
     Pruned,
@@ -789,12 +856,273 @@ enum Fate {
     Split(Candidate),
 }
 
-/// The plan with what is known of nodes' contents and how fine it goes: a
-/// node `class` calls [`NodeClass::Air`] is left out with its whole subtree,
-/// one it calls [`NodeClass::Rock`] stays a leaf (nothing inside shows),
-/// unless it holds loaded cubes. A node splits by `rule` (with hysteresis:
-/// one `previous` split splits while its ratio is above `1 / MERGE`), the
-/// nodes furthest over their target first, until `rule.budget` leaves.
+/// The tile quadtree a plan chose: its tiles, the footprints planned as cube
+/// nodes instead, and the footprints split further.
+#[derive(Default)]
+struct Quadtree {
+    tiles: FxHashSet<TileKey>,
+    cubes: FxHashSet<TileKey>,
+    split: FxHashSet<TileKey>,
+}
+
+impl Quadtree {
+    /// The region of `node`'s footprint, from that footprint alone (its
+    /// parent's was split, or it is a root).
+    fn region(&self, node: CubeKey) -> Region {
+        let t = TileKey::new(node.level, node.x, node.z);
+        if self.tiles.contains(&t) {
+            Region::Tiles
+        } else if self.split.contains(&t) {
+            Region::Split
+        } else {
+            // A cube footprint, or one no tile plan reaches (out of range).
+            Region::Cubes
+        }
+    }
+}
+
+/// A tile the plan may split.
+#[derive(Clone, Copy, Debug)]
+struct TileCandidate {
+    forced: bool,
+    ratio: f64,
+    distance: f64,
+    key: TileKey,
+}
+
+impl PartialEq for TileCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for TileCandidate {}
+impl PartialOrd for TileCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TileCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.forced
+            .cmp(&other.forced)
+            .then(self.ratio.total_cmp(&other.ratio))
+            .then(other.key.cmp(&self.key))
+    }
+}
+
+enum TileFate {
+    Out,
+    /// Planned as cube nodes of its level.
+    Cubes,
+    Leaf(f64),
+    Split(TileCandidate),
+}
+
+/// Whether any of a tile's footprint lies within the world border.
+fn tile_in_world(t: TileKey) -> bool {
+    let size = i64::from(t.size());
+    let within = |c: i32| {
+        let at = i64::from(c) * size;
+        at < WORLD_BORDER && at + size > -WORLD_BORDER
+    };
+    within(t.x) && within(t.z)
+}
+
+/// The blocks a tile's terrain is taken to fill: its footprint, from the
+/// lowest its ground can reach to its highest top (or water), from its header;
+/// before it is generated, a band around the sea.
+pub fn tile_box(t: TileKey, info: Option<TileInfo>, sea_level: i32) -> ([f64; 3], [f64; 3]) {
+    let [ox, oz] = t.origin();
+    let size = f64::from(t.size());
+    let (lo, hi) = match info {
+        Some(i) => (
+            i.skirt.max(horizon_world::cubic::MIN_Y),
+            i.highest.min(horizon_world::cubic::MAX_Y) + 1,
+        ),
+        None => (sea_level - UNKNOWN_BELOW, sea_level + UNKNOWN_ABOVE),
+    };
+    (
+        [f64::from(ox), f64::from(lo), f64::from(oz)],
+        [
+            f64::from(ox) + size,
+            f64::from(hi.max(lo)),
+            f64::from(oz) + size,
+        ],
+    )
+}
+
+/// How far below and above the sea an unknown tile's terrain is taken to lie.
+const UNKNOWN_BELOW: i32 = 64;
+const UNKNOWN_ABOVE: i32 = 192;
+
+/// Distance in blocks from `point` to the nearest point of the box.
+fn box_distance(point: [f64; 3], lo: [f64; 3], hi: [f64; 3]) -> f64 {
+    let mut sum = 0.0;
+    for a in 0..3 {
+        let gap = (lo[a] - point[a]).max(point[a] - hi[a]).max(0.0);
+        sum += gap * gap;
+    }
+    sum.sqrt()
+}
+
+/// The tile quadtree: from the roots' columns down, a tile splits into its
+/// four children by `rule` (on the box of its terrain, so a tall mountain
+/// or a sky island refines as near as it reaches), the ones furthest over
+/// their target first, up to `surface.budget` tiles. A footprint becomes cube
+/// nodes where [`node_kind`] says so (below [`SURFACE_LEVEL`]; a complex tile
+/// sooner) and where it meets the loaded cubes or holds the camera: the
+/// camera's own footprint is never a tile.
+fn plan_tiles(
+    input: &PlanInput,
+    surface: &Surface,
+    roots: &[CubeKey],
+) -> (Quadtree, Vec<TileKey>, bool) {
+    let camera = input.camera;
+    let center = cube_of(camera);
+    let h = input.loaded.horizontal.max(0);
+    // The loaded box's footprint, in blocks: it always holds the camera.
+    let near = (
+        [i64::from(center.x - h) * 16, i64::from(center.z - h) * 16],
+        [
+            i64::from(center.x + h + 1) * 16,
+            i64::from(center.z + h + 1) * 16,
+        ],
+    );
+    let meets_near = |t: TileKey| {
+        let [ox, oz] = t.origin().map(i64::from);
+        let size = i64::from(t.size());
+        ox < near.1[0] && ox + size > near.0[0] && oz < near.1[1] && oz + size > near.0[1]
+    };
+    // The footprints the last plan split: those holding its tiles, or its
+    // cube leaves at least one level finer.
+    let mut was_split = FxHashSet::<TileKey>::default();
+    for &t in surface.previous {
+        let mut level = t.level;
+        while level < MAX_CUBE_LEVEL {
+            level += 1;
+            let up = level - t.level;
+            if !was_split.insert(TileKey::new(level, t.x >> up, t.z >> up)) {
+                break;
+            }
+        }
+    }
+    for &c in input.previous {
+        let mut level = c.level.max(SURFACE_LEVEL - 1);
+        while level < MAX_CUBE_LEVEL {
+            level += 1;
+            let up = level - c.level;
+            if !was_split.insert(TileKey::new(level, c.x >> up, c.z >> up)) {
+                break;
+            }
+        }
+    }
+    let fate = |t: TileKey| -> TileFate {
+        if !tile_in_world(t) {
+            return TileFate::Out;
+        }
+        let info = (surface.info)(t);
+        let (lo, hi) = tile_box(t, info, surface.sea_level);
+        let distance = box_distance(camera, lo, hi);
+        if distance > input.max_distance {
+            return TileFate::Out;
+        }
+        let as_node = CubeKey::new(t.level, t.x, 0, t.z);
+        if meets_near(t) {
+            return if t.level <= SURFACE_LEVEL {
+                TileFate::Cubes
+            } else {
+                TileFate::Split(TileCandidate {
+                    forced: true,
+                    ratio: f64::INFINITY,
+                    distance,
+                    key: t,
+                })
+            };
+        }
+        if node_kind(as_node, None, info) == NodeKind::Cube {
+            return TileFate::Cubes;
+        }
+        let merge = if was_split.contains(&t) { MERGE } else { 1.0 };
+        let ratio = input.rule.factor_box(camera, lo, hi) * f64::from(t.size()) * merge / distance;
+        if ratio > 1.0 {
+            TileFate::Split(TileCandidate {
+                forced: false,
+                ratio,
+                distance,
+                key: t,
+            })
+        } else {
+            TileFate::Leaf(distance)
+        }
+    };
+    let mut q = Quadtree::default();
+    let mut leaves: Vec<(f64, TileKey)> = Vec::new();
+    let mut heap = std::collections::BinaryHeap::new();
+    let mut count = 0usize;
+    let take = |t: TileKey,
+                f: TileFate,
+                q: &mut Quadtree,
+                leaves: &mut Vec<(f64, TileKey)>,
+                heap: &mut std::collections::BinaryHeap<TileCandidate>| match f {
+        TileFate::Out => {}
+        TileFate::Cubes => {
+            q.cubes.insert(t);
+        }
+        TileFate::Leaf(d) => leaves.push((d, t)),
+        TileFate::Split(c) => heap.push(c),
+    };
+    let mut columns: Vec<TileKey> = roots
+        .iter()
+        .map(|r| TileKey::new(r.level, r.x, r.z))
+        .collect();
+    columns.sort_unstable();
+    columns.dedup();
+    for t in columns {
+        let f = fate(t);
+        if matches!(f, TileFate::Leaf(_) | TileFate::Split(_)) {
+            count += 1;
+        }
+        take(t, f, &mut q, &mut leaves, &mut heap);
+    }
+    let mut full = false;
+    let mut limited = false;
+    while let Some(c) = heap.pop() {
+        if !c.forced && full {
+            leaves.push((c.distance, c.key));
+            continue;
+        }
+        let t = c.key;
+        let children: [TileKey; 4] = std::array::from_fn(|i| {
+            TileKey::new(
+                t.level - 1,
+                t.x * 2 + (i & 1) as i32,
+                t.z * 2 + (i >> 1) as i32,
+            )
+        });
+        let fates = children.map(&fate);
+        let added = fates
+            .iter()
+            .filter(|f| matches!(f, TileFate::Leaf(_) | TileFate::Split(_)))
+            .count();
+        if !c.forced && count - 1 + added > surface.budget {
+            full = true;
+            limited = true;
+            leaves.push((c.distance, t));
+            continue;
+        }
+        count = count - 1 + added;
+        q.split.insert(t);
+        for (child, f) in children.into_iter().zip(fates) {
+            take(child, f, &mut q, &mut leaves, &mut heap);
+        }
+    }
+    leaves.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    q.tiles = leaves.iter().map(|&(_, t)| t).collect();
+    (q, leaves.into_iter().map(|(_, t)| t).collect(), limited)
+}
+
+/// The plan with what is known of nodes' contents and how fine it goes, cube
+/// nodes everywhere ([`plan_far`] without tiles).
 pub fn plan_classified(
     camera: [f64; 3],
     max_distance: f64,
@@ -804,6 +1132,38 @@ pub fn plan_classified(
     previous: &[CubeKey],
     class: &dyn Fn(CubeKey) -> NodeClass,
 ) -> Plan {
+    plan_far(&PlanInput {
+        camera,
+        max_distance,
+        rule,
+        loaded,
+        is_loaded,
+        previous,
+        class,
+        surface: None,
+    })
+}
+
+/// The plan: a node `class` calls [`NodeClass::Air`] is left out with its
+/// whole subtree, one it calls [`NodeClass::Rock`] stays a leaf (nothing
+/// inside shows), unless it holds loaded cubes. A node splits by `rule` (with
+/// hysteresis: one `previous` split splits while its ratio is above
+/// `1 / MERGE`), the nodes furthest over their target first, until
+/// `rule.budget` leaves. With `surface`, the tile quadtree is planned first
+/// ([`plan_tiles`]) and the cube nodes fill the footprints it leaves them:
+/// a node under a tile is left out, a node that is partly under one splits
+/// (or, all rock, is left out: the tiles' skirts close the ground).
+pub fn plan_far(input: &PlanInput) -> Plan {
+    let PlanInput {
+        camera,
+        max_distance,
+        rule,
+        loaded,
+        is_loaded,
+        previous,
+        class,
+        surface,
+    } = *input;
     // The nodes holding a leaf of the last plan: the ones it split.
     let mut was_split = FxHashSet::<CubeKey>::default();
     for &leaf in previous {
@@ -815,8 +1175,22 @@ pub fn plan_classified(
             }
         }
     }
+    let roots = root_nodes(camera, max_distance);
+    let mut out = Plan {
+        coarsened: 1.0,
+        ..Plan::default()
+    };
+    let quadtree = match surface {
+        Some(s) if roots.first().is_some_and(|r| r.level >= SURFACE_LEVEL) => {
+            let (q, tiles, limited) = plan_tiles(input, &s, &roots);
+            out.tiles = tiles;
+            out.tiles_limited = limited;
+            Some(q)
+        }
+        _ => None,
+    };
     let center = cube_of(camera);
-    let fate = |node: CubeKey| -> Fate {
+    let fate = |node: CubeKey, parent: Option<Region>| -> Fate {
         if !in_world(node) {
             return Fate::Out;
         }
@@ -824,17 +1198,32 @@ pub fn plan_classified(
         if distance > max_distance {
             return Fate::Out;
         }
-        match loaded_state(node, center, loaded, is_loaded) {
-            Loaded::All => Fate::Out,
-            Loaded::Some => Fate::Split(Candidate {
-                forced: true,
+        let region = match (&quadtree, parent) {
+            (None, _) => Region::Cubes,
+            (Some(_), Some(Region::Cubes)) => Region::Cubes,
+            (Some(q), _) => q.region(node),
+        };
+        if region == Region::Tiles {
+            return Fate::Out;
+        }
+        let split = |forced| {
+            Fate::Split(Candidate {
+                forced,
                 ratio: f64::INFINITY,
                 distance,
                 key: node,
-            }),
+                region,
+            })
+        };
+        match loaded_state(node, center, loaded, is_loaded) {
+            Loaded::All => Fate::Out,
+            Loaded::Some => split(true),
             Loaded::None => match class(node) {
                 NodeClass::Air => Fate::Pruned,
+                // Rock reaching under a tile: the tile's skirts close it.
+                NodeClass::Rock if region == Region::Split => Fate::Out,
                 NodeClass::Rock => Fate::Leaf(distance, node),
+                NodeClass::Mixed if region == Region::Split => split(true),
                 NodeClass::Mixed if node.level == 0 => Fate::Leaf(distance, node),
                 NodeClass::Mixed => {
                     let merge = if was_split.contains(&node) {
@@ -850,6 +1239,7 @@ pub fn plan_classified(
                             ratio,
                             distance,
                             key: node,
+                            region,
                         })
                     } else {
                         Fate::Leaf(distance, node)
@@ -857,10 +1247,6 @@ pub fn plan_classified(
                 }
             },
         }
-    };
-    let mut out = Plan {
-        coarsened: 1.0,
-        ..Plan::default()
     };
     let mut leaves: Vec<(f64, CubeKey)> = Vec::new();
     let mut heap = std::collections::BinaryHeap::new();
@@ -875,8 +1261,8 @@ pub fn plan_classified(
         Fate::Leaf(distance, key) => leaves.push((distance, key)),
         Fate::Split(c) => heap.push(c),
     };
-    for root in root_nodes(camera, max_distance) {
-        let f = fate(root);
+    for root in roots {
+        let f = fate(root, None);
         if matches!(f, Fate::Leaf(..) | Fate::Split(_)) {
             count += 1;
         }
@@ -888,7 +1274,7 @@ pub fn plan_classified(
             leaves.push((c.distance, c.key));
             continue;
         }
-        let fates = c.key.children().map(&fate);
+        let fates = c.key.children().map(|child| fate(child, Some(c.region)));
         let added = fates
             .iter()
             .filter(|f| matches!(f, Fate::Leaf(..) | Fate::Split(_)))
@@ -964,12 +1350,14 @@ fn loaded_state(
 
 // ------------------------------------------------------------- node kinds
 
-/// From this level up, a node will be drawn as a 2D height-map tile rather
-/// than a 16^3 cube node, once the tiles exist (branch `cubic/far-surface`):
-/// a quadtree over X and Z covering all Y, holding per column a few solid
-/// spans, a top block and water. A level-12 node is 65,536 blocks wide with
-/// voxels 4,096 blocks tall: nearly all terrain lies inside one or two of
-/// them, so a cube node snaps the surface to whole voxels.
+/// From this level up, the far terrain is drawn as 2D height-map tiles
+/// (`gfx::surface_tile`) rather than 16^3 cube nodes, where tiles run (a
+/// Custom world on the GPU): a quadtree over X and Z, each tile standing for
+/// the whole height of its footprint, with per column a few solid spans at
+/// exact heights. A level-12 cube node is 65,536 blocks wide with voxels 4,096
+/// blocks tall: nearly all terrain lies inside one or two of them, so it snaps
+/// the surface to whole voxels, where a tile keeps every block of height.
+/// A guess to measure: with exact heights tiles may look right lower down.
 pub const SURFACE_LEVEL: u8 = 12;
 /// A tile flagged complex (some columns have more solid spans than a tile
 /// holds: floating islands, overhangs, a cavern's ceiling) turns into cube
@@ -985,38 +1373,24 @@ pub enum NodeKind {
     Cube,
 }
 
-/// What the tile module knows of the tile over a node's X and Z.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct TileInfo {
-    /// Some column has more solid spans than the tile holds.
-    pub complex: bool,
-}
-
-/// How the node at `key` is drawn: the one place this is decided. Until the
-/// tile module lands nothing knows of tiles (`tile` is always `None`), so
-/// every node is a cube node.
-///
-/// Where it plugs in: the planner asks this for each node it reaches, and a
-/// `Tile` stands for the whole column of nodes of its level over its X and Z
-/// (the plan stops splitting it in Y); the producer routes a `Tile` leaf to
-/// the tile generator. `view` is for a screen-size threshold later (a tile
-/// stays a tile while its height steps are below a pixel).
+/// How the footprint of `key` at its level is drawn where tiles run: the one
+/// place this is decided. A tile at [`SURFACE_LEVEL`] or up, cube nodes below;
+/// a tile whose header says it is complex turns into cube nodes
+/// [`COMPLEX_LIFT`] levels sooner. `tile` is that header, `None` while the
+/// tile is not generated: the tile is drawn first (it is the fastest coverage)
+/// and refined into cube nodes once known to be complex. `view` is for a
+/// screen-size threshold later (a tile stays a tile while its height steps are
+/// below a pixel).
 pub fn node_kind(key: CubeKey, view: Option<&FarView>, tile: Option<TileInfo>) -> NodeKind {
     let _ = view;
-    match tile {
-        None => NodeKind::Cube,
-        Some(info) => {
-            let from = if info.complex {
-                SURFACE_LEVEL.saturating_add(COMPLEX_LIFT)
-            } else {
-                SURFACE_LEVEL
-            };
-            if key.level >= from {
-                NodeKind::Tile
-            } else {
-                NodeKind::Cube
-            }
-        }
+    let from = match tile {
+        Some(info) if info.complex() => SURFACE_LEVEL.saturating_add(COMPLEX_LIFT),
+        _ => SURFACE_LEVEL,
+    };
+    if key.level >= from {
+        NodeKind::Tile
+    } else {
+        NodeKind::Cube
     }
 }
 
@@ -1129,6 +1503,16 @@ pub struct CubeLodStats {
     pub voxel_px: f32,
     /// The planner's time for the last plan, in milliseconds.
     pub plan_ms: f32,
+    /// Surface tiles in the plan (counted in `planned` too), and of them
+    /// those drawn.
+    pub tiles: usize,
+    pub tiles_ready: usize,
+    /// The renderer's tiles: in its pool, their bytes, and those complex.
+    pub tiles_resident: usize,
+    pub tile_bytes: u64,
+    pub tiles_complex: usize,
+    /// The tile budget kept some tiles whole.
+    pub tiles_limited: bool,
 }
 
 /// What a worker made of a node: a CPU mesh, or (the GPU path) a node for the
@@ -1448,6 +1832,16 @@ impl LoadedSnapshot {
     }
 }
 
+/// What a plan job needs for surface tiles.
+struct SurfaceJob {
+    /// The tiles' headers known so far.
+    info: Arc<FxHashMap<TileKey, TileInfo>>,
+    sea_level: i32,
+    budget: usize,
+    /// The tiles in place, for the hysteresis.
+    previous: Arc<Vec<TileKey>>,
+}
+
 /// A plan for the planner thread to make.
 struct PlanJob {
     /// [`CubeLod::clear`] counts up: a job of an older count starts afresh.
@@ -1459,6 +1853,15 @@ struct PlanJob {
     snapshot: LoadedSnapshot,
     /// The plan in place, for the hysteresis.
     previous: Arc<Vec<CubeKey>>,
+    /// Plan surface tiles at the coarse levels.
+    surface: Option<SurfaceJob>,
+}
+
+/// A far item: a cube node or a surface tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FarKey {
+    Cube(CubeKey),
+    Tile(TileKey),
 }
 
 /// A plan made, as the change from the one before.
@@ -1469,16 +1872,25 @@ struct PlanDone {
     changed: bool,
     added: Vec<CubeKey>,
     removed: Vec<CubeKey>,
+    /// The plan's tiles, nearest first, and the change.
+    tiles: Arc<Vec<TileKey>>,
+    tiles_added: Vec<TileKey>,
+    tiles_removed: Vec<TileKey>,
     /// The plan with each node's sector, nearest first (empty when unchanged).
     order: Vec<(u8, CubeKey)>,
-    /// The coverage layer's leaves (empty when unchanged).
+    /// The coverage layer's leaves and tiles (empty when unchanged).
     cover: FxHashSet<CubeKey>,
+    cover_tiles: FxHashSet<TileKey>,
     /// The plan in tree order ([`tree_order`], empty when unchanged): the
     /// nodes inside any node are a run of it.
     tree: Vec<(u128, CubeKey)>,
+    /// Cube leaves and tiles by footprint in Z order ([`footprint_order`]):
+    /// those inside a footprint are a run of it.
+    footprints: Vec<(u64, u8, FarKey)>,
     pruned: usize,
     limited: bool,
     coarsened: f64,
+    tiles_limited: bool,
     elapsed: Duration,
 }
 
@@ -1498,6 +1910,19 @@ fn tree_order(key: CubeKey) -> u128 {
     code
 }
 
+/// [`tree_order`] for the footprint (X and Z) of a node or tile of `level` at
+/// `(x, z)`: the footprints inside one of level `l` are exactly those of a
+/// level up to `l` whose code lies in `[code, code + 4^l)`.
+fn footprint_order(level: u8, x: i32, z: i32) -> u64 {
+    let axis = |c: i32| ((i64::from(c) << level) + (1 << 23)) as u64;
+    let (x, z) = (axis(x), axis(z));
+    let mut code = 0u64;
+    for bit in 0..24 {
+        code |= (x >> bit & 1) << (2 * bit) | (z >> bit & 1) << (2 * bit + 1);
+    }
+    code
+}
+
 #[derive(Default)]
 struct PlanSlot {
     job: Option<PlanJob>,
@@ -1505,83 +1930,117 @@ struct PlanSlot {
     done: Option<PlanDone>,
 }
 
+/// The plan a job asks for, with `rule` and no hysteresis when `fresh`.
+fn plan_job(job: &PlanJob, rule: &Rule, fresh: bool, class: &dyn Fn(CubeKey) -> NodeClass) -> Plan {
+    let is_loaded = |cube: SectionPos| job.snapshot.get(cube);
+    let info = |key: TileKey| job.surface.as_ref().and_then(|s| s.info.get(&key).copied());
+    plan_far(&PlanInput {
+        camera: job.camera,
+        max_distance: job.max_distance,
+        rule,
+        loaded: job.loaded,
+        is_loaded: &is_loaded,
+        previous: if fresh { &[] } else { job.previous.as_slice() },
+        class,
+        surface: job.surface.as_ref().map(|s| Surface {
+            info: &info,
+            sea_level: s.sea_level,
+            budget: s.budget,
+            previous: if fresh { &[] } else { s.previous.as_slice() },
+        }),
+    })
+}
+
+/// The change from `last` to `next`: what `next` adds, and what it drops.
+fn diff<K: Copy + Eq + std::hash::Hash>(
+    next: &[K],
+    last: &FxHashSet<K>,
+) -> (Vec<K>, Vec<K>, FxHashSet<K>) {
+    let set: FxHashSet<K> = next.iter().copied().collect();
+    let added = next.iter().copied().filter(|k| !last.contains(k)).collect();
+    let removed = last.iter().copied().filter(|k| !set.contains(k)).collect();
+    (added, removed, set)
+}
+
 /// Makes the plan of `job`, and its coverage layer, as the change from
-/// `last` (the plan before, which becomes this one).
+/// `last` and `last_tiles` (the plan before, which becomes this one).
 fn make_plan(
     job: &PlanJob,
     last: &mut FxHashSet<CubeKey>,
+    last_tiles: &mut FxHashSet<TileKey>,
     class: &dyn Fn(CubeKey) -> NodeClass,
 ) -> PlanDone {
     let started = Instant::now();
-    let is_loaded = |cube: SectionPos| job.snapshot.get(cube);
-    let plan = plan_classified(
-        job.camera,
-        job.max_distance,
-        &job.rule,
-        job.loaded,
-        &is_loaded,
-        &job.previous,
-        class,
-    );
-    let next: FxHashSet<CubeKey> = plan.leaves.iter().copied().collect();
-    let added: Vec<CubeKey> = plan
-        .leaves
-        .iter()
-        .copied()
-        .filter(|k| !last.contains(k))
-        .collect();
-    let removed: Vec<CubeKey> = last.iter().copied().filter(|k| !next.contains(k)).collect();
-    let changed = !added.is_empty() || !removed.is_empty();
+    let plan = plan_job(job, &job.rule, false, class);
+    let (added, removed, next) = diff(&plan.leaves, last);
+    let (tiles_added, tiles_removed, next_tiles) = diff(&plan.tiles, last_tiles);
+    let changed = !(added.is_empty()
+        && removed.is_empty()
+        && tiles_added.is_empty()
+        && tiles_removed.is_empty());
     *last = next;
-    let (leaves, order, cover, tree) = if changed {
-        let order = plan
+    *last_tiles = next_tiles;
+    let mut done = PlanDone {
+        epoch: job.epoch,
+        leaves: job.previous.clone(),
+        changed,
+        added,
+        removed,
+        tiles: job
+            .surface
+            .as_ref()
+            .map_or_else(Arc::default, |s| s.previous.clone()),
+        tiles_added,
+        tiles_removed,
+        order: Vec::new(),
+        cover: FxHashSet::default(),
+        cover_tiles: FxHashSet::default(),
+        tree: Vec::new(),
+        footprints: Vec::new(),
+        pruned: plan.pruned,
+        limited: plan.limited,
+        coarsened: plan.coarsened,
+        tiles_limited: plan.tiles_limited,
+        elapsed: Duration::ZERO,
+    };
+    if changed {
+        done.order = plan
             .leaves
             .iter()
             .map(|&k| (sector(job.camera, k), k))
             .collect();
-        let mut tree: Vec<(u128, CubeKey)> =
-            plan.leaves.iter().map(|&k| (tree_order(k), k)).collect();
-        tree.sort_unstable();
-        let cover = plan_classified(
-            job.camera,
-            job.max_distance,
+        done.tree = plan.leaves.iter().map(|&k| (tree_order(k), k)).collect();
+        done.tree.sort_unstable();
+        done.footprints = plan
+            .leaves
+            .iter()
+            .map(|&k| (footprint_order(k.level, k.x, k.z), k.level, FarKey::Cube(k)))
+            .chain(
+                plan.tiles
+                    .iter()
+                    .map(|&t| (footprint_order(t.level, t.x, t.z), t.level, FarKey::Tile(t))),
+            )
+            .collect();
+        done.footprints.sort_unstable();
+        let cover = plan_job(
+            job,
             &job.rule.coarser(COVER_SCALE, COVER_NODES),
-            job.loaded,
-            &is_loaded,
-            &[],
+            true,
             class,
-        )
-        .leaves
-        .into_iter()
-        .collect();
-        (Arc::new(plan.leaves), order, cover, tree)
-    } else {
-        (
-            job.previous.clone(),
-            Vec::new(),
-            FxHashSet::default(),
-            Vec::new(),
-        )
-    };
-    PlanDone {
-        epoch: job.epoch,
-        leaves,
-        changed,
-        added,
-        removed,
-        order,
-        cover,
-        tree,
-        pruned: plan.pruned,
-        limited: plan.limited,
-        coarsened: plan.coarsened,
-        elapsed: started.elapsed(),
+        );
+        done.cover = cover.leaves.into_iter().collect();
+        done.cover_tiles = cover.tiles.into_iter().collect();
+        done.leaves = Arc::new(plan.leaves);
+        done.tiles = Arc::new(plan.tiles);
     }
+    done.elapsed = started.elapsed();
+    done
 }
 
 /// The planner thread: plans off the game thread, one job at a time.
 fn plan_loop(shared: &Shared) {
     let mut last = FxHashSet::default();
+    let mut last_tiles = FxHashSet::default();
     let mut epoch = None;
     loop {
         let job = {
@@ -1600,9 +2059,10 @@ fn plan_loop(shared: &Shared) {
         if epoch != Some(job.epoch) {
             epoch = Some(job.epoch);
             last.clear();
+            last_tiles.clear();
         }
         let class = |key: CubeKey| classify_cached(shared, key);
-        let done = make_plan(&job, &mut last, &class);
+        let done = make_plan(&job, &mut last, &mut last_tiles, &class);
         let mut slot = shared.planner.lock().unwrap();
         slot.busy = false;
         slot.done = Some(done);
@@ -1617,13 +2077,13 @@ enum Phase {
     /// nodes, one over each hole) is all that is queued, since `since`.
     Cover {
         since: Instant,
-        wave: Vec<CubeKey>,
+        wave: Vec<FarKey>,
     },
 }
 
 /// A planned node with nothing drawn over its place, and the coverage leaf
-/// over it when the coverage layer has one.
-type Hole = (CubeKey, Option<CubeKey>);
+/// (a node or a tile) over it when the coverage layer has one.
+type Hole = (CubeKey, Option<FarKey>);
 
 /// What the last plan job was asked with.
 #[derive(Clone, Copy, Debug)]
@@ -1654,6 +2114,54 @@ fn refocused(before: &Rule, now: &Rule, view: &FarView) -> bool {
     }
 }
 
+/// The most surface tiles a plan holds.
+pub const TILE_BUDGET: usize = 3584;
+/// Surface tiles the renderer's pool holds (`Renderer::use_surface_tiles`):
+/// a plan's, the ones it replaces and the coverage layer's (about 110 MB).
+pub const TILE_CAPACITY: u32 = 8192;
+/// Tile headers kept for the plan past which those of tiles neither planned
+/// nor drawn are forgotten.
+const TILE_INFO_KEPT: usize = 4 * TILE_BUDGET;
+/// Levels a coverage leaf is coarser than the plan, about: `log2(COVER_SCALE)`.
+const COVER_LEVELS: u8 = 3;
+
+/// What the renderer's surface tiles are to do ([`CubeLod::take_tile_work`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TileWork {
+    /// Tiles to generate (`SurfaceTiles::request`), coverage first, then
+    /// nearest first.
+    pub request: Vec<TileKey>,
+    /// Tiles to fade out (`SurfaceTiles::retire`): what replaces them is in.
+    pub retire: Vec<TileKey>,
+    /// Requests to drop, never drawn (`SurfaceTiles::free`).
+    pub free: Vec<TileKey>,
+}
+
+/// The plan's surface tiles on the game thread.
+#[derive(Default)]
+struct TileState {
+    /// Tiles run ([`CubeLod::set_surface`]).
+    on: bool,
+    sea_level: i32,
+    plan: Arc<Vec<TileKey>>,
+    wanted: FxHashSet<TileKey>,
+    /// Generated and drawn (their header read back), not retired.
+    delivered: FxHashSet<TileKey>,
+    /// Delivered and not planned: drawn until what replaces them is in.
+    stale: FxHashSet<TileKey>,
+    /// Requested and not delivered yet.
+    asked: FxHashSet<TileKey>,
+    /// Planned and not delivered.
+    missing: usize,
+    /// The headers known, for the planner.
+    info: Arc<FxHashMap<TileKey, TileInfo>>,
+    /// The coverage layer's tiles for the current plan.
+    cover: FxHashSet<TileKey>,
+    /// Planned tiles with nothing drawn over their footprint.
+    holes: Vec<TileKey>,
+    work: TileWork,
+}
+
 /// The far terrain of a cubic level, built in the background.
 ///
 /// ```ignore
@@ -1673,13 +2181,20 @@ fn refocused(before: &Rule, now: &Rule, view: &FarView) -> bool {
 /// only when every node that now covers its place has been handed out (or
 /// none is wanted: out of range), so the renderer never opens a hole.
 ///
-/// The plan is made on a thread of its own ([`plan_classified`] with the
-/// view's [`Rule`]). After a big change (a teleport, joining: a quarter of
-/// the plan has nothing drawn over it) only the coverage layer is queued: the
-/// plan for voxels [`COVER_SCALE`] times coarser, a few hundred nodes, over
-/// the holes. Once it is in and shown, the rest of the plan is queued,
-/// holes first, then by direction (the view's first) and distance; the
-/// coverage nodes stay drawn until the nodes under them are in.
+/// The plan is made on a thread of its own ([`plan_far`] with the view's
+/// [`Rule`]). After a big change (a teleport, joining: a quarter of the plan
+/// has nothing drawn over it) only the coverage layer is queued: the plan for
+/// voxels [`COVER_SCALE`] times coarser, a few hundred nodes, over the holes.
+/// Once it is in and shown, the rest of the plan is queued, holes first, then
+/// by direction (the view's first) and distance; the coverage nodes stay
+/// drawn until the nodes under them are in.
+///
+/// With surface tiles on ([`CubeLod::set_surface`]), the coarse levels are
+/// tiles the renderer generates itself: [`CubeLod::take_tile_work`] hands it
+/// the requests, fades and drops, and [`CubeLod::surface_feedback`] notes the
+/// tiles it generated (their headers: a complex tile is planned again as cube
+/// nodes). A tile stays drawn until everything planned in its footprint is
+/// in, and a node under a planned tile until the tile is.
 ///
 /// [`removed`]: CubeLod::removed
 pub struct CubeLod {
@@ -1693,6 +2208,12 @@ pub struct CubeLod {
     order: Vec<(u8, CubeKey)>,
     /// The plan in tree order (`tree_order`).
     tree: Vec<(u128, CubeKey)>,
+    /// The plan's leaves and tiles by footprint (`footprint_order`).
+    footprints: Vec<(u64, u8, FarKey)>,
+    tiles: TileState,
+    /// The sampler's world can have surface tiles (`CubeSampler::surface`).
+    surface_allowed: bool,
+    surface_stats: Option<crate::gfx::surface_tile::SurfaceStats>,
     /// The coverage layer's leaves for the current plan.
     cover_plan: FxHashSet<CubeKey>,
     /// Coverage nodes asked for (not in the plan): their results are kept.
@@ -1762,6 +2283,7 @@ impl CubeLod {
     ) -> Self {
         let wanted_threads = (horizon_threads::worker_count() / 2).clamp(2, 4);
         let backend = sampler.gpu();
+        let surface_allowed = sampler.surface();
         // One more fork classifies nodes for the planner, on a thread of its own.
         let classifier = backend.is_some().then(|| sampler.fork()).flatten();
         let descent = sampler.descent();
@@ -1813,6 +2335,7 @@ impl CubeLod {
         }));
         let mut lod = Self::assemble(shared, results, threads, backend, Some(context), air);
         lod.has_descent = has_descent;
+        lod.surface_allowed = surface_allowed;
         // Benchmarks and autoresearch loops set the node budget from outside.
         if let Some(nodes) = std::env::var(BUDGET_VAR)
             .ok()
@@ -1840,6 +2363,13 @@ impl CubeLod {
             wanted: FxHashSet::default(),
             order: Vec::new(),
             tree: Vec::new(),
+            footprints: Vec::new(),
+            tiles: TileState {
+                sea_level: backend.as_ref().map_or(63, |b| b.params.sea_level),
+                ..TileState::default()
+            },
+            surface_allowed: false,
+            surface_stats: None,
             cover_plan: FxHashSet::default(),
             cover: FxHashSet::default(),
             holes: Vec::new(),
@@ -1861,7 +2391,6 @@ impl CubeLod {
             camera: [0.0; 3],
             facing: None,
             budget: NODE_BUDGET,
-            backend,
             gpu_out: Vec::new(),
             context,
             known_states: FxHashSet::default(),
@@ -1877,6 +2406,7 @@ impl CubeLod {
             descent_asked: None,
             descent_runs_asked: 0,
             jumped: None,
+            backend,
         }
     }
 
@@ -1884,6 +2414,96 @@ impl CubeLod {
     /// for [`CubeLod::stats`].
     pub fn set_render_stats(&mut self, stats: Option<crate::gfx::cube_far::FarStats>) {
         self.render = stats;
+    }
+
+    /// The renderer's surface tile counters (`Renderer::surface_stats`).
+    pub fn set_surface_stats(&mut self, stats: Option<crate::gfx::surface_tile::SurfaceStats>) {
+        self.surface_stats = stats;
+    }
+
+    /// Whether this world's far terrain can have surface tiles: a Custom world
+    /// without `cubeAreas` (`CubeSampler::surface`) whose generator runs on
+    /// the GPU with its climate pass.
+    pub fn surface_allowed(&self) -> bool {
+        self.surface_allowed
+            && self
+                .backend
+                .as_ref()
+                .is_some_and(|b| b.biome_params.is_some())
+    }
+
+    /// Turns surface tiles on (the renderer runs them:
+    /// `Renderer::use_surface_tiles`) or off. They need the GPU path and a
+    /// world that allows them. A change forgets every node handed out, as
+    /// [`CubeLod::clear`]: clear the renderer's too. Returns whether it changed.
+    pub fn set_surface(&mut self, on: bool) -> bool {
+        let on = on && self.surface_allowed() && self.gpu_path();
+        if self.tiles.on == on {
+            return false;
+        }
+        self.clear();
+        self.tiles.on = on;
+        true
+    }
+
+    /// Whether the plan has surface tiles.
+    pub fn surface_on(&self) -> bool {
+        self.tiles.on
+    }
+
+    /// Notes the tiles the renderer generated since the last call: `info`
+    /// reads a tile's header once it is generated and read back
+    /// (`Renderer::surface_tile_info`). Call each frame before `update`.
+    pub fn surface_feedback(&mut self, info: impl Fn(TileKey) -> Option<TileInfo>) {
+        if self.tiles.asked.is_empty() {
+            return;
+        }
+        let arrived: Vec<(TileKey, TileInfo)> = self
+            .tiles
+            .asked
+            .iter()
+            .filter_map(|&k| info(k).map(|i| (k, i)))
+            .collect();
+        for (key, info) in arrived {
+            self.deliver_tile(key, info);
+        }
+    }
+
+    /// Notes a tile as drawn, and its header for the plan: a complex tile is
+    /// planned again as cube nodes, a tall one refines as near as it reaches.
+    fn deliver_tile(&mut self, key: TileKey, info: TileInfo) {
+        self.tiles.asked.remove(&key);
+        if !self.tiles.delivered.insert(key) {
+            return;
+        }
+        self.release_dirty = true;
+        self.holes_dirty = true;
+        if self.tiles.wanted.contains(&key) {
+            self.tiles.missing = self.tiles.missing.saturating_sub(1);
+        } else {
+            self.tiles.stale.insert(key);
+        }
+        if self.tiles.info.get(&key) == Some(&info) {
+            return;
+        }
+        let (wanted, delivered) = (&self.tiles.wanted, &self.tiles.delivered);
+        let map = Arc::make_mut(&mut self.tiles.info);
+        if map.len() >= TILE_INFO_KEPT {
+            map.retain(|k, _| wanted.contains(k) || delivered.contains(k));
+        }
+        map.insert(key, info);
+        if (info.complex() && key.level < SURFACE_LEVEL.saturating_add(COMPLEX_LIFT))
+            || info.highest > self.tiles.sea_level + UNKNOWN_ABOVE
+        {
+            self.replan = true;
+        }
+    }
+
+    /// What the renderer's surface tiles are to do since the last call
+    /// (`Renderer::queue_surface_tiles`). Call after [`CubeLod::removed`],
+    /// which finds the tiles to fade out.
+    pub fn take_tile_work(&mut self) -> TileWork {
+        std::mem::take(&mut self.tiles.work)
     }
 
     /// The most nodes a plan may hold (a terrain memory target, in nodes).
@@ -1916,9 +2536,16 @@ impl CubeLod {
     /// as ready.
     pub fn stats(&self) -> CubeLodStats {
         let mut out = self.stats;
-        out.planned = self.plan.len();
-        out.pending = self.missing;
-        out.ready = self.plan.len() - self.missing;
+        out.planned = self.plan.len() + self.tiles.plan.len();
+        out.pending = self.missing + self.tiles.missing;
+        out.ready = out.planned - out.pending;
+        out.tiles = self.tiles.plan.len();
+        out.tiles_ready = self.tiles.plan.len() - self.tiles.missing;
+        if let Some(s) = self.surface_stats {
+            out.tiles_resident = s.resident;
+            out.tile_bytes = s.bytes;
+            out.tiles_complex = s.complex;
+        }
         out.uniform_skipped = self.pruned + self.empty_planned;
         if let Some(render) = self.render {
             out.gpu_meshed = render.meshed + render.uniform;
@@ -1926,7 +2553,7 @@ impl CubeLod {
             out.pool_bytes = render.pool_bytes;
         }
         out.complete = self.is_complete();
-        out.holes = self.holes.len();
+        out.holes = self.holes.len() + self.tiles.holes.len();
         out.covering = matches!(self.phase, Phase::Cover { .. });
         out.budget = self.asked.map_or(self.budget(), |a| a.rule.budget);
         if let Ok(slot) = self.shared.descent.lock() {
@@ -1947,7 +2574,10 @@ impl CubeLod {
     }
 
     fn is_complete(&self) -> bool {
-        !self.plan.is_empty() && self.missing == 0 && self.shown()
+        !(self.plan.is_empty() && self.tiles.plan.is_empty())
+            && self.missing == 0
+            && self.tiles.missing == 0
+            && self.shown()
     }
 
     fn track_completion(&mut self, now: Instant) {
@@ -1956,13 +2586,14 @@ impl CubeLod {
             (false, Some(_)) => self.stats.plan_complete = None,
             _ => {}
         }
-        let covered = !self.plan.is_empty()
-            && self.holes.is_empty()
+        let holes = !(self.holes.is_empty() && self.tiles.holes.is_empty());
+        let covered = !(self.plan.is_empty() && self.tiles.plan.is_empty())
+            && !holes
             && matches!(self.phase, Phase::Refine)
             && self.shown();
         match (covered, self.stats.plan_covered) {
             (true, None) => self.stats.plan_covered = Some(now),
-            (false, Some(_)) if !self.holes.is_empty() => self.stats.plan_covered = None,
+            (false, Some(_)) if holes => self.stats.plan_covered = None,
             _ => {}
         }
     }
@@ -2178,6 +2809,12 @@ impl CubeLod {
                     loaded,
                     snapshot: LoadedSnapshot::take(cube, loaded, &is_loaded),
                     previous: self.plan.clone(),
+                    surface: self.tiles.on.then(|| SurfaceJob {
+                        info: self.tiles.info.clone(),
+                        sea_level: self.tiles.sea_level,
+                        budget: TILE_BUDGET,
+                        previous: self.tiles.plan.clone(),
+                    }),
                 });
                 drop(slot);
                 self.shared.planner_wake.notify_one();
@@ -2265,6 +2902,7 @@ impl CubeLod {
         self.pruned = done.pruned;
         self.coarsened = done.coarsened;
         self.stats.limited = done.limited;
+        self.stats.tiles_limited = done.tiles_limited;
         self.stats.voxel_px = self.stats.target_px * done.coarsened.max(1.0) as f32;
         self.stats.plan_ms = done.elapsed.as_secs_f32() * 1000.0;
         if !done.changed {
@@ -2297,10 +2935,38 @@ impl CubeLod {
                 self.missing += 1;
             }
         }
-        let big = done.added.len() * COVER_HOLES > done.leaves.len();
+        // Tiles: the new ones are asked for at once (the renderer makes them
+        // on its own), dropped ones never drawn are let go.
+        self.tiles.cover = done.cover_tiles;
+        for &key in &done.tiles_removed {
+            self.tiles.wanted.remove(&key);
+            if self.tiles.delivered.contains(&key) {
+                self.tiles.stale.insert(key);
+            } else {
+                self.tiles.missing = self.tiles.missing.saturating_sub(1);
+                if !self.tiles.cover.contains(&key) && self.tiles.asked.remove(&key) {
+                    self.tiles.work.free.push(key);
+                }
+            }
+        }
+        for &key in &done.tiles_added {
+            self.tiles.wanted.insert(key);
+            if self.tiles.delivered.contains(&key) {
+                self.tiles.stale.remove(&key);
+            } else {
+                self.tiles.missing += 1;
+                if self.tiles.asked.insert(key) {
+                    self.tiles.work.request.push(key);
+                }
+            }
+        }
+        let planned = done.leaves.len() + done.tiles.len();
+        let big = (done.added.len() + done.tiles_added.len()) * COVER_HOLES > planned;
         self.plan = done.leaves;
+        self.tiles.plan = done.tiles;
         self.order = done.order;
         self.tree = done.tree;
+        self.footprints = done.footprints;
         self.cover_plan = done.cover;
         // The holes: all of them after a big change, else the old ones still
         // planned and the new nodes with nothing over them.
@@ -2315,22 +2981,37 @@ impl CubeLod {
         };
         let covering = matches!(self.phase, Phase::Cover { .. });
         let (new_holes, holding) = self.find_holes(&fresh, big || covering);
+        let fresh_tiles: Vec<TileKey> = if big {
+            self.tiles.plan.to_vec()
+        } else {
+            done.tiles_added
+                .iter()
+                .copied()
+                .filter(|k| !self.tiles.delivered.contains(k))
+                .collect()
+        };
+        let new_tile_holes = self.find_tile_holes(&fresh_tiles, big || covering);
         if big {
             self.holes = new_holes;
             self.holding = holding;
+            self.tiles.holes = new_tile_holes;
         } else {
             let wanted = &self.wanted;
             self.holes.retain(|(k, _)| wanted.contains(k));
             self.holes.extend(new_holes);
             self.holding.retain(|k| wanted.contains(k));
             self.holding.extend(holding);
+            let wanted = &self.tiles.wanted;
+            self.tiles.holes.retain(|k| wanted.contains(k));
+            self.tiles.holes.extend(new_tile_holes);
         }
         self.holes_dirty = false;
         self.holes_at = now;
-        if !self.holes.is_empty() {
+        let holes = self.holes.len() + self.tiles.holes.len();
+        if holes > 0 {
             self.stats.plan_covered = None;
         }
-        if (big && self.holes.len() * COVER_HOLES > self.plan.len()) || covering {
+        if (big && holes * COVER_HOLES > planned) || covering {
             self.begin_cover(now);
         } else if big {
             self.fill_queue();
@@ -2405,7 +3086,7 @@ impl CubeLod {
                 let held = (key.level + 1..=MAX_CUBE_LEVEL)
                     .filter(|l| levels >> l & 1 == 1)
                     .any(|l| self.stale.contains(&ancestor(key, l)));
-                if !held {
+                if !held && !self.tile_drawn_over(key, MAX_CUBE_LEVEL) {
                     holes.push((key, None));
                 }
             }
@@ -2448,18 +3129,107 @@ impl CubeLod {
                 };
                 memo.insert(n, found);
             }
-            if !found.0 {
-                holes.push((key, found.1));
+            if found.0 {
+                continue;
+            }
+            // Where the coverage layer has a tile over the node, the tile.
+            let over = match found.1 {
+                Some(c) => Some(FarKey::Cube(c)),
+                None => self.cover_tile_over(key).map(FarKey::Tile),
+            };
+            let limit = match over {
+                Some(FarKey::Cube(c)) => c.level,
+                Some(FarKey::Tile(t)) => t.level,
+                None => key.level,
+            };
+            if !self.tile_drawn_over(key, limit) {
+                holes.push((key, over));
             }
         }
         (holes, holding)
+    }
+
+    /// Whether a drawn tile of level `limit` or finer covers `key`'s footprint.
+    fn tile_drawn_over(&self, key: CubeKey, limit: u8) -> bool {
+        if self.tiles.delivered.is_empty() {
+            return false;
+        }
+        (key.level.max(SURFACE_LEVEL)..=limit.min(MAX_CUBE_LEVEL)).any(|l| {
+            let up = l - key.level;
+            self.tiles
+                .delivered
+                .contains(&TileKey::new(l, key.x >> up, key.z >> up))
+        })
+    }
+
+    /// The coverage layer's tile over `key`'s footprint, if it has one.
+    fn cover_tile_over(&self, key: CubeKey) -> Option<TileKey> {
+        if self.tiles.cover.is_empty() {
+            return None;
+        }
+        (key.level.max(SURFACE_LEVEL)..=MAX_CUBE_LEVEL)
+            .map(|l| {
+                let up = l - key.level;
+                TileKey::new(l, key.x >> up, key.z >> up)
+            })
+            .find(|t| self.tiles.cover.contains(t))
+    }
+
+    /// The planned tiles among `keys` with nothing drawn over their
+    /// footprint: not drawn, under no drawn tile (with `cover`, none more than
+    /// [`COVER_LEVELS`] coarser counts) and over no drawn node or tile of an
+    /// older plan.
+    fn find_tile_holes(&self, keys: &[TileKey], cover: bool) -> Vec<TileKey> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        // The footprints holding an older plan's tiles or nodes.
+        let mut inner = FxHashSet::<TileKey>::default();
+        let mut add = |level: u8, x: i32, z: i32, own: bool| {
+            if own {
+                inner.insert(TileKey::new(level, x, z));
+            }
+            let mut l = level;
+            while l < MAX_CUBE_LEVEL {
+                l += 1;
+                let up = l - level;
+                if !inner.insert(TileKey::new(l, x >> up, z >> up)) {
+                    break;
+                }
+            }
+        };
+        for &t in &self.tiles.stale {
+            add(t.level, t.x, t.z, false);
+        }
+        for &c in &self.stale {
+            add(c.level, c.x, c.z, true);
+        }
+        keys.iter()
+            .copied()
+            .filter(|t| {
+                if self.tiles.delivered.contains(t) || inner.contains(t) {
+                    return false;
+                }
+                let limit = if cover {
+                    t.level.saturating_add(COVER_LEVELS).min(MAX_CUBE_LEVEL)
+                } else {
+                    MAX_CUBE_LEVEL
+                };
+                !(t.level + 1..=limit).any(|l| {
+                    let up = l - t.level;
+                    self.tiles
+                        .delivered
+                        .contains(&TileKey::new(l, t.x >> up, t.z >> up))
+                })
+            })
+            .collect()
     }
 
     /// Drops the holes that something now covers: the node itself, or the
     /// coverage node over it. A pass over every hole runs at most every
     /// [`SCAN_EVERY`] while there are many.
     fn recheck_holes(&mut self, now: Instant, force: bool) {
-        if !self.holes_dirty || self.holes.is_empty() {
+        if !self.holes_dirty || (self.holes.is_empty() && self.tiles.holes.is_empty()) {
             return;
         }
         if !force
@@ -2470,10 +3240,16 @@ impl CubeLod {
         }
         self.holes_dirty = false;
         self.holes_at = now;
-        let delivered = &self.delivered;
+        let (delivered, tiles) = (&self.delivered, &self.tiles.delivered);
         self.holes.retain(|(key, over)| {
-            !(delivered.contains(key) || over.is_some_and(|c| delivered.contains(&c)))
+            !(delivered.contains(key)
+                || match over {
+                    Some(FarKey::Cube(c)) => delivered.contains(c),
+                    Some(FarKey::Tile(t)) => tiles.contains(t),
+                    None => false,
+                })
         });
+        self.tiles.holes.retain(|t| !tiles.contains(t));
     }
 
     /// Queues only the coverage layer over the holes: a coverage node over a
@@ -2485,21 +3261,39 @@ impl CubeLod {
             Phase::Refine => now,
         };
         let mut seen = FxHashSet::default();
-        let mut wave: Vec<CubeKey> = self
+        let wave: Vec<FarKey> = self
             .holes
             .iter()
-            .map(|&(key, over)| over.unwrap_or(key))
-            .chain(self.holding.iter().copied())
-            .filter(|k| seen.insert(*k) && !self.delivered.contains(k))
+            .map(|&(key, over)| over.unwrap_or(FarKey::Cube(key)))
+            .chain(self.holding.iter().map(|&k| FarKey::Cube(k)))
+            .chain(self.tiles.holes.iter().map(|&t| FarKey::Tile(t)))
+            .filter(|k| seen.insert(*k) && !self.far_delivered(*k))
             .collect();
         if wave.is_empty() {
             self.phase = Phase::Refine;
             self.fill_queue();
             return;
         }
+        // The coverage tiles go to the renderer first: they are the fastest.
+        let tiles: Vec<TileKey> = wave
+            .iter()
+            .filter_map(|k| match *k {
+                FarKey::Tile(t) => Some(t),
+                FarKey::Cube(_) => None,
+            })
+            .filter(|t| self.tiles.asked.insert(*t))
+            .collect();
+        self.tiles.work.request.splice(0..0, tiles);
         let rank = self.rank();
-        wave.sort_by(|a, b| self.priority(&rank, a).total_cmp(&self.priority(&rank, b)));
-        self.cover = wave
+        let mut cubes: Vec<CubeKey> = wave
+            .iter()
+            .filter_map(|k| match *k {
+                FarKey::Cube(c) => Some(c),
+                FarKey::Tile(_) => None,
+            })
+            .collect();
+        cubes.sort_by(|a, b| self.priority(&rank, a).total_cmp(&self.priority(&rank, b)));
+        self.cover = cubes
             .iter()
             .copied()
             .filter(|k| !self.wanted.contains(k))
@@ -2507,10 +3301,18 @@ impl CubeLod {
         self.stats.cover_nodes = wave.len();
         let mut queue = self.shared.queue.lock().unwrap();
         queue.clear();
-        queue.first.extend(wave.iter().copied());
+        queue.first.extend(cubes);
         drop(queue);
         self.shared.wake.notify_all();
         self.phase = Phase::Cover { since, wave };
+    }
+
+    /// Whether a node or tile is drawn.
+    fn far_delivered(&self, key: FarKey) -> bool {
+        match key {
+            FarKey::Cube(c) => self.delivered.contains(&c),
+            FarKey::Tile(t) => self.tiles.delivered.contains(&t),
+        }
     }
 
     /// Ends the coverage phase once its nodes are in and shown (or failed,
@@ -2519,10 +3321,16 @@ impl CubeLod {
         let Phase::Cover { since, wave } = &self.phase else {
             return;
         };
-        let landed = wave.iter().all(|k| {
-            self.delivered.contains(k)
-                || self.failed.contains_key(k)
-                || !(self.wanted.contains(k) || self.cover.contains(k))
+        let landed = wave.iter().all(|k| match *k {
+            FarKey::Cube(c) => {
+                self.delivered.contains(&c)
+                    || self.failed.contains_key(&c)
+                    || !(self.wanted.contains(&c) || self.cover.contains(&c))
+            }
+            FarKey::Tile(t) => {
+                self.tiles.delivered.contains(&t)
+                    || !(self.tiles.asked.contains(&t) || self.tiles.wanted.contains(&t))
+            }
         });
         if !(landed && self.shown()) && now.saturating_duration_since(*since) < COVER_WAIT {
             return;
@@ -2635,10 +3443,12 @@ impl CubeLod {
     /// every [`SCAN_EVERY`] while many planned nodes are missing.
     fn releasable(&mut self) -> Vec<CubeKey> {
         let now = Instant::now();
-        if self.stale.is_empty() || !self.release_dirty {
+        if (self.stale.is_empty() && self.tiles.stale.is_empty()) || !self.release_dirty {
             return Vec::new();
         }
-        if self.missing > SLOW_SCAN && now.saturating_duration_since(self.released_at) < SCAN_EVERY
+        // A pass costs about the stale nodes and the missing ones.
+        if self.missing + self.stale.len() > SLOW_SCAN
+            && now.saturating_duration_since(self.released_at) < SCAN_EVERY
         {
             return Vec::new();
         }
@@ -2664,7 +3474,12 @@ impl CubeLod {
         let mut path = Vec::new();
         let mut released = Vec::new();
         for &key in &self.stale {
-            if blocked(key) {
+            // Under a planned tile not in yet, or (a coarse node) over one.
+            if blocked(key)
+                || self.tile_pending_over(key)
+                || (key.level > SURFACE_LEVEL
+                    && self.pending_in(TileKey::new(key.level, key.x, key.z), true))
+            {
                 continue;
             }
             path.clear();
@@ -2686,7 +3501,75 @@ impl CubeLod {
                 released.push(key);
             }
         }
+        // Tiles: faded out once nothing planned in or over their footprint
+        // waits (few, and the renderer's fade is one write each).
+        let retire: Vec<TileKey> = self
+            .tiles
+            .stale
+            .iter()
+            .copied()
+            .filter(|&t| !(self.pending_in(t, false) || self.pending_over(t)))
+            .collect();
+        for t in &retire {
+            self.tiles.delivered.remove(t);
+            self.tiles.stale.remove(t);
+        }
+        self.tiles.work.retire.extend(retire);
         released
+    }
+
+    /// Whether a planned tile not drawn yet covers `key`'s footprint.
+    fn tile_pending_over(&self, key: CubeKey) -> bool {
+        self.tiles.missing > 0
+            && (key.level.max(SURFACE_LEVEL)..=MAX_CUBE_LEVEL).any(|l| {
+                let up = l - key.level;
+                let t = TileKey::new(l, key.x >> up, key.z >> up);
+                self.tiles.wanted.contains(&t) && !self.tiles.delivered.contains(&t)
+            })
+    }
+
+    /// Whether something planned and not drawn yet lies in the footprint
+    /// `fp` (a tile's, or a node's at its level): a tile, or (unless
+    /// `tiles_only`) a node.
+    fn pending_in(&self, fp: TileKey, tiles_only: bool) -> bool {
+        if self.missing + self.tiles.missing == 0 {
+            return false;
+        }
+        let lo = footprint_order(fp.level, fp.x, fp.z);
+        let hi = lo + (1u64 << (2 * u32::from(fp.level)));
+        let start = self.footprints.partition_point(|e| e.0 < lo);
+        self.footprints[start..]
+            .iter()
+            .take_while(|e| e.0 < hi)
+            .any(|e| {
+                e.1 <= fp.level
+                    && match e.2 {
+                        FarKey::Cube(c) => !tiles_only && !self.delivered.contains(&c),
+                        FarKey::Tile(t) => !self.tiles.delivered.contains(&t),
+                    }
+            })
+    }
+
+    /// Whether a planned tile or node not drawn yet has a footprint holding
+    /// the footprint `fp` (a coarser one).
+    fn pending_over(&self, fp: TileKey) -> bool {
+        if self.missing + self.tiles.missing == 0 {
+            return false;
+        }
+        (fp.level + 1..=MAX_CUBE_LEVEL).any(|l| {
+            let up = l - fp.level;
+            let (x, z) = (fp.x >> up, fp.z >> up);
+            let t = TileKey::new(l, x, z);
+            if self.tiles.wanted.contains(&t) && !self.tiles.delivered.contains(&t) {
+                return true;
+            }
+            let code = footprint_order(l, x, z);
+            let start = self.footprints.partition_point(|e| (e.0, e.1) < (code, l));
+            self.footprints[start..]
+                .iter()
+                .take_while(|e| e.0 == code && e.1 == l)
+                .any(|e| matches!(e.2, FarKey::Cube(c) if !self.delivered.contains(&c)))
+        })
     }
 
     /// Forgets everything: nodes handed out, queued and cached.
@@ -2705,6 +3588,12 @@ impl CubeLod {
         self.wanted.clear();
         self.order.clear();
         self.tree.clear();
+        self.footprints.clear();
+        self.tiles = TileState {
+            on: self.tiles.on,
+            sea_level: self.tiles.sea_level,
+            ..TileState::default()
+        };
         self.cover_plan.clear();
         self.cover.clear();
         self.holes.clear();
@@ -3622,6 +4511,34 @@ mod tests {
     /// Puts `keys` in as the plan, as the planner thread would hand it over,
     /// with `cover` as its coverage layer.
     fn put(lod: &mut CubeLod, keys: &[CubeKey], cover: &[CubeKey]) {
+        put_far(lod, keys, &[], cover);
+    }
+
+    /// [`put`] with surface tiles.
+    fn put_far(lod: &mut CubeLod, keys: &[CubeKey], tiles: &[TileKey], cover: &[CubeKey]) {
+        let next_tiles: FxHashSet<TileKey> = tiles.iter().copied().collect();
+        let tiles_added = tiles
+            .iter()
+            .copied()
+            .filter(|k| !lod.tiles.wanted.contains(k))
+            .collect();
+        let tiles_removed = lod
+            .tiles
+            .wanted
+            .iter()
+            .copied()
+            .filter(|k| !next_tiles.contains(k))
+            .collect();
+        let mut footprints: Vec<(u64, u8, FarKey)> = keys
+            .iter()
+            .map(|&k| (footprint_order(k.level, k.x, k.z), k.level, FarKey::Cube(k)))
+            .chain(
+                tiles
+                    .iter()
+                    .map(|&t| (footprint_order(t.level, t.x, t.z), t.level, FarKey::Tile(t))),
+            )
+            .collect();
+        footprints.sort_unstable();
         let next: FxHashSet<CubeKey> = keys.iter().copied().collect();
         let added = keys
             .iter()
@@ -3648,9 +4565,15 @@ mod tests {
             added,
             removed,
             cover: cover.iter().copied().collect(),
+            tiles: Arc::new(tiles.to_vec()),
+            tiles_added,
+            tiles_removed,
+            cover_tiles: FxHashSet::default(),
+            footprints,
             pruned: 0,
             limited: false,
             coarsened: 1.0,
+            tiles_limited: false,
             elapsed: Duration::ZERO,
         };
         lod.install(done, Instant::now());
@@ -3884,17 +4807,206 @@ mod tests {
     }
 
     #[test]
-    fn only_tiles_the_tile_module_knows_are_tiles() {
+    fn tiles_from_the_surface_level_complex_ones_sooner() {
         let high = key(SURFACE_LEVEL, 3, 0, -2);
-        assert_eq!(node_kind(high, None, None), NodeKind::Cube);
-        let plain = Some(TileInfo { complex: false });
-        let complex = Some(TileInfo { complex: true });
+        // Not generated yet: a tile first.
+        assert_eq!(node_kind(high, None, None), NodeKind::Tile);
+        let plain = Some(TileInfo::default());
+        let complex = Some(TileInfo {
+            overflow_columns: 3,
+            ..TileInfo::default()
+        });
         assert_eq!(node_kind(high, None, plain), NodeKind::Tile);
         assert_eq!(node_kind(high.children()[0], None, plain), NodeKind::Cube);
         // A complex tile turns into cube nodes sooner.
         assert_eq!(node_kind(high, None, complex), NodeKind::Cube);
         let higher = key(SURFACE_LEVEL + COMPLEX_LIFT, 0, 0, 0);
         assert_eq!(node_kind(higher, None, complex), NodeKind::Tile);
+    }
+
+    // ---- surface tiles in the plan
+
+    const WHOLE: f64 = 67_108_864.0;
+
+    /// Air above y 1,000, rock below y -1,000: the terrain lies between.
+    fn banded(k: CubeKey) -> NodeClass {
+        let [_, y, _] = k.origin();
+        if i64::from(y) > 1000 {
+            NodeClass::Air
+        } else if i64::from(y) + i64::from(k.size()) < -1000 {
+            NodeClass::Rock
+        } else {
+            NodeClass::Mixed
+        }
+    }
+
+    /// A Whole World plan with tiles, at 16 px, with the headers `info` gives.
+    fn tiled(camera: [f64; 3], info: &dyn Fn(TileKey) -> Option<TileInfo>) -> Plan {
+        let loaded = near(camera);
+        plan_far(&PlanInput {
+            camera,
+            max_distance: WHOLE,
+            rule: &FarView::standard(16.0).rule(usize::MAX),
+            loaded: BOX,
+            is_loaded: &loaded,
+            previous: &[],
+            class: &banded,
+            surface: Some(Surface {
+                info,
+                sea_level: 63,
+                budget: usize::MAX,
+                previous: &[],
+            }),
+        })
+    }
+
+    /// Whether the footprint of `t` holds the block column `(x, z)`.
+    fn tile_holds(t: TileKey, x: i64, z: i64) -> bool {
+        let [ox, oz] = t.origin().map(i64::from);
+        let size = i64::from(t.size());
+        (ox..ox + size).contains(&x) && (oz..oz + size).contains(&z)
+    }
+
+    #[test]
+    fn no_cube_node_shares_a_footprint_with_a_tile() {
+        let camera = [0.5, 100.5, 0.5];
+        let plan = tiled(camera, &|_| None);
+        assert!(plan.tiles.len() > 100, "{} tiles", plan.tiles.len());
+        assert!(!plan.leaves.is_empty());
+        let tiles: FxHashSet<TileKey> = plan.tiles.iter().copied().collect();
+        assert_eq!(tiles.len(), plan.tiles.len());
+        // Tiles overlap neither each other nor any node's footprint, at any height.
+        let mut under = FxHashSet::default();
+        for &t in &plan.tiles {
+            for l in t.level + 1..=MAX_CUBE_LEVEL {
+                let up = l - t.level;
+                let a = TileKey::new(l, t.x >> up, t.z >> up);
+                assert!(!tiles.contains(&a), "{t:?} inside {a:?}");
+                under.insert(a);
+            }
+        }
+        for &c in &plan.leaves {
+            assert!(
+                !under.contains(&TileKey::new(c.level, c.x, c.z)),
+                "{c:?} over a tile"
+            );
+            for l in c.level..=MAX_CUBE_LEVEL {
+                let up = l - c.level;
+                let t = TileKey::new(l, c.x >> up, c.z >> up);
+                assert!(!tiles.contains(&t), "{c:?} under {t:?}");
+            }
+        }
+        // Far away the ground is a tile, and no tile is finer than the
+        // surface level.
+        assert!(
+            plan.tiles
+                .iter()
+                .any(|&t| tile_holds(t, 1_000_000, -2_000_000))
+        );
+        assert!(plan.tiles.iter().all(|t| t.level >= SURFACE_LEVEL));
+    }
+
+    #[test]
+    fn the_camera_footprint_is_never_a_tile() {
+        for camera in [
+            [0.5, 100.5, 0.5],
+            // Deep underground, in a cavern: the surface far above stays
+            // tiles elsewhere, the rock between hides it.
+            [12_345.5, -2000.5, -6789.5],
+            // On a corner of the surface level's tiles.
+            [65_535.5, 80.5, 65_535.5],
+        ] {
+            let plan = tiled(camera, &|_| None);
+            assert!(!plan.tiles.is_empty());
+            let c = cube_of(camera);
+            let h = i64::from(BOX.horizontal);
+            for &t in &plan.tiles {
+                for dz in -h..=h {
+                    for dx in -h..=h {
+                        let x = (i64::from(c.x) + dx) * 16;
+                        let z = (i64::from(c.z) + dz) * 16;
+                        assert!(
+                            !tile_holds(t, x, z),
+                            "{t:?} over the loaded cubes at {camera:?}"
+                        );
+                    }
+                }
+            }
+            // Around the camera, the far terrain is cube nodes.
+            assert!(
+                plan.leaves.iter().any(|k| k.distance(camera) < 64.0),
+                "{camera:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_complex_tile_turns_into_cube_nodes_sooner() {
+        let camera = [0.5, 100.5, 0.5];
+        let first = tiled(camera, &|_| None);
+        let pick = |level: u8| {
+            *first
+                .tiles
+                .iter()
+                .find(|t| t.level == level)
+                .unwrap_or_else(|| panic!("no tile of level {level}"))
+        };
+        let lifted = pick(SURFACE_LEVEL + 1);
+        let kept = pick(SURFACE_LEVEL + COMPLEX_LIFT);
+        // The same heights the plan assumes before a tile is generated.
+        let complex = TileInfo {
+            overflow_columns: 7,
+            highest: 63 + UNKNOWN_ABOVE - 1,
+            skirt: 63 - UNKNOWN_BELOW,
+            ..TileInfo::default()
+        };
+        let info = move |t: TileKey| (t == lifted || t == kept).then_some(complex);
+        let second = tiled(camera, &info);
+        assert!(
+            !second.tiles.contains(&lifted),
+            "a complex tile below the lift stays"
+        );
+        let inside = |c: &CubeKey| {
+            let [x, _, z] = c.origin().map(i64::from);
+            tile_holds(lifted, x, z) && c.size() <= lifted.size()
+        };
+        assert!(second.leaves.iter().any(inside), "no node under {lifted:?}");
+        // From the lift's level up, a complex tile is still a tile.
+        assert!(second.tiles.contains(&kept));
+    }
+
+    #[test]
+    fn a_tile_fades_out_only_once_the_nodes_under_it_are_in() {
+        let mut lod = lod_for_test();
+        lod.tiles.on = true;
+        let tile = TileKey::new(SURFACE_LEVEL, 3, -2);
+        put_far(&mut lod, &[], &[tile], &[]);
+        assert_eq!(lod.take_tile_work().request, vec![tile]);
+        lod.surface_feedback(|k| (k == tile).then_some(TileInfo::default()));
+        assert!(lod.stats().complete);
+        // The plan turns the tile into the cube nodes of its footprint.
+        let node = CubeKey::new(SURFACE_LEVEL, tile.x, 0, tile.z);
+        let kids = node.children();
+        put_far(&mut lod, &kids, &[], &[]);
+        assert!(lod.removed().is_empty());
+        assert!(
+            lod.take_tile_work().retire.is_empty(),
+            "nothing under it is in"
+        );
+        for &k in &kids[..7] {
+            lod.deliver(k, false);
+        }
+        assert!(lod.removed().is_empty());
+        assert!(lod.take_tile_work().retire.is_empty(), "one node missing");
+        lod.deliver(kids[7], false);
+        assert!(lod.removed().is_empty());
+        assert_eq!(lod.take_tile_work().retire, vec![tile]);
+        // And back: the nodes stay until the tile is in again.
+        put_far(&mut lod, &[], &[tile], &[]);
+        assert_eq!(lod.take_tile_work().request, vec![tile]);
+        assert!(lod.removed().is_empty(), "the tile is not in");
+        lod.surface_feedback(|k| (k == tile).then_some(TileInfo::default()));
+        assert_eq!(lod.removed().len(), 8);
     }
 
     // ---- coverage first, and the queue's order
@@ -3912,8 +5024,14 @@ mod tests {
             loaded: NONE,
             snapshot: LoadedSnapshot::default(),
             previous: Arc::default(),
+            surface: None,
         };
-        let done = make_plan(&job, &mut FxHashSet::default(), &mixed);
+        let done = make_plan(
+            &job,
+            &mut FxHashSet::default(),
+            &mut FxHashSet::default(),
+            &mixed,
+        );
         let plan: Vec<CubeKey> = done.leaves.to_vec();
         lod.install(done, Instant::now());
         assert!(matches!(lod.phase, Phase::Cover { .. }));

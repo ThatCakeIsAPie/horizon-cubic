@@ -173,6 +173,13 @@ impl CustomCubicGenerator {
         })
     }
 
+    /// Whether some `cubeAreas` entry hands cubes to other settings (what
+    /// reproduces only the main terrain, as the far view's surface tiles,
+    /// does not apply).
+    pub fn has_areas(&self) -> bool {
+        !self.areas.is_empty()
+    }
+
     fn area(&self, cube: SectionPos) -> Option<&CustomCubicGenerator> {
         self.areas
             .iter()

@@ -1,11 +1,15 @@
 //! Far meshes share the terrain arenas and passes, with their actual bounds
 //! rather than the 16³ boxes used by the near-section residency walk.
-use super::{Frustum, Renderer, SectionGpu, cube_far, cube_gen::GpuBackend};
+use super::{
+    Frustum, Renderer, SectionGpu, cube_far,
+    cube_gen::GpuBackend,
+    surface_tile::{self, TileInfo as SurfaceInfo, TileKey as SurfaceKey},
+};
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
     lod::{
         MAX_LEVEL, TileKey,
-        cube::{CubeKey, GpuBatch},
+        cube::{CubeKey, GpuBatch, TileWork},
     },
     mesher::SectionMesh,
 };
@@ -448,10 +452,81 @@ impl Renderer {
                 && self.info.backend != wgpu::Backend::Dx12,
         };
         self.cube_far = cube_far::CubeFar::new(backend, states, air, &setup);
-        if let Some(far) = &self.cube_far {
-            self.surface_debug = super::surface_tile::DebugTiles::from_env(backend, far, &setup);
-        }
         self.cube_far.is_some()
+    }
+
+    /// Makes the surface tiles ready beside the GPU far terrain
+    /// (`use_gpu_cube_lods` first), with a pool of `capacity` tiles, from the
+    /// generator's parameters and its GPU climate pass. False when they cannot
+    /// run: no GPU far terrain, no GPU climate pass (`GpuBackend::biome_params`,
+    /// a Custom world's), or a pipeline that does not build.
+    pub fn use_surface_tiles(&mut self, backend: &GpuBackend, capacity: u32) -> bool {
+        if self.surface_tiles.is_some() {
+            return true;
+        }
+        let (Some(far), Some(biomes)) = (&self.cube_far, &backend.biome_params) else {
+            return false;
+        };
+        if self.surface_tiles_failed || *far.device() != backend.device {
+            return false;
+        }
+        // Built once: a pipeline that does not build will not the next frame.
+        self.surface_tiles_failed = true;
+        let setup = cube_far::DrawSetup {
+            bindings: &self.terrain_layout,
+            format: self.frame_format,
+            sprite_constants: self.terrain_sprites,
+            counts: self
+                .device
+                .features()
+                .contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT)
+                && self.info.backend != wgpu::Backend::Dx12,
+        };
+        let Some(mut tiles) = surface_tile::SurfaceTiles::new(
+            &backend.device,
+            &backend.queue,
+            backend.params.clone(),
+            surface_tile::ColumnSource::Gpu(biomes.clone()),
+            capacity,
+        ) else {
+            return false;
+        };
+        if !tiles.enable_draw(&setup, far.material_buffer(), far.biome_buffer()) {
+            return false;
+        }
+        self.surface_tiles = Some(tiles);
+        self.surface_tiles_failed = false;
+        true
+    }
+
+    /// Whether the surface tiles run (`use_surface_tiles`).
+    pub fn surface_tiles_on(&self) -> bool {
+        self.surface_tiles.is_some()
+    }
+
+    /// Hands the surface tiles what `CubeLod::take_tile_work` returned: drops,
+    /// fades and requests, in that order.
+    pub fn queue_surface_tiles(&mut self, work: TileWork) {
+        let Some(tiles) = &mut self.surface_tiles else {
+            return;
+        };
+        for key in work.free {
+            tiles.free(key);
+        }
+        for key in work.retire {
+            tiles.retire(key);
+        }
+        tiles.request(&work.request);
+    }
+
+    /// A surface tile's header, once generated and read back.
+    pub fn surface_tile_info(&self, key: SurfaceKey) -> Option<SurfaceInfo> {
+        self.surface_tiles.as_ref()?.info(key)
+    }
+
+    /// The surface tiles' counters, if they run.
+    pub fn surface_stats(&self) -> Option<surface_tile::SurfaceStats> {
+        self.surface_tiles.as_ref().map(|t| t.stats())
     }
 
     /// Queues the nodes `CubeLod::take_gpu_nodes` returned for meshing.
@@ -479,6 +554,12 @@ impl Renderer {
         self.cube_pending = None;
         if let Some(far) = &mut self.cube_far {
             far.clear();
+        }
+        if let Some(tiles) = &mut self.surface_tiles {
+            let keys: Vec<SurfaceKey> = tiles.keys().collect();
+            for key in keys {
+                tiles.free(key);
+            }
         }
         for (_, tile) in std::mem::take(&mut self.lod_cubes) {
             self.lod_cull_free.push(tile.cull_slot);

@@ -686,6 +686,15 @@ impl CubeSampler for CubicLodSampler {
         self.far.as_ref()?.gpu()
     }
 
+    /// Surface tiles reproduce CubicWorldGen's main terrain from the GPU
+    /// climate pass: a Custom world (not Hybrid's vanilla band) without
+    /// `cubeAreas`, whose far generator runs on the GPU with its climate.
+    fn surface(&self) -> bool {
+        self.wg.kind == CubicKind::Custom
+            && !self.wg.generator.has_areas()
+            && self.gpu().is_some_and(|b| b.biome_params.is_some())
+    }
+
     fn descent(&self) -> Option<std::sync::Arc<crate::gfx::cube_descent::GpuDescent>> {
         self.far.as_ref()?.descent()
     }

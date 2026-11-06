@@ -1527,6 +1527,14 @@ impl Game<'_> {
                     "holes": s.holes,
                     "cover_nodes": s.cover_nodes,
                     "covering": s.covering,
+                    // Surface tiles (counted in planned and ready too).
+                    "surface": lod.surface_on(),
+                    "tiles": s.tiles,
+                    "tiles_ready": s.tiles_ready,
+                    "tiles_resident": s.tiles_resident,
+                    "tile_bytes": s.tile_bytes,
+                    "tiles_complex": s.tiles_complex,
+                    "tiles_limited": s.tiles_limited,
                     "plan_changed_ago_s": ago(s.plan_changed),
                     "plan_complete_ago_s": ago(s.plan_complete),
                     // When every part of the plan last had something drawn over it.

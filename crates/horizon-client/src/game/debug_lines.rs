@@ -303,8 +303,13 @@ impl Game<'_> {
                 format!(" {}px", s.target_px)
             };
             let covering = if s.covering { " covering" } else { "" };
+            let tiles = if lod.surface_on() {
+                format!(" t: {}/{} {}MB", s.tiles_ready, s.tiles, s.tile_bytes >> 20)
+            } else {
+                String::new()
+            };
             d.line(format!(
-                "Far: {}/{} p: {} u: {} {} {}MB{detail}{covering}{done}",
+                "Far: {}/{} p: {} u: {} {} {}MB{tiles}{detail}{covering}{done}",
                 s.ready,
                 s.planned,
                 s.pending,

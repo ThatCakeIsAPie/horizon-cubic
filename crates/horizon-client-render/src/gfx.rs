@@ -1282,9 +1282,11 @@ pub struct Renderer {
     cube_pending: Option<lod::CubePending>,
     /// Far cube terrain meshed and drawn on the GPU (`cube_far`), once a GPU sampler asked.
     cube_far: Option<cube_far::CubeFar>,
-    /// `HORIZON_SURFACE_TILES_DEBUG`'s view of the surface tiles, drawn in place of
-    /// `cube_far` (temporary, until the planner hands tiles out).
-    surface_debug: Option<surface_tile::DebugTiles>,
+    /// Height-map tiles for a Custom cubic world's coarsest far terrain, beside
+    /// `cube_far` (`lod::cube::CubeLod` plans them: `queue_surface_tiles`).
+    surface_tiles: Option<surface_tile::SurfaceTiles>,
+    /// `use_surface_tiles` tried and could not build them: not again.
+    surface_tiles_failed: bool,
     /// Far tiles' occlusion culling slots (`lod::Tile::cull_slot`): those
     /// free, and the next never used.
     lod_cull_free: Vec<u32>,
@@ -4683,7 +4685,8 @@ impl Renderer {
             lod_cubes: HashMap::new(),
             cube_pending: None,
             cube_far: None,
-            surface_debug: None,
+            surface_tiles: None,
+            surface_tiles_failed: false,
             lod_cull_free: Vec::new(),
             lod_cull_next: 0,
             lod_cutout: Default::default(),
@@ -7715,9 +7718,10 @@ impl Renderer {
             far.prepare(&mut encoder, camera, view.planes);
         }
         if !frame.title
-            && let Some(debug) = &mut self.surface_debug
+            && let Some(tiles) = &mut self.surface_tiles
         {
-            debug.frame(&mut encoder, camera, view.planes);
+            tiles.update();
+            tiles.prepare(&mut encoder, camera, view.planes);
         }
         let reachable = &self.occlusion;
         let cutout = &self.lod_cutout;
@@ -9857,9 +9861,9 @@ impl Renderer {
                 && let Some(far) = &self.cube_far
             {
                 pass.set_bind_group(0, &self.group, &[]);
-                match &self.surface_debug {
-                    Some(debug) => debug.tiles.draw(&mut pass, false),
-                    None => far.draw(&mut pass, false),
+                far.draw(&mut pass, false);
+                if let Some(tiles) = &self.surface_tiles {
+                    tiles.draw(&mut pass, false);
                 }
             }
             // `[displacement]`'s grid over the flat quads it took over, writing its depth.
@@ -10321,9 +10325,9 @@ impl Renderer {
                 && let Some(far) = &self.cube_far
             {
                 pass.set_bind_group(0, &self.group, &[]);
-                match &self.surface_debug {
-                    Some(debug) => debug.tiles.draw(&mut pass, true),
-                    None => far.draw(&mut pass, true),
+                far.draw(&mut pass, true);
+                if let Some(tiles) = &self.surface_tiles {
+                    tiles.draw(&mut pass, true);
                 }
                 pass.set_bind_group(0, &self.group, &[]);
                 pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);

@@ -17892,6 +17892,18 @@ impl Game<'_> {
                 // The sparse descent rides the GPU path (the sampler has one
                 // only in a Custom world).
                 cube_lod.set_gpu_descent(gpu);
+                // Surface tiles draw the coarse levels where the world allows them
+                // (a Custom world on the GPU path), beside the far cube nodes.
+                let tiles = gpu
+                    && cube_lod.surface_allowed()
+                    && cube_lod.gpu_backend().is_some_and(|backend| {
+                        renderer
+                            .use_surface_tiles(backend, horizon_client::lod::cube::TILE_CAPACITY)
+                    });
+                if cube_lod.set_surface(tiles) {
+                    renderer.clear_cube_lods();
+                }
+                cube_lod.surface_feedback(|key| renderer.surface_tile_info(key));
                 let meshes = horizon_client::spans::time("cube_lod_update", || {
                     cube_lod.update(camera, f64::from(lod_distance) * 16.0, &view, loaded, |p| {
                         shape.has_section(p.y)
@@ -17905,10 +17917,12 @@ impl Game<'_> {
                     })
                 });
                 renderer.queue_cube_lods(meshes, cube_lod.removed());
+                renderer.queue_surface_tiles(cube_lod.take_tile_work());
                 if cube_lod.gpu_path() {
                     renderer.queue_gpu_cube_lods(cube_lod.take_gpu_nodes());
                 }
                 cube_lod.set_render_stats(renderer.cube_far_stats());
+                cube_lod.set_surface_stats(renderer.surface_stats());
                 horizon_client::spans::time("cube_lod_upload", || {
                     renderer.upload_cube_lods(std::time::Duration::from_millis(2))
                 });
