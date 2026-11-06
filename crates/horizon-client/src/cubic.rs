@@ -247,8 +247,11 @@ struct CubeIo {
 
 impl CubeIo {
     fn read(&self, pos: SectionPos) -> Option<NamedTag> {
-        if let Some(tag) = self.pending.lock().unwrap().get(&pos) {
-            return Some((**tag).clone());
+        // Only the `Arc` is cloned under the lock; the record is copied
+        // outside it, so loads never wait on a copy.
+        let queued = self.pending.lock().unwrap().get(&pos).cloned();
+        if let Some(tag) = queued {
+            return Some((*tag).clone());
         }
         match self.store.read(pos) {
             Ok(tag) => tag,
