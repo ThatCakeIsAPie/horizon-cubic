@@ -166,6 +166,64 @@ fn the_octave_bounds_hold() {
     assert!(worst_grad <= GRADIENT_BOUND, "{worst_grad}");
 }
 
+/// `VALUE_BOUND` and `GRADIENT_BOUND` are suprema of the best case over every
+/// gradient assignment, certified on a grid plus the Lipschitz allowance of
+/// the module docs of `bounds.rs`.
+#[test]
+fn the_octave_constants_are_certified() {
+    fn fade(t: f64) -> f64 {
+        t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+    }
+    fn dfade(t: f64) -> f64 {
+        30.0 * t * t * (1.0 - t) * (1.0 - t)
+    }
+    // The sum of the two largest |d_i|: the best of the +-d_a +- d_b.
+    fn best(d: [f64; 3]) -> f64 {
+        let a = d.map(f64::abs);
+        a[0] + a[1] + a[2] - a[0].min(a[1]).min(a[2])
+    }
+    let n = 256;
+    let h = 1.0 / f64::from(n);
+    let (mut vmax, mut gmax): (f64, f64) = (0.0, 0.0);
+    // The half cube: both functions are symmetric under u_a -> 1 - u_a.
+    for iz in 0..=n / 2 {
+        for iy in 0..=n / 2 {
+            for ix in 0..=n / 2 {
+                let u = [ix, iy, iz].map(|i| f64::from(i) * h);
+                let f = u.map(fade);
+                let df = u.map(dfade);
+                let mut value = 0.0;
+                let mut grad = [0.0; 3];
+                for c in 0..8_usize {
+                    let corner: [bool; 3] = std::array::from_fn(|a| (c >> a) & 1 == 1);
+                    let om = |a: usize| if corner[a] { f[a] } else { 1.0 - f[a] };
+                    let dom = |a: usize| if corner[a] { df[a] } else { -df[a] };
+                    let w = om(0) * om(1) * om(2);
+                    let d: [f64; 3] =
+                        std::array::from_fn(|a| u[a] - if corner[a] { 1.0 } else { 0.0 });
+                    value += w * best(d);
+                    for (axis, g) in grad.iter_mut().enumerate() {
+                        let mut dw = dom(axis);
+                        for other in (0..3).filter(|&o| o != axis) {
+                            dw *= om(other);
+                        }
+                        let mut v = d.map(|x| dw * x);
+                        v[axis] += w;
+                        *g += best(v);
+                    }
+                }
+                vmax = vmax.max(value);
+                gmax = grad.iter().fold(gmax, |m, &g| m.max(g));
+            }
+        }
+    }
+    assert!(vmax + 12.75 * h <= VALUE_BOUND, "{vmax}");
+    assert!(gmax + 54.0 * h <= GRADIENT_BOUND, "{gmax}");
+    // And the grid is not far from the constants: they are not slack by
+    // accident (the supremum of V is 1.036, of F_x 3.75).
+    assert!(vmax > 1.03 && gmax > 3.7, "{vmax} {gmax}");
+}
+
 /// Every biome of the table is inside the constants the large-box bound
 /// uses.
 #[test]

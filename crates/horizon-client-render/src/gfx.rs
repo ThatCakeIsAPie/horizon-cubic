@@ -160,6 +160,7 @@ pub mod biome_gen;
 pub mod capture;
 pub mod compositor;
 pub(crate) mod core_lines;
+pub mod cube_descent;
 pub mod cube_far;
 pub mod cube_gen;
 pub mod cube_mesh;

@@ -10,30 +10,57 @@
 //! One octave is vanilla's improved noise `P` of the point scaled by
 //! `f_a * 2^i` per axis, weighted by `A_i = |factor| * 0.5^i / norm`.
 //!
-//! **`|P| <= 1.5`.** Inside a lattice cell, `P = sum_c w_c t_c` over the 8
-//! corners, with `w_c` the product of the per-axis fades (`w_c >= 0`,
-//! `sum w_c = 1`) and `t_c = g_c . (p - c)`. Every gradient `g_c` has
-//! components in `{-1, 0, 1}`, so `|t_c| <= |dx| + |dy| + |dz|` (the offsets to
-//! the corner). Per axis, `E|d| = (1 - f(u)) u + f(u) (1 - u) <= 1/2` (it is
-//! symmetric about `u = 1/2` and increasing before it), so `|P| <= 3/2`.
+//! **The two constants are suprema, certified on a grid.** Inside a lattice
+//! cell with local coordinates `u` in `[0, 1]^3`, `P = sum_c w_c(u) t_c(u)`
+//! over the 8 corners, with `w_c` the product of the per-axis fades
+//! (`f(u) = 6u^5 - 15u^4 + 10u^3` or `1 - f(u)`; `w_c >= 0`, `sum w_c = 1`)
+//! and `t_c = g_c . (u - c)`. Every gradient `g_c` in the 16-entry table is
+//! one of the 12 vectors with exactly two nonzero components, each `+-1`, and
+//! the corners' gradients can be any of them (a permutation table makes them
+//! independent for all this bound knows). So for a point `u`:
 //!
-//! **`|dP/da| <= 6.625` per axis.** With `f` the fade `6u^5 - 15u^4 + 10u^3`
-//! and `f' = 30 u^2 (1 - u)^2 <= 15/8`,
-//! `dP/dx = sum w_c g_{c,x} + f'(u_x) sum_{j,k} w^y_j w^z_k (t_{1jk} - t_{0jk})`.
-//! The first sum is at most 1 (`|g_x| <= 1`, weights sum to 1). In the second,
-//! `|t| <= |dx| + |dy| + |dz|`; taking the weighted mean over the other two
-//! axes gives `E|t_1| <= (1 - u_x) + 1/2 + 1/2` and `E|t_0| <= u_x + 1`, which
-//! sum to 3, so it is at most `3 * 15/8 = 5.625`. Total `1 + 5.625`. The true
-//! maximum is smaller (about 3 to 4), so this is safe, not tight; the
-//! constants are [`GRADIENT_BOUND`] (rounded up to cover `f32` rounding in
-//! `PerlinNoise`) and [`VALUE_BOUND`].
+//! * `max_g |P| = V(u) = sum_c w_c m(u - c)`, where `m(d)` is the sum of the
+//!   two largest `|d_i|` (the best of the `+-d_a +- d_b`);
+//! * `dP/du_x = sum_c g_c . v_c` with `v_c = (d w_c / d u_x)(u - c) + w_c e_x`,
+//!   so `max_g |dP/du_x| = F_x(u) = sum_c m(v_c(u))`. The axes are alike.
+//!
+//! [`VALUE_BOUND`] bounds `sup V` and [`GRADIENT_BOUND`] bounds `sup F_x`
+//! (the largest change of `P` per unit of phase along one axis; a change of
+//! phase along several axes adds, as the path may go axis by axis). Both are
+//! certified by `bounds_tests::the_octave_constants_are_certified`, which
+//! evaluates `V` and `F_x` on a grid of spacing `h = 1/256` over `[0, 1/2]^3`
+//! (the functions are symmetric under `u_a -> 1 - u_a`: mirroring an axis
+//! permutes the corners and flips signs inside `m`, which ignores signs) and
+//! adds the change a function can make within `h/2` per axis. That change is
+//! bounded with the derivatives of the weights, `|f'| <= 15/8` and
+//! `|f''| <= 10/sqrt 3 = 5.774` (`f'' = 60 u (1 - u) (2u - 1)` peaks at
+//! `u = 1/2 +- 1/(2 sqrt 3)`, where `u (1 - u) = 1/6` and `|2u - 1| = 1/sqrt 3`),
+//! `sum_c |d w_c / d u_a| = 2 f'_a`, `sum_c |d^2 w_c / d u_a d u_b| <= 4 f'_a f'_b`
+//! (`a != b`) and `<= 2 |f''_a|` (`a = b`), and `|u - c| <= 1` per component:
+//!
+//! * `V` changes by at most `8.5` per unit of one coordinate
+//!   (`sum_c |d w_c| m + sum_c w_c |d m| <= 2 * 15/8 * 2 + 1`), so by
+//!   `8.5 * 3 * h/2 = 12.75 h` within `h/2` per axis;
+//! * `F_x` changes at most `2 sum_c |d^2 w_c/du_k du_x| + sum_c |dw_c/du_x| + sum_c |dw_c/du_k|`
+//!   per axis `k`, which is at most `2 * 14.0625 + 3.75 + 3.75 = 35.63`, so by
+//!   `36 * 3 * h/2 = 54 h`.
+//!
+//! The grid gives `sup V = 1.0364` (reached near the cell centre, where all
+//! eight corners weigh in) and `sup F_x = 3.75`; with the allowances,
+//! `V <= 1.0862` and `F_x <= 3.9609`, so the constants are `1.1` and `4.0`
+//! (a finer grid, `h = 1/512`, certifies `1.0613` and `3.8555`). This
+//! replaces the first derivation here, which used the cruder
+//! `|t_c| <= |dx| + |dy| + |dz|` and gave `1.5` and `6.7`; the bound on the
+//! octaves is now about 1.7 times as tight, which proves far more nodes
+//! uniform (every `lin` term and every amplitude-bounded octave shrinks).
 //!
 //! So between two points `p, q`, octave `i` changes by at most
-//! `min(2 * 1.5 * A_i, A_i * G * 2^i * sum_a |f_a| |p_a - q_a|)`. For a
+//! `min(2 * V * A_i, A_i * G * 2^i * sum_a |f_a| |p_a - q_a|)`. For a
 //! Euclidean distance `r` the sum is at most `|f| r` (Cauchy-Schwarz), which is
 //! [`DensityBound::l`]'s form: `A_i * G * |(fX, fY, fZ)| * 2^i * r`.
 //! When the octave value `p_i` at the box centre is known, the box range of
-//! the octave is `[max(p_i - lin, -1.5), min(p_i + lin, 1.5)]`, which is what
+//! the octave is `[max(p_i - lin, -V), min(p_i + lin, V)]` (`V` is
+//! [`VALUE_BOUND`]), which is what
 //! the classifier uses (it is never wider than the cap form).
 //!
 //! # Through the density formula
@@ -81,7 +108,7 @@
 //! # Octaves a node skips
 //!
 //! `min_wavelength` skips octaves like `OctaveNoise::get3` does. The skipped
-//! ones are bounded by amplitude alone (`A_i * 1.5` each side) so the answer
+//! ones are bounded by amplitude alone (`A_i * V` each side) so the answer
 //! is valid for the truncated density and for the full one.
 
 use std::rc::Rc;
@@ -90,10 +117,11 @@ use super::biomes::{BiomeBlend, ResolvedBiome, convert_height, convert_variation
 use super::density::{Column, OctaveNoise, TerrainNoise};
 use super::replacers::{BoxFacts, Replacers};
 
-/// Bound of `|dP/da|` for one axis of one octave (see the module docs).
-pub const GRADIENT_BOUND: f64 = 6.7;
-/// Bound of `|P|` of one octave.
-pub const VALUE_BOUND: f64 = 1.5;
+/// Bound of `|dP/da|` for one axis of one octave (see the module docs; the
+/// grid certifies 3.9609).
+pub const GRADIENT_BOUND: f64 = 4.0;
+/// Bound of `|P|` of one octave (the grid certifies 1.0862).
+pub const VALUE_BOUND: f64 = 1.1;
 /// Allowance for `f32` rounding inside `PerlinNoise`, per octave value.
 pub const F32_SLACK: f64 = 4.0e-6;
 /// Added to both ends of every density range.
