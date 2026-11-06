@@ -341,16 +341,20 @@ impl FarDetail {
 /// and so on. Coarser steps are for weaker hardware. The node budget
 /// (`lod::cube::NODE_BUDGET`) caps every step.
 ///
-/// Ultra is the default: measured on a 4-core i7 and a GTX 1070 Ti at 720 pixels
-/// (docs/cubic-v2-plan.md), it fills the budget (about 2.5 pixels per voxel)
-/// with the frame rate unchanged, covers a teleport in 0.2 s and completes in
-/// about 48 s; Extreme reaches no further within the budget.
+/// High is the default. Measured with the height-map tiles on a 4-core i7 and a
+/// GTX 1070 Ti at 720 pixels (docs/cubic-v2-plan.md):
+/// - High: a teleport covered in 0.18 s and complete in 19 s, at 120 fps, with
+///   a longest frame of 48 ms. It stays under the node budget, so the spyglass
+///   has room to refine what it looks at.
+/// - Ultra: full to the budget (about 2.2 pixels per voxel). Complete in 72 s,
+///   103 fps steady, a longest frame of 116 ms after a teleport.
+/// - Extreme reaches no further than Ultra within the budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CubicFarDetail {
     Low,
     Normal,
-    High,
     #[default]
+    High,
     Ultra,
     Extreme,
 }

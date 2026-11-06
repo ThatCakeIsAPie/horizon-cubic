@@ -317,14 +317,29 @@ Points 1 and 5 above are built (`lod/cube.rs`):
 | Low | 16 | 16 | 4,116 | 9 | 0.08 | 0.60 | 2.0 / 9.3 | 118 | 95 |
 | Normal | 8 | 8 | 13,507 | 15 | 0.08 | 2.81 | 0.9 / 11.2 | 120 | 97 |
 | High | 4 | 4 | 44,842 | 47 | 0.14 | 16.7 | 1.4 / 30.8 | 120 | 97 |
-| **Ultra (default)** | 2 | 2.5 (budget) | 120,000 | 96 | 0.21 | 48.2 | 1.6 / 54.5 | 120 | 61 |
+| Ultra | 2 | 2.5 (budget) | 120,000 | 96 | 0.21 | 48.2 | 1.6 / 54.5 | 120 | 61 |
 | Extreme | 1 | 2.5 (budget) | 120,000 | 95 | 0.22 | 48.4 | 6.6 / 54.1 | 118 | 69 |
 
 - The coverage layer is in after 0.1–0.2 s at every step (main had no coverage: nothing showed until the nearest nodes landed). Normal is finer than main and fills about as fast: workers now wait for room in the GPU pool instead of failing a batch for a second, and take at most two CPU-sampled nodes per batch.
 - The node budget (120,000) stops Ultra and Extreme at about 2.5 px at 720 pixels; it grows with the viewport's height squared, so at 1440 pixels High meets it too. True 1 px at 720 pixels needs about 700,000 nodes by the counts above (nodes grow with the square of the detail): about 700 MB of arena and a fill of four to five minutes at the measured ~2,600 nodes/s. Not measured yet: it needs a build with a bigger node table.
 - Teleport hitch, measured before `RELEASE_BATCH`: the longest frame after a teleport was 17–81 ms on main, 117–131 ms at High and 235–281 ms at Ultra. The renderer retires each released node with buffer writes of its own (`CubeFar::upload`), and a teleport released the whole last plan in one frame; `removed` now hands out 4,096 at a time. To re-measure.
 - Fill rate (~2,600 planned nodes/s, ~1,700 generated on the GPU) is the next lever, for the autoresearch loops: GPU batch sizes, the pool, the mesher's batch.
-- Not run yet (`tools/cubic_far_check.py`): the spyglass (`--spyglass`), a cavern at y -2,000 (`--cavern`), the teleport hitch after `RELEASE_BATCH` (`--hitch`). Nothing with surface tiles in the plan has been run either: views from y 300 to 5,000,000 (`--views`), the tall-mountain world (`--tall`), `SURFACE_LEVEL` 10, 12 and 14, and the benchmark's numbers with tiles.
+**With surface tiles** (the owner's quick set, `220f3ef986`, one run each, `D:\ClaudeData\far-detail-runs\quick`):
+
+| Step | Nodes (tiles) | `cover_s` | `far_fill_s` | Spawn cover / fill s | fps steady / min | Longest frame after a teleport (p99) | Tile MB |
+|---|---|---|---|---|---|---|---|
+| **High (default)** | 35,794 (3,582) | 0.18 | 18.6 | 0.9 / 35.0 | 120 / 61 | 48 ms (35) | 75 |
+| Ultra | 123,583 (3,584) | 0.31 | 72.2 | 1.1 / 76.7 | 103 / 60 | 116 ms (68) | 75 |
+
+- **High is the default:** 4 times faster to complete than Ultra, at a full 120 fps, with a 48 ms longest frame after a teleport. It also stays under the node budget, which the spyglass needs to have room to refine.
+- **`RELEASE_BATCH` worked:** the longest frame after a teleport fell from 235–281 ms to 116 ms at Ultra, and from 117–131 ms to 48 ms at High.
+- **Ultra is slower with tiles** (72 s against 48 s without; 103 fps against 120). Not investigated yet. Candidates are the tile draw (each tile draws a fixed 256 × spans × 36 vertices, with no compaction) and the bigger plan. The tile budget (3,584) is full at every step (`tiles_limited`).
+- **Coverage:** a teleport is covered at once (`cover_s` measured from the first plan; the coarse tiles already drawn cover the new place).
+- **Views:** from y 300 to 5,000,000 there are no holes and no log errors. From 100,000 up, the ground is a mix of real biomes and oceans; the regular pattern is gone.
+- **Tall world** (peaks of 8,000–12,000 blocks): complete in 1.7–5.3 s from y 60,000, with 16 complex tiles. From y 20,000 at 60° it took over 180 s (budget-limited).
+- **Cavern:** at y -2,000, in rock and in a carved open space, it is complete in 5.7 s and 0.2 s, with no holes, no errors and no tile over the camera.
+- **Spyglass: not verified.** At Ultra the plan was already at the budget (`planned` went 123,582 → 123,577), and the test's screenshot shows the spyglass held but not zoomed. Rerun at High, with the check fixed to really use the spyglass.
+- **Not run:** `SURFACE_LEVEL` 10/14, the per-step sweep with tiles at Low/Normal/Extreme, and true 1 px.
 
 ### Where the GPU far view stands
 
