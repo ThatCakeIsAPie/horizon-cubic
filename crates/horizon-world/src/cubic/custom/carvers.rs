@@ -138,19 +138,48 @@ impl Walks {
     }
 }
 
+/// A multiplicative hash for the position-keyed maps (SipHash's resistance
+/// to chosen keys is not needed for cube positions).
+#[derive(Default)]
+struct PosHasher(u64);
+
+impl std::hash::Hasher for PosHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(4) {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from(u32::from_le_bytes(word)))
+                .wrapping_mul(0x51_7cc1_b727_220a_95);
+        }
+    }
+    fn write_usize(&mut self, _: usize) {}
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type PosMap<V> = HashMap<[i32; 3], V, std::hash::BuildHasherDefault<PosHasher>>;
+
 #[derive(Default)]
 struct Cache {
-    shards: [Mutex<HashMap<[i32; 3], Option<Arc<Walks>>>>; SHARDS],
+    shards: [Mutex<PosMap<Option<Arc<Walks>>>>; SHARDS],
 }
 
 impl Cache {
-    fn get(&self, key: [i32; 3], make: impl FnOnce() -> Option<Walks>) -> Option<Arc<Walks>> {
+    /// Origin `key`'s walks (made by `make` the first time) when they may
+    /// reach the cube centred on `c`.
+    fn reaching(
+        &self,
+        key: [i32; 3],
+        c: [f64; 3],
+        make: impl FnOnce() -> Option<Walks>,
+    ) -> Option<Arc<Walks>> {
         let h = (key[0].wrapping_mul(73856093)
             ^ key[1].wrapping_mul(19349663)
             ^ key[2].wrapping_mul(83492791)) as u32 as usize;
         let shard = &self.shards[h % SHARDS];
         if let Some(v) = shard.lock().unwrap().get(&key) {
-            return v.clone();
+            return v.as_ref().filter(|w| w.may_reach(c)).cloned();
         }
         let v = make().map(Arc::new);
         let mut map = shard.lock().unwrap();
@@ -158,8 +187,16 @@ impl Cache {
             map.clear();
         }
         map.insert(key, v.clone());
-        v
+        v.filter(|w| w.may_reach(c))
     }
+}
+
+/// The origins of one 8 x 8 x 8 region whose activity draw hits, in `z`,
+/// `y`, `x` order, and where each (`z`, `y`) row of them starts.
+struct Region {
+    origins: Box<[[i32; 3]]>,
+    /// `rows[z * 8 + y]..rows[z * 8 + y + 1]` (local `z`, `y`).
+    rows: [u16; 65],
 }
 
 /// Which origin cubes of 8 x 8 x 8 have a walk (the activity draw only
@@ -167,7 +204,7 @@ impl Cache {
 /// 17 x 17 x 17 origins every time.
 #[derive(Default)]
 struct ActiveOrigins {
-    shards: [Mutex<HashMap<[i32; 3], Arc<[[i32; 3]]>>>; SHARDS],
+    shards: [Mutex<PosMap<Arc<Region>>>; SHARDS],
 }
 
 const REGION: i32 = 8;
@@ -179,7 +216,7 @@ impl ActiveOrigins {
         seeds: &OriginSeeds,
         rarity: i32,
         y_ok: &impl Fn(i32) -> bool,
-    ) -> Arc<[[i32; 3]]> {
+    ) -> Arc<Region> {
         let h = (key[0].wrapping_mul(73856093)
             ^ key[1].wrapping_mul(19349663)
             ^ key[2].wrapping_mul(83492791)) as u32 as usize;
@@ -188,8 +225,10 @@ impl ActiveOrigins {
             return v.clone();
         }
         let mut list = Vec::new();
+        let mut rows = [0u16; 65];
         for z in 0..REGION {
             for y in 0..REGION {
+                rows[(z * REGION + y) as usize] = list.len() as u16;
                 for x in 0..REGION {
                     let o = [
                         key[0] * REGION + x,
@@ -202,7 +241,11 @@ impl ActiveOrigins {
                 }
             }
         }
-        let v: Arc<[[i32; 3]]> = list.into();
+        rows[64] = list.len() as u16;
+        let v = Arc::new(Region {
+            origins: list.into(),
+            rows,
+        });
         let mut map = shard.lock().unwrap();
         if map.len() >= SHARD_LIMIT {
             map.clear();
@@ -211,32 +254,51 @@ impl ActiveOrigins {
         v
     }
 
-    /// The origins within `RANGE` cubes of `cube` whose activity draw hits,
-    /// in CWG's loop order (`z`, then `y`, then `x`).
+    /// Calls `visit` with the origins within `RANGE` cubes of `cube` whose
+    /// activity draw hits, in CWG's loop order (`z`, then `y`, then `x`):
+    /// row by row, each row's regions from west to east.
     fn near(
         &self,
         cube: SectionPos,
         seeds: &OriginSeeds,
         rarity: i32,
         y_ok: impl Fn(i32) -> bool,
-    ) -> Vec<[i32; 3]> {
+        mut visit: impl FnMut([i32; 3]),
+    ) {
         let lo = [cube.x - RANGE, cube.y - RANGE, cube.z - RANGE];
         let hi = [cube.x + RANGE, cube.y + RANGE, cube.z + RANGE];
-        let mut out = Vec::new();
-        for rz in lo[2].div_euclid(REGION)..=hi[2].div_euclid(REGION) {
-            for ry in lo[1].div_euclid(REGION)..=hi[1].div_euclid(REGION) {
-                for rx in lo[0].div_euclid(REGION)..=hi[0].div_euclid(REGION) {
-                    let list = self.region([rx, ry, rz], seeds, rarity, &y_ok);
-                    out.extend(
-                        list.iter()
-                            .copied()
-                            .filter(|o| (0..3).all(|i| o[i] >= lo[i] && o[i] <= hi[i])),
-                    );
+        let rlo = lo.map(|v| v.div_euclid(REGION));
+        let rhi = hi.map(|v| v.div_euclid(REGION));
+        // At most 3 regions per axis: the range spans 17 cubes.
+        let mut regions: [[[Option<Arc<Region>>; 3]; 3]; 3] = Default::default();
+        for rz in rlo[2]..=rhi[2] {
+            for ry in rlo[1]..=rhi[1] {
+                for rx in rlo[0]..=rhi[0] {
+                    regions[(rz - rlo[2]) as usize][(ry - rlo[1]) as usize]
+                        [(rx - rlo[0]) as usize] =
+                        Some(self.region([rx, ry, rz], seeds, rarity, &y_ok));
                 }
             }
         }
-        out.sort_unstable_by_key(|o| (o[2], o[1], o[0]));
-        out
+        for z in lo[2]..=hi[2] {
+            let (rz, lz) = (z.div_euclid(REGION), z.rem_euclid(REGION));
+            for y in lo[1]..=hi[1] {
+                let (ry, ly) = (y.div_euclid(REGION), y.rem_euclid(REGION));
+                let row = (lz * REGION + ly) as usize;
+                for rx in rlo[0]..=rhi[0] {
+                    let region = regions[(rz - rlo[2]) as usize][(ry - rlo[1]) as usize]
+                        [(rx - rlo[0]) as usize]
+                        .as_ref()
+                        .expect("every region in range");
+                    let run = region.rows[row] as usize..region.rows[row + 1] as usize;
+                    for &o in &region.origins[run] {
+                        if o[0] >= lo[0] && o[0] <= hi[0] {
+                            visit(o);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -465,6 +527,21 @@ fn walls_have(out: &[u32; 4096], b: [i32; 6], ids: &[u32]) -> bool {
     false
 }
 
+/// `norm_dist` across `z` and up `y` for the box `b` of sphere `s`, by
+/// local coordinate (`y` one past the box, for the floor test above it):
+/// the same values, computed once per coordinate instead of once per block.
+fn sphere_tables(cmz: i32, cmy: i32, s: &Sphere, b: [i32; 6]) -> ([f64; 16], [f64; 17]) {
+    let mut dzs = [0.0; 16];
+    for lz in b[2]..b[5] {
+        dzs[lz as usize] = norm_dist(cmz, lz, s.z, s.rh);
+    }
+    let mut dys = [0.0; 17];
+    for ly in b[1]..=b[4] {
+        dys[ly as usize] = norm_dist(cmy, ly, s.y, s.rv);
+    }
+    (dzs, dys)
+}
+
 fn norm_dist(cube_min: i32, local: i32, centre: f64, scale: f64) -> f64 {
     (f64::from(cube_min + local) + 0.5 - centre) / scale
 }
@@ -639,22 +716,19 @@ impl CaveCarver {
     fn carve(&self, cube: SectionPos, out: &mut [u32; 4096], lava: &[u32]) {
         let c = centre(cube);
         let (min, max) = (self.cfg.cave_min_height, self.cfg.cave_max_height);
-        let origins = self
-            .active
-            .near(cube, &self.seeds, self.cfg.cave_rarity, |y| {
-                y >= min && y <= max
-            });
-        for o in origins {
-            let Some(w) = self.cache.get(o, || self.walks(o)) else {
-                continue;
-            };
-            if !w.may_reach(c) {
-                continue;
-            }
-            for s in w.near(lowest(cube)) {
-                self.carve_sphere(cube, out, s, lava);
-            }
-        }
+        self.active.near(
+            cube,
+            &self.seeds,
+            self.cfg.cave_rarity,
+            |y| y >= min && y <= max,
+            |o| {
+                if let Some(w) = self.cache.reaching(o, c, || self.walks(o)) {
+                    for s in w.near(lowest(cube)) {
+                        self.carve_sphere(cube, out, s, lava);
+                    }
+                }
+            },
+        );
     }
 
     fn carve_sphere(&self, cube: SectionPos, out: &mut [u32; 4096], s: &Sphere, lava: &[u32]) {
@@ -666,15 +740,16 @@ impl CaveCarver {
         }
         let cfg = &self.cfg;
         let (cmx, cmy, cmz) = (cube.x * 16, cube.y * 16, cube.z * 16);
+        let (dzs, dys) = sphere_tables(cmz, cmy, s, b);
         for lx in b[0]..b[3] {
             let dx = norm_dist(cmx, lx, s.x, s.rh);
             for lz in b[2]..b[5] {
-                let dz = norm_dist(cmz, lz, s.z, s.rh);
+                let dz = dzs[lz as usize];
                 if dx * dx + dz * dz >= 1.0 {
                     continue;
                 }
                 for ly in b[1]..b[4] {
-                    let dy = norm_dist(cmy, ly, s.y, s.rv);
+                    let dy = dys[ly as usize];
                     let i = ((ly << 8) | (lz << 4) | lx) as usize;
                     let state = out[i];
                     if !self.allowed.contains(&state) {
@@ -683,7 +758,7 @@ impl CaveCarver {
                     if dy > cfg.cave_floor_depth && dx * dx + dy * dy + dz * dz < 1.0 {
                         out[i] = self.cave_block;
                     } else if state == self.dirt {
-                        let above = norm_dist(cmy, ly + 1, s.y, s.rv);
+                        let above = dys[ly as usize + 1];
                         if above > cfg.cave_floor_depth && dx * dx + above * above + dz * dz < 1.0 {
                             out[i] = self.grass;
                         }
@@ -784,20 +859,14 @@ impl RavineCarver {
     fn carve(&self, cube: SectionPos, out: &mut [u32; 4096]) {
         let c = centre(cube);
         let max = self.max_cube_y;
-        let origins = self
-            .active
-            .near(cube, &self.seeds, RAVINE_RARITY, |y| y <= max);
-        for o in origins {
-            let Some(w) = self.cache.get(o, || self.walk(o)) else {
-                continue;
-            };
-            if !w.may_reach(c) {
-                continue;
-            }
-            for s in w.near(lowest(cube)) {
-                self.carve_sphere(cube, out, s, &w);
-            }
-        }
+        self.active
+            .near(cube, &self.seeds, RAVINE_RARITY, |y| y <= max, |o| {
+                if let Some(w) = self.cache.reaching(o, c, || self.walk(o)) {
+                    for s in w.near(lowest(cube)) {
+                        self.carve_sphere(cube, out, s, &w);
+                    }
+                }
+            });
     }
 
     fn carve_sphere(&self, cube: SectionPos, out: &mut [u32; 4096], s: &Sphere, w: &Walks) {
@@ -809,15 +878,16 @@ impl RavineCarver {
         }
         let Some(widths) = &w.widths else { return };
         let (cmx, cmy, cmz) = (cube.x * 16, cube.y * 16, cube.z * 16);
+        let (dzs, dys) = sphere_tables(cmz, cmy, s, b);
         for lx in b[0]..b[3] {
             let dx = norm_dist(cmx, lx, s.x, s.rh);
             for lz in b[2]..b[5] {
-                let dz = norm_dist(cmz, lz, s.z, s.rh);
+                let dz = dzs[lz as usize];
                 if dx * dx + dz * dz >= 1.0 {
                     continue;
                 }
                 for ly in b[1]..b[4] {
-                    let dy = norm_dist(cmy, ly, s.y, s.rv);
+                    let dy = dys[ly as usize];
                     let wd = f64::from(widths[((ly + cmy) & 0xFF) as usize]);
                     if (dx * dx + dz * dz) * wd + dy * dy / STRETCH_Y >= 1.0 {
                         continue;
