@@ -58,7 +58,7 @@ enum Cond {
     Rand(f64),
     PosRand(f64),
     PosRandSeed(f64, i64),
-    Block { off: [i32; 3], ids: HashSet<u32> },
+    Block { off: [i32; 3], ids: Vec<u32> },
 }
 
 impl Cond {
@@ -137,9 +137,10 @@ pub struct Populator {
     variation: f64,
     ores: Vec<Ore>,
     lakes: Vec<Lake>,
-    stone_set: HashSet<u32>,
-    deep_set: HashSet<u32>,
-    spring_stone: HashSet<u32>,
+    /// Small sets of block states: a slice scan beats hashing them.
+    stone_set: Vec<u32>,
+    deep_set: Vec<u32>,
+    spring_stone: Vec<u32>,
     air: u32,
     water: u32,
     lava: u32,
@@ -162,8 +163,11 @@ impl Populator {
         reg: &BlockRegistry,
     ) -> Result<Self, String> {
         let id = |n: &str| resolve_block(reg, &BlockStateDesc::new(n));
-        let set = |names: &[&str]| -> Result<HashSet<u32>, String> {
-            names.iter().map(|n| id(n)).collect()
+        let set = |names: &[&str]| -> Result<Vec<u32>, String> {
+            let mut v: Vec<u32> = names.iter().map(|n| id(n)).collect::<Result<_, _>>()?;
+            v.sort_unstable();
+            v.dedup();
+            Ok(v)
         };
         let deep_variant = |d: &BlockStateDesc| -> Option<u32> {
             if !d.properties.is_empty() {
@@ -425,12 +429,13 @@ impl Populator {
                         continue;
                     }
                     let cur = world.block(p);
+                    let deep = self.deep_set.contains(&cur);
                     let allowed = match &o.place {
                         Some(cond) => cond.eval(rand, &*world, self.seed, p),
-                        None => self.stone_set.contains(&cur) || self.deep_set.contains(&cur),
+                        None => self.stone_set.contains(&cur) || deep,
                     };
                     if allowed {
-                        let block = if self.deep_set.contains(&cur) {
+                        let block = if deep {
                             o.deep_block.unwrap_or(o.block)
                         } else {
                             o.block
