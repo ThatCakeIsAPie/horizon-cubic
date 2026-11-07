@@ -87,12 +87,18 @@ def main():
     ap.add_argument('--tmp', default=str(ROOT / 'research' / 'cube-load' / 'tmp'), help='scratch folder (TMPDIR)')
     ap.add_argument('--tests', action='store_true', help="also run the generator's unit tests (cubic, cubic_gen, horizon-world cubic)")
     ap.add_argument('--write-baseline', action='store_true')
+    ap.add_argument('--baseline', default=str(BASELINE),
+                    help='the baseline file; give each --spec its own (e.g. research/cube-load/baseline-sky.json)')
+    ap.add_argument('--settings', help="a cubicgen.json to generate with (HORIZON_CUBE_BENCH_SETTINGS)")
     args = ap.parse_args()
+    baseline_path = Path(args.baseline)
 
     tmp = Path(args.tmp)
     tmp.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, HORIZON_TEST_RESOURCES=args.resources, HORIZON_CUBE_BENCH=args.spec,
                TMPDIR=str(tmp), TMP=str(tmp), TEMP=str(tmp))
+    if args.settings:
+        env['HORIZON_CUBE_BENCH_SETTINGS'] = str(Path(args.settings).resolve())
     exe = build(args, env)
     if not exe:
         print('SCORE: crash')
@@ -118,12 +124,12 @@ def main():
     guard = 'PASS'
     if threads == 1 and len(hashes) != 1:
         guard = f'FAIL the hash changed between runs: {sorted(hashes)}'
-    baseline = json.loads(BASELINE.read_text()) if BASELINE.exists() else None
+    baseline = json.loads(baseline_path.read_text()) if baseline_path.exists() else None
     if args.write_baseline:
-        BASELINE.parent.mkdir(parents=True, exist_ok=True)
-        BASELINE.write_text(json.dumps({'spec': args.spec, 'hash': results[0]['hash'], 'ms_per_cube': median,
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        baseline_path.write_text(json.dumps({'spec': args.spec, 'hash': results[0]['hash'], 'ms_per_cube': median,
                                         'runs': times}, indent=2) + '\n')
-        print(f'baseline written: {BASELINE}')
+        print(f'baseline written: {baseline_path}')
     elif baseline and threads == 1:
         if baseline.get('spec') != args.spec:
             guard = f"FAIL --spec {args.spec} is not the baseline's {baseline.get('spec')}"

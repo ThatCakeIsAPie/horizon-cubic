@@ -2105,10 +2105,15 @@ mod tests {
             self.level_of(CubicKind::Hybrid)
         }
         fn level_of(&self, kind: CubicKind) -> Arc<CubicLevel> {
+            self.level_with(kind, String::new())
+        }
+        /// A level whose generator takes `settings_json` (a world's
+        /// cubicgen.json; empty: the defaults).
+        fn level_with(&self, kind: CubicKind, settings_json: String) -> Arc<CubicLevel> {
             let window = LevelShape::cubic_window(LevelShape::OVERWORLD, -192, 512);
             let generation = CubicGeneration {
                 kind,
-                settings_json: String::new(),
+                settings_json,
             };
             let level = CubicLevel::new(
                 &self.dir,
@@ -2770,6 +2775,8 @@ mod tests {
     /// (default "4,-4,8,1"). More than one thread is faster, but its hash can
     /// differ from run to run: overlapping populations go in either order.
     /// The scratch level goes in the system's temporary folder (`TMPDIR`).
+    /// `HORIZON_CUBE_BENCH_SETTINGS`: a cubicgen.json to generate with
+    /// instead of the defaults (a world's own, to see what it costs).
     #[test]
     #[ignore = "a benchmark: tools/cube_load_bench.py"]
     fn cube_load_bench() {
@@ -2783,7 +2790,10 @@ mod tests {
             .map(|s| s.trim().parse().expect("HORIZON_CUBE_BENCH: four integers"))
             .collect();
         let (r, y0, y1, threads) = (v[0], v[1], v[2], v[3].max(1) as usize);
-        let level = f.level_of(CubicKind::Custom);
+        let settings = std::env::var_os("HORIZON_CUBE_BENCH_SETTINGS")
+            .map(|p| std::fs::read_to_string(p).expect("HORIZON_CUBE_BENCH_SETTINGS: a readable file"))
+            .unwrap_or_default();
+        let level = f.level_with(CubicKind::Custom, settings);
         let mut cubes = Vec::new();
         for y in y0..=y1 {
             for z in -r..=r {

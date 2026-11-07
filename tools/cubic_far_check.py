@@ -53,6 +53,7 @@ def main():
     ap.add_argument('--cavern', action='store_true')
     ap.add_argument('--views', nargs='*', default=[], help='Y:PITCH views to screenshot after each fill')
     ap.add_argument('--tall', action='store_true', help='raise the terrain to peaks of thousands of blocks')
+    ap.add_argument('--settings', help="a cubicgen.json (a world's own) to generate with, set before the checks")
     ap.add_argument('--timeout', type=float, default=180.0, help='seconds a fill may take')
     args = ap.parse_args()
     bins = Path(args.bin_dir)
@@ -84,7 +85,7 @@ def main():
             return {}
 
     def counters(lod):
-        keys = ['planned', 'ready', 'pending', 'holes', 'covering', 'complete', 'target_px', 'voxel_px',
+        keys = ['planned', 'uniform_skipped', 'descent_uniform', 'descent_ms', 'gpu_generated', 'ready', 'pending', 'holes', 'covering', 'complete', 'target_px', 'voxel_px',
                 'limited', 'budget', 'cover_nodes', 'plan_ms', 'arena_bytes', 'surface', 'tiles', 'tiles_ready',
                 'tiles_complex', 'tile_bytes']
         return ' '.join(f'{k}={lod.get(k)}' for k in keys)
@@ -147,6 +148,13 @@ def main():
                       '--width', args.size.split('x')[0], '--height', args.size.split('x')[1], timeout=600)[:120], flush=True)
 
     launch()
+    if args.settings:
+        ctl_run('quit')
+        time.sleep(3)
+        settings = game_dir / 'saves' / 'FarCheck' / 'cubicgen.json'
+        settings.write_text(Path(args.settings).read_text())
+        print(f'cubicgen.json: {args.settings}', flush=True)
+        launch()
     if args.tall:
         ctl_run('quit')
         time.sleep(3)
