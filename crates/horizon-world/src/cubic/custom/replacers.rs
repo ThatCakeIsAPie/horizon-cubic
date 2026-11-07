@@ -19,7 +19,6 @@
 
 use horizon_core::noise::{PerlinNoise, SimplexNoise, wrap};
 use horizon_core::random::{XoroshiroRandom, mix_stafford13};
-use std::collections::HashSet;
 
 use super::biomes::ResolvedBiome;
 use super::rng::{JRandom, hash_unit};
@@ -223,7 +222,8 @@ impl Surface {
 struct DensityRange {
     in_range: Option<u32>,
     out_of_range: Option<u32>,
-    filter: HashSet<u32>,
+    /// A few block states: a slice scan beats hashing them.
+    filter: Vec<u32>,
     include: bool,
     min: f64,
     max: f64,
@@ -340,7 +340,8 @@ struct Gradient {
     block: u32,
     function: UserFunction,
     seed: i64,
-    filter: HashSet<u32>,
+    /// A few block states: a slice scan beats hashing them.
+    filter: Vec<u32>,
     include: bool,
 }
 
@@ -425,9 +426,12 @@ impl Replacers {
                 ReplacerConfig::DensityRange(c) => {
                     let in_range = resolve_opt(registry, &c.block_in_range).map_err(err)?;
                     let out_of_range = resolve_opt(registry, &c.block_out_of_range).map_err(err)?;
-                    let mut filter = HashSet::new();
+                    let mut filter = Vec::new();
                     for b in &c.filter_blocks {
-                        filter.insert(resolve_block(registry, b).map_err(err)?);
+                        let id = resolve_block(registry, b).map_err(err)?;
+                        if !filter.contains(&id) {
+                            filter.push(id);
+                        }
                     }
                     let include = c.block_filter_type == FilterType::Include;
                     let never_in = c.min_density.is_nan()
@@ -602,9 +606,12 @@ impl Replacers {
                     match resolve_opt(registry, &c.block_to_place).map_err(err)? {
                         None => Kind::Noop,
                         Some(block) => {
-                            let mut filter = HashSet::new();
+                            let mut filter = Vec::new();
                             for b in &c.filter_blocks {
-                                filter.insert(resolve_block(registry, b).map_err(err)?);
+                                let id = resolve_block(registry, b).map_err(err)?;
+                                if !filter.contains(&id) {
+                                    filter.push(id);
+                                }
                             }
                             Kind::Gradient(Gradient {
                                 block,
