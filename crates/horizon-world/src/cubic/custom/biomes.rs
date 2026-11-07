@@ -250,6 +250,9 @@ struct Caches {
     biomes: HashMap<(i32, i32), BiomeId>,
     terrain: HashMap<(i32, i32), (f64, f64)>,
     resolved: HashMap<u32, Rc<ResolvedBiome>>,
+    /// Density lattice corners (`Lattice::for_cube`), which neighbouring
+    /// cubes share.
+    corners: HashMap<(i32, i32, i32), f64>,
 }
 
 thread_local! {
@@ -288,6 +291,19 @@ impl BiomeBlend {
         &self.columns
     }
 
+    /// The density lattice corner at a block position, as this thread last
+    /// computed it for this blend's terrain (`Lattice::for_cube`).
+    pub fn cached_corner(&self, at: (i32, i32, i32)) -> Option<f64> {
+        self.with(|c| c.corners.get(&at).copied())
+    }
+
+    /// Remembers a lattice corner (`cached_corner`).
+    pub fn keep_corner(&self, at: (i32, i32, i32), density: f64) {
+        self.with(|c| {
+            c.corners.insert(at, density);
+        });
+    }
+
     fn with<R>(&self, f: impl FnOnce(&mut Caches) -> R) -> R {
         CACHES.with(|c| {
             let mut all = c.borrow_mut();
@@ -300,6 +316,9 @@ impl BiomeBlend {
             }
             if caches.terrain.len() > CACHE_LIMIT {
                 caches.terrain.clear();
+            }
+            if caches.corners.len() > CACHE_LIMIT {
+                caches.corners.clear();
             }
             f(caches)
         })

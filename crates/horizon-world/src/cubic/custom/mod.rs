@@ -457,6 +457,19 @@ impl Terrain {
         );
         let biomes = self.blend.cube_biomes(cube);
         let (bx, by, bz) = (cube.x * 16, cube.y * 16, cube.z * 16);
+        // The replacers that can act in this cube, per biome of its columns.
+        let mut plans: Vec<(*const biomes::ResolvedBiome, Vec<u16>)> = Vec::new();
+        let mut column_plan = [0u8; 256];
+        for (i, biome) in biomes.iter().enumerate() {
+            let key = std::rc::Rc::as_ptr(biome);
+            column_plan[i] = match plans.iter().position(|(k, _)| *k == key) {
+                Some(p) => p as u8,
+                None => {
+                    plans.push((key, self.replacers.plan(by, by + 15, biome)));
+                    (plans.len() - 1) as u8
+                }
+            };
+        }
         lattice.for_each(|lx, ly, lz, dx, dy, dz, density| {
             let ctx = BlockCtx {
                 x: bx + lx as i32,
@@ -468,7 +481,8 @@ impl Terrain {
                 density,
                 biome: &biomes[lz << 4 | lx],
             };
-            out[ly << 8 | lz << 4 | lx] = self.replacers.block(&ctx);
+            let plan = &plans[column_plan[lz << 4 | lx] as usize].1;
+            out[ly << 8 | lz << 4 | lx] = self.replacers.block_planned(plan, &ctx);
         });
     }
 

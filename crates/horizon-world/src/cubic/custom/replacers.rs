@@ -642,6 +642,51 @@ impl Replacers {
     }
 
     /// Runs the chain for one block.
+    /// The replacers that can change a block of `biome` with Y in
+    /// `y0..=y1`, in chain order: those the biome takes, minus no-ops, those
+    /// whose Y range misses (a decoration's own), and gradients whose
+    /// probability is at most 0 at every one of those Y (`apply` returns the
+    /// block it got there).
+    pub fn plan(&self, y0: i32, y1: i32, biome: &ResolvedBiome) -> Vec<u16> {
+        let mut plan = Vec::new();
+        for (i, r) in self.list.iter().enumerate() {
+            if !biome.replacer_applies(i) {
+                continue;
+            }
+            let live = match &r.kind {
+                Kind::Noop => false,
+                Kind::Decoration(d) => y1 >= d.min_y && y0 <= d.max_y,
+                _ if y1 < r.min_y || y0 > r.max_y => false,
+                Kind::Gradient(g) => (y0.max(r.min_y)..=y1.min(r.max_y))
+                    .any(|y| !(g.function.get(f64::from(y)) <= 0.0)),
+                _ => true,
+            };
+            if live {
+                plan.push(i as u16);
+            }
+        }
+        plan
+    }
+
+    /// `block` with the replacers of a `plan` made for the block's biome and
+    /// a Y range holding it.
+    pub fn block_planned(&self, plan: &[u16], c: &BlockCtx) -> u32 {
+        let mut block = self.air;
+        for &i in plan {
+            let r = &self.list[i as usize];
+            block = match &r.kind {
+                Kind::Noop => continue,
+                Kind::Decoration(d) => d.apply(block, c),
+                _ if c.y < r.min_y || c.y > r.max_y => continue,
+                Kind::Density(d) => d.apply(block, c.density),
+                Kind::Surface(s) => s.apply(block, c),
+                Kind::Mesa(m) => m.apply(block, c),
+                Kind::Gradient(g) => g.apply(block, c),
+            };
+        }
+        block
+    }
+
     pub fn block(&self, c: &BlockCtx) -> u32 {
         let mut block = self.air;
         for (i, r) in self.list.iter().enumerate() {
