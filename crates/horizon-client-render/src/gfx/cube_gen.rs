@@ -801,6 +801,11 @@ pub struct PoolHandle {
 }
 
 impl PoolHandle {
+    /// Whether `other` is a handle of this same pool (a level's far
+    /// generator has its own: another level, another pool).
+    pub fn same_pool(&self, other: &PoolHandle) -> bool {
+        Arc::ptr_eq(&self.free, &other.free)
+    }
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
     }
@@ -2072,6 +2077,23 @@ mod tests {
             );
         }
         assert!(nodes[6].as_uniform().is_some());
+    }
+
+    #[test]
+    fn each_far_generator_has_its_own_pool_its_forks_share() {
+        let Some((device, queue)) = device() else {
+            return;
+        };
+        let first = GpuCubeSampler::new(device.clone(), queue.clone(), params(), Arc::new(columns));
+        let second = GpuCubeSampler::new(device, queue, params(), Arc::new(columns));
+        let (Some(a), Some(b)) = (first.gpu(), second.gpu()) else {
+            return;
+        };
+        // A second world's generator: the far terrain must not read its
+        // slots from the first one's pool (`CubeFar::serves`).
+        assert!(!a.pool.same_pool(&b.pool));
+        let fork = first.fork().unwrap();
+        assert!(a.pool.same_pool(&fork.gpu().unwrap().pool));
     }
 
     #[test]

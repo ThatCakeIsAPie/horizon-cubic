@@ -432,11 +432,22 @@ impl Renderer {
     /// must be on this renderer's device. `states` the registry's block state
     /// count, `air` its air state. False if it cannot run (stay on the CPU).
     pub fn use_gpu_cube_lods(&mut self, backend: &GpuBackend, states: usize, air: u32) -> bool {
-        if self.cube_far.is_some() {
-            return self
-                .cube_far
-                .as_ref()
-                .is_some_and(|far| *far.device() == backend.device);
+        if let Some(far) = &self.cube_far {
+            if far.serves(backend) {
+                return true;
+            }
+            if *far.device() != backend.device {
+                return false;
+            }
+            // Another level's generator (a world opened after another in
+            // this game): its own node pool and terrain. The far terrain
+            // built for the last one would read this one's slots from the old
+            // pool, drawing stale nodes (rock in the sky), and its surface
+            // tiles the old terrain: both are made again.
+            self.clear_cube_lods();
+            self.cube_far = None;
+            self.surface_tiles = None;
+            self.surface_tiles_failed = false;
         }
         if !self.gpu_far_available() || backend.device != self.device {
             return false;

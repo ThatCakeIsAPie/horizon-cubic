@@ -391,6 +391,12 @@ impl CubeFar {
         &self.device
     }
 
+    /// Whether this draws the nodes of `backend`'s generator: the same device
+    /// and the same node pool (its slots are read from that pool's buffer).
+    pub fn serves(&self, backend: &GpuBackend) -> bool {
+        self.device == backend.device && self.pool.same_pool(&backend.pool)
+    }
+
     /// The material table (`cube_far.wgsl`'s `cf_materials`), for other
     /// far-terrain draws that share it (`gfx::surface_tile`).
     pub fn material_buffer(&self) -> &wgpu::Buffer {
