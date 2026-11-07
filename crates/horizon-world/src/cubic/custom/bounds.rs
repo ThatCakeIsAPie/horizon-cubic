@@ -482,14 +482,23 @@ impl Analyzer<'_> {
 
     /// Bounds of the density over the query's sample box.
     pub fn density_range(&self, q: &Query) -> Option<DensityRange> {
+        self.density_range_with(q, q.min_wavelength)
+    }
+
+    /// `density_range`, with the noise values bounded from the octaves of a
+    /// wavelength of at least `value_wavelength` only (the finer ones by
+    /// their amplitude): wider, so as sound, and cheaper. The gradient bound
+    /// still takes the query's octaves.
+    fn density_range_with(&self, q: &Query, value_wavelength: f64) -> Option<DensityRange> {
         let (lo, hi) = q.samples;
         let c: [f64; 3] = std::array::from_fn(|a| f64::from(lo[a] + hi[a]) * 0.5);
         let h: [f64; 3] = std::array::from_fn(|a| f64::from(hi[a] - lo[a]) * 0.5);
         let mwl = q.min_wavelength;
+        let vwl = value_wavelength;
         let n = self.noise;
-        let (s0, s1) = noise_range(n.selector(), false, c, h, mwl);
-        let (l0, l1) = noise_range(n.low(), false, c, h, mwl);
-        let (h0, h1) = noise_range(n.high(), false, c, h, mwl);
+        let (s0, s1) = noise_range(n.selector(), false, c, h, vwl);
+        let (l0, l1) = noise_range(n.low(), false, c, h, vwl);
+        let (h0, h1) = noise_range(n.high(), false, c, h, vwl);
         let (c0, c1) = (s0.clamp(0.0, 1.0), s1.clamp(0.0, 1.0));
         let (m0, m1) = if c1 <= 0.0 {
             (l0, l1)
@@ -501,7 +510,7 @@ impl Analyzer<'_> {
         let (d0, d1) = match q.column {
             Some(col) => (col.depth, col.depth),
             None => {
-                let (e0, e1) = noise_range(n.depth(), true, c, [h[0], 0.0, h[2]], mwl);
+                let (e0, e1) = noise_range(n.depth(), true, c, [h[0], 0.0, h[2]], vwl);
                 depth_range(e0, e1)
             }
         };
@@ -637,7 +646,23 @@ impl Analyzer<'_> {
     /// The one block every block of the query's box ends up as after
     /// density and replacers (no carvers), when that can be proven.
     pub fn uniform_block(&self, q: &Query) -> Option<u32> {
-        let r = self.density_range(q)?;
+        self.uniform_block_with(q, q.min_wavelength)
+    }
+
+    /// `uniform_block`, first from the noise octaves of a wavelength of at
+    /// least `coarse` blocks (`density_range_with`), which settles most
+    /// cubes far from a surface, then from all of the query's.
+    pub fn uniform_block_coarse_first(&self, q: &Query, coarse: f64) -> Option<u32> {
+        if coarse > q.min_wavelength
+            && let Some(block) = self.uniform_block_with(q, coarse)
+        {
+            return Some(block);
+        }
+        self.uniform_block_with(q, q.min_wavelength)
+    }
+
+    fn uniform_block_with(&self, q: &Query, value_wavelength: f64) -> Option<u32> {
+        let r = self.density_range_with(q, value_wavelength)?;
         let biomes = self.biomes(q.blocks.0, q.blocks.1);
         let facts = BoxFacts {
             dmin: r.min,

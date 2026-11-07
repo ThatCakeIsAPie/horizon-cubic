@@ -413,6 +413,10 @@ impl CustomCubicGenerator {
     }
 }
 
+/// The shortest noise wavelength, in blocks, a cube's first uniformity proof
+/// evaluates (finer octaves are bounded by their amplitude).
+const COARSE_PROOF: f64 = 16.0;
+
 impl Terrain {
     fn analyzer(&self) -> Analyzer<'_> {
         Analyzer {
@@ -430,8 +434,10 @@ impl Terrain {
     }
 
     fn uniform_block(&self, min: [i32; 3], max: [i32; 3]) -> Option<u32> {
+        // A sound proof answers the cube's true block whatever the octaves
+        // it bounds exactly: try the cheap one first.
         self.analyzer()
-            .uniform_block(&Query::lattice(self.sizes, min, max))
+            .uniform_block_coarse_first(&Query::lattice(self.sizes, min, max), COARSE_PROOF)
     }
 
     fn generate(&self, cube: SectionPos, out: &mut [u32; 4096]) {
