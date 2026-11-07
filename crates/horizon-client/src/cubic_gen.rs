@@ -279,10 +279,12 @@ impl PopRegion {
     }
 }
 
-/// A region cube's blocks: one state, or an array shared with the cache,
-/// until the population writes to it; then its own copy.
+/// A region cube's blocks: one state, a section or an array shared with the
+/// cache, read in place until the population writes to it; then its own
+/// copy.
 pub enum Slot {
     Uniform(u32),
+    Section(Arc<Section>),
     Shared(Arc<HeldBlocks>),
     Owned(Box<[u32; 4096]>),
 }
@@ -291,6 +293,7 @@ impl Slot {
     fn get(&self, i: usize) -> u32 {
         match self {
             Slot::Uniform(v) => *v,
+            Slot::Section(s) => s.get(i),
             Slot::Shared(b) => b.blocks[i],
             Slot::Owned(b) => b[i],
         }
@@ -300,6 +303,11 @@ impl Slot {
         let blocks = match self {
             Slot::Owned(b) => return b,
             Slot::Uniform(v) => Box::new([*v; 4096]),
+            Slot::Section(s) => {
+                let mut blocks = Box::new([0u32; 4096]);
+                s.unpack(&mut blocks);
+                blocks
+            }
             Slot::Shared(b) => b.blocks.clone(),
         };
         *self = Slot::Owned(blocks);
@@ -320,11 +328,7 @@ impl CubeBlocks for Arc<Section> {
     fn slot(&self) -> Slot {
         match self.blocks.uniform() {
             Some(v) => Slot::Uniform(v),
-            None => {
-                let mut blocks = Box::new([0u32; 4096]);
-                self.unpack(&mut blocks);
-                Slot::Owned(blocks)
-            }
+            None => Slot::Section(self.clone()),
         }
     }
 }
