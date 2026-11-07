@@ -398,21 +398,40 @@ Points 1 and 5 above are built (`lod/cube.rs`):
 
 The owner's verdict: "Not perfect yet, but WOW, this is insanity!" These are the issues the owner reported, what caused each one, and the fix.
 
-1. **Water vanished at middle distances.** The generator made a voxel water only when its centre lay below the sea's surface (sea level + 1). From 128-block voxels up (level 7), the centre of the voxel holding the surface lies above it, so that voxel was air and the sea showed its floor. The tiles (level 12 up) and fine cubes kept their water, so the sea disappeared only in a ring between them.
-   - **Fix (`cube_gen` `water_at_sea`):** an open voxel holding the surface is water when the column is open just under the surface (one more density sample, in that row only). The pre-pass and the GPU descent treat an all-open voxel as water when its bottom lies below the surface.
-   - **Drawing:** both meshers draw water in such a voxel up to the surface only (`cube_far.wgsl` takes the surface from the cull pass; the CPU mesher from `CubeSampler::sea_surface`), never as a slab 2,048 blocks deep.
+1. **Water vanished at closer and middle distances.** There were two causes, one at each end of the cube levels.
+   - **Levels 0–2.** The sea's surface (y 64) falls on a node's top. The mesher leaves out a fluid's faces on a node's edge, which keeps far oceans from showing a grid of node outlines (Nov 5). That left out the sea's own surface too, and a node of nothing but sea under it was dropped as uniform. The sea showed its floor nearest the camera, at Ultra from 1,500 blocks up.
+     - **Fix (`MeshJob::sea_top`):** a fluid's top on a node whose top is the surface is drawn, by both meshers. A node of all sea up to the surface counts as mixed, in the pre-pass and in the descent, and draws that top (`uniform_quads`).
+   - **Levels 7 and up.** The generator made a voxel water only when its centre lay below the surface (sea level + 1). From 128-block voxels up, the centre of the voxel holding the surface lies above it, so that voxel was air.
+     - **Fix (`cube_gen` `water_at_sea`):** an open voxel holding the surface is water when the column is open just under the surface (one more density sample, in that row only). The pre-pass and the GPU descent treat an all-open voxel as water when its bottom lies below the surface.
+     - **Drawing:** both meshers draw water in such a voxel up to the surface only, never as a slab 2,048 blocks deep (`cube_far.wgsl` takes the surface from the cull pass; the CPU mesher from `CubeSampler::sea_surface`).
+   - **Found on the way:** a uniform rock node drew its top, south and east faces one voxel from its bottom, north and west instead of on its far side (`uniform_quads`). Fixed.
 2. **A gap followed the player between far and near terrain.** The near renderer draws a circle of columns (`streaming::in_view_distance`). The octree left out every lit cube in the square the game holds, render distance + 2. The ring in between was drawn by neither.
    - **Fix:** the octree leaves out only lit cubes within the circle.
 3. **Dark stripes on far cliffs** (the face-light change had caused them). A wall on a node's side took its own column's sky light at the node's top. A cliff that rises past the node has rock over it there, so its walls went dark one node at a time.
    - **Fix:** a wall on a node's side looks into the neighbour node where it is known (open from that node's top down to the cell in front), and is lit where it is not.
 4. **Z-fighting through the spyglass at y 10,000.** A coarse tile or node stays drawn until everything planned in its place is in, which can take tens of seconds when zoomed. Meanwhile the finer nodes that are already in are drawn in the same place: same depth push, water and flat ground in the very same planes.
    - **Fix (`cube_far.wgsl` `cf_by_level`):** coarser far terrain is pushed back by 2e-5 of its distance per level, so the finer node wins.
-5. **Ultra went back and forth between levels.** Where the quad arena binds the budget (Ultra), the budget followed the bytes per node every frame. The bytes move with the plan, and a budget change of over 10% asks for a new plan (`refocused`). The new plan moved the bytes again.
-   - **Fix:** the arena's cap holds until the room moves outside 0.9–1.25 of it (`ARENA_CAP_BAND`).
-6. **The spyglass refines slowly.** This is fill rate. At y 10,000 the zoomed plan wants about 90,000 new nodes, and the GPU makes 2,600–3,500 a second. The fill-rate loops (Order of work 6.5) are the lever.
+5. **Ultra went back and forth between levels.** Reproduced at 1080p from y 1,500: with the camera still, there were 23 plans in 30 s, alternating between about 2.4 and 4.3 px per voxel, and the plan never completed. The cause is the class cache.
+   - **The cycle:**
+     - At Ultra, one descent answer holds about 150,000 uniform nodes. The cache held at most 262,144 (`CLASS_NODES`) and was emptied whole when full, keeping only the newest answer.
+     - With the union of a fine and a coarse answer, the plan reached 2.4 px. With one alone, it reached 4.3 px.
+     - The descent is asked at the detail the last plan reached (`coarsened`), so every plan asked again, about 6 times a second, and the cycle never ended.
+   - **Fix (`KnownClasses`):** two generations, a full one becoming the older, so the last answers are always all kept.
+   - **Also:** the arena's cap on the budget now holds until the room moves outside 0.9–1.25 of it (`ARENA_CAP_BAND`). It was not this cycle's cause, but it could start the same kind of swing where the arena binds.
+6. **The spyglass refines slowly.** It was mostly item 5's cycle. With the cycle gone, the zoomed view at y 10,000 completes in 3.8 s, where it had not completed after 120 s. A zoom that needs many more new nodes is still bound by fill rate (2,600–3,500 nodes a second). The fill-rate loops (Order of work 6.5) are the lever there.
 7. **Chunks flashed in.** Vanilla's chunk fade-in mixes a new section toward the fog colour, so a flash of sky showed where a chunk came in.
    - **Change (the owner's request):** solid terrain dithers in, as far terrain fades. Translucent faces draw whole from the start, as far water already does.
    - Not changed: the Metal opaque pass, which cannot discard, still mixes toward the fog colour, and so does the opt-in visibility buffer.
+
+Checked in the game (`tools/cubic_far_check.py`, `D:\ClaudeData\far-fixes-runs\r2`):
+- **Ultra at 1920 × 1080, from y 1,500:** no new plan in 30 s with the camera still (23 before). The view completes in 14.4 s; before, it never completed.
+- **Spyglass at y 10,000, looking down (High):** complete in 3.8 s (15,147 → 38,860 nodes). Before, it was not complete after 120 s. Most of the slow refinement the owner saw was the same class-cache cycle, not fill rate.
+- **Water:** at Ultra from y 1,500, the sea nearest the camera showed sand and gravel; it now has its water (`far-fixes-runs\ultra_water_cmp.png`). Through the spyglass, rivers and seas show where there were dry riverbeds.
+- **Cliffs (tall world):** no node-edge stripes. Walls under overhangs are still drawn at sky light 4, which is harsher than Minecraft, where light spreads sideways under an overhang. Waiting on the owner: is that what still looks off? Softening it is one constant (`SHADED` and the shaders' 64).
+- No holes and no log errors in any run.
+- Tests:
+  - A full test pass ran before the class-cache, sea-top and uniform-face changes. Its one failure was a flaky LAN test that passes alone.
+  - After those changes, the render crate's whole suite ran: 1,636 passed.
 
 ### Where the GPU far view stands
 
@@ -422,7 +441,7 @@ Done: generate, mesh and draw (stages 1, 3 and most of 4) run on the GPU for a c
   - A count pass gives each node's quads per (direction, solid/water). The CPU reads those 48 bytes back, takes one range per node from the arena's first-fit allocator (`RangeAlloc`), and the emit pass writes the quads there. Voxels never leave the GPU.
   - Quads are 8 bytes: x, y, z, w-1, h-1, direction, shaded and overlay in word 0, state id and biome in word 1 (layout in the module docs). Texture, tint and emission are looked up at draw time.
   - Neighbour slots are part of a job (`MeshJob::neighbours`) and the shader hides border faces behind them, but `CubeFar` passes none yet: borders stay walls, which is what keeps levels crack-free until a node's neighbours are remeshed when they change.
-  - Uniform nodes from the pre-pass take no slot: air and fluid draw nothing, rock gets its six faces written by the CPU.
+  - Uniform nodes from the pre-pass take no slot: air draws nothing, a fluid only the sea's surface on its top (`MeshJob::sea_top`), and rock gets its six faces written by the CPU.
 - **Draw** (`gfx/cube_far.rs`, `cube_far.wgsl`, `cube_cull.wgsl`): a vertex-pulling pipeline appended to `terrain.wgsl`, so the fragment stage, fog, light, fade dither and emission are the far tiles'. A culling compute pass tests each node against the frustum and the camera's side of each direction, writes the instance data and compacts one indirect draw per (node, direction, pass), drawn with `multi_draw_indirect_count` (or `multi_draw_indirect` over a cleared tail where counts are unavailable, DX12 included). Node origins are `i32` blocks minus the camera's integer part, so positions stay exact at 30,000,000 blocks. The Hi-Z test of `gpu_occlusion.wgsl` has a marked hook in `cube_cull.wgsl`.
 - **`CubeLod` switches paths** with `set_gpu_path` (the sampler must have a GPU generator on the renderer's device and the "Far Terrain on GPU" setting must be Auto). On the GPU path workers hand out slots (`GpuNode`) instead of meshes; CPU-sampled nodes (saved cubes, downsampled fine levels) are written into pool slots with `write_buffer`. The renderer frees a slot once its emit pass is submitted, and a node's arena range and table entry when the plan drops it.
 - **Whole World**: the octree root is level 22, the LOD Distance slider's top step reads "Whole World", and the planner leaves out nodes outside the world border and cube range. A classifier thread asks the sampler's 2D pre-pass (`node_class`) about nodes: uniform air or fluid subtrees are left out, uniform rock stays one closed leaf.

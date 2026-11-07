@@ -798,6 +798,8 @@ fn mesh_voxels(
     // The sea's surface in node-local blocks: a fluid voxel holding it (one of
     // 128 blocks or more, the generator's `water_at_sea`) stops there.
     let surface = sea_surface.map(|top| (i64::from(top) - i64::from(oy)) as f32);
+    let sea_top = sea_surface
+        .is_some_and(|top| i64::from(oy) + i64::from(node.key.size()) == i64::from(top));
     let span = |voxel: Voxel, light: u16| Span {
         min: 0,
         max: 1,
@@ -873,12 +875,13 @@ fn mesh_voxels(
                     } else {
                         // A fluid's faces on the node's edge are inside the
                         // water the next node goes on with: drawn, they show
-                        // through it as a grid.
+                        // through it as a grid. Except its top on a node whose
+                        // top is the sea's surface: there the sea ends.
                         let (_, own_fluid) = *hiding.entry(voxel.state.0).or_insert_with(|| {
                             let m = material(&own, Direction::Up, at);
                             (m.opaque, m.fluid)
                         });
-                        if own_fluid != 0 {
+                        if own_fluid != 0 && !(matches!(direction, Direction::Up) && sea_top) {
                             continue;
                         }
                     }
@@ -2281,6 +2284,29 @@ mod cube_tests {
             .flat_map(|q| q.iter().map(|v| v.pos[1]))
             .fold(f32::NEG_INFINITY, f32::max);
         assert_eq!(top, 128.0);
+    }
+
+    #[test]
+    fn the_sea_on_a_nodes_top_edge_shows_its_surface() {
+        // Level 2 (64 blocks a node): the node at y 0..64 is all sea, its top
+        // the sea's surface (sea level 63). Its top faces lie on the node's
+        // edge, where a fluid's faces are left out, but these are the sea's.
+        let sea = CubeNode::from_fn(CubeKey::new(2, 0, 0, 0), |_, _, _| voxel(WATER));
+        let mut mesh = SectionMesh::default();
+        mesh_voxels(&sea, AIR, Some(64), material, &mut mesh);
+        let water = quads(&mesh.translucent);
+        assert!(!water.is_empty(), "the surface is drawn");
+        assert!(
+            water.iter().all(|q| q.iter().all(|v| v.pos[1] == 64.0)),
+            "only the surface: no walls or floor inside the sea"
+        );
+        // The node under it, or a sampler that knows no sea: nothing.
+        for (key, sea_surface) in [(CubeKey::new(2, 0, -1, 0), Some(64)), (CubeKey::new(2, 0, 0, 0), None)] {
+            let deep = CubeNode::from_fn(key, |_, _, _| voxel(WATER));
+            let mut mesh = SectionMesh::default();
+            mesh_voxels(&deep, AIR, sea_surface, material, &mut mesh);
+            assert!(mesh.translucent.is_empty(), "{key:?}");
+        }
     }
 
     #[test]

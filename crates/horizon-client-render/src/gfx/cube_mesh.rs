@@ -323,6 +323,10 @@ pub struct MeshJob {
     /// voxels hide this node's border faces; [`NONE`] draws the border as a
     /// wall, as `lod::mesh::mesh_cube` does.
     pub neighbours: [u32; 6],
+    /// The node's top is the sea's surface (sea level + 1): a fluid's top on
+    /// it is the sea's and is drawn, where a fluid's other faces on the
+    /// node's edge are left out (the next node's fluid goes on).
+    pub sea_top: bool,
 }
 
 impl MeshJob {
@@ -330,7 +334,7 @@ impl MeshJob {
         let mut w = [0u32; JOB_WORDS];
         w[0] = self.slot;
         w[1] = u32::from(self.key.level);
-        w[2] = u32::from(self.cover.is_some());
+        w[2] = u32::from(self.cover.is_some()) | u32::from(self.sea_top) << 1;
         w[4..10].copy_from_slice(&self.neighbours);
         if let Some(cover) = self.cover {
             w[12..20].copy_from_slice(&cover);
@@ -726,24 +730,34 @@ pub fn uniform_quads(
     table: &MaterialTable,
     state: u32,
     biome: u8,
+    sea_top: bool,
 ) -> (Vec<[u32; 2]>, Vec<(u8, [u32; 2])>) {
     let mut solid = Vec::new();
     let mut translucent = Vec::new();
     let Some(record) = table.record(state) else {
         return (solid, translucent);
     };
-    if table.fluid(state) != 0 {
+    // A fluid draws only the sea's surface on its top (`MeshJob::sea_top`):
+    // the rest lies inside the fluid the next nodes go on with.
+    let fluid = table.fluid(state) != 0;
+    if fluid && !sea_top {
         return (solid, translucent);
     }
     for dir in 0..6 {
+        if fluid && dir != 1 {
+            continue;
+        }
         for overlay in 0..2 {
             let Some(face) = decode_face(&record, dir, overlay) else {
                 continue;
             };
+            // A face lies on its cell's plane, pushed one voxel for Up, South
+            // and East: theirs is the far layer's.
+            let far = if dir % 2 == 1 { 15 } else { 0 };
             let quad = Quad {
-                x: 0,
-                y: 0,
-                z: 0,
+                x: if dir == 5 { far } else { 0 },
+                y: if dir == 1 { far } else { 0 },
+                z: if dir == 3 { far } else { 0 },
                 w: 16,
                 h: 16,
                 dir: dir as u8,
@@ -945,9 +959,20 @@ mod tests {
         assert!(!table.opaque(3), "an unknown state hides nothing");
         assert_eq!(table.fluid(2), 0);
         // A uniform solid node: the six faces, the grass overlay on its sides.
-        let (solid, translucent) = uniform_quads(&table, 2, 5);
+        let (solid, translucent) = uniform_quads(&table, 2, 5, false);
         assert_eq!(solid.len(), 6 + 4);
         assert!(translucent.is_empty());
+        // Each face on its own side of the node: Up, South and East on the far
+        // layer (the face is pushed one voxel past its cell), the rest on 0.
+        for quad in &solid {
+            let q = Quad::unpack(*quad);
+            let at = match q.dir {
+                0 | 1 => q.y,
+                2 | 3 => q.z,
+                _ => q.x,
+            };
+            assert_eq!(at, if q.dir % 2 == 1 { 15 } else { 0 }, "{q:?}");
+        }
         let overlay = Quad::unpack(solid[solid.len() - 1]);
         assert_eq!(
             (overlay.w, overlay.h, overlay.overlay, overlay.biome),
@@ -1128,6 +1153,7 @@ mod tests {
             slot,
             cover: None,
             neighbours: [NONE; 6],
+            sea_top: false,
         };
         mesher.begin(vec![job(0), job(1)]);
         let mut meshed = None;

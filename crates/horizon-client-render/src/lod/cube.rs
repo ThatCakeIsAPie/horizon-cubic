@@ -1735,13 +1735,53 @@ impl Cache {
 /// What the classifier thread has found of nodes, and what it is to look at.
 #[derive(Default)]
 struct Classes {
-    known: FxHashMap<CubeKey, NodeClass>,
+    known: KnownClasses,
     queue: VecDeque<CubeKey>,
     queued: FxHashSet<CubeKey>,
 }
 
-/// Classes kept at most (a plan asks for a few thousand).
+/// Classes kept in each generation of [`KnownClasses`].
 const CLASS_NODES: usize = 1 << 18;
+
+/// The classes found so far, in two generations of at most [`CLASS_NODES`]:
+/// a full one becomes the older and a new one starts, so the classes of the
+/// last answers are always all there. Emptied whole when full, as it was, it
+/// kept only the newest descent's at Ultra (one answer holds 150,000 or so),
+/// and the plan swung between that one's detail and the union's: a still
+/// camera's far view went back and forth between levels, the descent asked
+/// again at each plan's detail, for good.
+#[derive(Default)]
+struct KnownClasses {
+    newer: FxHashMap<CubeKey, NodeClass>,
+    older: FxHashMap<CubeKey, NodeClass>,
+}
+
+impl KnownClasses {
+    fn get(&self, key: &CubeKey) -> Option<NodeClass> {
+        self.newer.get(key).or_else(|| self.older.get(key)).copied()
+    }
+
+    /// Files `found`, starting a new generation first when they would not
+    /// fit in this one.
+    fn extend(&mut self, found: impl ExactSizeIterator<Item = (CubeKey, NodeClass)>) {
+        if self.newer.len() + found.len() > CLASS_NODES {
+            self.older = std::mem::take(&mut self.newer);
+        }
+        self.newer.extend(found);
+    }
+
+    fn insert(&mut self, key: CubeKey, class: NodeClass) {
+        if self.newer.len() >= CLASS_NODES {
+            self.older = std::mem::take(&mut self.newer);
+        }
+        self.newer.insert(key, class);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.newer.len() + self.older.len()
+    }
+}
 
 impl Shared {
     fn new() -> Self {
@@ -3706,7 +3746,7 @@ fn classify_cached(shared: &Shared, key: CubeKey) -> NodeClass {
         return NodeClass::Mixed;
     }
     let mut classes = shared.classes.lock().unwrap();
-    if let Some(&class) = classes.known.get(&key) {
+    if let Some(class) = classes.known.get(&key) {
         return class;
     }
     if shared.descent_on.load(Ordering::Relaxed) {
@@ -3741,10 +3781,8 @@ fn descent_loop(shared: &Shared, descent: &GpuDescent) {
         let found = descent.descend(&request);
         if let Some(found) = &found {
             let mut classes = shared.classes.lock().unwrap();
-            if classes.known.len() + found.uniform_count() > CLASS_NODES {
-                classes.known.clear();
-            }
-            classes.known.extend(found.uniform());
+            let uniform: Vec<_> = found.uniform().collect();
+            classes.known.extend(uniform.into_iter());
         }
         let mut slot = shared.descent.lock().unwrap();
         slot.busy = false;
@@ -3777,9 +3815,6 @@ fn classify_loop(shared: &Shared, sampler: &mut dyn CubeSampler) {
         let class = sampler.classify(key);
         let mut classes = shared.classes.lock().unwrap();
         classes.queued.remove(&key);
-        if classes.known.len() >= CLASS_NODES {
-            classes.known.clear();
-        }
         classes.known.insert(key, class);
     }
 }
@@ -4047,6 +4082,23 @@ fn node(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn known_classes_keep_the_last_answers_whole() {
+        use super::{CubeKey, KnownClasses, NodeClass};
+        let key = |i: usize| CubeKey::new(2, i as i32, 0, 0);
+        let answer = |from: usize| (from..from + 150_000).map(move |i| (key(i), NodeClass::Air));
+        let mut known = KnownClasses::default();
+        // Two answers of 150,000 (an Ultra descent's): both kept.
+        known.extend(answer(0));
+        known.extend(answer(150_000));
+        assert_eq!(known.len(), 300_000);
+        assert!(known.get(&key(0)).is_some() && known.get(&key(299_999)).is_some());
+        // A third: the first goes, the last two stay whole.
+        known.extend(answer(300_000));
+        assert!(known.get(&key(0)).is_none());
+        assert!(known.get(&key(150_000)).is_some() && known.get(&key(449_999)).is_some());
+    }
+
     #[test]
     fn the_arena_cap_holds_through_small_moves() {
         // Within the band the held cap stays; past it the cap follows.

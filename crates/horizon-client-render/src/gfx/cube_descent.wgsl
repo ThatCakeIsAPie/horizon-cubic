@@ -306,7 +306,9 @@ fn classify_node(key: vec3<i32>, level: u32) -> u32 {
         let fs = f32(s);
         let below_low = ylo < sea;
         let below_high = (ylo + 15.0 * fs) < sea;
-        if below_low == below_high {
+        // Water up to the node's top, the sea's surface: its top is drawn.
+        let surface = below_high && (ylo + 16.0 * fs) == sea;
+        if below_low == below_high && !surface {
             return KIND_AIR;
         }
         return KIND_MIXED;

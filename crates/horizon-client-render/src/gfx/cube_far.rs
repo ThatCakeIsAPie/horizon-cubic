@@ -536,12 +536,17 @@ impl CubeFar {
 
     /// A uniform node needs no GPU work: air and fluid draw nothing, rock its
     /// six faces, written by the CPU.
+    /// Whether `key`'s top is the sea's surface (`MeshJob::sea_top`).
+    fn sea_top(&self, key: CubeKey) -> bool {
+        i64::from(key.origin()[1]) + i64::from(key.size()) == i64::from(self.water_top)
+    }
+
     fn install_uniform(&mut self, key: CubeKey, state: u32, biome: u16) {
         self.stats.uniform += 1;
         let (solid, translucent) = if state == self.air {
             (Vec::new(), Vec::new())
         } else {
-            uniform_quads(&self.table, state, biome.min(255) as u8)
+            uniform_quads(&self.table, state, biome.min(255) as u8, self.sea_top(key))
         };
         // One range per (dir, pass), solid quads first in dir order.
         let mut all: Vec<[u32; 2]> = Vec::new();
@@ -635,6 +640,7 @@ impl CubeFar {
                         slot,
                         cover: node.cover.as_deref().map(cover_words),
                         neighbours: [NONE; 6],
+                        sea_top: self.sea_top(key),
                     }),
                     GpuContent::Slot(_) => {
                         self.pending.insert(key, node);

@@ -499,7 +499,9 @@ pub fn node_class(p: &CubeGenParams, key: CubeKey, columns: &NodeColumns) -> Nod
             let sea = (p.sea_level + 1) as f32;
             let low = y < sea;
             let high = (y + (15.0 * s) as f32) < sea;
-            if low == high {
+            // Water up to the node's top, the sea's surface: drawn (its top).
+            let surface = high && (y + (16.0 * s) as f32) == sea;
+            if low == high && !surface {
                 NodeClass::Air
             } else {
                 NodeClass::Mixed
@@ -1980,6 +1982,16 @@ mod tests {
             assert_eq!(states(&filled), states(&node));
         }
         assert_eq!(node_class(&p, key, &sea), NodeClass::Mixed, "not uniform air");
+        // All sea up to its top, the surface (a level-2 node at y 0..64): drawn
+        // for its top; the one under it is not.
+        assert_eq!(
+            node_class(&p, CubeKey::new(2, 0, 0, 0), &sea),
+            NodeClass::Mixed
+        );
+        assert_eq!(
+            node_class(&p, CubeKey::new(2, 0, -1, 0), &sea),
+            NodeClass::Air
+        );
         // Ground standing over the surface there keeps its voxel solid.
         let land = cpu_reference_node(&p, key, &NodeColumns::flat(600.0, 1.0, 0));
         assert!((0..16).all(|x| land.get(x, 0, 0).state.0 != WATER));

@@ -48,6 +48,7 @@ def main():
     ap.add_argument('--hitch', action='store_true')
     ap.add_argument('--spyglass', action='store_true')
     ap.add_argument('--spyglass-at', default='300:2', help='Y:PITCH the spyglass looks from')
+    ap.add_argument('--size', default='1280x720', help='the window, WIDTHxHEIGHT')
     ap.add_argument('--watch', type=float, default=0.0, help='seconds to watch a still plan for swings')
     ap.add_argument('--cavern', action='store_true')
     ap.add_argument('--views', nargs='*', default=[], help='Y:PITCH views to screenshot after each fill')
@@ -143,7 +144,7 @@ def main():
     def launch():
         print(ctl_run('launch', '--game', game, '--world', 'FarCheck', '--seed', args.seed, '--creative',
                       '--offscreen', '--wait', '--cubic', '--resources', args.resources, '--game-dir', game_dir,
-                      '--width', 1280, '--height', 720, timeout=600)[:120], flush=True)
+                      '--width', args.size.split('x')[0], '--height', args.size.split('x')[1], timeout=600)[:120], flush=True)
 
     launch()
     if args.tall:
@@ -176,6 +177,11 @@ def main():
                 ago = lod.get('plan_changed_ago_s')
                 if ago is not None and last is not None and ago + 0.05 < last:
                     changes += 1
+                    # One line a plan: what moved.
+                    print(f'  plan at {args.watch - (end - time.monotonic()):.1f} s: ' + ' '.join(
+                        f'{k}={lod.get(k)}' for k in ['planned', 'tiles', 'tiles_complex', 'limited', 'voxel_px',
+                                                     'tiles_limited', 'uniform_skipped', 'descent_runs', 'descent_uniform',
+                                                     'descent_leaves', 'descent_overflow', 'holes', 'ready']), flush=True)
                 last = ago
                 if lod.get('planned') is not None:
                     planned.append(lod['planned'])

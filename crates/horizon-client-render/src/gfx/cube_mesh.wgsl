@@ -22,7 +22,8 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> pool: array<u32>;
 @group(0) @binding(2) var<storage, read> materials: array<u32>;
-// Per job: slot, level, flags (bit 0: has cover), 0, six neighbour slots
+// Per job: slot, level, flags (bit 0: has cover, bit 1: the node's top is the sea's
+// surface), 0, six neighbour slots
 // (Down, Up, North, South, West, East; NONE), 2 spare, eight cover words
 // (bit z << 4 | x), 4 spare.
 @group(0) @binding(3) var<storage, read> jobs: array<u32>;
@@ -97,8 +98,12 @@ fn cell_key(base: u32, slot: u32, dir: u32, o: u32, p: vec3<u32>) -> u32 {
         next = state_at(slot, u32(q.x), u32(q.y), u32(q.z));
         known = true;
     } else {
-        if fluid_of(own) != 0u {
-            // A fluid's faces on the node's edge lie inside the fluid the next node goes on with.
+        // A fluid's faces on the node's edge lie inside the fluid the next node goes on
+        // with, except its top on a node whose top is the sea's surface (job flags bit 1):
+        // there the sea ends, and without it the sea showed its floor wherever its
+        // surface fell on a node's top (levels 0 to 2).
+        let sea_top = (jobs[base + 2u] & 2u) != 0u;
+        if fluid_of(own) != 0u && !(dir == 1u && sea_top) {
             return 0u;
         }
         let neighbour = jobs[base + 4u + dir];
