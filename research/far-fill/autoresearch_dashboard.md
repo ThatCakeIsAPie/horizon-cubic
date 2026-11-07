@@ -1,10 +1,10 @@
 # Lane A: far view fill (desktop) - autoresearch dashboard
 
 **Metric:** far_fill_s: median s to complete a fill over 6 teleports (2 launches x 3 hops), lower is better
-**Baseline:** 17.267 s | **Best:** 8.25 s (-52.2%) | **Min-delta:** 1.5 s | **Iterations:** 11
+**Baseline:** 17.267 s | **Best:** 8.085 s (-53.2%) | **Min-delta:** 1.5 s | **Iterations:** 14
 **Guard:** no timeout; planned within 3%, voxel_px within 2%, fps_steady within 10%, cover_s within 20% of baseline; far view tests
 
-**Kept:** 6 | **Discarded:** 0 | **Screened:** 27 | **Crashed:** 0 | **Guard failures:** 0
+**Kept:** 7 | **Discarded:** 1 | **Screened:** 30 | **Crashed:** 0 | **Guard failures:** 1
 
 | # | Score (s) | Delta | Status | Commit | Description |
 |---|---|---|---|---|---|
@@ -44,3 +44,9 @@
 | 9 | 8.994 | -1.660 | keep | 64e40f1647 | sky cover: skip each look's slab the density bound proves free (was only the whole 600-block box); evals 8.994 / 9.822, pooled median ~9.65 vs 10.65; 0 cover mismatches with HORIZON_FAR_COVER_CHECK; min-delta now 8.7% of best |
 | 10 | 8.970 | -0.024 | keep | 0539ad82ab | cache writes (and parent building) on a Keeper thread: keep 2-13 s -> 0.01-0.13 s per 40 worker-s; evals 9.575 / 8.970 / 9.216 (1 launch), pooled ~9.05 vs ~9.65; below the noise bar, kept on the profile (work off the critical path) |
 | 11 | 8.250 | -0.720 | keep | b66d93115c | lane B merged to 42f4779a28 (first_at_column, coarse-first uniform proofs) + cover_of asks each column's open looks in one first_at_column probe; 0 mismatches vs per-height block_at; evals 8.250 / 8.854 (+7.876 1 launch), pooled ~8.45 vs ~9.05; cover 7-17 s per 40 worker-s (was 9-21) |
+| 12 | 9.159 | +0.909 | screen | 80315a7ddf | sweep 5 (2 launches): DESCENT_WAIT_MS=100 |
+| 12 | 8.457 | +0.207 | guard_fail | 80315a7ddf | sweep 5 (2 launches): DESCENT_WAIT_MS=0 (guard fail: cover 0.43 s) |
+| 12 | 7.951 | -0.299 | screen | 80315a7ddf | sweep 5 (2 launches): REPLAN_MS=100 |
+| 12 | 8.070 | -0.180 | screen | 80315a7ddf | sweep 5 (2 launches): TILE_BATCHES=2 |
+| 13 | 9.105 | +0.655 | discard | 80315a7ddf | REPLAN_MS=100 + TILE_BATCHES=2 together, 2 evals (9.227, 8.869): pooled 9.105 vs ~8.45; the single-setting gains in sweep 5 were noise |
+| 14 | 8.085 | -0.165 | keep | 195cd3243c | all-air node with covered columns stays uniform (no slot, no mesher job); states in a short list; slab-proof timing. evals 8.085 / 8.203 (+8.354), pooled ~8.2 vs ~8.45: within noise, kept as less work for the same output. hv600 world at spawn: 52 s (was 90-95) |
