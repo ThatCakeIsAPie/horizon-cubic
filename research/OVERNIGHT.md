@@ -8,10 +8,10 @@ All numbers are from the desktop (i7, 4 cores / 8 threads, GTX 1070 Ti), unless 
 
 | What | Before | After | Change |
 |---|---|---|---|
-| **Far view complete after a teleport** (y 300, High; median of 12 hops) | 17.3 s | **about 8.3 s** | **−52%** |
+| **Far view complete after a teleport** (y 300, High; median of 12 hops) | 17.3 s | **about 8.3 s**; 9.1 s with the near-first default (see below) | **−52%** (−47%) |
 | Far view complete at spawn | about 34 s | about 15 s | −56% |
 | Far view in the owner's height-variation-600 world, at spawn | 90–95 s | 52 s | −45% |
-| **Near terrain in after a teleport to the surface** (y 80: generated, lit, meshed) | about 7.7 s | **about 4.7 s** | **−39%** |
+| **Near terrain in after a teleport to the surface** (y 80: generated, lit, meshed) | about 7.7 s | **about 4.2 s** (4.7 s before the near-first default) | **−46%** |
 | Cube generation and population, 1 thread, desktop | 1.14 ms/cube | 0.29 ms/cube | −75% |
 | Same, 8 threads (wall time per cube) | 0.38 ms | 0.075 ms (checkerboard order) | −80% |
 | Laptop, surface / sky / deep (ms per cube) | 0.73 / 0.20 / 0.30 | 0.20 / 0.013 / 0.12 | −73% / −94% / −61% |
@@ -39,6 +39,13 @@ What every number holds to:
 - A trace showed the near loading pool half busy. The cube code barely scaled with threads: 8 threads were only about 2× one, because columns made side by side wait on each other's population locks.
 - The streaming scheduler now starts a cubic level's columns away from those in flight (`spread_pick`).
 - In the benchmark that gave +20% throughput at 8 threads; in the game, near-in went from 5.25 s to 4.7 s.
+
+## A call I made: near terrain first (cf6845d373)
+
+While the near terrain loads, and for 1.5 s after, only 1 far worker runs; the other 7 wait.
+- **Near terrain:** in after a surface teleport 21% sooner, 4.17 s against 5.31 s (12 hops each). Spawn was better in every run.
+- **The cost:** the far view completes about 0.9 s later, 14.5 s against 13.6 s at the surface, and about 9.1 s against 8.3 s at y 300.
+- **To undo it:** `HORIZON_FAR_WORKERS_NEAR=8` restores the old behaviour. The hold is `HORIZON_FAR_NEAR_HOLD_MS`. Both are one constant in `lod/cube.rs` (`WORKERS_NEAR`, `NEAR_HOLD`).
 
 ## Things to know before merging
 

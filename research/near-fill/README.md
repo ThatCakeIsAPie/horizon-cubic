@@ -9,6 +9,7 @@
 | Before tonight (743db86f57, plus the status field) | 7.5–7.9 s | 24–29 s |
 | Lanes A and B (5b7a3e7368…3e7b30a316) | 5.1–5.8 s | 11–14 s |
 | Plus the spread scheduler (5c8b6ac934) | about 4.7 s median (at spawn 2.8–2.9 s, against 3.3) | 11–14 s |
+| Plus near terrain first (cf6845d373): 1 far worker while it loads, and for 1.5 s after | 4.17 s against 5.31 (12 hops each) | 14.55 s against 13.65 |
 
 ## What the trace showed
 
