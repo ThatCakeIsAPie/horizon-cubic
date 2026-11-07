@@ -2,12 +2,12 @@
 
 | spec | cubes | baseline | best | change | min-delta |
 |---|---|---|---|---|---|
-| surface | `4,-4,8,1` | 0.7325 | **0.4502** | -38.5% | 4.1% |
+| surface | `4,-4,8,1` | 0.7325 | **0.4032** | -45.0% | 4.1% |
 | sky | `4,20,32,1` | 0.2018 | **0.0231** | -88.6% | 6.5% |
 | deep | `4,-40,-28,1` | 0.2991 | **0.2099** | -29.8% | 3.0% |
 
-Iterations: 11; kept 7. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 21:19.
+Iterations: 13; kept 8. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 21:38.
 
 ## Hot spots
 
@@ -32,3 +32,5 @@ Updated 2026-11-06 21:19.
 | 7 | surface | keep | 0.4502 | -27.7% | PASS | e52179485 | deferred record encoding: populate queues section+entities+flags, NBT made once on first need (writer or read); writer skips superseded records. First 0.4511, confirm 0.4502. Disk records verified identical (flush + hash of every record) on all specs; make+flush 1.37 s -> 0.57 s |
 | 7 | sky | keep | 0.0231 | -58.9% | PASS | e52179485 | same change: first 0.0236, confirm 0.0231 (uniform air cubes were spending 24 us each encoding) |
 | 7 | deep | keep | 0.2099 | -18.6% | PASS | e52179485 | same change: first 0.2119, confirm 0.2099 |
+| 8 | deep | discard | 0.2078 | -1.0% | PASS | - | carver replaceable lists as a bitset instead of Vec::contains: deep -1%, surface 0.4470 (-0.7%): noise |
+| 9 | surface | keep | 0.4032 | -10.4% | PASS | d162110b5 | replacer filters (densityRange, randomYGradient) as small Vec instead of HashSet: first 0.4136, confirm 0.4032. Deep 0.2139/0.2149 vs previous commit re-measured 0.2133 (drift), sky 0.0231 |
