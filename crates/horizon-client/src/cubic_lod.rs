@@ -506,6 +506,7 @@ impl CubicLodSampler {
         let air_box = |min: [i32; 3], max: [i32; 3]| {
             generator.classify_box(min, max) == horizon_world::cubic::custom::BoxClass::Air
         };
+        let boxes = std::time::Instant::now();
         let mut open = [[false; COVER_LOOKS.len()]; 16];
         for (i, open) in open.iter_mut().enumerate() {
             let x = origin[0] + (i as i32 & 3) * tile;
@@ -517,6 +518,9 @@ impl CubicLodSampler {
                 let y = start.saturating_add(up);
                 open[j] = !air_box([x, y, z], [x + tile - 1, y, z + tile - 1]);
             }
+        }
+        if crate::lod::cube::profile::on() {
+            crate::lod::cube::profile::add(&crate::lod::cube::profile::S_COVER_BOX, boxes);
         }
         let solid = |state: u32| state != 0 && state != air && !fluids.contains(&state);
         let check = crate::lod::cube::far_knob("HORIZON_FAR_COVER_CHECK", 0) != 0;

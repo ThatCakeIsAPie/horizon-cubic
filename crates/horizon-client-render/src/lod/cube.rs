@@ -1453,6 +1453,7 @@ pub mod profile {
     pub static S_COVER: AtomicU64 = AtomicU64::new(0);
     pub static S_KEEP: AtomicU64 = AtomicU64::new(0);
     pub static S_FAR: AtomicU64 = AtomicU64::new(0);
+    pub static S_COVER_BOX: AtomicU64 = AtomicU64::new(0);
     static LAST: AtomicU64 = AtomicU64::new(0);
 
     pub fn on() -> bool {
@@ -1472,7 +1473,7 @@ pub mod profile {
         let ms = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
         let n = |c: &AtomicU64| c.swap(0, Relaxed);
         log::info!(
-            "Horizon far profile ({} ms): pool wait {:.0} ms, queue wait {:.0} ms, resident_many {:.0} ms, cpu nodes {:.0} ms, gpu nodes {:.0} ms, send {:.0} ms; keys {} (cpu {}); gpu thread busy {:.0} ms over {} rounds, {} keys; sampler: cache {:.0} ms, sample {:.0} ms, cover {:.0} ms, keep {:.0} ms, far request {:.0} ms",
+            "Horizon far profile ({} ms): pool wait {:.0} ms, queue wait {:.0} ms, resident_many {:.0} ms, cpu nodes {:.0} ms, gpu nodes {:.0} ms, send {:.0} ms; keys {} (cpu {}); gpu thread busy {:.0} ms over {} rounds, {} keys; sampler: cache {:.0} ms, sample {:.0} ms, cover {:.0} ms (slab proofs {:.0} ms), keep {:.0} ms, far request {:.0} ms",
             now - last,
             ms(&POOL_WAIT),
             ms(&QUEUE_WAIT),
@@ -1488,6 +1489,7 @@ pub mod profile {
             ms(&S_CACHE),
             ms(&S_SAMPLE),
             ms(&S_COVER),
+            ms(&S_COVER_BOX),
             ms(&S_KEEP),
             ms(&S_FAR),
         );
@@ -4139,17 +4141,21 @@ const POOL_WAITS: u32 = 250;
 /// rest are uploaded into one. `None` when the pool is full.
 fn gpu_from_node(node: &CubeNode, air: BlockStateId, backend: &GpuBackend) -> Option<GpuNode> {
     let cover = node.covered_mask().map(|mask| Box::new(*mask));
-    let mut states = Vec::new();
+    let mut states: Vec<u32> = Vec::new();
     if node.as_uniform().is_none() {
-        let mut seen = FxHashSet::<u32>::default();
+        // A node holds a handful of states: a short list beats a hash set.
+        let mut last = u32::MAX;
         for i in 0..VOLUME {
-            if seen.insert(node.at(i).state.0) {
-                states.push(node.at(i).state.0);
+            let state = node.at(i).state.0;
+            if state != last && !states.contains(&state) {
+                states.push(state);
             }
+            last = state;
         }
     }
     let content = match node.as_uniform() {
-        Some(voxel) if cover.is_none() => GpuContent::Uniform(voxel),
+        // Air draws nothing, covered or not: no slot, no mesher job.
+        Some(voxel) if cover.is_none() || voxel.state == air => GpuContent::Uniform(voxel),
         _ => {
             let slot = backend.pool.alloc()?;
             backend
