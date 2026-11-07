@@ -2,12 +2,12 @@
 
 | spec | cubes | baseline | best | change | min-delta |
 |---|---|---|---|---|---|
-| surface | `4,-4,8,1` | 0.7325 | **0.2228** | -69.6% | 4.1% |
+| surface | `4,-4,8,1` | 0.7325 | **0.2107** | -71.2% | 4.1% |
 | sky | `4,20,32,1` | 0.2018 | **0.0130** | -93.6% | 6.5% |
 | deep | `4,-40,-28,1` | 0.2991 | **0.1220** | -59.2% | 3.0% |
 
-Iterations: 46; kept 24. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-07 00:13.
+Iterations: 47; kept 25. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-07 00:18.
 
 ## Hot spots
 
@@ -67,3 +67,4 @@ Updated 2026-11-07 00:13.
 | 36 | surface | discard | 0.2233 | +0.2% | PASS | - | fused replace_ore (one locate/read per cell) + generic population functions: 0.2233: no gain |
 | 37 | deep | discard | 0.1185 | -2.9% | PASS | - | walk size profile sin(walked/max*PI) tabled per (walked, max) + sincosf: deep 0.1185, surface 0.2255: no gain |
 | 38 | surface | discard | 0.2165 | -2.8% | PASS | - | generated mixed cubes held as block arrays (packed on demand): first 0.2128 (-4.5%), confirm 0.2165 (-2.8%, below min-delta); deep 0.1167, sky 0.0128. Disk records verified identical; make+flush surface 0.31 s. Patch kept (also costs 16 KB per in-flight mixed cube) |
+| 39 | surface | keep | 0.2107 | -5.4% | PASS | 434c598f3 | per-cube memo of surface/mesa depth noise per column (profile: SimplexNoise::get2 ~6%); was -1.4% before plans/proofs, now -5.4%: first 0.2107, confirm 0.2107 (--tests); deep 0.1209 |
