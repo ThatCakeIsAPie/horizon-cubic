@@ -1675,6 +1675,7 @@ impl GpuCubeSampler {
 fn gpu_thread(mut generator: CubeGen, messages: mpsc::Receiver<Work>) {
     let mut biomes: Option<BiomeGen> = None;
     while let Ok(first) = messages.recv() {
+        let busy = std::time::Instant::now();
         let (mut jobs_in, mut keys_in) = (Vec::new(), Vec::new());
         let mut nodes = 0;
         let mut work = Some(first);
@@ -1728,6 +1729,12 @@ fn gpu_thread(mut generator: CubeGen, messages: mpsc::Receiver<Work>) {
                 let part: Vec<_> = results.by_ref().take(message.keys.len()).collect();
                 let _ = message.reply.send(part);
             }
+        }
+        if crate::lod::cube::profile::on() {
+            use crate::lod::cube::profile;
+            profile::add(&profile::GPU_BUSY, busy);
+            profile::GPU_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            profile::GPU_KEYS.fetch_add(nodes as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

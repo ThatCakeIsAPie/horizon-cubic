@@ -1429,6 +1429,60 @@ pub(crate) fn far_knob(name: &'static str, default: u64) -> u64 {
         })
 }
 
+/// Opt-in timing of the far view's producers (`HORIZON_FAR_PROFILE=1`), for
+/// the overnight loop (research/far-fill): where a worker's time goes, and how
+/// busy the GPU thread is. Logged every 5 s while on; nothing is timed off.
+pub(crate) mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::Instant;
+
+    pub static POOL_WAIT: AtomicU64 = AtomicU64::new(0);
+    pub static QUEUE_WAIT: AtomicU64 = AtomicU64::new(0);
+    pub static RESIDENT: AtomicU64 = AtomicU64::new(0);
+    pub static CPU_NODES: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_NODES: AtomicU64 = AtomicU64::new(0);
+    pub static SEND: AtomicU64 = AtomicU64::new(0);
+    pub static KEYS: AtomicU64 = AtomicU64::new(0);
+    pub static CPU_KEYS: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_BUSY: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_ROUNDS: AtomicU64 = AtomicU64::new(0);
+    pub static GPU_KEYS: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        super::far_knob("HORIZON_FAR_PROFILE", 0) != 0
+    }
+    pub fn add(counter: &AtomicU64, since: Instant) {
+        counter.fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+    }
+    /// Logs the totals since the last log, at most every 5 s.
+    pub fn maybe_log() {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+        let last = LAST.load(Relaxed);
+        if now < last + 5000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+            return;
+        }
+        let ms = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
+        let n = |c: &AtomicU64| c.swap(0, Relaxed);
+        log::info!(
+            "Horizon far profile ({} ms): pool wait {:.0} ms, queue wait {:.0} ms, resident_many {:.0} ms, cpu nodes {:.0} ms, gpu nodes {:.0} ms, send {:.0} ms; keys {} (cpu {}); gpu thread busy {:.0} ms over {} rounds, {} keys",
+            now - last,
+            ms(&POOL_WAIT),
+            ms(&QUEUE_WAIT),
+            ms(&RESIDENT),
+            ms(&CPU_NODES),
+            ms(&GPU_NODES),
+            ms(&SEND),
+            n(&KEYS),
+            n(&CPU_KEYS),
+            ms(&GPU_BUSY),
+            n(&GPU_ROUNDS),
+            n(&GPU_KEYS),
+        );
+    }
+}
+
 fn far_ms(name: &'static str, default: Duration) -> Duration {
     Duration::from_millis(far_knob(name, default.as_millis() as u64))
 }
@@ -1826,6 +1880,7 @@ impl Shared {
             descent: Mutex::default(),
             descent_wake: Condvar::new(),
             classes_dirty: AtomicBool::new(false),
+            near_loading: AtomicBool::new(false),
             planner: Mutex::default(),
             planner_wake: Condvar::new(),
         }
@@ -1864,6 +1919,9 @@ struct Shared {
     /// The planner thread's job and answer (one at a time).
     planner: Mutex<PlanSlot>,
     planner_wake: Condvar,
+    /// The near terrain is loading: the workers step behind it
+    /// (`CubeLod::set_near_loading`).
+    near_loading: AtomicBool,
 }
 
 // ---------------------------------------------------------------- planner
@@ -2379,13 +2437,14 @@ impl CubeLod {
         context: Arc<WorkerContext>,
         air: BlockStateId,
     ) -> Self {
-        // All the threads but two, from 2 to 8: the far view's fill waits on
-        // its workers (the GPU and its pool have room to spare). Half the
-        // threads, at most 4, took 17.3 s to fill after a teleport on 8
-        // threads; 6 workers took 15.1 s (research/far-fill).
+        // As many as the threads, from 2 to 8: the far view's fill waits on its
+        // workers (the GPU and its pool have room to spare), and they step
+        // behind the near terrain while it loads. On 8 threads: 4 workers
+        // filled in 17.3 s after a teleport, 6 in 14.8 s, 8 at normal priority
+        // about 13 s (research/far-fill).
         let wanted_threads = far_knob(
             "HORIZON_FAR_WORKERS",
-            horizon_threads::worker_count().saturating_sub(2).clamp(2, 8) as u64,
+            horizon_threads::worker_count().clamp(2, 8) as u64,
         )
         .max(1) as usize;
         let backend = sampler.gpu();
@@ -2515,6 +2574,12 @@ impl CubeLod {
             jumped: None,
             backend,
         }
+    }
+
+    /// Whether the near terrain is loading: the far workers step behind it
+    /// meanwhile and come back to normal priority once it is in.
+    pub fn set_near_loading(&self, loading: bool) {
+        self.shared.near_loading.store(loading, Ordering::Relaxed);
     }
 
     /// The renderer's GPU far terrain counters (`Renderer::cube_far_stats`),
@@ -3892,18 +3957,19 @@ fn work(
     air: BlockStateId,
     backend: Option<GpuBackend>,
 ) {
-    // 0: behind the server and at far terrain's priority (below normal on
-    // Windows); 1: behind the server only; 2: left as spawned.
-    match far_knob("HORIZON_FAR_PRIORITY", 0) {
-        0 => {
-            horizon_threads::behind_server();
-            horizon_threads::far_terrain_current();
-        }
-        1 => {
-            horizon_threads::behind_server();
-        }
-        _ => {}
+    // The far workers start behind the server and at far terrain's priority
+    // (below normal on Windows), and by default step back to normal once the
+    // near terrain is in, behind it again while it loads
+    // (`CubeLod::set_near_loading`), as the column far terrain's threads do.
+    // Kept below normal for good, they filled the far view slower: 14.8 s
+    // after a teleport with 6 workers, about 13 s at normal (research/far-fill).
+    // `HORIZON_FAR_PRIORITY`: 0 that, 1 below normal for good, 2 left as spawned.
+    let priority = far_knob("HORIZON_FAR_PRIORITY", 0);
+    if priority != 2 {
+        horizon_threads::behind_server();
+        horizon_threads::far_terrain_current();
     }
+    let mut behind = true;
     let mut mesher = Mesher::default();
     let kind = classifier(&context, air);
     loop {
@@ -3914,6 +3980,18 @@ fn work(
         // the sampler for them at once (`resident_many`); on the CPU path one.
         let gpu_batch = far_knob("HORIZON_FAR_GPU_BATCH", GPU_BATCH as u64).max(1) as usize;
         let take = if gpu.is_some() { gpu_batch } else { 1 };
+        if priority == 0 {
+            let loading = shared.near_loading.load(Ordering::Relaxed);
+            if loading != behind {
+                horizon_threads::far_terrain_behind(loading);
+                behind = loading;
+            }
+        }
+        let profiling = profile::on();
+        if profiling {
+            profile::maybe_log();
+        }
+        let started = Instant::now();
         if let Some(backend) = gpu {
             // The pool is full while the renderer meshes what is in it: wait
             // for room rather than fail the batch (a failed node waits RETRY).
@@ -3930,6 +4008,10 @@ fn work(
                 waited += 1;
             }
         }
+        if profiling {
+            profile::add(&profile::POOL_WAIT, started);
+        }
+        let started = Instant::now();
         let keys: Vec<CubeKey> = {
             let mut queue = shared.queue.lock().unwrap();
             loop {
@@ -3965,6 +4047,11 @@ fn work(
                 queue = shared.wake.wait(queue).unwrap();
             }
         };
+        if profiling {
+            profile::add(&profile::QUEUE_WAIT, started);
+            profile::KEYS.fetch_add(keys.len() as u64, Ordering::Relaxed);
+        }
+        let started = Instant::now();
         match sampler.changes() {
             Changes::None => {}
             Changes::Cubes(cubes) => shared.cache.lock().unwrap().forget(&cubes),
@@ -3984,7 +4071,11 @@ fn work(
                 fetched.extend(uncached.into_iter().zip(answers));
             }
         }
+        if profiling {
+            profile::add(&profile::RESIDENT, started);
+        }
         for key in keys {
+            let started = Instant::now();
             let product = match gpu {
                 Some(backend) => gpu_node(
                     &shared,
@@ -4004,9 +4095,21 @@ fn work(
                     Product::Mesh(mesh)
                 }),
             };
+            if profiling {
+                if key.level < MIN_LEVEL {
+                    profile::add(&profile::CPU_NODES, started);
+                    profile::CPU_KEYS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    profile::add(&profile::GPU_NODES, started);
+                }
+            }
+            let started = Instant::now();
             shared.queue.lock().unwrap().running.remove(&key);
             if tx.send(Done { key, product }).is_err() {
                 return;
+            }
+            if profiling {
+                profile::add(&profile::SEND, started);
             }
         }
     }

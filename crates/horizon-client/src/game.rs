@@ -17912,6 +17912,7 @@ impl Game<'_> {
                     renderer.clear_cube_lods();
                 }
                 cube_lod.surface_feedback(|key| renderer.surface_tile_info(key));
+                cube_lod.set_near_loading(self.streaming.terrain_loading());
                 let meshes = horizon_client::spans::time("cube_lod_update", || {
                     cube_lod.update(camera, f64::from(lod_distance) * 16.0, &view, loaded, |p| {
                         horizon_client::streaming::in_view_distance(
