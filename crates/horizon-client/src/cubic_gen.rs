@@ -38,7 +38,7 @@ use horizon_world::registry::BlockRegistry;
 use horizon_world::worldgen::generator::GeneratorData;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The key in a cube record with its population flags.
 pub const FLAGS_KEY: &str = "horizon:cubic_flags";
@@ -233,20 +233,16 @@ pub struct PopRegion {
 
 impl PopRegion {
     /// The region from `origin`, cube `d` (`dx | dy << 1 | dz << 2`) from
-    /// `sections[d]`.
+    /// `cubes[d]`.
     pub fn new(
         origin: SectionPos,
-        sections: &[Arc<Section>; 8],
+        cubes: &[impl CubeBlocks; 8],
         columns: Arc<dyn BiomeColumns>,
         vegetation: Option<Arc<Vegetation>>,
     ) -> Self {
         let cubes = std::array::from_fn(|d| {
             let mut blocks = Box::new([0u32; 4096]);
-            let s = &sections[d];
-            match s.blocks.uniform() {
-                Some(v) => blocks.fill(v),
-                None => s.unpack(&mut blocks),
-            }
+            cubes[d].blocks_into(&mut blocks);
             blocks
         });
         Self {
@@ -281,6 +277,89 @@ impl PopRegion {
     /// Cube `d`'s blocks.
     pub fn blocks(&self, d: usize) -> &[u32; 4096] {
         &self.cubes[d]
+    }
+
+    /// The eight cubes' blocks.
+    pub fn into_blocks(self) -> [Box<[u32; 4096]>; 8] {
+        self.cubes
+    }
+}
+
+/// What a population region's cube is read from.
+pub trait CubeBlocks {
+    /// Writes the cube's block states into `out` (index `y << 8 | z << 4 | x`).
+    fn blocks_into(&self, out: &mut [u32; 4096]);
+}
+
+impl CubeBlocks for Arc<Section> {
+    fn blocks_into(&self, out: &mut [u32; 4096]) {
+        match self.blocks.uniform() {
+            Some(v) => out.fill(v),
+            None => self.unpack(out),
+        }
+    }
+}
+
+impl CubeBlocks for Held {
+    fn blocks_into(&self, out: &mut [u32; 4096]) {
+        match self {
+            Held::Section(s) => s.blocks_into(out),
+            Held::Blocks(b) => out.copy_from_slice(&b.blocks[..]),
+        }
+    }
+}
+
+/// A cube in flight: a section, or the blocks a population left it with,
+/// made into a section (as `Section::from_blocks`, compacted) when first
+/// asked for. A cube that population after population changes is not
+/// packed and unpacked again for each of them.
+#[derive(Clone)]
+pub enum Held {
+    Section(Arc<Section>),
+    Blocks(Arc<HeldBlocks>),
+}
+
+pub struct HeldBlocks {
+    blocks: Box<[u32; 4096]>,
+    biomes: PalettedContainer,
+    section: OnceLock<Arc<Section>>,
+}
+
+impl Held {
+    /// `blocks` with `biomes`, as a population left them.
+    pub fn blocks(blocks: Box<[u32; 4096]>, biomes: PalettedContainer) -> Self {
+        Held::Blocks(Arc::new(HeldBlocks {
+            blocks,
+            biomes,
+            section: OnceLock::new(),
+        }))
+    }
+
+    /// The cube as a section.
+    pub fn section(&self) -> Arc<Section> {
+        match self {
+            Held::Section(section) => section.clone(),
+            Held::Blocks(b) => b
+                .section
+                .get_or_init(|| {
+                    let mut section = Section {
+                        blocks: Section::from_blocks(&b.blocks),
+                        biomes: b.biomes.clone(),
+                        ..Section::default()
+                    };
+                    section.compact();
+                    Arc::new(section)
+                })
+                .clone(),
+        }
+    }
+
+    /// The cube's biomes.
+    pub fn biomes(&self) -> PalettedContainer {
+        match self {
+            Held::Section(section) => section.biomes.clone(),
+            Held::Blocks(b) => b.biomes.clone(),
+        }
     }
 }
 
@@ -326,7 +405,8 @@ pub struct Population {
 
 #[derive(Default)]
 struct Cache {
-    map: HashMap<SectionPos, Arc<Section>>,
+    /// Each cube, and whether it is all its record holds (`plain`).
+    map: HashMap<SectionPos, (Held, bool)>,
     order: VecDeque<SectionPos>,
 }
 
@@ -396,14 +476,49 @@ impl Population {
     }
 
     /// A cube in flight.
-    pub fn cached(&self, pos: SectionPos) -> Option<Arc<Section>> {
-        self.cache.lock().unwrap().map.get(&pos).cloned()
+    pub fn cached(&self, pos: SectionPos) -> Option<Held> {
+        self.cache.lock().unwrap().map.get(&pos).map(|e| e.0.clone())
     }
 
-    /// Keeps `section` as cube `pos`'s current content.
-    pub fn keep(&self, pos: SectionPos, section: Arc<Section>) {
+    /// Whether cube `pos` is in flight with a record that is exactly its
+    /// content: written by a population with no entities, and not since.
+    pub fn is_plain(&self, pos: SectionPos) -> bool {
+        matches!(self.cache.lock().unwrap().map.get(&pos), Some((_, true)))
+    }
+
+    /// The section of a plain cube in flight (`is_plain`). Kept as that
+    /// section from then on: the blocks a population left are dropped.
+    pub fn plain_section(&self, pos: SectionPos) -> Option<Arc<Section>> {
+        let held = match self.cache.lock().unwrap().map.get(&pos) {
+            Some((held, true)) => held.clone(),
+            _ => return None,
+        };
+        let section = held.section();
+        if let Held::Blocks(b) = &held {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some((entry, true)) = cache.map.get_mut(&pos)
+                && matches!(entry, Held::Blocks(now) if Arc::ptr_eq(now, b))
+            {
+                *entry = Held::Section(section.clone());
+            }
+        }
+        Some(section)
+    }
+
+    /// Keeps `held` as cube `pos`'s current content.
+    pub fn keep(&self, pos: SectionPos, held: Held) {
+        self.keep_as(pos, held, false);
+    }
+
+    /// Keeps `held` as cube `pos`'s current content and its whole record
+    /// (`is_plain`).
+    pub fn keep_plain(&self, pos: SectionPos, held: Held) {
+        self.keep_as(pos, held, true);
+    }
+
+    fn keep_as(&self, pos: SectionPos, held: Held, plain: bool) {
         let mut cache = self.cache.lock().unwrap();
-        if cache.map.insert(pos, section).is_none() {
+        if cache.map.insert(pos, (held, plain)).is_none() {
             cache.order.push_back(pos);
         }
         while cache.map.len() > CACHE_CUBES {

@@ -46,9 +46,50 @@ struct Sphere {
     rv: f64,
 }
 
+/// Spheres per [`SphereRun`].
+const RUN: usize = 16;
+
+/// The extent of some spheres: the least `centre - radius` and the greatest
+/// `centre + radius` on each axis (`rh` across, `rv` up), computed as
+/// `local_box` computes them.
+#[derive(Clone, Copy, Debug)]
+struct SphereRun {
+    lo: [f64; 3],
+    hi: [f64; 3],
+}
+
+impl SphereRun {
+    fn of(spheres: &[Sphere]) -> Self {
+        let mut r = Self {
+            lo: [f64::MAX; 3],
+            hi: [f64::MIN; 3],
+        };
+        for s in spheres {
+            let lo = [s.x - s.rh, s.y - s.rv, s.z - s.rh];
+            let hi = [s.x + s.rh, s.y + s.rv, s.z + s.rh];
+            for i in 0..3 {
+                r.lo[i] = r.lo[i].min(lo[i]);
+                r.hi[i] = r.hi[i].max(hi[i]);
+            }
+        }
+        r
+    }
+
+    /// Whether `local_box` rejects every one of the spheres for the cube
+    /// whose lowest block is `c0`. Its box test, `floor(c + r) - c0 + 1 <= 0`
+    /// or `floor(c - r) - c0 - 1 >= 16` on an axis, is `c + r < c0` or
+    /// `c - r >= c0 + 17` (`c0` is an integer), and a sphere meets one when
+    /// the extent does.
+    fn misses(&self, c0: [f64; 3]) -> bool {
+        (0..3).any(|i| self.hi[i] < c0[i] || self.lo[i] >= c0[i] + 17.0)
+    }
+}
+
 /// Everything one origin cube carves.
 struct Walks {
     spheres: Vec<Sphere>,
+    /// Bounds of `spheres` by runs of `RUN`.
+    runs: Vec<SphereRun>,
     min: [f64; 3],
     max: [f64; 3],
     max_r: f64,
@@ -69,8 +110,10 @@ impl Walks {
             }
             max_r = max_r.max(s.rh).max(s.rv);
         }
+        let runs = spheres.chunks(RUN).map(SphereRun::of).collect();
         Self {
             spheres,
+            runs,
             min,
             max,
             max_r,
@@ -82,6 +125,16 @@ impl Walks {
     fn may_reach(&self, centre: [f64; 3]) -> bool {
         let m = 16.0 + 2.0 * self.max_r;
         (0..3).all(|i| centre[i] >= self.min[i] - m && centre[i] <= self.max[i] + m)
+    }
+
+    /// The spheres that may touch the cube whose lowest block is `c0`, in
+    /// walk order: the runs whose extent reaches it.
+    fn near(&self, c0: [f64; 3]) -> impl Iterator<Item = &Sphere> {
+        self.runs
+            .iter()
+            .zip(self.spheres.chunks(RUN))
+            .filter(move |(run, _)| !run.misses(c0))
+            .flat_map(|(_, spheres)| spheres)
     }
 }
 
@@ -304,12 +357,24 @@ impl Carvers {
         })
     }
 
+    /// Whether some carver may replace `state`.
+    fn replaces(&self, state: u32) -> bool {
+        self.caves.iter().any(|c| c.allowed.contains(&state))
+            || self.ravine.as_ref().is_some_and(|r| r.allowed.contains(&state))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.caves.is_empty() && self.ravine.is_none()
     }
 
     /// Carves `out`, the blocks of `cube` (index `y << 8 | z << 4 | x`).
     pub fn carve(&self, cube: SectionPos, out: &mut [u32; 4096]) {
+        // A carver only changes blocks of its replaceable list: a cube of one
+        // block that no list holds stays as it is (sky, water, bedrock...).
+        let first = out[0];
+        if !self.replaces(first) && out.iter().all(|&b| b == first) {
+            return;
+        }
         for c in &self.caves {
             c.carve(cube, out, &self.lava_ids);
         }
@@ -317,6 +382,15 @@ impl Carvers {
             r.carve(cube, out);
         }
     }
+}
+
+/// The cube's lowest block.
+fn lowest(cube: SectionPos) -> [f64; 3] {
+    [
+        f64::from(cube.x * 16),
+        f64::from(cube.y * 16),
+        f64::from(cube.z * 16),
+    ]
 }
 
 fn centre(cube: SectionPos) -> [f64; 3] {
@@ -577,7 +651,7 @@ impl CaveCarver {
             if !w.may_reach(c) {
                 continue;
             }
-            for s in &w.spheres {
+            for s in w.near(lowest(cube)) {
                 self.carve_sphere(cube, out, s, lava);
             }
         }
@@ -720,7 +794,7 @@ impl RavineCarver {
             if !w.may_reach(c) {
                 continue;
             }
-            for s in &w.spheres {
+            for s in w.near(lowest(cube)) {
                 self.carve_sphere(cube, out, s, &w);
             }
         }
