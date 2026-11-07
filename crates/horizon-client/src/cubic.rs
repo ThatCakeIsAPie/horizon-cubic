@@ -3280,6 +3280,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&g.dir);
     }
 
+    /// The far view's sketch of a village (`cubic_far_structures`) holds the
+    /// blocks the near terrain builds: the building blocks of the cubes
+    /// around its first piece, made as the game makes them, are in the
+    /// sketch at the same places, and a coarse far node over it shows them.
+    #[test]
+    fn the_far_sketch_of_a_village_holds_its_built_blocks() {
+        use crate::cubic_far_structures::FarStructures;
+        use crate::lod::cube::{CubeKey, CubeNode, Voxel};
+        let Some(f) = Fixture::new("far-sketch") else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let level = f.level_with_data(CubicKind::Custom, String::new());
+        let structures = level.generation().structures.clone().expect("structures");
+        let registry = f.assets.registry;
+        let air = registry.default_state("minecraft:air").unwrap().0;
+        let starts = structures.touching([-1024, -1024], [1024, 1024]);
+        let village = (starts.iter())
+            .filter(|s| s.name.contains("village"))
+            .min_by_key(|s| i64::from(s.chunk.x).pow(2) + i64::from(s.chunk.z).pow(2))
+            .expect("a village within 1,024 blocks of the origin");
+        let far = FarStructures::new(
+            structures.clone(),
+            level.generation().generator.clone(),
+            None,
+            air,
+        );
+        let t = std::time::Instant::now();
+        assert!(far.sketch_now(village), "{} sketched", village.name);
+        eprintln!(
+            "{} sketched in {:.2} s",
+            village.name,
+            t.elapsed().as_secs_f64()
+        );
+        let built = |name: &str| {
+            [
+                "planks",
+                "cobblestone",
+                "door",
+                "glass",
+                "stairs",
+                "log",
+                "bell",
+                "hay_block",
+            ]
+            .iter()
+            .any(|k| name.contains(k))
+        };
+        let c = village.pieces[0].bounding_box().center();
+        let (lo, hi) = (
+            [c[0] - 24, c[1] - 24, c[2] - 24],
+            [c[0] + 23, c[1] + 23, c[2] + 23],
+        );
+        let sketched: HashMap<[i32; 3], u32> = far.sketched(lo, hi).into_iter().collect();
+        let (mut near, mut found) = (0, 0);
+        let mut states = [0u32; 4096];
+        for cy in lo[1] >> 4..=hi[1] >> 4 {
+            for cz in lo[2] >> 4..=hi[2] >> 4 {
+                for cx in lo[0] >> 4..=hi[0] >> 4 {
+                    let p = SectionPos::new(cx, cy, cz);
+                    level.make_cube(p).section.unpack(&mut states);
+                    for (i, &s) in states.iter().enumerate() {
+                        let name = registry
+                            .state(horizon_world::registry::BlockStateId(s))
+                            .map_or("", |st| st.name.as_str());
+                        if !built(name) {
+                            continue;
+                        }
+                        let at = [
+                            cx * 16 + (i & 15) as i32,
+                            cy * 16 + (i >> 8) as i32,
+                            cz * 16 + (i >> 4 & 15) as i32,
+                        ];
+                        if (0..3).any(|a| !(lo[a]..=hi[a]).contains(&at[a])) {
+                            continue;
+                        }
+                        near += 1;
+                        found += usize::from(sketched.get(&at) == Some(&s));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{} at {c:?}: {found} of {near} built blocks in the sketch",
+            village.name
+        );
+        assert!(
+            near > 50,
+            "{} at {c:?}: {near} built blocks near",
+            village.name
+        );
+        // The populations' trees and features may change a few blocks.
+        assert!(
+            found * 100 >= near * 97,
+            "{} at {c:?}: {found} of {near} built blocks in the sketch",
+            village.name
+        );
+        // A level-4 node (256 blocks) over it, all air, shows the village.
+        let key = CubeKey {
+            level: 4,
+            x: c[0].div_euclid(256),
+            y: c[1].div_euclid(256),
+            z: c[2].div_euclid(256),
+        };
+        let blank = CubeNode::uniform(
+            key,
+            Voxel {
+                state: horizon_world::registry::BlockStateId(air),
+                biome: 0,
+            },
+        );
+        let (drawn, _) = far.overlay(blank);
+        let shown = (0..crate::lod::cube::VOLUME)
+            .filter(|&i| drawn.at(i).state.0 != air)
+            .count();
+        assert!(
+            shown > 0,
+            "{} at {c:?}: nothing in the far node",
+            village.name
+        );
+        drop(level);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
     /// With every structure switched off there are none.
     #[test]
     fn structures_switched_off_make_none() {

@@ -48,6 +48,7 @@ pub mod crafting;
 pub mod creative;
 pub mod cubic;
 pub mod cubic_convert;
+pub mod cubic_far_structures;
 pub mod cubic_gen;
 pub mod cubic_lod;
 pub mod cubic_prefetch;

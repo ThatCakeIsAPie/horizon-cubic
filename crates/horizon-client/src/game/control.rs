@@ -1513,6 +1513,8 @@ impl Game<'_> {
                     "pool_bytes": s.pool_bytes,
                     "complete": s.complete,
                     "gpu_path": lod.on_gpu_path(),
+                    // Drawn nodes made again for structures found late.
+                    "late_refreshed": s.late_refreshed,
                     "descent_runs": s.descent_runs,
                     "descent_uniform": s.descent_uniform,
                     "descent_leaves": s.descent_leaves,
