@@ -98,6 +98,9 @@ pub struct CubicLodSampler {
     far_setup: Option<FarSetup>,
     /// The biome of air with no column to say (plains).
     plains: u16,
+    /// Custom Cubic's structures, found in the background and drawn into the
+    /// nodes they reach (`cubic_far_structures`); shared by every fork.
+    structures: Option<Arc<crate::cubic_far_structures::FarStructures>>,
 }
 
 /// The inputs of the far generator: parameters and the node columns.
@@ -266,6 +269,16 @@ impl CubicLodSampler {
             Box::new(GpuCubeSampler::cpu(f.params.clone(), f.columns.clone()))
                 as Box<dyn CubeSampler>
         });
+        let structures = (level.generation().structures.clone())
+            .filter(|_| level.generation().kind == CubicKind::Custom)
+            .map(|s| {
+                crate::cubic_far_structures::FarStructures::new(
+                    s,
+                    level.generation().generator.clone(),
+                    cache.clone(),
+                    id("minecraft:air"),
+                )
+            });
         Self {
             wg: level.generation().clone(),
             level,
@@ -287,6 +300,7 @@ impl CubicLodSampler {
             far,
             far_setup,
             plains: level_plains,
+            structures,
         }
     }
 
@@ -791,6 +805,7 @@ impl CubeSampler for CubicLodSampler {
             return Some(node);
         }
         let node = self.sampled(key)?;
+        let node = self.with_structures(node);
         // The generator is exact outside a Hybrid world's band (and
         // everywhere in the others).
         if key.level == 1 && !self.in_band(key) {
@@ -811,6 +826,11 @@ impl CubeSampler for CubicLodSampler {
             if let Some(node) = self.of_cached_children(key, since) {
                 return Some(Resident::Node(node));
             }
+            if self.has_structures(key)
+                && let Some(node) = self.structure_node(key)
+            {
+                return Some(Resident::Node(node));
+            }
             return self.far.as_mut()?.resident(key);
         }
         self.node(key).map(Resident::Node)
@@ -829,6 +849,11 @@ impl CubeSampler for CubicLodSampler {
                 if let Some(node) = self.cache.as_ref().and_then(|c| c.get(key)) {
                     out[i] = Some(Resident::Node(node));
                 } else if let Some(node) = self.of_cached_children(key, since) {
+                    out[i] = Some(Resident::Node(node));
+                } else if self.has_structures(key)
+                    && let Some(node) = self.structure_node(key)
+                {
+                    // Drawn with a structure's voxels: sampled here.
                     out[i] = Some(Resident::Node(node));
                 } else {
                     far_keys.push(key);
@@ -913,11 +938,40 @@ impl CubeSampler for CubicLodSampler {
             },
             far_setup: self.far_setup.clone(),
             plains: self.plains,
+            structures: self.structures.clone(),
         }))
+    }
+
+    fn late(&self) -> Option<Arc<dyn crate::lod::cube::LateContent>> {
+        (self.structures.clone()).map(|s| s as Arc<dyn crate::lod::cube::LateContent>)
     }
 }
 
 impl CubicLodSampler {
+    /// Whether a structure the far search found reaches node `key`.
+    fn has_structures(&self, key: CubeKey) -> bool {
+        self.structures.as_ref().is_some_and(|s| s.touches(key))
+    }
+
+    /// A node the far generator would leave in the GPU pool, sampled here
+    /// to take a structure's voxels, or `None` when they change nothing (the
+    /// GPU then makes it as before: a node the CPU made over the sea draws
+    /// its water and floor a little unlike the GPU's own). Like the GPU's
+    /// nodes, it carries no sky cover (they are drawn lit).
+    fn structure_node(&mut self, key: CubeKey) -> Option<CubeNode> {
+        let node = self.sampled_plain(key)?;
+        let (node, changed) = self.structures.as_ref()?.overlay(node);
+        changed.then_some(node)
+    }
+
+    /// A sampled node with the voxels of the structures over it.
+    fn with_structures(&self, node: CubeNode) -> CubeNode {
+        match &self.structures {
+            Some(s) => s.overlay(node).0,
+            None => node,
+        }
+    }
+
     /// A node sampled from the generators at its own resolution, with its
     /// sky cover.
     fn sampled(&mut self, key: CubeKey) -> Option<CubeNode> {

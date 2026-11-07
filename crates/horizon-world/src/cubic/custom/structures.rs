@@ -235,6 +235,15 @@ impl CubicStructures {
             .collect()
     }
 
+    /// The chunks from `min` to `max` where a structure may start, for sets
+    /// at least `min_spacing` chunks apart (and the rings), without building
+    /// a start: see [`StructurePlanner::candidates`]. A far view's search
+    /// asks [`Self::starts_at`] only there.
+    pub fn candidates(&self, min: ChunkPos, max: ChunkPos, min_spacing: i32) -> Vec<ChunkPos> {
+        self.planner
+            .candidates(&mut self.context(), min, max, min_spacing)
+    }
+
     /// A structure's name (`minecraft:village_plains`).
     pub fn structure_name(&self, structure: usize) -> &str {
         self.planner.structure_name(structure)

@@ -390,6 +390,27 @@ pub trait CubeSampler: Send {
     fn changes(&mut self) -> Changes {
         Changes::None
     }
+    /// Content the sampler adds to nodes after they were first drawn (a far
+    /// view's structures, found in the background), if it has any: see
+    /// [`LateContent`]. `None` by default.
+    fn late(&self) -> Option<Arc<dyn LateContent>> {
+        None
+    }
+}
+
+/// Content that reaches the far view after its terrain (structures, found by
+/// a background job): the producer tells it the view each update, and once
+/// every planned node is drawn takes the boxes whose drawn nodes are out of
+/// date and makes those nodes again, behind all other work. The old nodes
+/// stay drawn until the new ones replace them.
+pub trait LateContent: Send + Sync {
+    /// The camera, where it faces, the far distance, and whether every
+    /// planned node is drawn (late work should wait for that: the terrain
+    /// comes first).
+    fn view(&self, camera: [f64; 3], forward: [f64; 3], max_distance: f64, complete: bool);
+    /// Boxes of blocks (minimum, maximum, inclusive) whose nodes are out of
+    /// date, taken.
+    fn take_refreshes(&self) -> Vec<([i32; 3], [i32; 3])>;
 }
 
 /// A sampled node on the GPU path: its voxels, or a slot of the GPU node pool
@@ -1582,6 +1603,9 @@ pub struct CubeLodStats {
     /// Every planned node is drawn or known empty, and the GPU mesher has
     /// nothing waiting.
     pub complete: bool,
+    /// Drawn nodes queued to be made again for late content (structures
+    /// found after the terrain: [`LateContent`]), ever.
+    pub late_refreshed: u64,
     /// GPU descents run (`CubeLod::set_gpu_descent`), ever.
     pub descent_runs: u64,
     /// Nodes the last descent proved uniform (air, fluid or rock).
@@ -1758,6 +1782,9 @@ struct Queue {
     /// Queued keys the plan dropped since: skipped when taken.
     dropped: FxHashSet<CubeKey>,
     running: FxHashSet<CubeKey>,
+    /// Drawn nodes to make again ([`LateContent`]): taken after the rest,
+    /// and kept when the plan is redone.
+    later: VecDeque<CubeKey>,
 }
 
 impl Default for Queue {
@@ -1768,6 +1795,7 @@ impl Default for Queue {
             order: (0..SECTORS as u8).collect(),
             dropped: FxHashSet::default(),
             running: FxHashSet::default(),
+            later: VecDeque::new(),
         }
     }
 }
@@ -1791,6 +1819,9 @@ impl Queue {
                         break;
                     }
                 }
+            }
+            if next.is_none() {
+                next = self.later.pop_front();
             }
             let key = next?;
             if self.dropped.remove(&key) || self.running.contains(&key) {
@@ -2414,6 +2445,10 @@ pub struct CubeLod {
     /// Delivered nodes not in the plan: coverage nodes, and an older plan's
     /// nodes still covering a place.
     stale: FxHashSet<CubeKey>,
+    /// The sampler's late content ([`LateContent`]).
+    late: Option<Arc<dyn LateContent>>,
+    /// Drawn nodes queued to be made again for it.
+    refreshing: FxHashSet<CubeKey>,
     /// Planned nodes not delivered.
     missing: usize,
     failed: FxHashMap<CubeKey, Instant>,
@@ -2479,6 +2514,7 @@ impl CubeLod {
         .max(1) as usize;
         let backend = sampler.gpu();
         let surface_allowed = sampler.surface();
+        let late = sampler.late();
         // One more fork classifies nodes for the planner, on a thread of its own.
         let classifier = backend.is_some().then(|| sampler.fork()).flatten();
         let descent = sampler.descent();
@@ -2531,6 +2567,7 @@ impl CubeLod {
         let mut lod = Self::assemble(shared, results, threads, backend, Some(context), air);
         lod.has_descent = has_descent;
         lod.surface_allowed = surface_allowed;
+        lod.late = late;
         // Benchmarks and autoresearch loops set the node budget from outside.
         if let Some(nodes) = std::env::var(BUDGET_VAR)
             .ok()
@@ -2574,6 +2611,8 @@ impl CubeLod {
             phase: Phase::Refine,
             delivered: FxHashSet::default(),
             stale: FxHashSet::default(),
+            late: None,
+            refreshing: FxHashSet::default(),
             missing: 0,
             failed: FxHashMap::default(),
             retry_at: now,
@@ -3051,8 +3090,12 @@ impl CubeLod {
         let mut out = Vec::new();
         while let Ok(done) = self.results.try_recv() {
             let key = done.key;
+            // A drawn node made again for late content replaces the old one
+            // (the renderer swaps a key's node); a failed remake keeps it.
+            let again = self.refreshing.remove(&key) && self.delivered.contains(&key);
             if !(self.wanted.contains(&key) || self.cover.contains(&key))
-                || self.delivered.contains(&key)
+                || (self.delivered.contains(&key) && !again)
+                || (again && done.product.is_none())
             {
                 if let Some(Product::Gpu(node)) = &done.product {
                     self.release(node);
@@ -3061,7 +3104,11 @@ impl CubeLod {
             }
             match done.product {
                 Some(Product::Mesh(mesh)) => {
-                    self.deliver(key, mesh.solid.is_empty() && mesh.translucent.is_empty());
+                    let empty = mesh.solid.is_empty() && mesh.translucent.is_empty();
+                    if again && !empty {
+                        self.empty.remove(&key);
+                    }
+                    self.deliver(key, empty);
                     out.push((key, mesh));
                 }
                 Some(Product::Gpu(node)) => {
@@ -3082,7 +3129,46 @@ impl CubeLod {
         self.recheck_holes(now, false);
         self.advance_phase(now);
         self.track_completion(now);
+        self.late_content(camera, view.forward, max_distance);
         out
+    }
+
+    /// Tells the late content the view, and once every planned node is
+    /// drawn queues the nodes it says are out of date ([`LateContent`]).
+    fn late_content(&mut self, camera: [f64; 3], forward: [f64; 3], max_distance: f64) {
+        let Some(late) = self.late.clone() else {
+            return;
+        };
+        let complete = self.is_complete();
+        late.view(camera, forward, max_distance, complete);
+        if !complete {
+            return;
+        }
+        let boxes = late.take_refreshes();
+        if boxes.is_empty() {
+            return;
+        }
+        let touches = |key: &CubeKey| {
+            let (o, size) = (key.origin(), i64::from(key.size()));
+            boxes.iter().any(|(min, max)| {
+                (0..3).all(|i| {
+                    i64::from(o[i]) <= i64::from(max[i])
+                        && i64::from(o[i]) + size > i64::from(min[i])
+                })
+            })
+        };
+        let again: Vec<CubeKey> = (self.delivered.iter())
+            .filter(|k| self.wanted.contains(k) || self.cover.contains(k))
+            .filter(|k| !self.refreshing.contains(k) && touches(k))
+            .copied()
+            .collect();
+        if again.is_empty() {
+            return;
+        }
+        self.stats.late_refreshed += again.len() as u64;
+        self.refreshing.extend(again.iter().copied());
+        self.shared.queue.lock().unwrap().later.extend(again);
+        self.shared.wake.notify_all();
     }
 
     /// How often the plan is redone with nothing else asking: [`REPLAN`], or
@@ -3584,6 +3670,13 @@ impl CubeLod {
         first.sort_by(|a, b| self.priority(&rank, a).total_cmp(&self.priority(&rank, b)));
         let mut queue = self.shared.queue.lock().unwrap();
         queue.clear();
+        // Nodes to make again that the new plan dropped: not worth making.
+        let (wanted, cover) = (&self.wanted, &self.cover);
+        queue
+            .later
+            .retain(|k| wanted.contains(k) || cover.contains(k));
+        self.refreshing
+            .retain(|k| wanted.contains(k) || cover.contains(k));
         queue.first.extend(first);
         for &(s, key) in &self.order {
             if waiting(&key) && !firsts.contains(&key) {
@@ -3794,7 +3887,12 @@ impl CubeLod {
 
     /// Forgets everything: nodes handed out, queued and cached.
     pub fn clear(&mut self) {
-        self.shared.queue.lock().unwrap().clear();
+        {
+            let mut queue = self.shared.queue.lock().unwrap();
+            queue.clear();
+            queue.later.clear();
+        }
+        self.refreshing.clear();
         self.shared.cache.lock().unwrap().nodes.clear();
         {
             // A plan in the works belongs to the old count: dropped.
@@ -4823,6 +4921,54 @@ mod tests {
         assert!(node(&shared, &mut OnlyCubes, key(6, 0, 0, 0), AIR, &kind).is_none());
         // The children are cached for the next parent.
         assert!(shared.cache.lock().unwrap().nodes.len() >= 8);
+    }
+
+    /// Late content (structures found after the terrain) has the drawn
+    /// nodes over its boxes made again once the plan is complete: only those
+    /// it touches, after every other job, and not once a plan drops them.
+    #[test]
+    fn late_content_remakes_the_drawn_nodes_over_it_after_the_rest() {
+        struct Late(std::sync::Mutex<Vec<([i32; 3], [i32; 3])>>);
+        impl LateContent for Late {
+            fn view(&self, _: [f64; 3], _: [f64; 3], _: f64, _: bool) {}
+            fn take_refreshes(&self) -> Vec<([i32; 3], [i32; 3])> {
+                std::mem::take(&mut *self.0.lock().unwrap())
+            }
+        }
+        let mut lod = lod_for_test();
+        let (near, far, other) = (key(1, 0, 0, 0), key(1, 4, 0, 0), key(1, 9, 0, 0));
+        put(&mut lod, &[near, far, other], &[]);
+        lod.deliver(near, false);
+        lod.deliver(far, false);
+        let late = Arc::new(Late(std::sync::Mutex::new(vec![([20, 5, 5], [140, 6, 6])])));
+        lod.late = Some(late.clone());
+        // Not complete (`other` is missing): nothing taken yet.
+        lod.late_content([0.0; 3], [0.0, 0.0, 1.0], 1e4);
+        assert!(lod.refreshing.is_empty());
+        lod.deliver(other, false);
+        // The workers took the plan's jobs.
+        lod.shared.queue.lock().unwrap().clear();
+        lod.late_content([0.0; 3], [0.0, 0.0, 1.0], 1e4);
+        let mut remade: Vec<CubeKey> = lod.refreshing.iter().copied().collect();
+        remade.sort_by_key(|k| k.x);
+        assert_eq!(remade, [near, far], "the nodes the box crosses");
+        // Behind the plan's own jobs.
+        lod.shared
+            .queue
+            .lock()
+            .unwrap()
+            .first
+            .push_back(key(0, 50, 0, 0));
+        let order = lod.shared.queue.lock().unwrap().drain();
+        assert_eq!(order[0], key(0, 50, 0, 0));
+        assert_eq!(order.len(), 3);
+        // A plan without them drops them.
+        lod.late_content([0.0; 3], [0.0, 0.0, 1.0], 1e4);
+        late.0.lock().unwrap().push(([0, 0, 0], [140, 6, 6]));
+        lod.late_content([0.0; 3], [0.0, 0.0, 1.0], 1e4);
+        put(&mut lod, &[other], &[]);
+        assert!(lod.refreshing.is_empty());
+        assert!(lod.shared.queue.lock().unwrap().later.is_empty());
     }
 
     fn lod_for_test() -> CubeLod {

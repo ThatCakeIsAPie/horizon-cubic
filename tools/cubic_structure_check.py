@@ -10,6 +10,12 @@ Launches a new Custom Cubic world offscreen with its own HORIZON_HOME, game dir 
 teleports there, waits until the near terrain has loaded and settled, and screenshots
 `view_<n>.png`. `--blocks X0,Y0,Z0,X1,Y1,Z1` prints the block counts of a box after the views (what a
 structure placed). Prints the log's errors at the end.
+
+Far views: `--lod CHUNKS` sets the LOD Distance (far terrain on the GPU where it can be), and
+`--far-wait S` waits up to S seconds at each view for the far view to complete and for the structures
+the background search finds to be drawn into it (`cube_lod.late_refreshed` unchanged for 10 s).
+`--command CMD` runs a command after the world opens and prints what it answered (`locate structure
+minecraft:village_snowy`).
 """
 import argparse
 import json
@@ -34,6 +40,11 @@ def main():
     ap.add_argument('--settings', help='a cubicgen.json to generate with')
     ap.add_argument('--size', default='1280x720', help='the window, WIDTHxHEIGHT')
     ap.add_argument('--timeout', type=float, default=120.0, help='seconds the near terrain may take')
+    ap.add_argument('--lod', type=int, help='LOD Distance in chunks (far views)')
+    ap.add_argument('--far-wait', type=float, default=0.0,
+                    help='seconds to wait at each view for the far view and its structures')
+    ap.add_argument('--command', action='append', default=[], help='a command to run, its answer printed')
+    ap.add_argument('--no-clouds', action='store_true', help='clouds off (far views)')
     args = ap.parse_args()
 
     bins = Path(args.bin_dir)
@@ -43,7 +54,11 @@ def main():
     for d in (home, game_dir):
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True)
-    (game_dir / 'options.txt').write_text('inactivityFpsLimit:"minimized"\n')
+    (game_dir / 'options.txt').write_text(
+        'inactivityFpsLimit:"minimized"\n' + ('renderClouds:"false"\n' if args.no_clouds else ''))
+    if args.lod:
+        (game_dir / 'horizon-graphics.txt').write_text(
+            f'lodDistance:{args.lod}\nfarDetail:full\ngpuFarTerrain:auto\n')
     env = dict(os.environ, HORIZON_HOME=str(home), HORIZON_NO_AUDIO='1')
     socket = scratch / 'control.json'
 
@@ -78,6 +93,20 @@ def main():
             time.sleep(0.5)
         print(f'{label}: near terrain still loading after {args.timeout} s', flush=True)
 
+    def far_done(label, since):
+        """Waits for the far view to complete and its structures to stop arriving."""
+        last, steady = None, time.monotonic()
+        while time.monotonic() - since < args.far_wait:
+            lod = status().get('cube_lod') or {}
+            late = lod.get('late_refreshed')
+            if late != last:
+                last, steady = late, time.monotonic()
+            if lod.get('complete') and time.monotonic() - steady >= 10:
+                break
+            time.sleep(1)
+        print(f'{label}: far view complete={lod.get("complete")}, nodes redrawn for structures '
+              f'{last} after {time.monotonic() - since:.0f} s', flush=True)
+
     launch()
     if args.settings:
         ctl_run('quit')
@@ -86,11 +115,15 @@ def main():
         launch()
     try:
         ctl_run('command', 'gamemode spectator')
+        for command in args.command:
+            print(f'/{command}: {ctl_run("command", command, timeout=300)[:300]}', flush=True)
         for i, view in enumerate(args.view):
             x, y, z, yaw, pitch = (float(v) for v in view.split(','))
             ctl_run('tp', x, y, z)
             ctl_run('look', yaw, pitch)
             loaded(f'view {i} at {x:.0f} {y:.0f} {z:.0f}', time.monotonic())
+            if args.far_wait:
+                far_done(f'view {i}', time.monotonic())
             ctl_run('screenshot', scratch / f'view_{i}.png')
         for box in args.blocks:
             lo_hi = [int(v) for v in box.split(',')]

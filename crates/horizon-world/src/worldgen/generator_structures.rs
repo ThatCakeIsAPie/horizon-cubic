@@ -1205,4 +1205,59 @@ impl StructurePlanner {
     pub fn structure_name(&self, structure: usize) -> &str {
         &self.state.registry.structures[structure].name
     }
+
+    /// The chunks from `min` to `max` (inclusive) where a set may start a
+    /// structure, without building any start: each random spread's one
+    /// chunk per placement sector (for sets at least `min_spacing` chunks
+    /// apart; denser ones, mineshafts and buried treasure, are left out)
+    /// that passes its placement's frequency and exclusion, and the rings'
+    /// chunks. [`Self::starts_at`] says whether a structure starts there.
+    pub fn candidates(
+        &self,
+        context: &mut impl StartContext,
+        min: ChunkPos,
+        max: ChunkPos,
+        min_spacing: i32,
+    ) -> Vec<ChunkPos> {
+        let seed = context.seed();
+        let rings = self.state.rings(context).clone();
+        let mut out = std::collections::BTreeSet::new();
+        for &si in &self.state.possible_sets {
+            let set = &self.state.registry.sets[si];
+            match set.spacing() {
+                Some(spacing) if spacing >= min_spacing.max(1) => {
+                    let sectors = |lo: i32, hi: i32| {
+                        (lo.div_euclid(spacing)..=hi.div_euclid(spacing)).map(move |s| s * spacing)
+                    };
+                    for sx in sectors(min.x, max.x) {
+                        for sz in sectors(min.z, max.z) {
+                            let Some(c) = StructureRegistry::potential_chunk(set, seed, sx, sz)
+                            else {
+                                continue;
+                            };
+                            let inside =
+                                (min.x..=max.x).contains(&c.x) && (min.z..=max.z).contains(&c.z);
+                            if inside
+                                && self
+                                    .state
+                                    .registry
+                                    .is_structure_chunk(set, seed, c.x, c.z, &rings)
+                            {
+                                out.insert((c.x, c.z));
+                            }
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    for c in rings.get(&set.name).into_iter().flatten() {
+                        if (min.x..=max.x).contains(&c.x) && (min.z..=max.z).contains(&c.z) {
+                            out.insert((c.x, c.z));
+                        }
+                    }
+                }
+            }
+        }
+        out.into_iter().map(|(x, z)| ChunkPos::new(x, z)).collect()
+    }
 }
