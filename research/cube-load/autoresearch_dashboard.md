@@ -3,11 +3,11 @@
 | spec | cubes | baseline | best | change | min-delta |
 |---|---|---|---|---|---|
 | surface | `4,-4,8,1` | 0.7325 | **0.2517** | -65.6% | 4.1% |
-| sky | `4,20,32,1` | 0.2018 | **0.0157** | -92.2% | 6.5% |
+| sky | `4,20,32,1` | 0.2018 | **0.0130** | -93.6% | 6.5% |
 | deep | `4,-40,-28,1` | 0.2991 | **0.1262** | -57.8% | 3.0% |
 
-Iterations: 33; kept 20. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 23:05.
+Iterations: 34; kept 21. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 23:14.
 
 ## Hot spots
 
@@ -54,3 +54,4 @@ Updated 2026-11-06 23:05.
 | 24 | surface | keep | 0.2517 | -3.7% | PASS | a6eb67668 | measurement on iteration 24 code (surface best tracking; cumulative small gains since 19) |
 | 25 | surface | discard | 0.2453 | -2.5% | PASS | - | population functions generic over the world (PopRegion block/set_block inline instead of dyn calls): -2.5%, below min-delta; patch kept |
 | 26 | deep | discard | 0.1251 | -0.9% | PASS | - | JRandom as an inlined copy of the Java LCG (no cross-crate calls): deep -0.9%, surface -0.9%, sky -2%: below min-delta (and mostly a non-LTO profile effect) |
+| 27 | sky | keep | 0.0130 | -17.2% | PASS | d53a190fb | uniformity proven first from coarse octaves (wavelength >= 16; finer bounded by amplitude, gradient from all): first 0.0132, confirm 0.0130 (--tests); deep 0.1278, surface 0.2534 (noise) |
