@@ -420,10 +420,22 @@ impl Lattice {
             let z = cube[2] * 16 + k as i32 * sz;
             for i in 0..nx {
                 let x = cube[0] * 16 + i as i32 * sx;
-                let col = noise.column(x, z, blend.terrain_at(x, z), 0.0);
+                // Corners on a face are a neighbouring cube's too: the blend
+                // (one per terrain, so one noise) keeps them per thread.
+                let mut col = None;
                 for j in 0..ny {
                     let y = cube[1] * 16 + j as i32 * sy;
-                    values[(j * nz + k) * nx + i] = noise.density(x, y, z, &col, 0.0);
+                    values[(j * nz + k) * nx + i] = match blend.cached_corner((x, y, z)) {
+                        Some(v) => v,
+                        None => {
+                            let col = col.get_or_insert_with(|| {
+                                noise.column(x, z, blend.terrain_at(x, z), 0.0)
+                            });
+                            let v = noise.density(x, y, z, col, 0.0);
+                            blend.keep_corner((x, y, z), v);
+                            v
+                        }
+                    };
                 }
             }
         }
