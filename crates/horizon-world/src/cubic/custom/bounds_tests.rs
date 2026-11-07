@@ -341,8 +341,8 @@ fn proven_lattice_cells_match_the_chain() {
                     rng.range(-6, 10),
                     rng.range(-200, 200),
                 );
-                t.base_with(cube, &mut a, true);
-                t.base_with(cube, &mut b, false);
+                t.base_with(cube, &mut a, true, None);
+                t.base_with(cube, &mut b, false, None);
                 assert!(a[..] == b[..], "{name} {biome} {cube:?}");
                 cubes += 1;
             }

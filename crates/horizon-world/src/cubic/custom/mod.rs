@@ -49,6 +49,7 @@
 
 use std::sync::Arc;
 
+use horizon_core::density::Beardifier;
 use horizon_core::position::SectionPos;
 
 use crate::registry::BlockRegistry;
@@ -203,6 +204,45 @@ impl CustomCubicGenerator {
                 let first = out[0];
                 out.iter().all(|&b| b == first).then_some(first)
             }
+        }
+    }
+
+    /// [`Self::generate`] with the terrain adapted to the structures nearby
+    /// (vanilla's beardifier, `beard`: the ground filled under and cleared
+    /// over village houses, buried structures dug out). Away from the
+    /// beard's reach the blocks are exactly `generate`'s; see [`adapt`].
+    pub fn generate_adapted(
+        &self,
+        cube: SectionPos,
+        out: &mut [u32; 4096],
+        beard: Option<&Beardifier>,
+    ) -> Option<u32> {
+        let Some(beard) = beard else {
+            return self.generate(cube, out);
+        };
+        if let Some(g) = self.area(cube) {
+            return g.generate_adapted(cube, out, Some(beard));
+        }
+        match &self.kind {
+            Kind::Flat(f) => f.generate(cube, out),
+            Kind::Terrain(t) => {
+                t.generate_adapted(cube, out, beard);
+                let first = out[0];
+                out.iter().all(|&b| b == first).then_some(first)
+            }
+        }
+    }
+
+    /// [`Self::chunk_tops`] (`tops`, changed in place) for the terrain as
+    /// `beard` adapts it: the heights a structure's pieces see once the
+    /// ground is flattened (vanilla places them after the noise, beard
+    /// included). Columns the beard does not reach keep their top.
+    pub fn adapt_tops(&self, cx: i32, cz: i32, tops: &mut [i32; 256], beard: &Beardifier) {
+        if self.has_areas() {
+            return;
+        }
+        if let Kind::Terrain(t) = &self.kind {
+            t.adapt_tops(cx, cz, tops, beard);
         }
     }
 
@@ -533,6 +573,115 @@ impl<'a> ColumnProbe<'a> {
     }
 }
 
+/// Vanilla's final density per block of depth under the surface, near it:
+/// `0.64 * 0.5` (the `squeeze` around 0) times `4 * factor * 3 / 384`
+/// (`sloped_cheese`'s depth gradient, `factor` 4.5 as on plains).
+const SOLID_SLOPE: f64 = 0.045;
+/// The same above the surface (`quarter_negative`).
+const AIR_SLOPE: f64 = SOLID_SLOPE / 4.0;
+/// `squeeze` of 1: the most a vanilla final density can be, before noodles
+/// and the beard.
+const SQUEEZE_MAX: f64 = 11.0 / 24.0;
+
+/// A Custom Cubic density (blocks of depth under the surface, about)
+/// adapted by a vanilla beard value `beard`.
+///
+/// The beard is vanilla's density, added to a final density that has the
+/// scale above: `squeeze(0.64 * x)`, steep under the surface, shallow over
+/// it and saturating at [`SQUEEZE_MAX`]. So the density is mapped to that
+/// scale (linearly by side, saturating), the beard added, and the sum mapped
+/// back by the same slopes. The map keeps the sign, so the blocks change only
+/// where the beard turns it; with no beard the density is untouched (the
+/// callers skip the map, so the terrain away from structures is bit for bit
+/// the same).
+fn adapt(density: f64, beard: f32) -> f64 {
+    if beard == 0.0 {
+        return density;
+    }
+    let slope = |v: f64| if v > 0.0 { SOLID_SLOPE } else { AIR_SLOPE };
+    let vanilla = (density * slope(density)).clamp(-SQUEEZE_MAX, SQUEEZE_MAX) + f64::from(beard);
+    vanilla / slope(vanilla)
+}
+
+/// A beard's values over a cube's blocks and `side - 16` more on each axis
+/// (`y << 8 | z << 4 | x` order, but `side` wide).
+struct BeardGrid {
+    side: usize,
+    values: Vec<f32>,
+    /// The local box outside which every value is 0 (inclusive).
+    reach: ([usize; 3], [usize; 3]),
+}
+
+impl BeardGrid {
+    /// `None` when the beard is zero over the whole grid.
+    fn new(beard: &Beardifier, min: [i32; 3], side: usize) -> Option<Self> {
+        let n = side as i32 - 1;
+        let near = beard.restricted(min, min.map(|v| v + n))?;
+        let reach = near.reach()?;
+        let low: [usize; 3] =
+            std::array::from_fn(|i| (reach.minimum()[i] - min[i]).clamp(0, n) as usize);
+        let high: [usize; 3] =
+            std::array::from_fn(|i| (reach.maximum()[i] - min[i]).clamp(0, n) as usize);
+        let mut values = vec![0.0f32; side * side * side];
+        let mut any = false;
+        for y in low[1]..=high[1] {
+            for z in low[2]..=high[2] {
+                for x in low[0]..=high[0] {
+                    let v = near.sample([min[0] + x as i32, min[1] + y as i32, min[2] + z as i32]);
+                    any |= v != 0.0;
+                    values[(y * side + z) * side + x] = v;
+                }
+            }
+        }
+        any.then_some(Self {
+            side,
+            values,
+            reach: (low, high),
+        })
+    }
+
+    /// Whether the beard can be nonzero over the local blocks `low..=high`.
+    fn reaches(&self, low: [usize; 3], high: [usize; 3]) -> bool {
+        (0..3).all(|i| low[i] <= self.reach.1[i] && high[i] >= self.reach.0[i])
+    }
+
+    fn at(&self, x: usize, y: usize, z: usize) -> f32 {
+        self.values[(y * self.side + z) * self.side + x]
+    }
+
+    /// A block's density and gradient adapted: the density by [`adapt`],
+    /// each gradient as the difference to the next block's adapted density
+    /// (the trilinear field's next block is `density + gradient`, exactly
+    /// within its cell). Untouched where the beard is zero.
+    #[allow(clippy::too_many_arguments)]
+    fn adapt(
+        &self,
+        x: usize,
+        y: usize,
+        z: usize,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        density: f64,
+    ) -> (f64, f64, f64, f64) {
+        let b = self.at(x, y, z);
+        let (bx, by, bz) = (
+            self.at(x + 1, y, z),
+            self.at(x, y + 1, z),
+            self.at(x, y, z + 1),
+        );
+        let d = adapt(density, b);
+        let next = |g: f64, bn: f32| {
+            if b == 0.0 && bn == 0.0 {
+                g
+            } else {
+                adapt(density + g, bn) - d
+            }
+        };
+        (next(dx, bx), next(dy, by), next(dz, bz), d)
+    }
+}
+
 /// A column without a solid block ([`CustomCubicGenerator::chunk_tops`]).
 pub const NO_TOP: i32 = i32::MIN / 2;
 
@@ -578,13 +727,85 @@ impl Terrain {
     /// The cube's blocks from the density lattice and the replacers, before
     /// the carvers.
     fn base(&self, cube: SectionPos, out: &mut [u32; 4096]) {
-        self.base_with(cube, out, true);
+        self.base_with(cube, out, true, None);
+    }
+
+    /// `generate` with the terrain adapted by `beard` where it reaches the
+    /// cube (no uniformity proof for the cube or for the lattice cells the
+    /// beard reaches: the bounds do not know the beard).
+    fn generate_adapted(&self, cube: SectionPos, out: &mut [u32; 4096], beard: &Beardifier) {
+        let min = [cube.x * 16, cube.y * 16, cube.z * 16];
+        // The blocks' finite differences read one block past the cube.
+        let Some(grid) = BeardGrid::new(beard, min, 17) else {
+            return self.generate(cube, out);
+        };
+        self.base_with(cube, out, true, Some(&grid));
+        self.carvers.carve(cube, out);
+    }
+
+    /// `CustomCubicGenerator::adapt_tops`.
+    fn adapt_tops(&self, cx: i32, cz: i32, tops: &mut [i32; 256], beard: &Beardifier) {
+        let (x0, z0) = (cx * 16, cz * 16);
+        let Some(near) = beard.restricted(
+            [x0, crate::cubic::MIN_Y, z0],
+            [x0 + 15, crate::cubic::MAX_Y, z0 + 15],
+        ) else {
+            return;
+        };
+        let Some(reach) = near.reach() else {
+            return;
+        };
+        let (low, high) = (reach.minimum()[1] >> 4, reach.maximum()[1] >> 4);
+        // Columns whose top is above the reach keep it; the others are
+        // searched from the reach's top cube down.
+        let mut left: Vec<usize> = (0..256).filter(|&i| tops[i] < (high + 1) * 16).collect();
+        // Below the reach the beard adds nothing: a column whose old top is
+        // there keeps it; one the beard cleared down past the reach is
+        // searched a few cubes further (vanilla's beard reaches 12 blocks).
+        let floor = (low - 4).max(crate::cubic::MIN_Y >> 4);
+        for cy in (floor..=high).rev() {
+            if cy < low {
+                left.retain(|&i| tops[i] >= low * 16);
+            }
+            if left.is_empty() {
+                break;
+            }
+            let y0 = cy * 16;
+            let grid = BeardGrid::new(&near, [x0, y0, z0], 16);
+            let lattice = Lattice::for_cube(&self.noise, &self.blend, self.sizes, [cx, cy, cz]);
+            let mut found = [NO_TOP; 256];
+            lattice.for_each(|lx, ly, lz, _, _, _, density| {
+                let b = grid.as_ref().map_or(0.0, |g| g.at(lx, ly, lz));
+                if adapt(density, b) > 0.0 {
+                    let i = lz << 4 | lx;
+                    found[i] = found[i].max(y0 + ly as i32);
+                }
+            });
+            left.retain(|&i| {
+                let hit = found[i] != NO_TOP;
+                if hit {
+                    tops[i] = found[i];
+                }
+                !hit
+            });
+        }
+        for i in left {
+            if tops[i] >= low * 16 {
+                tops[i] = NO_TOP;
+            }
+        }
     }
 
     /// `base`; with `prove_cells`, a lattice cell whose corners and gradient
     /// let the replacer analysis prove one block is filled with it instead of
     /// running the chain for each of its blocks (the same blocks).
-    fn base_with(&self, cube: SectionPos, out: &mut [u32; 4096], prove_cells: bool) {
+    fn base_with(
+        &self,
+        cube: SectionPos,
+        out: &mut [u32; 4096],
+        prove_cells: bool,
+        beard: Option<&BeardGrid>,
+    ) {
         let lattice = Lattice::for_cube(
             &self.noise,
             &self.blend,
@@ -615,6 +836,13 @@ impl Terrain {
             for cj in 0..cy {
                 for ck in 0..cz {
                     for ci in 0..cx {
+                        // Cells the beard reaches (their blocks and the next
+                        // ones, for the gradient) take the chain.
+                        let lo = [ci * sx, cj * sy, ck * sz];
+                        let hi = [(ci + 1) * sx, (cj + 1) * sy, (ck + 1) * sz];
+                        if beard.is_some_and(|g| g.reaches(lo, hi)) {
+                            continue;
+                        }
                         let v = lattice.cell_corners(ci, cj, ck);
                         if v.iter().any(|d| !d.is_finite()) {
                             continue;
@@ -631,7 +859,7 @@ impl Terrain {
                         let pad = 1e-9 * (1.0 + lo.abs().max(hi.abs()));
                         let dy = lattice.cell_dy(ci, cj, ck);
                         let y0 = by + (cj * sy) as i32;
-                        let biome = &biomes[(ck * sz) << 4 | ci * sx];
+                        let biome = &biomes[((ck * sz) << 4) | (ci * sx)];
                         let facts = replacers::BoxFacts {
                             dmin: lo - pad,
                             dmax: hi + pad,
@@ -656,6 +884,10 @@ impl Terrain {
         let skip = |ci: usize, cj: usize, ck: usize| proven[(cj * cz + ck) * cx + ci];
         let mut memo = self.replacers.memo();
         lattice.for_each_except(skip, |lx, ly, lz, dx, dy, dz, density| {
+            let (dx, dy, dz, density) = match beard {
+                Some(g) => g.adapt(lx, ly, lz, dx, dy, dz, density),
+                None => (dx, dy, dz, density),
+            };
             let ctx = BlockCtx {
                 x: bx + lx as i32,
                 y: by + ly as i32,

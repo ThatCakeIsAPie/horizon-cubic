@@ -1205,4 +1205,15 @@ impl StructurePlanner {
     pub fn structure_name(&self, structure: usize) -> &str {
         &self.state.registry.structures[structure].name
     }
+
+    /// `Beardifier.forStructuresInChunk`: the terrain adaptation of the
+    /// starts `starts` (those whose box crosses chunk `chunk`) for that
+    /// chunk, or `None` when none of them adapts the terrain near it.
+    pub fn beardifier(
+        &self,
+        starts: &[Arc<StructureStart>],
+        chunk: ChunkPos,
+    ) -> Option<Beardifier> {
+        self.state.beardifier(starts, chunk)
+    }
 }

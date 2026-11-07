@@ -37,11 +37,18 @@
 //! the entities the pieces carry (villagers, guardians, a witch) go to the
 //! [`CubeWorld`].
 //!
+//! # Terrain adaptation
+//!
+//! Each structure's `terrain_adaptation` (beard_thin, beard_box, bury,
+//! encapsulate) and its jigsaw junctions shape the terrain as vanilla's
+//! beardifier does: [`CubicStructures::beard`] is a chunk's
+//! (`Beardifier.forStructuresInChunk`), which generation adds to the density
+//! ([`CustomCubicGenerator::generate_adapted`]). The starts are decided on the
+//! unadapted terrain, as vanilla's are; the pieces are placed on the adapted
+//! one ([`CubicStructures::placed_height`]).
+//!
 //! # Not done
 //!
-//! * Terrain adaptation (vanilla's beardifier): the terrain is not flattened
-//!   under villages and outposts or dug around buried structures; a house on
-//!   a slope may float at one side.
 //! * The far view shows no structures (as it shows no trees).
 //! * Starts and references are not on the level's chunks: `/locate`, maps
 //!   and structure mob spawns (witch huts, monuments, outposts) don't know
@@ -50,6 +57,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use horizon_core::density::Beardifier;
 use horizon_core::position::{BlockPos, ChunkPos, SectionPos};
 use horizon_core::random::{LegacyRandom, RandomSource};
 
@@ -110,7 +118,15 @@ pub struct CubicStructures {
     /// The starts over each cube column's areas (every cube of a column
     /// populates the same columns), by shard.
     areas: Box<[Mutex<HashMap<(i32, i32), AreaStarts>>]>,
+    /// Each chunk's terrain adaptation, by shard.
+    beards: Box<[Mutex<HashMap<(i32, i32), Beard>>]>,
+    /// Each chunk's column tops with the terrain adapted (chunks the beard
+    /// reaches only), by shard.
+    adapted: Box<[Mutex<HashMap<(i32, i32), Arc<[i32; 256]>>>]>,
 }
+
+/// A chunk's terrain adaptation (`None`: no structure adapts it).
+type Beard = Option<Arc<Beardifier>>;
 
 impl CubicStructures {
     /// The structures `settings` switch on, or `None` when the bundle has no
@@ -215,6 +231,8 @@ impl CubicStructures {
             biome_ids,
             tops: (0..SHARDS).map(|_| Mutex::default()).collect(),
             areas: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            beards: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            adapted: (0..SHARDS).map(|_| Mutex::default()).collect(),
         })
     }
 
@@ -281,26 +299,85 @@ impl CubicStructures {
     /// The topmost solid block of column (`x`, `z`), or [`NO_SURFACE`]
     /// (found a chunk at a time: [`CustomCubicGenerator::chunk_tops`]).
     pub fn column_top(&self, x: i32, z: i32) -> i32 {
-        let key = (x >> 4, z >> 4);
-        let i = ((z & 15) << 4 | (x & 15)) as usize;
+        self.chunk_tops((x >> 4, z >> 4))[((z & 15) << 4 | (x & 15)) as usize]
+    }
+
+    /// [`CustomCubicGenerator::chunk_tops`] of chunk `key`, kept.
+    fn chunk_tops(&self, key: (i32, i32)) -> Arc<[i32; 256]> {
         let shard = &self.tops[shard_of(key.0, key.1)];
         if let Some(tops) = shard.lock().unwrap().get(&key) {
-            return tops[i];
+            return tops.clone();
         }
         let found: Arc<[i32; 256]> = Arc::from(self.generator.chunk_tops(key.0, key.1));
-        let top = found[i];
         let mut tops = shard.lock().unwrap();
         if tops.len() >= TOPS_PER_SHARD {
             tops.clear();
         }
-        tops.insert(key, found);
+        tops.insert(key, found.clone());
+        found
+    }
+
+    /// Vanilla's terrain adaptation for chunk `chunk`
+    /// (`Beardifier.forStructuresInChunk` over the starts whose box crosses
+    /// it), the same for every cube of the chunk's column; `None` when no
+    /// structure adapts the terrain there. The starts are decided on the
+    /// unadapted terrain ([`Self::column_top`]), as vanilla's are.
+    pub fn beard(&self, chunk: ChunkPos) -> Option<Arc<Beardifier>> {
+        let key = (chunk.x, chunk.z);
+        let shard = &self.beards[shard_of(key.0, key.1)];
+        if let Some(found) = shard.lock().unwrap().get(&key) {
+            return found.clone();
+        }
+        let (x, z) = (chunk.x * 16, chunk.z * 16);
+        let starts: Vec<Arc<StructureStart>> = (self.planner)
+            .touching(&mut self.context(), [x, z], [x + 15, z + 15])
+            .into_iter()
+            .map(|(_, _, s)| s)
+            .collect();
+        let beard = self.planner.beardifier(&starts, chunk).map(Arc::new);
+        let mut beards = shard.lock().unwrap();
+        if beards.len() >= AREAS_PER_SHARD {
+            beards.clear();
+        }
+        beards.entry(key).or_insert(beard).clone()
+    }
+
+    /// The topmost solid block of column (`x`, `z`) once the structures
+    /// have adapted the terrain: the ground their pieces are placed on.
+    pub fn adapted_top(&self, x: i32, z: i32) -> i32 {
+        let key = (x >> 4, z >> 4);
+        let i = ((z & 15) << 4 | (x & 15)) as usize;
+        let Some(beard) = self.beard(ChunkPos::new(key.0, key.1)) else {
+            return self.column_top(x, z);
+        };
+        let shard = &self.adapted[shard_of(key.0, key.1)];
+        if let Some(tops) = shard.lock().unwrap().get(&key) {
+            return tops[i];
+        }
+        let mut tops = Box::new(*self.chunk_tops(key));
+        self.generator.adapt_tops(key.0, key.1, &mut tops, &beard);
+        let top = tops[i];
+        let mut adapted = shard.lock().unwrap();
+        if adapted.len() >= TOPS_PER_SHARD {
+            adapted.clear();
+        }
+        adapted.insert(key, Arc::from(tops));
         top
+    }
+
+    /// [`Self::height`] on the adapted terrain ([`Self::adapted_top`]): what
+    /// the pieces see when they are placed.
+    pub fn placed_height(&self, kind: HeightmapType, x: i32, z: i32) -> i32 {
+        self.height_of(kind, self.adapted_top(x, z))
     }
 
     /// Generation's heightmap `kind` at column (`x`, `z`): one above the
     /// highest block of its kind, the sea filling to sea level.
     pub fn height(&self, kind: HeightmapType, x: i32, z: i32) -> i32 {
-        let top = self.column_top(x, z);
+        self.height_of(kind, self.column_top(x, z))
+    }
+
+    fn height_of(&self, kind: HeightmapType, top: i32) -> i32 {
         let solid = if top == NO_SURFACE { MIN_Y } else { top + 1 };
         match kind {
             HeightmapType::OceanFloor | HeightmapType::OceanFloorWg => solid,
@@ -362,7 +439,8 @@ impl CubicStructures {
             s: self,
         };
         let mut ticks = Ticks::new(0);
-        let heights = |kind: HeightmapType, x: i32, z: i32| self.height(kind, x, z);
+        // Vanilla places the pieces after the noise: on the adapted ground.
+        let heights = |kind: HeightmapType, x: i32, z: i32| self.placed_height(kind, x, z);
         let resources = self.planner.resources().clone();
         for (step, index, start) in starts.iter() {
             let (step, index) = (*step, *index);

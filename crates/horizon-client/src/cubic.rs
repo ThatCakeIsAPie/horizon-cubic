@@ -39,7 +39,7 @@ use crate::cubic_gen::{
 use crate::save::{ChunkExtras, Persistent, SaveTables, decode_with, encode_with};
 use crate::streaming::{ChunkGenerator, Proto};
 use horizon_core::paletted::PalettedContainer;
-use horizon_core::position::SectionPos;
+use horizon_core::position::{ChunkPos, SectionPos};
 use horizon_core::ticks::SavedTick;
 use horizon_world::cubic::store::CubeStore;
 use horizon_world::cubic::{MAX_CUBE_Y, MIN_CUBE_Y};
@@ -866,7 +866,10 @@ impl CubicLevel {
         }
         let start = std::time::Instant::now();
         let mut values = Box::new([0u32; 4096]);
-        let uniform = self.wg.generator.generate(pos, &mut values);
+        // The terrain as the structures nearby adapt it (vanilla's beard).
+        let beard =
+            (self.wg.structures.as_ref()).and_then(|s| s.beard(ChunkPos::new(pos.x, pos.z)));
+        let uniform = (self.wg.generator).generate_adapted(pos, &mut values, beard.as_deref());
         let biomes = self.wg.biome_container(&self.biomes, pos.x, pos.z);
         let held = match (uniform, biomes.uniform()) {
             (Some(state), Some(biome)) => Held::Section({
@@ -3070,6 +3073,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&g.dir);
     }
 
+    /// Vanilla's terrain adaptation under a village (beard_thin): the
+    /// village nearest the origin, on a slope, gets ground under its rigid
+    /// pieces (a solid block one or two below each one's ground level, its
+    /// box's bottom plus its `ground_level_delta`) and air at that level
+    /// over most of their footprints, where the unadapted terrain leaves
+    /// holes and humps. Not every column: the beards of streets that step
+    /// down beside a house pull the ground down at its edge, as in vanilla
+    /// (the house's foundation covers it), and caves may open under it.
+    #[test]
+    fn villages_stand_on_adapted_ground() {
+        use horizon_world::worldgen::structure::jigsaw::Projection;
+        use horizon_world::worldgen::structure::start::Piece;
+        let Some(f) = Fixture::new("structure-ground") else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let level = f.level_with_data(CubicKind::Custom, String::new());
+        let structures = level.generation().structures.clone().expect("structures");
+        let generator = level.generation().generator.clone();
+        let starts = structures.touching([-1024, -1024], [1024, 1024]);
+        let village = (starts.into_iter())
+            .filter(|s| s.name.contains("village"))
+            .min_by_key(|s| {
+                let c = s.bounding_box.center();
+                i64::from(c[0]).pow(2) + i64::from(c[2]).pow(2)
+            })
+            .expect("a village within 1,024 blocks of the origin");
+        let air = f.assets.registry.default_state("minecraft:air").unwrap().0;
+        let mut cubes: HashMap<(SectionPos, bool), Box<[u32; 4096]>> = HashMap::new();
+        let mut block = |x: i32, y: i32, z: i32, adapted: bool| -> u32 {
+            let pos = SectionPos::new(x >> 4, y >> 4, z >> 4);
+            let cube = cubes.entry((pos, adapted)).or_insert_with(|| {
+                let mut out = Box::new([0u32; 4096]);
+                let beard = adapted
+                    .then(|| structures.beard(ChunkPos::new(pos.x, pos.z)))
+                    .flatten();
+                generator.generate_adapted(pos, &mut out, beard.as_deref());
+                out
+            });
+            cube[((y & 15) << 8 | (z & 15) << 4 | (x & 15)) as usize]
+        };
+        // Columns with ground under the piece, and with air at its ground
+        // level: unadapted, adapted.
+        let (mut columns, mut under, mut over) = (0, [0; 2], [0; 2]);
+        for piece in &village.pieces {
+            let Piece::Pool(pool) = piece else { continue };
+            if pool.element.projection() != Projection::Rigid {
+                continue;
+            }
+            let b = pool.bounding_box;
+            let ground = b.min[1] + pool.ground_level_delta;
+            for x in b.min[0]..=b.max[0] {
+                for z in b.min[2]..=b.max[2] {
+                    columns += 1;
+                    for (i, adapted) in [false, true].into_iter().enumerate() {
+                        // 1.12's surface replacer leaves the top block bare
+                        // where its depth noise is negative: one more down.
+                        let ground_under = block(x, ground - 1, z, adapted) != air
+                            || block(x, ground - 2, z, adapted) != air;
+                        under[i] += usize::from(ground_under);
+                        over[i] += usize::from(block(x, ground, z, adapted) == air);
+                    }
+                }
+            }
+        }
+        let c = village.bounding_box.center();
+        let percent = |n: usize| n * 100 / columns.max(1);
+        let report = format!(
+            "{} at {c:?}, {columns} columns: ground under {}% -> {}%, air at the ground level {}% -> {}%",
+            village.name,
+            percent(under[0]),
+            percent(under[1]),
+            percent(over[0]),
+            percent(over[1])
+        );
+        eprintln!("{report}");
+        assert!(columns > 0, "{report}: no rigid piece");
+        // Seed 1's snowy village: 78% -> 90% and 86% -> 100%. The rest are
+        // houses whose ground is a street's (`ground_level_delta` 0) beside
+        // streets stepping down, whose junctions' beards outweigh the
+        // house's at its edge.
+        assert!(
+            percent(under[1]) >= 88 && percent(over[1]) >= 97,
+            "{report}"
+        );
+        assert!(under[1] > under[0] && over[1] > over[0], "{report}");
+        drop(level);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
     /// With every structure switched off there are none.
     #[test]
     fn structures_switched_off_make_none() {
@@ -3232,11 +3325,20 @@ mod tests {
         } else {
             f.level_with(CubicKind::Custom, settings)
         };
+        // `HORIZON_CUBE_BENCH_AT`: "X,Z", the cube column the block of cubes
+        // is centred on (default the origin's).
+        let at: Vec<i32> = std::env::var("HORIZON_CUBE_BENCH_AT")
+            .map(|s| {
+                s.split(',')
+                    .map(|v| v.trim().parse().expect("HORIZON_CUBE_BENCH_AT: X,Z"))
+                    .collect()
+            })
+            .unwrap_or_else(|_| vec![0, 0]);
         let mut cubes = Vec::new();
         for y in y0..=y1 {
             for z in -r..=r {
                 for x in -r..=r {
-                    cubes.push(SectionPos::new(x, y, z));
+                    cubes.push(SectionPos::new(at[0] + x, y, at[1] + z));
                 }
             }
         }
