@@ -2,12 +2,12 @@
 
 | spec | cubes | baseline | best | change | min-delta |
 |---|---|---|---|---|---|
-| surface | `4,-4,8,1` | 0.7325 | **0.3075** | -58.0% | 4.1% |
+| surface | `4,-4,8,1` | 0.7325 | **0.2816** | -61.6% | 4.1% |
 | sky | `4,20,32,1` | 0.2018 | **0.0231** | -88.6% | 6.5% |
 | deep | `4,-40,-28,1` | 0.2991 | **0.1949** | -34.8% | 3.0% |
 
-Iterations: 19; kept 12. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 22:02.
+Iterations: 22; kept 13. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 22:19.
 
 ## Hot spots
 
@@ -40,3 +40,6 @@ Updated 2026-11-06 22:02.
 | 13 | deep | discard | 0.2164 | +3.1% | PASS | - | SphereRun of 8 spheres instead of 16: deep 0.2164, surface 0.3249: no gain |
 | 14 | deep | keep | 0.1949 | -7.1% | PASS | 92b5d4f42 | sphere runs rejected with local_box's exact box test (extent c+-r vs c0, c0+17): first 0.1985, confirm 0.1949 |
 | 14 | surface | keep | 0.3075 | -4.4% | PASS | 92b5d4f42 | same change: first 0.3077, confirm 0.3075 (--tests); sky 0.0226 |
+| 15 | surface | discard | 0.2960 | -3.7% | PASS | - | per-cube replacer plans (active replacers per biome, dead gradients dropped): -3.7%, below 4.1% min-delta; patch kept for a combined replacer change |
+| 16 | surface | discard | 0.2978 | -3.2% | PASS | - | lattice corner cache alone (per-thread, keyed by blend id): -3.2%, below min-delta |
+| 17 | surface | keep | 0.2816 | -8.4% | PASS | 24a5eb340 | corner cache + per-cube replacer plans together (both exact, each ~3-4% alone): first 0.2880, confirm 0.2816; generate 135 -> 122 us/cube. Deep 0.1994 / sky 0.0240 vs HEAD re-measured 0.1982 / 0.0228 (noise) |
