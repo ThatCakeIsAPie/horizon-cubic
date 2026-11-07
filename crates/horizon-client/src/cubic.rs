@@ -843,17 +843,18 @@ impl CubicLevel {
     }
 
     /// The generator's terrain for cube `pos` (before population), uniform
-    /// cubes shared, with the biomes of the biome source.
-    fn generate(&self, pos: SectionPos) -> Arc<Section> {
+    /// cubes shared, with the biomes of the biome source. A mixed cube is
+    /// kept as its blocks, made into a section when one is asked for.
+    fn generate(&self, pos: SectionPos) -> Held {
         if !horizon_world::cubic::has_cube(pos) {
-            return self.air.get_or_init(Default::default).clone();
+            return Held::Section(self.air.get_or_init(Default::default).clone());
         }
         let start = std::time::Instant::now();
         let mut values = Box::new([0u32; 4096]);
         let uniform = self.wg.generator.generate(pos, &mut values);
         let biomes = self.wg.biome_container(&self.biomes, pos.x, pos.z);
-        let section = match (uniform, biomes.uniform()) {
-            (Some(state), Some(biome)) => {
+        let held = match (uniform, biomes.uniform()) {
+            (Some(state), Some(biome)) => Held::Section({
                 let mut shared = self.uniform.lock().unwrap();
                 shared
                     .entry((state, biome as u16))
@@ -865,21 +866,13 @@ impl CubicLevel {
                         })
                     })
                     .clone()
-            }
-            (Some(state), None) => Arc::new(Section {
+            }),
+            (Some(state), None) => Held::Section(Arc::new(Section {
                 blocks: PalettedContainer::new(block_strategy(), state),
                 biomes,
                 ..Section::default()
-            }),
-            (None, _) => {
-                let mut section = Section {
-                    blocks: Section::from_blocks(&values),
-                    biomes,
-                    ..Section::default()
-                };
-                section.compact();
-                Arc::new(section)
-            }
+            })),
+            (None, _) => Held::blocks(values, biomes),
         };
         self.pop
             .generated
@@ -888,7 +881,7 @@ impl CubicLevel {
             start.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        section
+        held
     }
 
     /// Cube `pos` as terrain, with whatever population wrote into it so far:
@@ -914,7 +907,7 @@ impl CubicLevel {
                 return (held, true);
             }
         }
-        let held = Held::Section(self.generate(pos));
+        let held = self.generate(pos);
         self.pop.keep(pos, held.clone());
         (held, false)
     }
