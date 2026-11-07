@@ -1549,6 +1549,9 @@ impl Game<'_> {
                 })
             });
         status["pending_uploads"] = self.pending_uploads.len().into();
+        // Near terrain in flight: generating, lighting or waiting for its meshes
+        // (`Streaming::terrain_loading`; tools/cubic_far_bench.py's near fill).
+        status["terrain_loading"] = self.streaming.terrain_loading().into();
         status["destroying"] = json!(destroying);
         status["physical_keys"] = json!(physical_keys);
         status["heard"] = json!(self.audio.heard);

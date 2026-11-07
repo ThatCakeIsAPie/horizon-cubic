@@ -103,12 +103,24 @@ def main():
 
     peak = {'arena': 0, 'pool': 0, 'tiles': 0}
 
+    near = {}
+
     def wait_fill(label, since, moved=True):
         """Seconds from `since` until the far terrain is first covered, and until it is complete again,
-        with the fps seen meanwhile. Without `moved`, a plan already complete counts after a second."""
+        with the fps seen meanwhile. Without `moved`, a plan already complete counts after a second.
+        Also notes in `near[label]` when the near terrain was in: `terrain_loading` seen true, then false
+        for a second (the time it went false)."""
         fps, last, cover = [], {}, None
+        loading_seen, quiet_since = False, None
         while time.monotonic() - since < args.timeout:
             s = status()
+            if s.get('terrain_loading') is not None and label not in near:
+                if s['terrain_loading']:
+                    loading_seen, quiet_since = True, None
+                elif loading_seen:
+                    quiet_since = quiet_since or time.monotonic()
+                    if time.monotonic() - quiet_since >= 1.0:
+                        near[label] = quiet_since - since
             lod = s.get('cube_lod') or {}
             if s.get('fps') is not None:
                 fps.append(float(s['fps']))
@@ -140,6 +152,21 @@ def main():
         print(f'{label}: timed out after {args.timeout}s: {json.dumps(last)}', flush=True)
         return None, cover, fps, last
 
+    def wait_near(label, since):
+        """Waits on for the near terrain when the far terrain was complete first (see `wait_fill`)."""
+        loading_seen, quiet_since = True, None
+        while label not in near and time.monotonic() - since < args.timeout:
+            s = status()
+            if s.get('terrain_loading') is None:
+                return
+            if s['terrain_loading']:
+                quiet_since = None
+            else:
+                quiet_since = quiet_since or time.monotonic()
+                if time.monotonic() - quiet_since >= 1.0:
+                    near[label] = quiet_since - since
+            time.sleep(0.1)
+
     out = ctl_run('launch', '--game', game, '--world', 'FarBench', '--seed', args.seed, '--creative',
                   '--offscreen', '--wait', '--cubic', '--resources', args.resources, '--game-dir', game_dir,
                   '--width', args.width, '--height', args.height, timeout=600)
@@ -150,6 +177,7 @@ def main():
         ctl_run('look', 0, 20)
         t0 = time.monotonic()
         spawn, spawn_cover, fps_all, lod = wait_fill('spawn', t0)
+        wait_near('spawn', t0)
         result['spawn_fill_s'] = spawn
         result['spawn_cover_s'] = spawn_cover
         hops, covers = [], []
@@ -158,12 +186,16 @@ def main():
             ctl_run('tp', x, args.y, 0)
             t = time.monotonic()
             fill, cover, fps, lod = wait_fill(f'hop {i + 1} (x {x})', t)
+            wait_near(f'hop {i + 1} (x {x})', t)
+            if f'hop {i + 1} (x {x})' in near:
+                print(f'hop {i + 1}: near terrain in after {near[f"hop {i + 1} (x {x})"]:.2f}s', flush=True)
             fps_all += fps
             hops.append(fill)
             covers.append(cover)
             ctl_run('screenshot', scratch / f'hop{i + 1}.png')
         result['hops'] = hops
         result['covers'] = covers
+        result['near'] = [near.get(k) for k in sorted(near, key=lambda k: (k != 'spawn', k))]
         good = [h for h in hops if h is not None]
         result['far_fill_s'] = statistics.mean(good) if len(good) == len(hops) and good else None
         good = [c for c in covers if c is not None]
