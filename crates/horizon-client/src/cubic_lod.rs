@@ -86,6 +86,9 @@ pub struct CubicLodSampler {
     grids: VecDeque<((u8, i32, i32), Arc<Vec<Column>>)>,
     /// The level's kept nodes, shared by every sampler and the saves.
     cache: Option<Arc<CubeLodCache>>,
+    /// Writes kept nodes (and the parents they complete) on a thread of its
+    /// own, shared by every fork: see [`Keeper`].
+    keeper: Option<Arc<Keeper>>,
     /// How far this sampler has read the cache's changes.
     cursor: u64,
     /// Levels 2 and up outside a Hybrid band: the GPU sampler (or its CPU
@@ -273,6 +276,13 @@ impl CubicLodSampler {
             fluids: vec![id("minecraft:water"), id("minecraft:lava")],
             grids: VecDeque::new(),
             cursor: cache.as_ref().map_or(0, |c| c.cursor()),
+            keeper: cache.as_ref().and_then(|c| {
+                Keeper::start(
+                    c.clone(),
+                    id("minecraft:air"),
+                    vec![id("minecraft:water"), id("minecraft:lava")],
+                )
+            }),
             cache,
             far,
             far_setup,
@@ -532,7 +542,14 @@ impl CubicLodSampler {
     /// `since` (the cache's cursor when the node's building started).
     fn keep(&mut self, node: &CubeNode, since: u64) {
         let started = std::time::Instant::now();
-        self.keep_timed(node, since);
+        // On the keeper's thread when it has room; here otherwise.
+        let queued = self
+            .keeper
+            .as_ref()
+            .is_some_and(|k| k.queue(node.clone(), since));
+        if !queued {
+            self.keep_timed(node, since);
+        }
         if crate::lod::cube::profile::on() {
             crate::lod::cube::profile::add(&crate::lod::cube::profile::S_KEEP, started);
         }
@@ -573,6 +590,88 @@ impl CubicLodSampler {
             cache.put(&node);
         }
         Some(node)
+    }
+}
+
+/// The cache writes of [`CubicLodSampler::keep`] on a thread of their own: a
+/// node, then each parent it completes (read back from its eight children,
+/// downsampled and stored). They took the far workers 2 to 13 s of every 40
+/// in a fill after a teleport (research/far-fill); nothing they write is
+/// needed for the nodes being made, only by later lookups. A full queue
+/// (`QUEUE`) sends the write back to the worker, as it was.
+pub struct Keeper {
+    tx: std::sync::Mutex<std::sync::mpsc::SyncSender<(CubeNode, u64)>>,
+}
+
+impl Keeper {
+    const QUEUE: usize = 1024;
+
+    fn start(cache: Arc<CubeLodCache>, air: u32, fluids: Vec<u32>) -> Option<Arc<Self>> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(CubeNode, u64)>(Self::QUEUE);
+        std::thread::Builder::new()
+            .name("Cube far keeper".into())
+            .spawn(move || {
+                horizon_threads::behind_server();
+                horizon_threads::far_terrain_current();
+                let kind = |state: BlockStateId| {
+                    if state.0 == air {
+                        Kind::Air
+                    } else if fluids.contains(&state.0) {
+                        Kind::Fluid
+                    } else {
+                        Kind::Solid
+                    }
+                };
+                while let Ok((node, since)) = rx.recv() {
+                    keep_into(&cache, air, &kind, &node, since);
+                }
+            })
+            .ok()?;
+        Some(Arc::new(Self {
+            tx: std::sync::Mutex::new(tx),
+        }))
+    }
+
+    /// Hands `node` to the thread: false when its queue is full.
+    fn queue(&self, node: CubeNode, since: u64) -> bool {
+        self.tx
+            .lock()
+            .is_ok_and(|tx| tx.try_send((node, since)).is_ok())
+    }
+}
+
+/// [`CubicLodSampler::keep`]'s work: stores `node` and each parent it now
+/// completes, unless a cube under one was saved since `since`.
+fn keep_into(
+    cache: &CubeLodCache,
+    air: u32,
+    kind: &impl Fn(BlockStateId) -> Kind,
+    node: &CubeNode,
+    since: u64,
+) {
+    if !unchanged(cache, node.key, since) {
+        return;
+    }
+    cache.put(node);
+    let mut key = node.key;
+    while key.level < MAX_CACHED_LEVEL {
+        let parent = key.parent();
+        if cache.contains(parent) || parent.level < 2 {
+            break;
+        }
+        let mut nodes = Vec::with_capacity(8);
+        for child in parent.children() {
+            match cache.get(child) {
+                Some(n) => nodes.push(n),
+                None => return,
+            }
+        }
+        let refs: [&CubeNode; 8] = std::array::from_fn(|i| &nodes[i]);
+        let built = downsample(refs, BlockStateId(air), kind);
+        if unchanged(cache, parent, since) {
+            cache.put(&built);
+        }
+        key = parent;
     }
 }
 
@@ -762,6 +861,7 @@ impl CubeSampler for CubicLodSampler {
             grids: VecDeque::new(),
             cursor: self.cache.as_ref().map_or(0, |c| c.cursor()),
             cache: self.cache.clone(),
+            keeper: self.keeper.clone(),
             far: match &self.far {
                 Some(far) => Some(far.fork()?),
                 None => None,
