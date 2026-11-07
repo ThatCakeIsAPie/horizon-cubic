@@ -46,9 +46,56 @@ struct Sphere {
     rv: f64,
 }
 
+/// Spheres per [`SphereRun`].
+const RUN: usize = 16;
+
+/// The bounds of a run of `RUN` consecutive spheres of a walk: a cube that
+/// `local_box` would reject for each sphere is rejected for the run at once.
+#[derive(Clone, Copy, Debug)]
+struct SphereRun {
+    min: [f64; 3],
+    max: [f64; 3],
+    rh: f64,
+    rv: f64,
+}
+
+impl SphereRun {
+    fn of(spheres: &[Sphere]) -> Self {
+        let mut r = Self {
+            min: [f64::MAX; 3],
+            max: [f64::MIN; 3],
+            rh: 0.0,
+            rv: 0.0,
+        };
+        for s in spheres {
+            for (i, v) in [s.x, s.y, s.z].into_iter().enumerate() {
+                r.min[i] = r.min[i].min(v);
+                r.max[i] = r.max[i].max(v);
+            }
+            r.rh = r.rh.max(s.rh);
+            r.rv = r.rv.max(s.rv);
+        }
+        r
+    }
+
+    /// Whether `local_box` rejects every sphere of the run for the cube
+    /// centred on `c`: the same tests, with the run's extremes (each bound
+    /// only moves away from the cube as a sphere's radius shrinks).
+    fn misses(&self, c: [f64; 3]) -> bool {
+        self.max[0] < c[0] - 16.0 - self.rh * 2.0
+            || self.max[1] < c[1] - 16.0 - self.rv * 2.0
+            || self.max[2] < c[2] - 16.0 - self.rh * 2.0
+            || self.min[0] > c[0] + 16.0 + self.rh * 2.0
+            || self.min[1] > c[1] + 16.0 + self.rv * 2.0
+            || self.min[2] > c[2] + 16.0 + self.rh * 2.0
+    }
+}
+
 /// Everything one origin cube carves.
 struct Walks {
     spheres: Vec<Sphere>,
+    /// Bounds of `spheres` by runs of `RUN`.
+    runs: Vec<SphereRun>,
     min: [f64; 3],
     max: [f64; 3],
     max_r: f64,
@@ -69,8 +116,10 @@ impl Walks {
             }
             max_r = max_r.max(s.rh).max(s.rv);
         }
+        let runs = spheres.chunks(RUN).map(SphereRun::of).collect();
         Self {
             spheres,
+            runs,
             min,
             max,
             max_r,
@@ -82,6 +131,16 @@ impl Walks {
     fn may_reach(&self, centre: [f64; 3]) -> bool {
         let m = 16.0 + 2.0 * self.max_r;
         (0..3).all(|i| centre[i] >= self.min[i] - m && centre[i] <= self.max[i] + m)
+    }
+
+    /// The spheres that may touch the cube centred on `c`, in walk order:
+    /// the runs whose bounds reach it.
+    fn near(&self, c: [f64; 3]) -> impl Iterator<Item = &Sphere> {
+        self.runs
+            .iter()
+            .zip(self.spheres.chunks(RUN))
+            .filter(move |(run, _)| !run.misses(c))
+            .flat_map(|(_, spheres)| spheres)
     }
 }
 
@@ -589,7 +648,7 @@ impl CaveCarver {
             if !w.may_reach(c) {
                 continue;
             }
-            for s in &w.spheres {
+            for s in w.near(c) {
                 self.carve_sphere(cube, out, s, lava);
             }
         }
@@ -732,7 +791,7 @@ impl RavineCarver {
             if !w.may_reach(c) {
                 continue;
             }
-            for s in &w.spheres {
+            for s in w.near(c) {
                 self.carve_sphere(cube, out, s, &w);
             }
         }
