@@ -9,8 +9,9 @@
 //! Speed: a walk is simulated once per origin cube and kept as the list of
 //! spheres it carves (the walk itself does not depend on the cube being
 //! generated; CWG's "this cube is unreachable, stop" early exit only skips
-//! work). The lists live in a sharded, bounded cache; a cube then only tests
-//! the spheres of the origins whose walk bounding box reaches it. Lava on the
+//! work). The lists live with their 8 x 8 x 8 region of origins (sharded,
+//! bounded); a cube then only tests the spheres of the origins whose walk
+//! bounding box reaches it. Lava on the
 //! walls of a sphere's box stops caves, water stops ravines, as in CWG.
 //!
 //! Differences from CWG: angles use `libm` so results match across
@@ -21,7 +22,7 @@
 //! CubicChunks' own helper was not read.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use horizon_core::position::SectionPos;
 
@@ -34,7 +35,6 @@ use crate::registry::BlockRegistry;
 pub const RANGE: i32 = 8;
 
 const SHARDS: usize = 16;
-const SHARD_LIMIT: usize = 2048;
 
 /// A set of block states, tested with one bit lookup.
 #[derive(Clone, Debug)]
@@ -186,44 +186,20 @@ impl std::hash::Hasher for PosHasher {
 
 type PosMap<V> = HashMap<[i32; 3], V, std::hash::BuildHasherDefault<PosHasher>>;
 
-#[derive(Default)]
-struct Cache {
-    shards: [Mutex<PosMap<Option<Arc<Walks>>>>; SHARDS],
-}
-
-impl Cache {
-    /// Origin `key`'s walks (made by `make` the first time) when they may
-    /// reach the cube centred on `c`.
-    fn reaching(
-        &self,
-        key: [i32; 3],
-        c: [f64; 3],
-        make: impl FnOnce() -> Option<Walks>,
-    ) -> Option<Arc<Walks>> {
-        let h = (key[0].wrapping_mul(73856093)
-            ^ key[1].wrapping_mul(19349663)
-            ^ key[2].wrapping_mul(83492791)) as u32 as usize;
-        let shard = &self.shards[h % SHARDS];
-        if let Some(v) = shard.lock().unwrap().get(&key) {
-            return v.as_ref().filter(|w| w.may_reach(c)).cloned();
-        }
-        let v = make().map(Arc::new);
-        let mut map = shard.lock().unwrap();
-        if map.len() >= SHARD_LIMIT {
-            map.clear();
-        }
-        map.insert(key, v.clone());
-        v.filter(|w| w.may_reach(c))
-    }
-}
-
 /// The origins of one 8 x 8 x 8 region whose activity draw hits, in `z`,
-/// `y`, `x` order, and where each (`z`, `y`) row of them starts.
+/// `y`, `x` order, where each (`z`, `y`) row of them starts, and each one's
+/// walks once a cube has asked for them.
 struct Region {
     origins: Box<[[i32; 3]]>,
+    walks: Box<[OnceLock<Option<Walks>>]>,
     /// `rows[z * 8 + y]..rows[z * 8 + y + 1]` (local `z`, `y`).
     rows: [u16; 65],
 }
+
+/// Regions kept per shard. One holds about `512 / rarity` walks (about 37
+/// for the overworld caves), so the walks kept stay near the 2,048 per shard
+/// a cache of walks held.
+const REGION_LIMIT: usize = 64;
 
 /// Which origin cubes of 8 x 8 x 8 have a walk (the activity draw only
 /// depends on the origin), so that a cube does not draw for all of its
@@ -269,15 +245,15 @@ impl ActiveOrigins {
         }
         rows[64] = list.len() as u16;
         let v = Arc::new(Region {
+            walks: list.iter().map(|_| OnceLock::new()).collect(),
             origins: list.into(),
             rows,
         });
         let mut map = shard.lock().unwrap();
-        if map.len() >= SHARD_LIMIT {
+        if map.len() >= REGION_LIMIT {
             map.clear();
         }
-        map.insert(key, v.clone());
-        v
+        map.entry(key).or_insert(v).clone()
     }
 
     /// Calls `visit` with the origins within `RANGE` cubes of `cube` whose
@@ -289,7 +265,7 @@ impl ActiveOrigins {
         seeds: &OriginSeeds,
         rarity: i32,
         y_ok: impl Fn(i32) -> bool,
-        mut visit: impl FnMut([i32; 3]),
+        mut visit: impl FnMut([i32; 3], &OnceLock<Option<Walks>>),
     ) {
         let lo = [cube.x - RANGE, cube.y - RANGE, cube.z - RANGE];
         let hi = [cube.x + RANGE, cube.y + RANGE, cube.z + RANGE];
@@ -317,9 +293,10 @@ impl ActiveOrigins {
                         .as_ref()
                         .expect("every region in range");
                     let run = region.rows[row] as usize..region.rows[row + 1] as usize;
-                    for &o in &region.origins[run] {
+                    for i in run {
+                        let o = region.origins[i];
                         if o[0] >= lo[0] && o[0] <= hi[0] {
-                            visit(o);
+                            visit(o, &region.walks[i]);
                         }
                     }
                 }
@@ -364,7 +341,6 @@ struct CaveCarver {
     dirt: u32,
     grass: u32,
     seeds: OriginSeeds,
-    cache: Cache,
     active: ActiveOrigins,
 }
 
@@ -375,7 +351,6 @@ struct RavineCarver {
     lava: u32,
     water: u32,
     seeds: OriginSeeds,
-    cache: Cache,
     active: ActiveOrigins,
 }
 
@@ -416,7 +391,6 @@ impl Carvers {
                 dirt,
                 grass,
                 seeds: OriginSeeds::new(world_seed, 0x6361_7665 + i as i64),
-                cache: Cache::default(),
                 active: ActiveOrigins::default(),
                 cfg: cfg.clone(),
             });
@@ -433,7 +407,6 @@ impl Carvers {
                 lava,
                 water,
                 seeds: OriginSeeds::new(world_seed, 0x7261_7669),
-                cache: Cache::default(),
                 active: ActiveOrigins::default(),
             })
         } else {
@@ -752,8 +725,10 @@ impl CaveCarver {
             &self.seeds,
             self.cfg.cave_rarity,
             |y| y >= min && y <= max,
-            |o| {
-                if let Some(w) = self.cache.reaching(o, c, || self.walks(o)) {
+            |o, walks| {
+                if let Some(w) = walks.get_or_init(|| self.walks(o))
+                    && w.may_reach(c)
+                {
                     for s in w.near(lowest(cube)) {
                         self.carve_sphere(cube, out, s, lava, &mut walls);
                     }
@@ -911,8 +886,10 @@ impl RavineCarver {
             &self.seeds,
             RAVINE_RARITY,
             |y| y <= max,
-            |o| {
-                if let Some(w) = self.cache.reaching(o, c, || self.walk(o)) {
+            |o, walks| {
+                if let Some(w) = walks.get_or_init(|| self.walk(o))
+                    && w.may_reach(c)
+                {
                     for s in w.near(lowest(cube)) {
                         self.carve_sphere(cube, out, s, &w, &mut walls);
                     }
