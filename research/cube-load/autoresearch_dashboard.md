@@ -2,12 +2,12 @@
 
 | spec | cubes | baseline | best | change | min-delta |
 |---|---|---|---|---|---|
-| surface | `4,-4,8,1` | 0.7325 | **0.3786** | -48.3% | 4.1% |
+| surface | `4,-4,8,1` | 0.7325 | **0.3217** | -56.1% | 4.1% |
 | sky | `4,20,32,1` | 0.2018 | **0.0231** | -88.6% | 6.5% |
 | deep | `4,-40,-28,1` | 0.2991 | **0.2099** | -29.8% | 3.0% |
 
-Iterations: 15; kept 9. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 21:46.
+Iterations: 16; kept 10. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 21:57.
 
 ## Hot spots
 
@@ -36,3 +36,4 @@ Updated 2026-11-06 21:46.
 | 9 | surface | keep | 0.4032 | -10.4% | PASS | d162110b5 | replacer filters (densityRange, randomYGradient) as small Vec instead of HashSet: first 0.4136, confirm 0.4032. Deep 0.2139/0.2149 vs previous commit re-measured 0.2133 (drift), sky 0.0231 |
 | 10 | surface | discard | 0.3975 | -1.4% | PASS | - | per-cube memo of surface/mesa column depth noise: -1.4%, below min-delta |
 | 11 | surface | keep | 0.3786 | -6.1% | PASS | faac3ad72 | ore/spring block sets and blockMatch ids as small Vec instead of HashSet, deepslate test once: first 0.3862, confirm 0.3786; deep 0.2119 |
+| 12 | surface | keep | 0.3217 | -15.0% | PASS | eb7f9e2a2 | population cache holds changed cubes as block arrays; section built once on demand (record encode / read_cube / terrain view): first 0.3201, confirm 0.3217. Disk records verified identical. Deep 0.2088, sky 0.0230 |
