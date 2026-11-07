@@ -2,12 +2,12 @@
 
 | spec | cubes | baseline | best | change | min-delta |
 |---|---|---|---|---|---|
-| surface | `4,-4,8,1` | 0.7325 | **0.2480** | -66.1% | 4.1% |
+| surface | `4,-4,8,1` | 0.7325 | **0.2228** | -69.6% | 4.1% |
 | sky | `4,20,32,1` | 0.2018 | **0.0130** | -93.6% | 6.5% |
 | deep | `4,-40,-28,1` | 0.2991 | **0.1220** | -59.2% | 3.0% |
 
-Iterations: 40; kept 23. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 23:35.
+Iterations: 42; kept 24. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 23:46.
 
 ## Hot spots
 
@@ -61,3 +61,5 @@ Updated 2026-11-06 23:35.
 | 31 | deep | discard | 0.1271 | +0.7% | PASS | - | libm sincosf for the walkers' and veins' sin/cos pairs (verified bit-identical to sinf/cosf over all 2^32 f32): deep 0.1271, surface 0.2521: no gain, walk simulation is not trig-bound |
 | 32 | deep | keep | 0.1220 | -3.3% | PASS | 39d90d758 | walks held per region in OnceLocks (no per-origin mutex/hash; region limit 64/shard): first 0.1212, confirm 0.1220 (--tests); surface 0.2480, sky 0.0130 |
 | 32 | surface | keep | 0.2480 | -1.5% | PASS | 39d90d758 | measurement on iteration 32 code |
+| 33 | sky | discard | 0.0125 | -3.8% | PASS | - | bounds' 25 terrain corners and 16 biomes looked up in one thread-local access: sky -3.8%, deep -1.3%: below min-delta |
+| 34 | surface | keep | 0.2228 | -10.2% | PASS | 06ee2ebd1 | per-cell proofs: lattice cells on one side of the surface get possible_blocks from their exact corners/edge gradient/biome; proven cells filled, chain skipped. New test vs unskipped chain. First 0.2295, confirm 0.2228; deep 0.1190, sky 0.0128 |
