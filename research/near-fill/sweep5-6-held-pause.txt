@@ -1,0 +1,8 @@
+control | near [8.15, 6.21, 6.08] median 6.21 | far [14.2, 14.1, 14.5] | spawn near 3.49
+HORIZON_FAR_WORKERS_NEAR=1 HORIZON_FAR_NEAR_HOLD_MS=1500 | near [5.27, 3.77, 5.18] median 5.18 | far [14.8, 14.3, 14.8] | spawn near 2.6
+control | near [5.43, 5.35, 4.1] median 5.35 | far [13.2, 12.8, 10.9] | spawn near 3.73
+HORIZON_FAR_WORKERS_NEAR=1 HORIZON_FAR_NEAR_HOLD_MS=1500 | near [3.65, 4.08, 3.77] median 3.77 | far [14.0, 15.0, 13.6] | spawn near 3.41
+HORIZON_FAR_WORKERS_NEAR=1 HORIZON_FAR_NEAR_HOLD_MS=1500 | near [4.43, 4.35, 4.26] median 4.35 | far [12.9, 15.0, 15.8] | spawn near 2.79
+control | near [4.63, 4.91, 5.26] median 4.91 | far [12.6, 13.7, 11.3] | spawn near 3.26
+HORIZON_FAR_WORKERS_NEAR=1 HORIZON_FAR_NEAR_HOLD_MS=1500 | near [3.75, 4.28, 3.54] median 3.75 | far [13.1, 14.8, 12.0] | spawn near 2.11
+control | near [5.37, 4.94, 3.91] median 4.94 | far [13.6, 14.1, 13.7] | spawn near 3.51

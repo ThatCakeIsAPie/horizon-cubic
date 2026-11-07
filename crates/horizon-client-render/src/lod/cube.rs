@@ -1905,6 +1905,8 @@ impl Shared {
             descent_wake: Condvar::new(),
             classes_dirty: AtomicBool::new(false),
             near_loading: AtomicBool::new(false),
+            near_seen_ms: std::sync::atomic::AtomicU64::new(0),
+            near_epoch: Instant::now(),
             planner: Mutex::default(),
             planner_wake: Condvar::new(),
         }
@@ -1946,6 +1948,10 @@ struct Shared {
     /// The near terrain is loading: the workers step behind it
     /// (`CubeLod::set_near_loading`).
     near_loading: AtomicBool,
+    /// When it last was (ms since `near_epoch`): `terrain_loading` flickers
+    /// off between the batches of columns arriving.
+    near_seen_ms: std::sync::atomic::AtomicU64,
+    near_epoch: Instant,
 }
 
 // ---------------------------------------------------------------- planner
@@ -2514,12 +2520,12 @@ impl CubeLod {
                     .expect("spawn the cube planner thread"),
             );
         }
-        threads.extend(samplers.into_iter().map(|sampler| {
+        threads.extend(samplers.into_iter().enumerate().map(|(index, sampler)| {
             let (shared, tx, context) = (shared.clone(), tx.clone(), context.clone());
             let backend = backend.clone();
             thread::Builder::new()
                 .name("Cube far terrain".into())
-                .spawn(move || work(shared, tx, context, sampler, air, backend))
+                .spawn(move || work(index, shared, tx, context, sampler, air, backend))
                 .expect("spawn a cube far terrain thread")
         }));
         let mut lod = Self::assemble(shared, results, threads, backend, Some(context), air);
@@ -2604,6 +2610,10 @@ impl CubeLod {
     /// meanwhile and come back to normal priority once it is in.
     pub fn set_near_loading(&self, loading: bool) {
         self.shared.near_loading.store(loading, Ordering::Relaxed);
+        if loading {
+            let ms = self.shared.near_epoch.elapsed().as_millis() as u64;
+            self.shared.near_seen_ms.store(ms, Ordering::Relaxed);
+        }
     }
 
     /// The renderer's GPU far terrain counters (`Renderer::cube_far_stats`),
@@ -3974,6 +3984,7 @@ fn classifier(context: &WorkerContext, air: BlockStateId) -> impl Fn(BlockStateI
 }
 
 fn work(
+    index: usize,
     shared: Arc<Shared>,
     tx: mpsc::Sender<Done>,
     context: Arc<WorkerContext>,
@@ -4009,6 +4020,24 @@ fn work(
             if loading != behind {
                 horizon_threads::far_terrain_behind(loading);
                 behind = loading;
+            }
+            // While the near terrain loads, and for `NEAR_HOLD` after (its
+            // `terrain_loading` flickers off between the batches of columns
+            // arriving), only the first `WORKERS_NEAR` workers go on; the others
+            // wait for it to be in. The near terrain is what the player stands
+            // in: after a teleport to the surface it was in 21% sooner (4.17 s
+            // against 5.31, 12 hops each), the far view complete 0.9 s later
+            // (research/near-fill). HORIZON_FAR_WORKERS_NEAR / _NEAR_HOLD_MS.
+            let hold = far_knob("HORIZON_FAR_NEAR_HOLD_MS", NEAR_HOLD.as_millis() as u64);
+            let recent = hold > 0
+                && shared.near_epoch.elapsed().as_millis() as u64
+                    <= shared.near_seen_ms.load(Ordering::Relaxed) + hold;
+            if (loading || recent)
+                && index as u64 >= far_knob("HORIZON_FAR_WORKERS_NEAR", WORKERS_NEAR)
+                && !shared.stop.load(Ordering::Relaxed)
+            {
+                thread::sleep(Duration::from_millis(5));
+                continue;
             }
         }
         let profiling = profile::on();
@@ -4139,6 +4168,10 @@ fn work(
     }
 }
 
+/// Far workers that go on while the near terrain loads (see `work`).
+const WORKERS_NEAR: u64 = 1;
+/// How long after the near terrain last loaded the others still wait.
+const NEAR_HOLD: Duration = Duration::from_millis(1500);
 /// Jobs a worker on the GPU path takes and asks for at once.
 const GPU_BATCH: usize = 64;
 /// At most this many of them are of the levels sampled on the CPU.
