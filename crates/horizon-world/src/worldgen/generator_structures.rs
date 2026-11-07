@@ -1216,4 +1216,20 @@ impl StructurePlanner {
     ) -> Option<Beardifier> {
         self.state.beardifier(starts, chunk)
     }
+
+    /// `ChunkGenerator.findNearestMapStructure` over these sets: the nearest
+    /// start of one of `names` from block `from` (rings: every ring chunk;
+    /// random spreads: sectors in growing squares up to `radius`), with its
+    /// locate position, passing over the starts `skip` names (structure
+    /// name, start chunk).
+    pub fn locate(
+        &self,
+        context: &mut impl StartContext,
+        names: &[String],
+        from: [i32; 3],
+        radius: i32,
+        skip: &dyn Fn(&str, ChunkPos) -> bool,
+    ) -> Option<(String, [i32; 3])> {
+        self.state.locate(context, names, from, radius, skip)
+    }
 }
