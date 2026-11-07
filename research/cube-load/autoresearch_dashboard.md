@@ -2,12 +2,12 @@
 
 | spec | cubes | baseline | best | change | min-delta |
 |---|---|---|---|---|---|
-| surface | `4,-4,8,1` | 0.7325 | **0.2816** | -61.6% | 4.1% |
+| surface | `4,-4,8,1` | 0.7325 | **0.2615** | -64.3% | 4.1% |
 | sky | `4,20,32,1` | 0.2018 | **0.0231** | -88.6% | 6.5% |
-| deep | `4,-40,-28,1` | 0.2991 | **0.1949** | -34.8% | 3.0% |
+| deep | `4,-40,-28,1` | 0.2991 | **0.1625** | -45.7% | 3.0% |
 
-Iterations: 22; kept 13. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 22:19.
+Iterations: 25; kept 15. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 22:30.
 
 ## Hot spots
 
@@ -43,3 +43,6 @@ Updated 2026-11-06 22:19.
 | 15 | surface | discard | 0.2960 | -3.7% | PASS | - | per-cube replacer plans (active replacers per biome, dead gradients dropped): -3.7%, below 4.1% min-delta; patch kept for a combined replacer change |
 | 16 | surface | discard | 0.2978 | -3.2% | PASS | - | lattice corner cache alone (per-thread, keyed by blend id): -3.2%, below min-delta |
 | 17 | surface | keep | 0.2816 | -8.4% | PASS | 24a5eb340 | corner cache + per-cube replacer plans together (both exact, each ~3-4% alone): first 0.2880, confirm 0.2816; generate 135 -> 122 us/cube. Deep 0.1994 / sky 0.0240 vs HEAD re-measured 0.1982 / 0.0228 (noise) |
+| 18 | deep | discard | 0.1924 | -1.3% | PASS | - | sphere distance tables (dz, dy per sphere) alone: deep -1.3% (vs re-measured HEAD -2.9%): below min-delta; folded into 19 |
+| 19 | deep | keep | 0.1625 | -16.6% | PASS | 111967cb6 | carver origins walked row by row (no Vec, no sort), may_reach inside the cache lock, multiplicative hash for position maps, sphere distance tables: first 0.1678, confirm 0.1625; generate 92 -> 76 us |
+| 19 | surface | keep | 0.2615 | -7.1% | PASS | 111967cb6 | same change: first 0.2645, confirm 0.2615 (--tests); sky 0.0229 |
