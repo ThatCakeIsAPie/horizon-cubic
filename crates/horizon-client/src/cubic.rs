@@ -33,7 +33,7 @@
 use crate::biome::Biomes;
 use crate::chunk::{Chunk, ColumnLayout, LevelShape, Section, block_strategy};
 use crate::cubic_gen::{
-    CubicGeneration, CubicKind, Generation, PARTIAL, POPULATED, PopRegion, Population,
+    CubicGeneration, CubicKind, Generation, Held, PARTIAL, POPULATED, PopRegion, Population,
     needs_population, root_flags, set_root_flags,
 };
 use crate::save::{ChunkExtras, Persistent, SaveTables, decode_with, encode_with};
@@ -308,7 +308,7 @@ enum Record {
     Tag(NamedTag),
     Cube {
         pos: SectionPos,
-        section: Arc<Section>,
+        section: Held,
         entities: Vec<Tag>,
         flags: u8,
         registry: &'static BlockRegistry,
@@ -339,7 +339,7 @@ impl Record {
                 };
                 let mut one =
                     Chunk::with_layout(pos.x, pos.z, ColumnLayout::window(pos.y * 16, 16));
-                one.sections[0] = section.clone();
+                one.sections[0] = section.section();
                 let mut root = ctx.encode(&one, 0, false, entities);
                 set_root_flags(&mut root, *flags);
                 root
@@ -752,7 +752,7 @@ impl CubicLevel {
 
     /// `write_later` of population's cube `pos`, `section` with `entities`,
     /// encoded when first needed.
-    fn write_cube_later(&self, pos: SectionPos, section: Arc<Section>, entities: Vec<Tag>) {
+    fn write_cube_later(&self, pos: SectionPos, section: Held, entities: Vec<Tag>) {
         let flags = self.record_flags(pos);
         self.queue_record(
             pos,
@@ -895,21 +895,28 @@ impl CubicLevel {
     /// a cube in flight, else its record, else the generator's. Whether it
     /// came from a record or a cube in flight is the second answer.
     fn terrain_section(&self, pos: SectionPos) -> (Arc<Section>, bool) {
-        if let Some(section) = self.pop.cached(pos) {
-            return (section, true);
+        let (held, recorded) = self.terrain_held(pos);
+        (held.section(), recorded)
+    }
+
+    /// `terrain_section`, as the cache holds the cube.
+    fn terrain_held(&self, pos: SectionPos) -> (Held, bool) {
+        if let Some(held) = self.pop.cached(pos) {
+            return (held, true);
         }
         if let Some(root) = self.read(pos) {
             self.pop.learn_flags(pos, root_flags(&root));
             if let Some(cube) = self.codec().decode(&root, pos.y)
                 && let Some(section) = cube.sections.into_iter().next()
             {
-                self.pop.keep(pos, section.clone());
-                return (section, true);
+                let held = Held::Section(section);
+                self.pop.keep(pos, held.clone());
+                return (held, true);
             }
         }
-        let section = self.generate(pos);
-        self.pop.keep(pos, section.clone());
-        (section, false)
+        let held = Held::Section(self.generate(pos));
+        self.pop.keep(pos, held.clone());
+        (held, false)
     }
 
     /// Terrain of cube `pos` for a light view (no population).
@@ -962,17 +969,17 @@ impl CubicLevel {
                 p.z + (d >> 2 & 1) as i32,
             )
         };
-        let loaded: [(Arc<Section>, bool); 8] =
-            std::array::from_fn(|d| self.terrain_section(at(d)));
-        let sections: [Arc<Section>; 8] = std::array::from_fn(|d| loaded[d].0.clone());
+        let loaded: [(Held, bool); 8] = std::array::from_fn(|d| self.terrain_held(at(d)));
+        let held: [Held; 8] = std::array::from_fn(|d| loaded[d].0.clone());
         let mut region = PopRegion::new(
             p,
-            &sections,
+            &held,
             self.wg.columns.clone(),
             self.wg.vegetation.clone(),
         );
         self.wg.generator.populate(p, &mut region);
         let dirty = region.dirty();
+        let mut blocks = region.into_blocks().map(Some);
         for d in 0..8 {
             let q = at(d);
             if !horizon_world::cubic::has_cube(q) {
@@ -983,19 +990,14 @@ impl CubicLevel {
                 continue;
             }
             let section = if dirty[d] {
-                let mut section = Section {
-                    blocks: Section::from_blocks(region.blocks(d)),
-                    biomes: sections[d].biomes.clone(),
-                    ..Section::default()
-                };
-                section.compact();
-                Arc::new(section)
+                let b = blocks[d].take().expect("each cube once");
+                Held::blocks(b, held[d].biomes())
             } else {
-                sections[d].clone()
+                held[d].clone()
             };
             // A plain cube's record is the section a population wrote, with
             // no entities: no need to read it.
-            let plain = self.pop.cached_plain(q).is_some();
+            let plain = self.pop.is_plain(q);
             let old = if plain { None } else { self.read(q) };
             let known = self.pop.flags(q).unwrap_or(0);
             let flags = if own {
@@ -1091,7 +1093,7 @@ impl CubicLevel {
         if !self.is_vanilla(pos.y) {
             self.ensure_populated_around(pos);
         }
-        if let Some(section) = self.pop.cached_plain(pos) {
+        if let Some(section) = self.pop.plain_section(pos) {
             return Some(LoadedCube::empty(pos, section));
         }
         if let Some(root) = self.read(pos)
