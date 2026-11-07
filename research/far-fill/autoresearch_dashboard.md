@@ -1,10 +1,10 @@
 # Lane A: far view fill (desktop) - autoresearch dashboard
 
 **Metric:** far_fill_s: median s to complete a fill over 6 teleports (2 launches x 3 hops), lower is better
-**Baseline:** 17.267 s | **Best:** 8.97 s (-48.1%) | **Min-delta:** 1.5 s | **Iterations:** 10
+**Baseline:** 17.267 s | **Best:** 8.25 s (-52.2%) | **Min-delta:** 1.5 s | **Iterations:** 11
 **Guard:** no timeout; planned within 3%, voxel_px within 2%, fps_steady within 10%, cover_s within 20% of baseline; far view tests
 
-**Kept:** 5 | **Discarded:** 0 | **Screened:** 27 | **Crashed:** 0 | **Guard failures:** 0
+**Kept:** 6 | **Discarded:** 0 | **Screened:** 27 | **Crashed:** 0 | **Guard failures:** 0
 
 | # | Score (s) | Delta | Status | Commit | Description |
 |---|---|---|---|---|---|
@@ -43,3 +43,4 @@
 | 8 | 10.276 | -0.378 | screen | (merge 67d659e111 + sampler profile, uncommitted) | merged lane B 67d659e111 (generate speedups; Windows hash unchanged, cube bench 0.390 ms) + sampler counters: 10.276 and 10.498, no gain over 10.654 (within noise). Profile per 5 s: cover 13-33 s, sample 7-14 s, keep 1.5-9 s of ~40 worker-s: the sky cover probes are the biggest cost |
 | 9 | 8.994 | -1.660 | keep | 64e40f1647 | sky cover: skip each look's slab the density bound proves free (was only the whole 600-block box); evals 8.994 / 9.822, pooled median ~9.65 vs 10.65; 0 cover mismatches with HORIZON_FAR_COVER_CHECK; min-delta now 8.7% of best |
 | 10 | 8.970 | -0.024 | keep | 0539ad82ab | cache writes (and parent building) on a Keeper thread: keep 2-13 s -> 0.01-0.13 s per 40 worker-s; evals 9.575 / 8.970 / 9.216 (1 launch), pooled ~9.05 vs ~9.65; below the noise bar, kept on the profile (work off the critical path) |
+| 11 | 8.250 | -0.720 | keep | b66d93115c | lane B merged to 42f4779a28 (first_at_column, coarse-first uniform proofs) + cover_of asks each column's open looks in one first_at_column probe; 0 mismatches vs per-height block_at; evals 8.250 / 8.854 (+7.876 1 launch), pooled ~8.45 vs ~9.05; cover 7-17 s per 40 worker-s (was 9-21) |
