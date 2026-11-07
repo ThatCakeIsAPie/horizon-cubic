@@ -10,14 +10,15 @@ The metric is `tools/cube_load_bench.py`: the median ms per cube over 5 runs, si
 
 | spec | cubes | baseline | best | change |
 |---|---|---|---|---|
-| surface | `4,-4,8,1` (spawn) | 0.7325 ms | **~0.25 ms** | **−66%** (2.9× faster) |
-| sky | `4,20,32,1` (y 320–528, all air) | 0.2018 ms | **0.0155 ms** | **−92%** (13×) |
-| deep | `4,-40,-28,1` (y −640…−448, stone) | 0.2991 ms | **0.1262 ms** | **−58%** (2.4×) |
+| surface | `4,-4,8,1` (spawn) | 0.7325 ms | **0.2107 ms** | **−71%** (3.5× faster) |
+| sky | `4,20,32,1` (y 320–528, all air) | 0.2018 ms | **0.0128 ms** | **−94%** (16×) |
+| deep | `4,-40,-28,1` (y −640…−448, stone) | 0.2991 ms | **~0.12 ms** | **−60%** (2.5×) |
 
 - All three terrain hashes are unchanged.
 - Each spec's baseline hash was written from the unchanged generator code (0bcb7db).
 - The changes that touch what is saved were also checked another way. A temporary test (not committed) made the cubes, flushed the writer, and hashed every record read back from disk (the NBT Debug strings). It gave the same hash as the original code on all three specs.
-- `generate` alone, which is what the far view's CPU nodes call, went from 190 to about 100 µs per cube at the surface, 117 to 67–74 µs in deep rock, and 84 to 5 µs in the sky.
+- `generate` alone, which is what the far view's CPU nodes call, went from 190 to 79 µs per cube at the surface, 117 to about 64 µs in deep rock, and 84 to 4 µs in the sky.
+- Making the surface spec's cubes and flushing every record to disk takes 0.45 s, against 1.37 s for the original code.
 
 One test fails, and it fails on unchanged main too: `horizon-world` `cubic::custom::settings::tests::the_preset_survives_a_json_round_trip`. It is an f64 mismatch in the lake UserFunction round trip on Linux, in frozen `settings.rs`. Every other `cubic` test passes: 84 in horizon-client-lib and 53 in horizon-world.
 
@@ -46,6 +47,13 @@ These are in commit order. The percentages are each change's confirmation median
 12. **The biome blend's thread-local caches hash with a multiply** instead of SipHash. Sky −14%; surface and deep about −1.5%.
 13. **Regions read mixed sections in place** through the palette, unpacking only on the first write. Before, every carved cube was unpacked by all 8 populations. Deep −13%.
 14. **Wall-scan skip plus bitset in `carve_sphere`.** The lava or water wall scans are skipped when the cube cannot hold any, and the replaceable lists are a bitset. Deep −9.5%.
+15. **Coarse-first uniformity proof.** `uniform_block` first bounds the noise from the octaves of a wavelength of 16 blocks or more, with finer ones bounded by their amplitude and the gradient from all octaves, then runs the full proof if needed. A sound proof answers the true block either way. Sky −16%. `block_at`'s early-out uses it too, which helps the far view's probes.
+16. **Carver walks kept with their region of origins** (a `OnceLock` per origin, no per-origin mutex or hash). Deep −3.3%.
+17. **Lattice cells proven by the replacer analysis.** In a mixed cube, a 4×8×4 cell whose 8 corners are on one side of the surface gets `possible_blocks` from its exact corner range, its edge gradient, its 8 Y and its single biome quart. When that proves one block, the cell is filled and its 128 replacer chains skipped. A new test compares it with the unskipped chain over about 600 cubes. Surface −10%.
+18. **Surface replacers' depth noise memoised per column** (per cube, by replacer). A sampling profile showed `SimplexNoise::get2` at about 6%. The same memo was −1.4% before items 9 and 17, and is −5.4% now.
+
+For lane A (the far view), not lane B's metric:
+- `CustomCubicGenerator::first_at_column` and `blocks_at_column`: column probes that reuse the noise columns and the biome across heights. A test compares them with `block_at` over about 15k points at resolutions 1, 2, 4 and 8.
 
 ## What did not work (discarded, the code reverted)
 
@@ -60,10 +68,26 @@ These are in commit order. The percentages are each change's confirmation median
   - the wall-scan skip (−2.8%).
 - **Population functions generic over `CubeWorld`** (no dyn calls in the ore loop): −2.5%, below min-delta. The patch is kept in the session notes.
 - **`JRandom` as an inlined copy of the Java LCG:** about −1%. That would mostly be an effect of the non-LTO `fast` profile anyway; release uses thin LTO.
+- **Walk simulation, two attempts, each within noise:**
+  - `libm::sincosf` for the sin/cos pairs, which I checked bit-identical to `sinf`/`cosf` over all 2³² f32 inputs;
+  - a table of the walk's `sin(walked / max · π)`.
+- **Narrowing each cave carve column to its inside run:** no gain.
+- **Ore cell access:** distance tables, a fused `replace_ore`, and generic population functions. Under 2% each, and under 2% together.
+- **Bounds lookups batched into one thread-local access** (sky −3.8%), and **a coarse cutoff of 32 instead of 16** (no change).
+- **Generated mixed cubes held as block arrays** (packed on demand). The first run was −4.5% but the confirmation only −2.8%, below min-delta, so it was discarded. It also costs 16 KB per in-flight mixed cube. Disk records were verified identical.
 
 ## Where the time goes now
 
-These were measured with temporary `Instant` timers, since `perf` is not installed.
+`perf` is not installed, and samply needs `perf_event_paranoid` ≤ 1, which is 2 here. I wrote a small `LD_PRELOAD` sampler instead (`SIGPROF` instruction pointers mapped through `nm`). It touches nothing in the repo. On a larger surface run (13×13×13 cubes), the bench thread's self time is:
+- ore veins (`try_vein` with the inlined ellipsoid, plus `PopRegion::block`): about 14%;
+- Perlin noise (`get3`, `gradients_at`): about 9% (frozen, horizon-core);
+- section packing (`pack_words`, `palette_ids`): about 8%;
+- cave carving (`carve_sphere`): about 6%;
+- origin enumeration (`near`): about 4%;
+- libc (memcpy, memset, malloc): about 9%;
+- the bench's own hash (outside the timing): about 8%.
+
+Earlier breakdowns, from temporary `Instant` timers:
 - **Surface** (about 263 ms per run):
   - generate is about 185 ms: about 90 ms base (lattice about 33, replacer chain about 55), about 60 ms carvers, about 10 ms bounds;
   - ores about 55 ms: 1.49M ellipsoid cells per run, about 37 ns each;
