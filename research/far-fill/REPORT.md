@@ -76,6 +76,25 @@ Per 40 worker-seconds (8 workers, 5 s):
 
 The workers make 20,000–23,500 keys per 5 s, against 17,000 at iteration 6. The fill is CPU-bound with all 8 threads busy.
 
+## Later in the night
+
+- **Iteration 14 (keep, within noise):**
+  - An all-air node with covered columns stays uniform: no slot and no mesher job.
+  - States are kept in a short list instead of a hash set.
+  - Evals 8.09 and 8.20.
+- **Lane B merged to its end:** 34daa578e2. The Windows hash is unchanged, and the cube bench went from 1.14 to 0.29 ms/cube. The far fill did not move beyond noise: about 8.1–8.7 s.
+- **Settings tried in sweep 5/6, all noise:**
+  - re-planning every 100 ms;
+  - 2 tile batches;
+  - the two together;
+  - a 100 ms descent wait, which was worse.
+
+  A 0 ms descent wait failed the cover guard.
+- **The owner's height-variation-600 world:** the far view at spawn completes in 52 s, from 90–95 s; after climbing to y 1,500 it completes in 7.6 s, from 12–13 s.
+- **Lane C, near terrain after a teleport,** is described in research/near-fill and in research/OVERNIGHT.md.
+  - Near-in went from about 7.7 s to about 4.7 s.
+  - The far view complete after a surface teleport went from 24–29 s to 11–14 s.
+
 ## Next
 
 - **Lane B's generator** is the main lever. Both `generate` and `block_at`'s early-out are on this path.
