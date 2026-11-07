@@ -1,10 +1,10 @@
 # Lane A: far view fill (desktop) - autoresearch dashboard
 
 **Metric:** far_fill_s: median s to complete a fill over 6 teleports (2 launches x 3 hops), lower is better
-**Baseline:** 17.267 s | **Best:** 13.402 s (-22.4%) | **Min-delta:** 1.5 s | **Iterations:** 6
+**Baseline:** 17.267 s | **Best:** 10.654 s (-38.3%) | **Min-delta:** 1.5 s | **Iterations:** 7
 **Guard:** no timeout; planned within 3%, voxel_px within 2%, fps_steady within 10%, cover_s within 20% of baseline; far view tests
 
-**Kept:** 2 | **Discarded:** 0 | **Screened:** 26 | **Crashed:** 0 | **Guard failures:** 0
+**Kept:** 3 | **Discarded:** 0 | **Screened:** 26 | **Crashed:** 0 | **Guard failures:** 0
 
 | # | Score (s) | Delta | Status | Commit | Description |
 |---|---|---|---|---|---|
@@ -39,3 +39,4 @@
 | 5 | 14.079 | -0.770 | screen | 64dba72697 | sweep 4 (2 launches): WORKERS=8 PRIORITY=1 (= below normal on Windows, behind_server is a no-op there) |
 | 5 | 12.945 | -1.904 | screen | 64dba72697 | sweep 4 (2 launches): WORKERS=10 PRIORITY=2 |
 | 6 | 13.402 | -1.447 | keep | 24017ce228 | 8 workers (threads, 2..8) + normal priority once near terrain is in (below normal while it loads); evals 14.044 and 13.402, pooled 12-hop median 13.55 vs 15.0; spawn fill ~24 s vs ~29.5; profile: 88% of worker time in resident_many, GPU thread 5-9% busy, 40% of keys are CPU-sampled levels 0-1 (~14 ms each) |
+| 7 | 10.654 | -2.748 | keep | 5b7a3e7368 | merged lane B (origin/research/cube-load 6debf91272): the far view's level 0-1 nodes use the same generate(); evals 10.741 and 10.654 (best was 13.402), spawn fill 17.7-20.4 s (was ~24). Windows terrain hash unchanged (4c048498d55916e2), cube bench surface 1.138 -> 0.456 ms. Tests: far view 206 pass; client cubic 84 pass; world cubic 52 pass + the preset JSON round trip, which fails on unchanged main in the fast profile, and a timing test that failed once under load and passed 5 of 5 after |
