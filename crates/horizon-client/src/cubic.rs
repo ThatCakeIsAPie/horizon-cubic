@@ -240,7 +240,7 @@ struct CubeIo {
     store: CubeStore,
     /// Cube records queued for the writer and not yet on disk: loads read
     /// these first.
-    pending: Mutex<HashMap<SectionPos, Arc<NamedTag>>>,
+    pending: Mutex<HashMap<SectionPos, Arc<Record>>>,
     /// Writes in flight, and a signal for `flush`.
     queued: (Mutex<usize>, Condvar),
 }
@@ -250,8 +250,8 @@ impl CubeIo {
         // Only the `Arc` is cloned under the lock; the record is copied
         // outside it, so loads never wait on a copy.
         let queued = self.pending.lock().unwrap().get(&pos).cloned();
-        if let Some(tag) = queued {
-            return Some((*tag).clone());
+        if let Some(record) = queued {
+            return Some(record.tag().clone());
         }
         match self.store.read(pos) {
             Ok(tag) => tag,
@@ -262,15 +262,24 @@ impl CubeIo {
         }
     }
 
-    fn write_now(&self, pos: SectionPos, tag: &Arc<NamedTag>) {
-        if let Err(e) = store_record(&self.store, pos, tag) {
-            log::warn!("Horizon: cube {pos:?} not saved: {e}");
+    fn write_now(&self, pos: SectionPos, record: &Arc<Record>) {
+        // A record a newer one replaced is not written: the newer one's turn
+        // comes after it.
+        let current = self
+            .pending
+            .lock()
+            .unwrap()
+            .get(&pos)
+            .is_some_and(|t| Arc::ptr_eq(t, record));
+        if current {
+            if let Err(e) = store_record(&self.store, pos, record.tag()) {
+                log::warn!("Horizon: cube {pos:?} not saved: {e}");
+            }
+            let mut pending = self.pending.lock().unwrap();
+            if pending.get(&pos).is_some_and(|t| Arc::ptr_eq(t, record)) {
+                pending.remove(&pos);
+            }
         }
-        let mut pending = self.pending.lock().unwrap();
-        if pending.get(&pos).is_some_and(|t| Arc::ptr_eq(t, tag)) {
-            pending.remove(&pos);
-        }
-        drop(pending);
         let (count, done) = &self.queued;
         let mut count = count.lock().unwrap();
         *count = count.saturating_sub(1);
@@ -288,6 +297,53 @@ impl CubeIo {
         drop(count);
         if let Err(e) = self.store.sync() {
             log::warn!("Horizon: cubes not synced: {e}");
+        }
+    }
+}
+
+/// A cube record queued for the writer: made, or a population's cube made
+/// into one when it is first needed (written or read), so a cube that later
+/// populations write again is not encoded for each of them.
+enum Record {
+    Tag(NamedTag),
+    Cube {
+        pos: SectionPos,
+        section: Arc<Section>,
+        entities: Vec<Tag>,
+        flags: u8,
+        registry: &'static BlockRegistry,
+        biomes: Arc<Biomes>,
+        tables: Option<Arc<SaveTables>>,
+        tag: std::sync::OnceLock<NamedTag>,
+    },
+}
+
+impl Record {
+    fn tag(&self) -> &NamedTag {
+        match self {
+            Record::Tag(tag) => tag,
+            Record::Cube {
+                pos,
+                section,
+                entities,
+                flags,
+                registry,
+                biomes,
+                tables,
+                tag,
+            } => tag.get_or_init(|| {
+                let ctx = Codec {
+                    registry,
+                    biomes,
+                    tables: tables.as_deref(),
+                };
+                let mut one =
+                    Chunk::with_layout(pos.x, pos.z, ColumnLayout::window(pos.y * 16, 16));
+                one.sections[0] = section.clone();
+                let mut root = ctx.encode(&one, 0, false, entities);
+                set_root_flags(&mut root, *flags);
+                root
+            }),
         }
     }
 }
@@ -404,7 +460,7 @@ pub(crate) fn replace_bedrock(chunk: &mut Chunk, bedrock: u32, deepslate: u32) {
 /// One cubic level's cubes on disk and in generation.
 pub struct CubicLevel {
     io: Arc<CubeIo>,
-    send: Mutex<Option<Sender<(SectionPos, Arc<NamedTag>)>>>,
+    send: Mutex<Option<Sender<(SectionPos, Arc<Record>)>>>,
     /// Columns whose vanilla range is known to be generated (`has_vanilla`).
     vanilla_done: Mutex<std::collections::HashSet<(i32, i32)>>,
     wg: Arc<Generation>,
@@ -474,7 +530,7 @@ impl CubicLevel {
             pending: Mutex::default(),
             queued: (Mutex::new(0usize), Condvar::new()),
         });
-        let (send, receive) = channel::<(SectionPos, Arc<NamedTag>)>();
+        let (send, receive) = channel::<(SectionPos, Arc<Record>)>();
         let writer = io.clone();
         std::thread::Builder::new()
             .name("Cube writer".into())
@@ -676,17 +732,44 @@ impl CubicLevel {
         self.io.read(pos)
     }
 
-    fn write_later(&self, pos: SectionPos, mut tag: NamedTag) {
+    /// The population flags a record written at `pos` now keeps.
+    fn record_flags(&self, pos: SectionPos) -> u8 {
         // The record keeps its population flags whoever writes it.
-        let flags = match self.pop.flags(pos) {
+        match self.pop.flags(pos) {
             Some(flags) => flags,
             None => {
                 let flags = self.read(pos).map_or(0, |old| root_flags(&old));
                 self.pop.learn_flags(pos, flags);
                 flags
             }
-        };
-        set_root_flags(&mut tag, flags);
+        }
+    }
+
+    fn write_later(&self, pos: SectionPos, mut tag: NamedTag) {
+        set_root_flags(&mut tag, self.record_flags(pos));
+        self.queue_record(pos, Record::Tag(tag));
+    }
+
+    /// `write_later` of population's cube `pos`, `section` with `entities`,
+    /// encoded when first needed.
+    fn write_cube_later(&self, pos: SectionPos, section: Arc<Section>, entities: Vec<Tag>) {
+        let flags = self.record_flags(pos);
+        self.queue_record(
+            pos,
+            Record::Cube {
+                pos,
+                section,
+                entities,
+                flags,
+                registry: self.registry,
+                biomes: self.biomes.clone(),
+                tables: self.tables.get().cloned(),
+                tag: std::sync::OnceLock::new(),
+            },
+        );
+    }
+
+    fn queue_record(&self, pos: SectionPos, record: Record) {
         self.pop.forget(pos);
         if let Some(cache) = &self.lod_cache {
             cache.invalidate(pos);
@@ -694,7 +777,7 @@ impl CubicLevel {
         if self.is_marker(pos.y) {
             self.surfaces.lock().unwrap().remove(&(pos.x, pos.z));
         }
-        let tag = Arc::new(tag);
+        let tag = Arc::new(record);
         self.io.pending.lock().unwrap().insert(pos, tag.clone());
         // A cube read before this write is older than its record. Dropped
         // once the record can be read, so the ring (one for every shard) does
@@ -890,7 +973,6 @@ impl CubicLevel {
         );
         self.wg.generator.populate(p, &mut region);
         let dirty = region.dirty();
-        let ctx = self.codec();
         for d in 0..8 {
             let q = at(d);
             if !horizon_world::cubic::has_cube(q) {
@@ -926,12 +1008,10 @@ impl CubicLevel {
                 known | PARTIAL
             };
             self.pop.set_flags(q, flags);
-            let mut one = Chunk::with_layout(q.x, q.z, ColumnLayout::window(q.y * 16, 16));
-            one.sections[0] = section.clone();
             let entities = old.map(|old| record_entities(&old)).unwrap_or_default();
-            let root = ctx.encode(&one, 0, false, &entities);
-            self.write_later(q, root);
-            if entities.is_empty() && !self.is_marker(q.y) {
+            let plain = entities.is_empty() && !self.is_marker(q.y);
+            self.write_cube_later(q, section.clone(), entities);
+            if plain {
                 self.pop.keep_plain(q, section);
             } else {
                 self.pop.keep(q, section);
@@ -1484,7 +1564,7 @@ impl Drop for CubicLevel {
 
 /// The writer thread: cubes to disk in the order they were queued, until
 /// the level is gone and its queue empty.
-fn write_cubes(io: &CubeIo, receive: Receiver<(SectionPos, Arc<NamedTag>)>) {
+fn write_cubes(io: &CubeIo, receive: Receiver<(SectionPos, Arc<Record>)>) {
     // While idle, the store's uniform cubes (kept in memory and written in
     // batches) are written too, so a crash loses at most a second of them.
     loop {
