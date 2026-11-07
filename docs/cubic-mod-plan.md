@@ -211,7 +211,7 @@ opaque and translucent passes, with the world's depth.
 | Vertical shards (`LevelId {dim, shard}`, about 20 files) | It changes what a level *is*, in every system that picks one | **Drop for v1.** LAN guests share one window over the union of their ranges, capped at 99 cubes, as in v1 (`several_players_share_the_union_of_their_ranges_up_to_99_cubes`). Later, propose an opaque `LevelKey` upstream (useful for per-player instances and arenas) |
 | The re-key cluster, if D1 is refused | Ten private structures | OVERWRITE injections on a pinned Nightly, or wait for D1 |
 | Title `Mode` arms, if B3 is refused | A closed enum | OVERWRITE on a pinned Nightly. Or make the Customize screen a mod screen opened from the world type (B1) and convert from a CLI/command only |
-| Dithered fade-in | Not Cubic | Plain upstream PR, or drop it |
+| Dithered fade-in | Not Cubic | Kept. Proposed upstream as a feature of its own, separate from the Cubic hooks (Lyle, 2026-11-07) |
 | `relight_entering` internals (`increase_pass`, `Region`, `Light`) | Private helpers | A `pub` exposure PR (P6), then the code lives in the mod |
 
 ## 4. Plain upstream PRs (no hooks, each under ~500 lines)
@@ -237,7 +237,7 @@ the hooks must carry.
 ## 5. The bundle
 
 ```
-horizon-cubic/                      one repo (or a folder of this one; open question 6)
+ThatCakeIsAPie/horizon-cubic        this repo (Lyle, 2026-11-07); the bundle in a folder, e.g. mod/
   horizon-mixin.toml                 [mod] id = "cubic"; [compatibility] horizon_revision only while pinned
   horizon-native.json                (in the .hnmod) "hooks": N, the NATIVE_HOOKS_API the hooks need
   helpers/                           thin adapters: each named hook → the crates
@@ -281,12 +281,12 @@ the build's versions. `horizon-client` depends on the crates (the default `depen
 
 | Phase | What | Done when |
 |---|---|---|
-| 0 | This plan agreed with Lyle. The RFC issue (section 8) opened upstream, after Lyle reviews it | the maintainers' view on A2, D1 and E2 is known |
+| 0 | This plan agreed with Lyle. We file the RFC issue (section 8) upstream once Lyle has read its text (each issue and PR text is shown to Lyle before posting) | the maintainers' view on A2, D1 and E2 is known |
 | 1 | Plain PRs P1–P11, one at a time (AGENTS.md: small PRs, claims, `pr_ready.py`) | merged upstream |
 | 2 | Hook PRs, in the order they unlock:<br>1. A1 `level_shapes`<br>2. A2 `level_backend` (+ `DynChunkGenerator`, `ColumnStore`)<br>3. B1–B3 world types and title mod screens<br>4. C2/C3 handshake and wide positions<br>5. C4 hub streaming<br>6. D1 relayout<br>7. E1–E3 far terrain<br>8. F1–F2 | merged, `NATIVE_HOOKS_API` raised |
-| 3 | Port Cubic onto a current Nightly:<br>- move the new files into the four crates;<br>- write the helpers;<br>- for any hook not merged yet, an OVERWRITE injection pinned to that Nightly;<br>- shards dropped | the fork's tests pass in the mod repo, and `cube_load_bench` and `cubic_far_bench` are within noise of the fork |
-| 4 | The bundle builds through the launcher (`native-build`) on a clean instance; existing Cubic worlds open | a Custom world, a Hybrid world and a converted world play and save |
-| 5 | `.hnmod` release (`hooks: N`, or pinned), GitHub release | installs from GitHub in the launcher |
+| 3 | Port Cubic onto a current Nightly:<br>- move the new files into the four crates;<br>- write the helpers;<br>- for any hook not merged yet, an OVERWRITE injection pinned to that Nightly (for development only: no pinned release unless the hooks stall);<br>- shards dropped | the fork's tests pass in the mod repo, and `cube_load_bench` and `cubic_far_bench` are within noise of the fork |
+| 4 | The bundle builds through the launcher (`native-build`) on a clean instance; existing Cubic worlds open. **Hybrid is tested first** (Lyle hasn't played it): create, play across the vanilla band's edges, save, reopen, convert a vanilla world. It ships in v1 only if it works | a Custom world, a Hybrid world and a converted world play and save |
+| 5 | `.hnmod` release on the hooks (`hooks: N`), GitHub release. Until then the fork's own builds stay the way to play Cubic. A pinned-Nightly mod release is a fallback, only if the hooks stall upstream | installs from GitHub in the launcher |
 | 6 | Registry listing (needs a review) | listed |
 
 ## 7. Risks
@@ -354,15 +354,18 @@ Questions for maintainers:
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
-## 9. Open questions for Lyle
+## 9. Decisions and open questions
 
+Lyle's answers (2026-11-07):
+- **Filing upstream:** we file the proposals with Horizon. Each issue or PR text is shown to Lyle before it's posted.
+- **Interim release:** none planned. The fork's GitHub builds are the stopgap, and the goal is the hooks. A
+  pinned-Nightly mod release is a fallback, only if the hooks stall.
+- **Dithered fade-in:** keep it. It is proposed upstream as its own feature, separate from the Cubic hooks.
+- **Where the mod lives:** this repo, ThatCakeIsAPie/horizon-cubic. No new repo.
+- **Hybrid:** kept if it works. It's tested before it goes into v1 (roadmap phase 4). It leans on the vanilla generator
+  through A2's `open.vanilla`.
+
+Still open:
 1. **Shards.** OK to drop vertical shards for the first mod release (LAN guests share one window again)?
 2. **TTM's features** (Ultimine, pack biome sounds, the stronghold cache, worldgen speedups…): upstream PRs, mods of
    their own, or fork-only?
-3. **Upstream.** OK to open the RFC (section 8) under your account, and then the plain PRs P1–P11? Who claims the
-   issues?
-4. **Interim release.** Release a pinned-Nightly version with OVERWRITEs before all hooks land, or wait for the hooks?
-5. **Dithered fade-in.** Propose it upstream separately, or drop it?
-6. **Where the mod lives.** A new repo (`horizon-cubic-mod`), or a folder of this one?
-7. **Hybrid** (a vanilla band inside Cubic). Keep it in v1? It leans on the vanilla generator through A2's
-   `open.vanilla`.
