@@ -204,7 +204,7 @@ unblock Cubic.
 
 | # | Ask | Hook or handle | NeoForge 26.3 counterpart | Who uses it | Phase |
 |---|---|---|---|---|---|
-| 1 | **Levels taller than the codec's build height.** Lift #1742's −2032..2031 cap for Horizon-only levels, and the data-pack path's. Section Y as an int in saves, heightmaps relative to `min_y`, `SectionMask` past 32 sections (done), and wide block positions on the wire for Horizon clients, negotiated per connection; vanilla clients refused with a message | `DimensionSettings` accepts larger `min_y`/`height`, with an opt-in (`horizon_only: true`) | none (vanilla's codec stops at 4064 blocks) | Cubic Chunks; tall-world packs; sky and void worlds | Hooks |
+| 1 ([#1903](https://github.com/arismoko/horizon/issues/1903)) | **Levels taller than the codec's build height.** Lift #1742's −2032..2031 cap for Horizon-only levels, and the data-pack path's. Section Y as an int in saves, heightmaps relative to `min_y`, `SectionMask` past 32 sections (done), and wide block positions on the wire for Horizon clients, negotiated per connection; vanilla clients refused with a message | `DimensionSettings` accepts larger `min_y`/`height`, with an opt-in (`horizon_only: true`) | none (vanilla's codec stops at 4064 blocks) | Cubic Chunks; tall-world packs; sky and void worlds | Hooks |
 | 2 | **Per-world level shapes and generators: world types.** A mod's world type on Create World that chooses its levels' shapes and generators for that world, with its editor screen (#888's) | `Registrar::register_world_type(id, WorldType { label, levels, editor })` | the `WorldPreset` registry and `RegisterPresetEditorsEvent` | Cubic Chunks (Custom, Hybrid, Flat Cubic); amplified-like and custom-noise presets | Hooks |
 | 3 | **Cube generators.** A generator that fills 16³ cubes on worldgen workers, any height, with population over a 2×2×2 region afterwards and the structure placement it calls | `register_cube_generator` with `CubeGenerator::{generate(&mut CubeAccess), populate(&mut RegionAccess)}` | none (Cubic Chunks' own `ICubeGenerator`) | Cubic Chunks; sky-island and deep-world generators | Hooks |
 | 4 | **Level storage.** A mod stores a level's chunks or cubes, with their entities and ticks; the region files stay the default | `register_level_storage` with a `LevelStorage` trait (load and save of columns or cubes, entities by area) | none | Cubic Chunks (cube regions, uniform-cube sidecar); one-file region formats | Hooks |
@@ -283,7 +283,7 @@ Then bring `cubic_shards.rs` back on it.
 
 | Phase | What | Done when |
 |---|---|---|
-| 0 | Lyle approves the texts (section 8). We file the tracker issue and ask 1 on arismoko/horizon, then `/claim` ask 1 | both filed |
+| 0 | Lyle approves the texts (section 8). We file the tracker issue and ask 1 on arismoko/horizon, then `/claim` ask 1 | both filed: #1902 and #1903 (2026-11-07); the claim waits for Lyle |
 | 1 | Ask 1, then asks 3, 4 and 5 (generator, storage, windows), each as its own issue and PR, in the fork's PR template with `pr_ready.py` | merged on arismoko/horizon |
 | 2 | Asks 2 and 7 (world types, screens), then 8 and 9 (network), then 6 (far terrain, with the render roadmap) and 10 | merged |
 | 3 | Port Cubic into `mod/`: the crate on `mod_api`; internals for what an ask hasn't covered yet; slots for world created, flags and status. Shards dropped. **Hybrid tested first**: create, play across the vanilla band's edges, save, reopen, convert a vanilla world; it ships only if it works | the fork's tests pass in the mod, and `cube_load_bench` and `cubic_far_bench` are within noise of the fork |
@@ -313,7 +313,17 @@ Then bring `cubic_shards.rs` back on it.
 - **Save compatibility.** Existing Cubic worlds (`horizon_cubic.json`, `cubicgen.json`, cube records, the far cache)
   must open unchanged under the mod.
 
-## 8. Draft issues for arismoko/horizon (for Lyle to review; not posted)
+## 8. Issues on arismoko/horizon
+
+Lyle approved both ("Post both"). They were posted from Lyle's account on 2026-11-07 with this text (hard line
+breaks unwrapped):
+- the tracker: [#1902](https://github.com/arismoko/horizon/issues/1902);
+- ask 1, taller levels: [#1903](https://github.com/arismoko/horizon/issues/1903).
+
+Not done yet, each waiting for Lyle's OK:
+- linking #1903 from the tracker's list;
+- `/claim` on #1903;
+- asking Aria about the install path (section 5.2).
 
 ### 8.1 The tracker
 
