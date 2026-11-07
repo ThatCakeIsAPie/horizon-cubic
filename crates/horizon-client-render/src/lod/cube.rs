@@ -1423,6 +1423,12 @@ pub const COVER_NODES: usize = 768;
 /// delivered over their place: a teleport, joining) asks for the coverage
 /// layer first.
 const COVER_HOLES: usize = 4;
+/// ...or with more than this many holes, whatever the plan's size: at the fill
+/// rate (about 1,000 to 3,000 nodes a second) that is a second or more of
+/// holes, where the coverage layer's few hundred nodes take a fraction of
+/// one. Rough terrain (a height variation of 600) left holes 11 s after
+/// climbing from y 150 to 1,500 without it.
+const COVER_MIN_HOLES: usize = 2048;
 /// The longest the coverage layer holds the rest of the plan back.
 const COVER_WAIT: Duration = Duration::from_millis(1500);
 /// The most nodes a plan holds unless [`CubeLod::set_budget`] says
@@ -3089,7 +3095,7 @@ impl CubeLod {
         if holes > 0 {
             self.stats.plan_covered = None;
         }
-        if (big && holes * COVER_HOLES > planned) || covering {
+        if (big && holes * COVER_HOLES > planned) || holes > COVER_MIN_HOLES || covering {
             self.begin_cover(now);
         } else if big {
             self.fill_queue();
