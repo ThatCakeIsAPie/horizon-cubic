@@ -2,12 +2,12 @@
 
 | spec | cubes | baseline | best | change | min-delta |
 |---|---|---|---|---|---|
-| surface | `4,-4,8,1` | 0.7325 | **0.6231** | -14.9% | 4.1% |
-| sky | `4,20,32,1` | 0.2018 | **0.0562** | -72.2% | 6.5% |
-| deep | `4,-40,-28,1` | 0.2991 | **0.2578** | -13.8% | 3.0% |
+| surface | `4,-4,8,1` | 0.7325 | **0.4502** | -38.5% | 4.1% |
+| sky | `4,20,32,1` | 0.2018 | **0.0231** | -88.6% | 6.5% |
+| deep | `4,-40,-28,1` | 0.2991 | **0.2099** | -29.8% | 3.0% |
 
-Iterations: 7; kept 4. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 20:53.
+Iterations: 11; kept 7. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 21:19.
 
 ## Hot spots
 
@@ -28,3 +28,7 @@ Updated 2026-11-06 20:53.
 | 4 | deep | baseline | 0.2816 | -5.9% | PASS | d88e519d4 | deep spec re-measured after iteration 2 (plain cache): medians 0.2826, 0.2807; carvers are 176 ms of 295 ms here (stone is replaceable) |
 | 5 | deep | keep | 0.2578 | -8.5% | PASS | be61d382b | carver sphere runs: bounds per 16 spheres skip runs local_box would reject (12.2k sphere tests/cube -> few hundred). first 0.2609, confirm 0.2578 |
 | 5 | surface | keep | 0.6231 | -6.3% | PASS | be61d382b | same change (iteration 5) on surface: first 0.6253, confirm 0.6231 with --tests |
+| 6 | deep | discard | 0.2584 | +0.2% | PASS | - | carver walks resolved per 8^3 region with OnceLocks (no per-origin mutex/hash): deep 0.2584, surface 0.6257, sky 0.0550: no gain |
+| 7 | surface | keep | 0.4502 | -27.7% | PASS | e52179485 | deferred record encoding: populate queues section+entities+flags, NBT made once on first need (writer or read); writer skips superseded records. First 0.4511, confirm 0.4502. Disk records verified identical (flush + hash of every record) on all specs; make+flush 1.37 s -> 0.57 s |
+| 7 | sky | keep | 0.0231 | -58.9% | PASS | e52179485 | same change: first 0.0236, confirm 0.0231 (uniform air cubes were spending 24 us each encoding) |
+| 7 | deep | keep | 0.2099 | -18.6% | PASS | e52179485 | same change: first 0.2119, confirm 0.2099 |
