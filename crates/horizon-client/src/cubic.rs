@@ -2759,4 +2759,93 @@ mod tests {
             crate::cubic_lod::far_setup(&f.level_of(CubicKind::Flat), f.assets.registry).is_none()
         );
     }
+
+    /// The near-terrain loading benchmark: lane B of the overnight loops
+    /// (`tools/cube_load_bench.py`). It makes the cubes of a block around
+    /// spawn in a fresh Custom world, as a teleport there loads them:
+    /// generated, populated by the eight populations around each, and read
+    /// back. It prints the time per cube and a hash of every block, so a
+    /// faster generator that changes the terrain shows.
+    /// `HORIZON_CUBE_BENCH` is "RADIUS,Y_LOW,Y_HIGH,THREADS" in cubes
+    /// (default "4,-4,8,1"). More than one thread is faster, but its hash can
+    /// differ from run to run: overlapping populations go in either order.
+    /// The scratch level goes in the system's temporary folder (`TMPDIR`).
+    #[test]
+    #[ignore = "a benchmark: tools/cube_load_bench.py"]
+    fn cube_load_bench() {
+        let Some(f) = Fixture::new("bench") else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let spec = std::env::var("HORIZON_CUBE_BENCH").unwrap_or_else(|_| "4,-4,8,1".into());
+        let v: Vec<i32> = spec
+            .split(',')
+            .map(|s| s.trim().parse().expect("HORIZON_CUBE_BENCH: four integers"))
+            .collect();
+        let (r, y0, y1, threads) = (v[0], v[1], v[2], v[3].max(1) as usize);
+        let level = f.level_of(CubicKind::Custom);
+        let mut cubes = Vec::new();
+        for y in y0..=y1 {
+            for z in -r..=r {
+                for x in -r..=r {
+                    cubes.push(SectionPos::new(x, y, z));
+                }
+            }
+        }
+        let start = std::time::Instant::now();
+        let made: Vec<LoadedCube> = if threads == 1 {
+            cubes.iter().map(|&p| level.make_cube(p)).collect()
+        } else {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let slots: Vec<Mutex<Option<LoadedCube>>> =
+                (0..cubes.len()).map(|_| Mutex::new(None)).collect();
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&p) = cubes.get(i) else { break };
+                        *slots[i].lock().unwrap() = Some(level.make_cube(p));
+                    });
+                }
+            });
+            slots
+                .into_iter()
+                .map(|slot| slot.into_inner().unwrap().expect("every cube made"))
+                .collect()
+        };
+        let seconds = start.elapsed().as_secs_f64();
+        // FNV-1a over each cube's position and its 4,096 block states.
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |v: u32| {
+            for b in v.to_le_bytes() {
+                hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        let mut states = [0u32; 4096];
+        for cube in &made {
+            eat(cube.pos.x as u32);
+            eat(cube.pos.y as u32);
+            eat(cube.pos.z as u32);
+            cube.section.unpack(&mut states);
+            for &state in &states {
+                eat(state);
+            }
+        }
+        let pops = level.population_stats();
+        println!(
+            "CUBE_BENCH {{\"cubes\":{},\"seconds\":{:.4},\"ms_per_cube\":{:.4},\"hash\":\"{:016x}\",\"populations\":{},\"populate_micros\":{:.1},\"generated\":{},\"generate_micros\":{:.1},\"threads\":{}}}",
+            made.len(),
+            seconds,
+            seconds * 1000.0 / made.len() as f64,
+            hash,
+            pops.populations,
+            pops.populate_micros,
+            pops.generated,
+            pops.generate_micros,
+            threads
+        );
+        drop(made);
+        drop(level);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
 }
