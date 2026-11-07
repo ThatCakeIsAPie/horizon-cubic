@@ -225,7 +225,7 @@ pub fn set_root_flags(root: &mut NamedTag, flags: u8) {
 /// of eight cubes, which cubes were written, and the vegetation hook.
 pub struct PopRegion {
     origin: SectionPos,
-    cubes: [Box<[u32; 4096]>; 8],
+    cubes: [Slot; 8],
     dirty: [bool; 8],
     columns: Arc<dyn BiomeColumns>,
     vegetation: Option<Arc<Vegetation>>,
@@ -240,11 +240,7 @@ impl PopRegion {
         columns: Arc<dyn BiomeColumns>,
         vegetation: Option<Arc<Vegetation>>,
     ) -> Self {
-        let cubes = std::array::from_fn(|d| {
-            let mut blocks = Box::new([0u32; 4096]);
-            cubes[d].blocks_into(&mut blocks);
-            blocks
-        });
+        let cubes = std::array::from_fn(|d| cubes[d].slot());
         Self {
             origin,
             cubes,
@@ -274,37 +270,70 @@ impl PopRegion {
         self.dirty
     }
 
-    /// Cube `d`'s blocks.
-    pub fn blocks(&self, d: usize) -> &[u32; 4096] {
-        &self.cubes[d]
+    /// The blocks of each cube the population wrote (`dirty`).
+    pub fn into_blocks(self) -> [Option<Box<[u32; 4096]>>; 8] {
+        self.cubes.map(|slot| match slot {
+            Slot::Owned(blocks) => Some(blocks),
+            _ => None,
+        })
+    }
+}
+
+/// A region cube's blocks: one state, or an array shared with the cache,
+/// until the population writes to it; then its own copy.
+pub enum Slot {
+    Uniform(u32),
+    Shared(Arc<HeldBlocks>),
+    Owned(Box<[u32; 4096]>),
+}
+
+impl Slot {
+    fn get(&self, i: usize) -> u32 {
+        match self {
+            Slot::Uniform(v) => *v,
+            Slot::Shared(b) => b.blocks[i],
+            Slot::Owned(b) => b[i],
+        }
     }
 
-    /// The eight cubes' blocks.
-    pub fn into_blocks(self) -> [Box<[u32; 4096]>; 8] {
-        self.cubes
+    fn owned(&mut self) -> &mut [u32; 4096] {
+        let blocks = match self {
+            Slot::Owned(b) => return b,
+            Slot::Uniform(v) => Box::new([*v; 4096]),
+            Slot::Shared(b) => b.blocks.clone(),
+        };
+        *self = Slot::Owned(blocks);
+        match self {
+            Slot::Owned(b) => b,
+            _ => unreachable!(),
+        }
     }
 }
 
 /// What a population region's cube is read from.
 pub trait CubeBlocks {
-    /// Writes the cube's block states into `out` (index `y << 8 | z << 4 | x`).
-    fn blocks_into(&self, out: &mut [u32; 4096]);
+    /// The cube's blocks as a region holds them.
+    fn slot(&self) -> Slot;
 }
 
 impl CubeBlocks for Arc<Section> {
-    fn blocks_into(&self, out: &mut [u32; 4096]) {
+    fn slot(&self) -> Slot {
         match self.blocks.uniform() {
-            Some(v) => out.fill(v),
-            None => self.unpack(out),
+            Some(v) => Slot::Uniform(v),
+            None => {
+                let mut blocks = Box::new([0u32; 4096]);
+                self.unpack(&mut blocks);
+                Slot::Owned(blocks)
+            }
         }
     }
 }
 
 impl CubeBlocks for Held {
-    fn blocks_into(&self, out: &mut [u32; 4096]) {
+    fn slot(&self) -> Slot {
         match self {
-            Held::Section(s) => s.blocks_into(out),
-            Held::Blocks(b) => out.copy_from_slice(&b.blocks[..]),
+            Held::Section(s) => s.slot(),
+            Held::Blocks(b) => Slot::Shared(b.clone()),
         }
     }
 }
@@ -365,13 +394,13 @@ impl Held {
 
 impl CubeWorld for PopRegion {
     fn block(&self, p: [i32; 3]) -> u32 {
-        self.locate(p).map_or(0, |(d, i)| self.cubes[d][i])
+        self.locate(p).map_or(0, |(d, i)| self.cubes[d].get(i))
     }
     fn set_block(&mut self, p: [i32; 3], state: u32) {
         if let Some((d, i)) = self.locate(p)
-            && self.cubes[d][i] != state
+            && self.cubes[d].get(i) != state
         {
-            self.cubes[d][i] = state;
+            self.cubes[d].owned()[i] = state;
             self.dirty[d] = true;
         }
     }
