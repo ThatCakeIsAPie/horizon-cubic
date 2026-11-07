@@ -50,15 +50,39 @@ horizon-rust/horizon          upstream; main 35f3dad20 on 2026-11-07
 
 ### Not Cubic (stays out of the mod)
 
-TTM's features are in the same fork but are not Cubic. Each should become a plain upstream PR, a mod of its own, or
-stay fork-only (open question 2):
-- the stronghold ring cache; `/locate biome` off the game thread;
-- the Windows cursor fix; the 26.2 data-pack upgrade on Create World;
-- the far terrain bake;
-- lattice reuse, biome search hints, decoration feature bitsets and lazy jigsaw templates (worldgen speed);
-- pack biomes' ambient particles, music and sounds;
-- Ultimine;
-- Big Ore Deposits (`tools/ttm/`).
+TTM's features are in the same fork but aren't Cubic. Lyle's decisions (2026-11-07):
+
+| Feature | Decision |
+|---|---|
+| Ultimine | its own mod |
+| Big Ore Deposits (`tools/ttm/big-ore-deposits`) | its own data pack |
+| Data-pack biomes' ambient particles, music and ambient sounds (`a123999ca`) | offer upstream as a vanilla-parity PR (below) |
+| The speed-ups (table below) | for each one upstream lacks, Lyle chooses: suggest it again, or leave it |
+| Windows cursor fix; Create World's 26.2 pack upgrade | dropped (upstream already has the upgrade tool itself, `upgrade-datapack`, from Lyle's PRs #3369–#3374) |
+
+**Data-pack biome effects upstream.** Upstream (35f3dad20) reads `minecraft:visual/ambient_particles` and the
+music attributes only from vanilla's own `data/minecraft/worldgen/biome/<name>.json` (`animate_tick.rs:383`,
+`music.rs:197`). So a data pack's biomes in other namespaces get no particles, music or ambient sounds. The fork reads
+them from the world's biome table (`horizon-client-render/src/biome.rs`). That is vanilla behaviour upstream still
+lacks: a parity PR.
+
+**The speed-ups.** Lyle remembers most of them as merged upstream. Checked against upstream main 35f3dad20 by their
+code (the fork's types and functions) and by behaviour, **none of them is upstream yet**. What was merged from
+Lyle's account is related work: the level-shape series (#3480–#3490), data-pack biomes (#3491, #7393, #7528), the
+data-pack upgrade (#3369–#3374), `perf/worldgen-surface-biomes` (#3366) and `perf/far-saved-chunks` (#3391).
+
+| Speed-up | Fork commit | In the fork's main | Upstream (35f3dad20) |
+|---|---|---|---|
+| Stronghold ring cache (`ring_cache.rs`, `keep_rings`: positions kept with the world) | `7b7964755` | yes | no |
+| `/locate biome` off the game thread, on all cores | `82d0f525a`, `fe8e063ce` | yes | no (still on the game thread) |
+| Far terrain bake (`lod/bake.rs`) | `2c93f3585` | yes | no |
+| Lattice reuse in the noise interpolator (`LatticeSamples`) | `bfec4acb2` | yes | no |
+| Biome search hints (`SearchHint`) | `80535105c` | yes | no |
+| Decoration feature bitsets (`set_feature_bit`) | merged in `142c137d1` | yes | no |
+| Lazy jigsaw templates (`LazyTemplate`) | `242467244` | yes | no |
+
+Each would be its own PR. Upstream has changed the same code since, so each one needs a rebase and a fresh
+measurement before it's suggested.
 
 General changes that sit inside the Cubic range but aren't Cubic (plain upstream PRs, section 4):
 - `remote_chunks.rs`: `blocks_of` split out of the section decoder;
@@ -208,7 +232,7 @@ opaque and translucent passes, with the world's depth.
 
 | Edit | Why not a hook | Plan |
 |---|---|---|
-| Vertical shards (`LevelId {dim, shard}`, about 20 files) | It changes what a level *is*, in every system that picks one | **Drop for v1.** LAN guests share one window over the union of their ranges, capped at 99 cubes, as in v1 (`several_players_share_the_union_of_their_ranges_up_to_99_cubes`). Later, propose an opaque `LevelKey` upstream (useful for per-player instances and arenas) |
+| Vertical shards (`LevelId {dim, shard}`, about 20 files) | It changes what a level *is*, in every system that picks one | **Left out of v1** (Lyle). LAN guests share one window over the union of their ranges, capped at 99 cubes, as in v1 (`several_players_share_the_union_of_their_ranges_up_to_99_cubes`). **Kept as a suggestion for a later version:** propose an opaque `LevelKey` upstream (also useful for per-player instances and arenas), then bring `cubic_shards.rs` back on it |
 | The re-key cluster, if D1 is refused | Ten private structures | OVERWRITE injections on a pinned Nightly, or wait for D1 |
 | Title `Mode` arms, if B3 is refused | A closed enum | OVERWRITE on a pinned Nightly. Or make the Customize screen a mod screen opened from the world type (B1) and convert from a CLI/command only |
 | Dithered fade-in | Not Cubic | Kept. Proposed upstream as a feature of its own, separate from the Cubic hooks (Lyle, 2026-11-07) |
@@ -365,7 +389,9 @@ Lyle's answers (2026-11-07):
 - **Hybrid:** kept if it works. It's tested before it goes into v1 (roadmap phase 4). It leans on the vanilla generator
   through A2's `open.vanilla`.
 
-Still open:
-1. **Shards.** OK to drop vertical shards for the first mod release (LAN guests share one window again)?
-2. **TTM's features** (Ultimine, pack biome sounds, the stronghold cache, worldgen speedups…): upstream PRs, mods of
-   their own, or fork-only?
+- **Vertical shards:** left out of v1, kept as a suggestion for a later version (section 3.3).
+- **TTM's features:** Ultimine becomes its own mod and Big Ore Deposits its own data pack. Data-pack biome effects go
+  upstream as a parity PR. Each speed-up upstream lacks (all seven, section 1) is Lyle's choice: suggest it again or
+  leave it. The Windows cursor fix and the 26.2 pack upgrade on Create World are dropped.
+
+No questions are open. Upstream texts are still shown to Lyle before they're posted.
