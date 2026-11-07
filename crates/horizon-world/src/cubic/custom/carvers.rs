@@ -304,12 +304,24 @@ impl Carvers {
         })
     }
 
+    /// Whether some carver may replace `state`.
+    fn replaces(&self, state: u32) -> bool {
+        self.caves.iter().any(|c| c.allowed.contains(&state))
+            || self.ravine.as_ref().is_some_and(|r| r.allowed.contains(&state))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.caves.is_empty() && self.ravine.is_none()
     }
 
     /// Carves `out`, the blocks of `cube` (index `y << 8 | z << 4 | x`).
     pub fn carve(&self, cube: SectionPos, out: &mut [u32; 4096]) {
+        // A carver only changes blocks of its replaceable list: a cube of one
+        // block that no list holds stays as it is (sky, water, bedrock...).
+        let first = out[0];
+        if !self.replaces(first) && out.iter().all(|&b| b == first) {
+            return;
+        }
         for c in &self.caves {
             c.carve(cube, out, &self.lava_ids);
         }
