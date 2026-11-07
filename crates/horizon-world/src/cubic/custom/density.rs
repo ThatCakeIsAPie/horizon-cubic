@@ -456,12 +456,50 @@ impl Lattice {
 
     /// Calls `f(local x, local y, local z, dx, dy, dz, density)` for all 4096
     /// blocks, in `y, z, x` order, like `forEachScaled`.
-    pub fn for_each(&self, mut f: impl FnMut(usize, usize, usize, f64, f64, f64, f64)) {
+    pub fn for_each(&self, f: impl FnMut(usize, usize, usize, f64, f64, f64, f64)) {
+        self.for_each_except(|_, _, _| false, f);
+    }
+
+    /// The cells along each axis (`x`, `y`, `z`).
+    pub fn cells(&self) -> [usize; 3] {
+        [self.nx - 1, self.ny - 1, self.nz - 1]
+    }
+
+    /// The 8 corner densities of cell (`ci`, `cj`, `ck`), `[x][y][z]` as
+    /// `x << 2 | y << 1 | z`.
+    pub fn cell_corners(&self, ci: usize, cj: usize, ck: usize) -> [f64; 8] {
+        std::array::from_fn(|n| self.at(ci + (n >> 2), cj + (n >> 1 & 1), ck + (n & 1)))
+    }
+
+    /// The largest `|dy|` (the density's change per block up, as `for_each`
+    /// computes it) at the 4 vertical edges of cell (`ci`, `cj`, `ck`): every
+    /// block's `dy` in the cell interpolates between them.
+    pub fn cell_dy(&self, ci: usize, cj: usize, ck: usize) -> f64 {
+        let sty = 1.0 / self.sy as f64;
+        let mut m: f64 = 0.0;
+        for a in 0..2 {
+            for d in 0..2 {
+                let v = (self.at(ci + a, cj + 1, ck + d) - self.at(ci + a, cj, ck + d)) * sty;
+                m = m.max(v.abs());
+            }
+        }
+        m
+    }
+
+    /// `for_each`, leaving out the cells for which `skip(ci, cj, ck)` holds.
+    pub fn for_each_except(
+        &self,
+        skip: impl Fn(usize, usize, usize) -> bool,
+        mut f: impl FnMut(usize, usize, usize, f64, f64, f64, f64),
+    ) {
         let (sx, sy, sz) = (self.sx as usize, self.sy as usize, self.sz as usize);
         let (stx, sty, stz) = (1.0 / sx as f64, 1.0 / sy as f64, 1.0 / sz as f64);
         for cj in 0..(self.ny - 1) {
             for ck in 0..(self.nz - 1) {
                 for ci in 0..(self.nx - 1) {
+                    if skip(ci, cj, ck) {
+                        continue;
+                    }
                     let c = |a: usize, b: usize, d: usize| self.at(ci + a, cj + b, ck + d);
                     // v[x][y][z]
                     let v = [

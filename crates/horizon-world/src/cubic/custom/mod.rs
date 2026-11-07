@@ -560,6 +560,13 @@ impl Terrain {
     /// The cube's blocks from the density lattice and the replacers, before
     /// the carvers.
     fn base(&self, cube: SectionPos, out: &mut [u32; 4096]) {
+        self.base_with(cube, out, true);
+    }
+
+    /// `base`; with `prove_cells`, a lattice cell whose corners and gradient
+    /// let the replacer analysis prove one block is filled with it instead of
+    /// running the chain for each of its blocks (the same blocks).
+    fn base_with(&self, cube: SectionPos, out: &mut [u32; 4096], prove_cells: bool) {
         let lattice = Lattice::for_cube(
             &self.noise,
             &self.blend,
@@ -581,7 +588,55 @@ impl Terrain {
                 }
             };
         }
-        lattice.for_each(|lx, ly, lz, dx, dy, dz, density| {
+        let [cx, cy, cz] = lattice.cells();
+        let mut proven = [false; 64];
+        // A cell must lie in one 4 x 4 biome column (and the mask fit).
+        let one_quart = 4 % self.sizes[0] == 0 && 4 % self.sizes[2] == 0 && cx * cy * cz <= 64;
+        if prove_cells && one_quart {
+            let [sx, sy, sz] = self.sizes.map(|v| v as usize);
+            for cj in 0..cy {
+                for ck in 0..cz {
+                    for ci in 0..cx {
+                        let v = lattice.cell_corners(ci, cj, ck);
+                        if v.iter().any(|d| !d.is_finite()) {
+                            continue;
+                        }
+                        let lo = v.iter().copied().fold(f64::INFINITY, f64::min);
+                        let hi = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        // Only cells on one side of the surface can be one block.
+                        if lo <= 0.0 && hi > 0.0 {
+                            continue;
+                        }
+                        // The blocks interpolate the corners (and their
+                        // vertical differences): within their range but for
+                        // a few ulps of rounding, which the pads cover.
+                        let pad = 1e-9 * (1.0 + lo.abs().max(hi.abs()));
+                        let dy = lattice.cell_dy(ci, cj, ck);
+                        let y0 = by + (cj * sy) as i32;
+                        let biome = &biomes[(ck * sz) << 4 | ci * sx];
+                        let facts = replacers::BoxFacts {
+                            dmin: lo - pad,
+                            dmax: hi + pad,
+                            dy: dy * (1.0 + 1e-9) + 1e-12,
+                            y0,
+                            y1: y0 + sy as i32 - 1,
+                            biomes: Some(std::slice::from_ref(biome)),
+                        };
+                        if let Some(&[block]) = self.replacers.possible_blocks(&facts).as_deref() {
+                            for ly in cj * sy..(cj + 1) * sy {
+                                for lz in ck * sz..(ck + 1) * sz {
+                                    let row = ly << 8 | lz << 4;
+                                    out[row + ci * sx..row + (ci + 1) * sx].fill(block);
+                                }
+                            }
+                            proven[(cj * cz + ck) * cx + ci] = true;
+                        }
+                    }
+                }
+            }
+        }
+        let skip = |ci: usize, cj: usize, ck: usize| proven[(cj * cz + ck) * cx + ci];
+        lattice.for_each_except(skip, |lx, ly, lz, dx, dy, dz, density| {
             let ctx = BlockCtx {
                 x: bx + lx as i32,
                 y: by + ly as i32,

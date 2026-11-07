@@ -324,3 +324,29 @@ fn column_probes_answer_as_block_at() {
     }
     assert!(checked > 10_000, "{checked}");
 }
+
+/// Cells the replacer analysis proves one block are that block: the cube
+/// with them filled equals the cube with every block through the chain.
+#[test]
+fn proven_lattice_cells_match_the_chain() {
+    let mut rng = Lcg(4242);
+    let mut cubes = 0;
+    for biome in ["plains", "badlands", "deep_ocean", "swamp", "snowy_slopes"] {
+        for (name, g) in generators(5, biome) {
+            let Kind::Terrain(t) = &g.kind else { continue };
+            let (mut a, mut b) = (Box::new([0_u32; 4096]), Box::new([0_u32; 4096]));
+            for _ in 0..40 {
+                let cube = SectionPos::new(
+                    rng.range(-200, 200),
+                    rng.range(-6, 10),
+                    rng.range(-200, 200),
+                );
+                t.base_with(cube, &mut a, true);
+                t.base_with(cube, &mut b, false);
+                assert!(a[..] == b[..], "{name} {biome} {cube:?}");
+                cubes += 1;
+            }
+        }
+    }
+    assert!(cubes >= 400, "{cubes}");
+}
