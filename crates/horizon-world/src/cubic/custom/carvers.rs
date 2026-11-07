@@ -36,6 +36,28 @@ pub const RANGE: i32 = 8;
 const SHARDS: usize = 16;
 const SHARD_LIMIT: usize = 2048;
 
+/// A set of block states, tested with one bit lookup.
+#[derive(Clone, Debug)]
+struct BlockSet(Vec<u64>);
+
+impl BlockSet {
+    fn new(ids: &[u32]) -> Self {
+        let len = ids.iter().map(|&id| id as usize / 64 + 1).max().unwrap_or(0);
+        let mut bits = vec![0u64; len];
+        for &id in ids {
+            bits[id as usize / 64] |= 1 << (id % 64);
+        }
+        Self(bits)
+    }
+
+    #[inline]
+    fn contains(&self, id: &u32) -> bool {
+        self.0
+            .get(*id as usize / 64)
+            .is_some_and(|w| w >> (id % 64) & 1 != 0)
+    }
+}
+
 /// One carved ellipsoid.
 #[derive(Clone, Copy, Debug)]
 struct Sphere {
@@ -334,7 +356,7 @@ impl OriginSeeds {
 struct CaveCarver {
     cfg: CaveConfig,
     cave_block: u32,
-    allowed: Vec<u32>,
+    allowed: BlockSet,
     dirt: u32,
     grass: u32,
     seeds: OriginSeeds,
@@ -344,7 +366,7 @@ struct CaveCarver {
 
 struct RavineCarver {
     max_cube_y: i32,
-    allowed: Vec<u32>,
+    allowed: BlockSet,
     air: u32,
     lava: u32,
     water: u32,
@@ -382,6 +404,7 @@ impl Carvers {
                 .map(|b| resolve_block(registry, b))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("caves[{i}].isBlockReplaceable: {e}"))?;
+            let allowed = BlockSet::new(&allowed);
             caves.push(CaveCarver {
                 cave_block: resolve_block(registry, &cfg.cave_block)
                     .map_err(|e| format!("caves[{i}].caveBlock: {e}"))?,
@@ -397,7 +420,7 @@ impl Carvers {
         let ravine = if s.ravines {
             let allowed = match s.caves.first() {
                 Some(c) if !c.is_block_replaceable.is_empty() => caves[0].allowed.clone(),
-                _ => vec![id("stone")?, dirt, grass],
+                _ => BlockSet::new(&[id("stone")?, dirt, grass]),
             };
             Some(RavineCarver {
                 max_cube_y: (s.expected_base_height / 16.0).floor() as i32,
@@ -716,6 +739,7 @@ impl CaveCarver {
     fn carve(&self, cube: SectionPos, out: &mut [u32; 4096], lava: &[u32]) {
         let c = centre(cube);
         let (min, max) = (self.cfg.cave_min_height, self.cfg.cave_max_height);
+        let mut walls = None;
         self.active.near(
             cube,
             &self.seeds,
@@ -724,18 +748,33 @@ impl CaveCarver {
             |o| {
                 if let Some(w) = self.cache.reaching(o, c, || self.walks(o)) {
                     for s in w.near(lowest(cube)) {
-                        self.carve_sphere(cube, out, s, lava);
+                        self.carve_sphere(cube, out, s, lava, &mut walls);
                     }
                 }
             },
         );
     }
 
-    fn carve_sphere(&self, cube: SectionPos, out: &mut [u32; 4096], s: &Sphere, lava: &[u32]) {
+    /// `walls`: whether lava may be in the cube, found at the first sphere
+    /// that reaches it. Without lava in the cube when the carver starts, and
+    /// with a cave block and grass that are not lava, no wall can hold any.
+    fn carve_sphere(
+        &self,
+        cube: SectionPos,
+        out: &mut [u32; 4096],
+        s: &Sphere,
+        lava: &[u32],
+        walls: &mut Option<bool>,
+    ) {
         let Some(b) = local_box(cube, s) else {
             return;
         };
-        if walls_have(out, b, lava) {
+        let may_have_lava = *walls.get_or_insert_with(|| {
+            lava.contains(&self.cave_block)
+                || lava.contains(&self.grass)
+                || out.iter().any(|v| lava.contains(v))
+        });
+        if may_have_lava && walls_have(out, b, lava) {
             return;
         }
         let cfg = &self.cfg;
@@ -859,21 +898,34 @@ impl RavineCarver {
     fn carve(&self, cube: SectionPos, out: &mut [u32; 4096]) {
         let c = centre(cube);
         let max = self.max_cube_y;
+        let mut walls = None;
         self.active
             .near(cube, &self.seeds, RAVINE_RARITY, |y| y <= max, |o| {
                 if let Some(w) = self.cache.reaching(o, c, || self.walk(o)) {
                     for s in w.near(lowest(cube)) {
-                        self.carve_sphere(cube, out, s, &w);
+                        self.carve_sphere(cube, out, s, &w, &mut walls);
                     }
                 }
             });
     }
 
-    fn carve_sphere(&self, cube: SectionPos, out: &mut [u32; 4096], s: &Sphere, w: &Walks) {
+    /// `walls`: whether water may be in the cube (as for caves and lava; a
+    /// ravine places air and lava).
+    fn carve_sphere(
+        &self,
+        cube: SectionPos,
+        out: &mut [u32; 4096],
+        s: &Sphere,
+        w: &Walks,
+        walls: &mut Option<bool>,
+    ) {
         let Some(b) = local_box(cube, s) else {
             return;
         };
-        if walls_have(out, b, &[self.water]) {
+        let may_have_water = *walls.get_or_insert_with(|| {
+            self.air == self.water || self.lava == self.water || out.contains(&self.water)
+        });
+        if may_have_water && walls_have(out, b, &[self.water]) {
             return;
         }
         let Some(widths) = &w.widths else { return };
