@@ -1455,7 +1455,7 @@ impl GpuCubeSampler {
             device.clone(),
             queue.clone(),
             params.clone(),
-            DEFAULT_POOL_SLOTS,
+            crate::lod::cube::far_knob("HORIZON_FAR_POOL_SLOTS", u64::from(DEFAULT_POOL_SLOTS)) as u32,
         )
         .map(|generator| {
             let mut states = vec![params.air, params.stone, params.deepslate, params.water];

@@ -110,6 +110,9 @@ def main():
         'planned': statistics.median([r.get('planned') or 0 for r in runs]),
         'voxel_px': max(r.get('voxel_px') or 0 for r in runs),
         'fps_steady': statistics.median([r.get('fps_steady') or 0 for r in runs]),
+        'peak_pool_mb': max(r.get('peak_pool_mb') or 0 for r in runs),
+        'peak_arena_mb': max(r.get('peak_arena_mb') or 0 for r in runs),
+        'spawn_fills': [r.get('spawn_fill_s') for r in runs],
     }
     baseline = json.loads(BASELINE.read_text()) if BASELINE.exists() else None
     if args.write_baseline:

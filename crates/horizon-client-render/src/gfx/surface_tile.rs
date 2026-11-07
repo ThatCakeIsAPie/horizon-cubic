@@ -1531,7 +1531,7 @@ impl SurfaceTiles {
         for key in faded {
             self.free(key);
         }
-        for _ in 0..BATCHES_PER_UPDATE {
+        for _ in 0..crate::lod::cube::far_knob("HORIZON_FAR_TILE_BATCHES", BATCHES_PER_UPDATE as u64) {
             if self.pending.is_empty() || self.free.is_empty() {
                 break;
             }

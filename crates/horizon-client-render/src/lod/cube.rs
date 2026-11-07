@@ -1409,6 +1409,29 @@ const CACHE_NODES: usize = 1024;
 /// How often the plan is recomputed when the camera stays in one cube, for
 /// cubes that loaded or unloaded meanwhile.
 const REPLAN: Duration = Duration::from_millis(250);
+
+/// A far-view tunable: the environment variable `name` when set to a number,
+/// else `default`, read once per process. For the overnight loop's sweeps
+/// (research/far-fill): a value tried without a rebuild. Unset, the game runs
+/// on the defaults as before.
+pub(crate) fn far_knob(name: &'static str, default: u64) -> u64 {
+    static KNOBS: std::sync::OnceLock<Mutex<FxHashMap<&'static str, u64>>> = std::sync::OnceLock::new();
+    *KNOBS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap()
+        .entry(name)
+        .or_insert_with(|| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(default)
+        })
+}
+
+fn far_ms(name: &'static str, default: Duration) -> Duration {
+    Duration::from_millis(far_knob(name, default.as_millis() as u64))
+}
 /// How long a node whose sampling failed waits before it is asked again.
 const RETRY: Duration = Duration::from_secs(1);
 /// The plan is redone when the view's detail changes by more than this ratio
@@ -2356,7 +2379,11 @@ impl CubeLod {
         context: Arc<WorkerContext>,
         air: BlockStateId,
     ) -> Self {
-        let wanted_threads = (horizon_threads::worker_count() / 2).clamp(2, 4);
+        let wanted_threads = far_knob(
+            "HORIZON_FAR_WORKERS",
+            (horizon_threads::worker_count() / 2).clamp(2, 4) as u64,
+        )
+        .max(1) as usize;
         let backend = sampler.gpu();
         let surface_allowed = sampler.surface();
         // One more fork classifies nodes for the planner, on a thread of its own.
@@ -2780,7 +2807,11 @@ impl CubeLod {
             self.jumped = None;
         }
         self.jumped
-            .is_some_and(|at| !answered && now.saturating_duration_since(at) < DESCENT_WAIT)
+            .is_some_and(|at| {
+                !answered
+                    && now.saturating_duration_since(at)
+                        < far_ms("HORIZON_FAR_DESCENT_WAIT_MS", DESCENT_WAIT)
+            })
     }
 
     /// The nodes finished for the GPU mesher since the last call (their slots
@@ -2955,7 +2986,9 @@ impl CubeLod {
     /// four times what the last plan took, so a big plan keeps the planner
     /// thread busy a quarter of the time at most.
     fn replan_every(&self) -> Duration {
-        REPLAN.max(Duration::from_secs_f32(self.stats.plan_ms.max(0.0) * 0.004))
+        far_ms("HORIZON_FAR_REPLAN_MS", REPLAN).max(Duration::from_secs_f32(
+            self.stats.plan_ms.max(0.0) * far_knob("HORIZON_FAR_REPLAN_PLANS", 4) as f32 / 1000.0,
+        ))
     }
 
     /// Notes `key` as handed out (`empty`: it draws nothing).
@@ -3435,7 +3468,7 @@ impl CubeLod {
                 && self
                     .failed
                     .get(k)
-                    .is_none_or(|at| now.saturating_duration_since(*at) >= RETRY)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= far_ms("HORIZON_FAR_RETRY_MS", RETRY))
         };
         let mut firsts = FxHashSet::default();
         let mut first: Vec<CubeKey> = self
@@ -3464,14 +3497,14 @@ impl CubeLod {
         if now < self.retry_at || self.failed.is_empty() {
             return;
         }
-        self.retry_at = now + RETRY / 2;
+        self.retry_at = now + far_ms("HORIZON_FAR_RETRY_MS", RETRY) / 2;
         let (wanted, cover) = (&self.wanted, &self.cover);
         self.failed
             .retain(|k, _| wanted.contains(k) || cover.contains(k));
         let due: Vec<CubeKey> = self
             .failed
             .iter()
-            .filter(|(_, at)| now.saturating_duration_since(**at) >= RETRY)
+            .filter(|(_, at)| now.saturating_duration_since(**at) >= far_ms("HORIZON_FAR_RETRY_MS", RETRY))
             .map(|(&k, _)| k)
             .collect();
         if due.is_empty() {
@@ -3855,8 +3888,18 @@ fn work(
     air: BlockStateId,
     backend: Option<GpuBackend>,
 ) {
-    horizon_threads::behind_server();
-    horizon_threads::far_terrain_current();
+    // 0: behind the server and at far terrain's priority (below normal on
+    // Windows); 1: behind the server only; 2: left as spawned.
+    match far_knob("HORIZON_FAR_PRIORITY", 0) {
+        0 => {
+            horizon_threads::behind_server();
+            horizon_threads::far_terrain_current();
+        }
+        1 => {
+            horizon_threads::behind_server();
+        }
+        _ => {}
+    }
     let mut mesher = Mesher::default();
     let kind = classifier(&context, air);
     loop {
@@ -3865,16 +3908,21 @@ fn work(
             .filter(|_| shared.gpu_path.load(Ordering::Relaxed));
         // On the GPU path a worker takes a batch of the first jobs and asks
         // the sampler for them at once (`resident_many`); on the CPU path one.
-        let take = if gpu.is_some() { GPU_BATCH } else { 1 };
+        let gpu_batch = far_knob("HORIZON_FAR_GPU_BATCH", GPU_BATCH as u64).max(1) as usize;
+        let take = if gpu.is_some() { gpu_batch } else { 1 };
         if let Some(backend) = gpu {
             // The pool is full while the renderer meshes what is in it: wait
             // for room rather than fail the batch (a failed node waits RETRY).
             let mut waited = 0;
-            while backend.pool.free_slots() < GPU_BATCH
-                && waited < POOL_WAITS
+            while backend.pool.free_slots()
+                < gpu_batch * far_knob("HORIZON_FAR_POOL_NEED", 1) as usize
+                && waited < far_knob("HORIZON_FAR_POOL_WAITS", u64::from(POOL_WAITS)) as u32
                 && !shared.stop.load(Ordering::Relaxed)
             {
-                thread::sleep(POOL_WAIT);
+                thread::sleep(Duration::from_micros(far_knob(
+                    "HORIZON_FAR_POOL_WAIT_US",
+                    POOL_WAIT.as_micros() as u64,
+                )));
                 waited += 1;
             }
         }
@@ -3895,7 +3943,7 @@ fn work(
                     && let Some(key) = queue.pop()
                 {
                     if gpu.is_some() && key.level < MIN_LEVEL {
-                        if cpu == CPU_PER_BATCH {
+                        if cpu == far_knob("HORIZON_FAR_CPU_PER_BATCH", CPU_PER_BATCH as u64) as usize {
                             later.push(key);
                             continue;
                         }

@@ -36,4 +36,4 @@
 # Release-only compiled original exporter bundle.
 /exporters/
 /research/*/tmp/
-/research/*/baseline.json
+/research/*/baseline*.json
