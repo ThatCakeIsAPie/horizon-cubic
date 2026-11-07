@@ -265,6 +265,46 @@ impl CustomCubicGenerator {
         }
     }
 
+    /// [`Self::block_at`] at the heights `ys` of the column (`x`, `z`), in
+    /// order, until `stop` holds for a block: the index of that height and its
+    /// block, or `None`. The same answers as `block_at` for each height, with
+    /// the column's noise columns and biome computed once instead of per
+    /// height (a far view's sky-cover probes ask a few heights per column).
+    pub fn first_at_column(
+        &self,
+        x: i32,
+        z: i32,
+        ys: &[i32],
+        resolution_blocks: i32,
+        mut stop: impl FnMut(u32) -> bool,
+    ) -> Option<(usize, u32)> {
+        let mut probe = None;
+        for (i, &y) in ys.iter().enumerate() {
+            let cube = SectionPos::new(x >> 4, y >> 4, z >> 4);
+            let block = match (&self.kind, self.area(cube)) {
+                (Kind::Terrain(t), None) => probe
+                    .get_or_insert_with(|| ColumnProbe::new(t, x, z, resolution_blocks))
+                    .block_at(y),
+                _ => self.block_at(x, y, z, resolution_blocks),
+            };
+            if stop(block) {
+                return Some((i, block));
+            }
+        }
+        None
+    }
+
+    /// [`Self::block_at`] at each of the heights `ys` of the column (`x`,
+    /// `z`), as [`Self::first_at_column`] computes them.
+    pub fn blocks_at_column(&self, x: i32, z: i32, ys: &[i32], resolution_blocks: i32) -> Vec<u32> {
+        let mut out = Vec::with_capacity(ys.len());
+        self.first_at_column(x, z, ys, resolution_blocks, |b| {
+            out.push(b);
+            false
+        });
+        out
+    }
+
     /// The terrain surface of a column: the topmost solid block's Y at or
     /// below `from_y` (searching down at most 4096 blocks), or, when `from_y`
     /// is inside terrain, the top of that solid run (searching up at most 512
@@ -413,6 +453,71 @@ impl CustomCubicGenerator {
     }
 }
 
+/// `Terrain::block_at` for the blocks of one column: the noise columns its
+/// finite differences take (at `x`, `x + h` and `z + h`) and the column's
+/// biome are computed once, when a height first needs them.
+struct ColumnProbe<'a> {
+    t: &'a Terrain,
+    x: i32,
+    z: i32,
+    resolution: i32,
+    /// The columns at (`x`, `z`), (`x + h`, `z`) and (`x`, `z + h`).
+    columns: Option<[density::Column; 3]>,
+    biome: Option<std::rc::Rc<biomes::ResolvedBiome>>,
+}
+
+impl<'a> ColumnProbe<'a> {
+    fn new(t: &'a Terrain, x: i32, z: i32, resolution: i32) -> Self {
+        Self {
+            t,
+            x,
+            z,
+            resolution,
+            columns: None,
+            biome: None,
+        }
+    }
+
+    fn block_at(&mut self, y: i32) -> u32 {
+        let (t, x, z, resolution) = (self.t, self.x, self.z, self.resolution);
+        if let Some(block) = t
+            .analyzer()
+            .uniform_block(&t.block_query(x, y, z, resolution))
+        {
+            return block;
+        }
+        let (density, dx, dy, dz) = if resolution <= 1 {
+            cell_at(&t.noise, &t.blend, t.sizes, x, y, z)
+        } else {
+            let mw = f64::from(resolution);
+            let h = resolution.min(8);
+            let [c0, cx, cz] = self.columns.get_or_insert_with(|| {
+                let col = |x: i32, z: i32| t.noise.column(x, z, t.blend.terrain_at(x, z), mw);
+                [col(x, z), col(x + h, z), col(x, z + h)]
+            });
+            let v = t.noise.density(x, y, z, c0, mw);
+            let inv = 1.0 / f64::from(h);
+            (
+                v,
+                (t.noise.density(x + h, y, z, cx, mw) - v) * inv,
+                (t.noise.density(x, y + h, z, c0, mw) - v) * inv,
+                (t.noise.density(x, y, z + h, cz, mw) - v) * inv,
+            )
+        };
+        let biome = self.biome.get_or_insert_with(|| t.blend.biome_at(x, z));
+        t.replacers.block(&BlockCtx {
+            x,
+            y,
+            z,
+            dx,
+            dy,
+            dz,
+            density,
+            biome,
+        })
+    }
+}
+
 /// The shortest noise wavelength, in blocks, a cube's first uniformity proof
 /// evaluates (finer octaves are bounded by their amplitude).
 const COARSE_PROOF: f64 = 16.0;
@@ -493,9 +598,14 @@ impl Terrain {
     }
 
     fn block_at(&self, x: i32, y: i32, z: i32, resolution: i32) -> u32 {
+        ColumnProbe::new(self, x, z, resolution).block_at(y)
+    }
+
+    /// `block_at`'s proof query for the block (`x`, `y`, `z`).
+    fn block_query(&self, x: i32, y: i32, z: i32, resolution: i32) -> Query {
         // One bound over the points the answer is computed from, instead of
         // eight (lattice cell) or four (finite differences) densities.
-        let q = if resolution <= 1 {
+        if resolution <= 1 {
             Query::lattice(self.sizes, [x, y, z], [x, y, z])
         } else {
             let h = resolution.min(8);
@@ -506,39 +616,7 @@ impl Terrain {
                 min_wavelength: f64::from(resolution),
                 column: None,
             }
-        };
-        if let Some(block) = self.analyzer().uniform_block(&q) {
-            return block;
         }
-        let (density, dx, dy, dz) = if resolution <= 1 {
-            cell_at(&self.noise, &self.blend, self.sizes, x, y, z)
-        } else {
-            let mw = f64::from(resolution);
-            let h = resolution.min(8);
-            let d = |x: i32, y: i32, z: i32| {
-                let col = self.noise.column(x, z, self.blend.terrain_at(x, z), mw);
-                self.noise.density(x, y, z, &col, mw)
-            };
-            let v = d(x, y, z);
-            let inv = 1.0 / f64::from(h);
-            (
-                v,
-                (d(x + h, y, z) - v) * inv,
-                (d(x, y + h, z) - v) * inv,
-                (d(x, y, z + h) - v) * inv,
-            )
-        };
-        let biome = self.blend.biome_at(x, z);
-        self.replacers.block(&BlockCtx {
-            x,
-            y,
-            z,
-            dx,
-            dy,
-            dz,
-            density,
-            biome: &biome,
-        })
     }
 
     fn surface_y(&self, x: i32, z: i32, from_y: i32) -> Option<i32> {

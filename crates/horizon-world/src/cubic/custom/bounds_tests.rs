@@ -288,3 +288,39 @@ fn nodes_are_uniform_at_every_resolution_they_claim() {
     }
     assert!(proven > 20, "{proven}");
 }
+
+/// The column probes answer what `block_at` answers, at every resolution,
+/// whether they stop early or not.
+#[test]
+fn column_probes_answer_as_block_at() {
+    let mut rng = Lcg(2026);
+    let mut checked = 0;
+    for biome in ["plains", "badlands", "deep_ocean"] {
+        for (name, g) in generators(11, biome) {
+            for _ in 0..60 {
+                let (x, z) = (rng.range(-2000, 2000), rng.range(-2000, 2000));
+                let base = rng.range(-200, 300);
+                let ys: Vec<i32> = [0, 2, 12, 36, 100, 260, 600]
+                    .iter()
+                    .map(|d| base + d)
+                    .collect();
+                for resolution in [1, 2, 4, 8] {
+                    let want: Vec<u32> = ys
+                        .iter()
+                        .map(|&y| g.block_at(x, y, z, resolution))
+                        .collect();
+                    assert_eq!(
+                        g.blocks_at_column(x, z, &ys, resolution),
+                        want,
+                        "{name} {biome} ({x}, {z}) at {resolution}"
+                    );
+                    let first = g.first_at_column(x, z, &ys, resolution, |b| b == want[3]);
+                    let at = want.iter().position(|&b| b == want[3]).unwrap();
+                    assert_eq!(first, Some((at, want[3])));
+                    checked += ys.len();
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000, "{checked}");
+}
