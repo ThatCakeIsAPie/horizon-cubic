@@ -6,8 +6,8 @@
 | sky | `4,20,32,1` | 0.2018 | **0.0130** | -93.6% | 6.5% |
 | deep | `4,-40,-28,1` | 0.2991 | **0.1220** | -59.2% | 3.0% |
 
-Iterations: 42; kept 24. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 23:46.
+Iterations: 46; kept 24. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-07 00:13.
 
 ## Hot spots
 
@@ -63,3 +63,7 @@ Updated 2026-11-06 23:46.
 | 32 | surface | keep | 0.2480 | -1.5% | PASS | 39d90d758 | measurement on iteration 32 code |
 | 33 | sky | discard | 0.0125 | -3.8% | PASS | - | bounds' 25 terrain corners and 16 biomes looked up in one thread-local access: sky -3.8%, deep -1.3%: below min-delta |
 | 34 | surface | keep | 0.2228 | -10.2% | PASS | 06ee2ebd1 | per-cell proofs: lattice cells on one side of the surface get possible_blocks from their exact corners/edge gradient/biome; proven cells filled, chain skipped. New test vs unskipped chain. First 0.2295, confirm 0.2228; deep 0.1190, sky 0.0128 |
+| 35 | deep | discard | 0.1213 | -0.6% | PASS | - | cave carve columns narrowed to the inside run (dy^2 valley), ravine dy^2/STRETCH tabled: deep 0.1248/0.1213, surface 0.2309: no gain |
+| 36 | surface | discard | 0.2233 | +0.2% | PASS | - | fused replace_ore (one locate/read per cell) + generic population functions: 0.2233: no gain |
+| 37 | deep | discard | 0.1185 | -2.9% | PASS | - | walk size profile sin(walked/max*PI) tabled per (walked, max) + sincosf: deep 0.1185, surface 0.2255: no gain |
+| 38 | surface | discard | 0.2165 | -2.8% | PASS | - | generated mixed cubes held as block arrays (packed on demand): first 0.2128 (-4.5%), confirm 0.2165 (-2.8%, below min-delta); deep 0.1167, sky 0.0128. Disk records verified identical; make+flush surface 0.31 s. Patch kept (also costs 16 KB per in-flight mixed cube) |
