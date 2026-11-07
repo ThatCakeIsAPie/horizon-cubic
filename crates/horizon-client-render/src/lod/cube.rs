@@ -2379,9 +2379,13 @@ impl CubeLod {
         context: Arc<WorkerContext>,
         air: BlockStateId,
     ) -> Self {
+        // All the threads but two, from 2 to 8: the far view's fill waits on
+        // its workers (the GPU and its pool have room to spare). Half the
+        // threads, at most 4, took 17.3 s to fill after a teleport on 8
+        // threads; 6 workers took 15.1 s (research/far-fill).
         let wanted_threads = far_knob(
             "HORIZON_FAR_WORKERS",
-            (horizon_threads::worker_count() / 2).clamp(2, 4) as u64,
+            horizon_threads::worker_count().saturating_sub(2).clamp(2, 8) as u64,
         )
         .max(1) as usize;
         let backend = sampler.gpu();

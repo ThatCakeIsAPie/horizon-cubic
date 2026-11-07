@@ -88,6 +88,11 @@ def main():
     for i in range(args.launches):
         r = launch(args, bin_dir, i)
         if r is None:
+            # A launch now and then fails to come up (the last game still closing): once more.
+            print(f'launch {i + 1}: no result, retrying once', flush=True)
+            time.sleep(15)
+            r = launch(args, bin_dir, i)
+        if r is None:
             print('SCORE: crash')
             print('GUARD: FAIL the benchmark crashed')
             sys.exit(1)
