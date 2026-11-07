@@ -437,7 +437,11 @@ impl CubicLodSampler {
 
     /// `node` with the sky cover of its place.
     fn covered(&mut self, node: CubeNode) -> CubeNode {
+        let started = std::time::Instant::now();
         let (cover, _) = self.cover_of(node.key);
+        if crate::lod::cube::profile::on() {
+            crate::lod::cube::profile::add(&crate::lod::cube::profile::S_COVER, started);
+        }
         node.with_covered(cover)
     }
 
@@ -485,21 +489,40 @@ impl CubicLodSampler {
             start.saturating_add(COVER_LOOKS[0]),
             start.saturating_add(COVER_LOOKS[COVER_LOOKS.len() - 1]),
         );
-        let mut open = [false; 16];
+        // Then each look's slab of a tile that is not: the slabs high over the
+        // terrain are proved free too (most of the probes left were there, and
+        // a probe is a whole `block_at`), the same bound over less of the box.
+        // Which columns come out covered does not change.
+        let air_box = |min: [i32; 3], max: [i32; 3]| {
+            generator.classify_box(min, max) == horizon_world::cubic::custom::BoxClass::Air
+        };
+        let mut open = [[false; COVER_LOOKS.len()]; 16];
         for (i, open) in open.iter_mut().enumerate() {
             let x = origin[0] + (i as i32 & 3) * tile;
             let z = origin[2] + (i as i32 >> 2) * tile;
-            *open = generator.classify_box([x, low, z], [x + tile - 1, high, z + tile - 1])
-                != horizon_world::cubic::custom::BoxClass::Air;
+            if air_box([x, low, z], [x + tile - 1, high, z + tile - 1]) {
+                continue;
+            }
+            for (j, &up) in COVER_LOOKS.iter().enumerate() {
+                let y = start.saturating_add(up);
+                open[j] = !air_box([x, y, z], [x + tile - 1, y, z + tile - 1]);
+            }
         }
+        let probe = |x: i32, y: i32, z: i32| {
+            let state = generator.block_at(x, y, z, resolution);
+            state != 0 && state != air && !fluids.contains(&state)
+        };
         cover_columns(origin, key.level, start, &mut mask, |x, y, z| {
             let tx = ((x - origin[0]) / tile).clamp(0, 3);
             let tz = ((z - origin[2]) / tile).clamp(0, 3);
-            if !open[(tz * 4 + tx) as usize] {
-                return false;
+            let Some(j) = COVER_LOOKS.iter().position(|&up| start.saturating_add(up) == y) else {
+                return probe(x, y, z);
+            };
+            let skip = !open[(tz * 4 + tx) as usize][j];
+            if skip && crate::lod::cube::far_knob("HORIZON_FAR_COVER_CHECK", 0) != 0 && probe(x, y, z) {
+                log::warn!("Horizon far cover: a slab proved free holds solid ground at {x} {y} {z} (level {})", key.level);
             }
-            let state = generator.block_at(x, y, z, resolution);
-            state != 0 && state != air && !fluids.contains(&state)
+            !skip && probe(x, y, z)
         });
         (Some(mask), exact)
     }
@@ -508,6 +531,14 @@ impl CubicLodSampler {
     /// eight children are stored), unless a cube under it was saved since
     /// `since` (the cache's cursor when the node's building started).
     fn keep(&mut self, node: &CubeNode, since: u64) {
+        let started = std::time::Instant::now();
+        self.keep_timed(node, since);
+        if crate::lod::cube::profile::on() {
+            crate::lod::cube::profile::add(&crate::lod::cube::profile::S_KEEP, started);
+        }
+    }
+
+    fn keep_timed(&mut self, node: &CubeNode, since: u64) {
         let Some(cache) = self.cache.clone() else {
             return;
         };
@@ -649,6 +680,7 @@ impl CubeSampler for CubicLodSampler {
         let mut far_places = Vec::new();
         for (i, &key) in keys.iter().enumerate() {
             if self.far_makes(key) {
+                let started = std::time::Instant::now();
                 let since = self.cache.as_ref().map_or(0, |c| c.cursor());
                 if let Some(node) = self.cache.as_ref().and_then(|c| c.get(key)) {
                     out[i] = Some(Resident::Node(node));
@@ -658,6 +690,9 @@ impl CubeSampler for CubicLodSampler {
                     far_keys.push(key);
                     far_places.push(i);
                 }
+                if crate::lod::cube::profile::on() {
+                    crate::lod::cube::profile::add(&crate::lod::cube::profile::S_CACHE, started);
+                }
             } else {
                 out[i] = self.node(key).map(Resident::Node);
             }
@@ -665,7 +700,12 @@ impl CubeSampler for CubicLodSampler {
         if !far_keys.is_empty()
             && let Some(far) = self.far.as_mut()
         {
-            for (i, answer) in far_places.into_iter().zip(far.resident_many(&far_keys)) {
+            let started = std::time::Instant::now();
+            let answers = far.resident_many(&far_keys);
+            if crate::lod::cube::profile::on() {
+                crate::lod::cube::profile::add(&crate::lod::cube::profile::S_FAR, started);
+            }
+            for (i, answer) in far_places.into_iter().zip(answers) {
                 out[i] = answer;
             }
         }
@@ -736,8 +776,12 @@ impl CubicLodSampler {
     /// A node sampled from the generators at its own resolution, with its
     /// sky cover.
     fn sampled(&mut self, key: CubeKey) -> Option<CubeNode> {
-        let node = self.sampled_plain(key)?;
-        Some(self.covered(node))
+        let started = std::time::Instant::now();
+        let node = self.sampled_plain(key);
+        if crate::lod::cube::profile::on() {
+            crate::lod::cube::profile::add(&crate::lod::cube::profile::S_SAMPLE, started);
+        }
+        Some(self.covered(node?))
     }
 
     /// Cube `key` (level 0) as the generator makes it whole: terrain and

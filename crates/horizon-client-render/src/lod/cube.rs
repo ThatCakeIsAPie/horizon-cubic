@@ -1414,7 +1414,7 @@ const REPLAN: Duration = Duration::from_millis(250);
 /// else `default`, read once per process. For the overnight loop's sweeps
 /// (research/far-fill): a value tried without a rebuild. Unset, the game runs
 /// on the defaults as before.
-pub(crate) fn far_knob(name: &'static str, default: u64) -> u64 {
+pub fn far_knob(name: &'static str, default: u64) -> u64 {
     static KNOBS: std::sync::OnceLock<Mutex<FxHashMap<&'static str, u64>>> = std::sync::OnceLock::new();
     *KNOBS
         .get_or_init(Mutex::default)
@@ -1432,7 +1432,7 @@ pub(crate) fn far_knob(name: &'static str, default: u64) -> u64 {
 /// Opt-in timing of the far view's producers (`HORIZON_FAR_PROFILE=1`), for
 /// the overnight loop (research/far-fill): where a worker's time goes, and how
 /// busy the GPU thread is. Logged every 5 s while on; nothing is timed off.
-pub(crate) mod profile {
+pub mod profile {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::time::Instant;
 
@@ -1447,6 +1447,12 @@ pub(crate) mod profile {
     pub static GPU_BUSY: AtomicU64 = AtomicU64::new(0);
     pub static GPU_ROUNDS: AtomicU64 = AtomicU64::new(0);
     pub static GPU_KEYS: AtomicU64 = AtomicU64::new(0);
+    // Inside the game's sampler (cubic_lod.rs): its CPU nodes and the far request.
+    pub static S_CACHE: AtomicU64 = AtomicU64::new(0);
+    pub static S_SAMPLE: AtomicU64 = AtomicU64::new(0);
+    pub static S_COVER: AtomicU64 = AtomicU64::new(0);
+    pub static S_KEEP: AtomicU64 = AtomicU64::new(0);
+    pub static S_FAR: AtomicU64 = AtomicU64::new(0);
     static LAST: AtomicU64 = AtomicU64::new(0);
 
     pub fn on() -> bool {
@@ -1466,7 +1472,7 @@ pub(crate) mod profile {
         let ms = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
         let n = |c: &AtomicU64| c.swap(0, Relaxed);
         log::info!(
-            "Horizon far profile ({} ms): pool wait {:.0} ms, queue wait {:.0} ms, resident_many {:.0} ms, cpu nodes {:.0} ms, gpu nodes {:.0} ms, send {:.0} ms; keys {} (cpu {}); gpu thread busy {:.0} ms over {} rounds, {} keys",
+            "Horizon far profile ({} ms): pool wait {:.0} ms, queue wait {:.0} ms, resident_many {:.0} ms, cpu nodes {:.0} ms, gpu nodes {:.0} ms, send {:.0} ms; keys {} (cpu {}); gpu thread busy {:.0} ms over {} rounds, {} keys; sampler: cache {:.0} ms, sample {:.0} ms, cover {:.0} ms, keep {:.0} ms, far request {:.0} ms",
             now - last,
             ms(&POOL_WAIT),
             ms(&QUEUE_WAIT),
@@ -1479,6 +1485,11 @@ pub(crate) mod profile {
             ms(&GPU_BUSY),
             n(&GPU_ROUNDS),
             n(&GPU_KEYS),
+            ms(&S_CACHE),
+            ms(&S_SAMPLE),
+            ms(&S_COVER),
+            ms(&S_KEEP),
+            ms(&S_FAR),
         );
     }
 }
