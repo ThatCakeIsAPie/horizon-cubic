@@ -911,10 +911,15 @@ impl CubicLevel {
             } else {
                 sections[d].clone()
             };
+            // A plain cube's record is the section a population wrote, with
+            // no entities: no need to read it.
+            let plain = self.pop.cached_plain(q).is_some();
+            let old = if plain { None } else { self.read(q) };
             let known = self.pop.flags(q).unwrap_or(0);
             let flags = if own {
                 (known | POPULATED) & !PARTIAL
-            } else if known & (POPULATED | PARTIAL) != 0 || (loaded[d].1 && self.read(q).is_some())
+            } else if known & (POPULATED | PARTIAL) != 0
+                || (loaded[d].1 && (plain || old.is_some()))
             {
                 known
             } else {
@@ -923,13 +928,14 @@ impl CubicLevel {
             self.pop.set_flags(q, flags);
             let mut one = Chunk::with_layout(q.x, q.z, ColumnLayout::window(q.y * 16, 16));
             one.sections[0] = section.clone();
-            let entities = self
-                .read(q)
-                .map(|old| record_entities(&old))
-                .unwrap_or_default();
+            let entities = old.map(|old| record_entities(&old)).unwrap_or_default();
             let root = ctx.encode(&one, 0, false, &entities);
             self.write_later(q, root);
-            self.pop.keep(q, section);
+            if entities.is_empty() && !self.is_marker(q.y) {
+                self.pop.keep_plain(q, section);
+            } else {
+                self.pop.keep(q, section);
+            }
         }
         self.pop
             .populations
@@ -1004,6 +1010,9 @@ impl CubicLevel {
         // that touch it have run.
         if !self.is_vanilla(pos.y) {
             self.ensure_populated_around(pos);
+        }
+        if let Some(section) = self.pop.cached_plain(pos) {
+            return Some(LoadedCube::empty(pos, section));
         }
         if let Some(root) = self.read(pos)
             && let Some(mut cube) = ctx.decode(&root, pos.y)

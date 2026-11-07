@@ -326,7 +326,8 @@ pub struct Population {
 
 #[derive(Default)]
 struct Cache {
-    map: HashMap<SectionPos, Arc<Section>>,
+    /// Each cube's section, and whether it is all its record holds (`plain`).
+    map: HashMap<SectionPos, (Arc<Section>, bool)>,
     order: VecDeque<SectionPos>,
 }
 
@@ -397,13 +398,32 @@ impl Population {
 
     /// A cube in flight.
     pub fn cached(&self, pos: SectionPos) -> Option<Arc<Section>> {
-        self.cache.lock().unwrap().map.get(&pos).cloned()
+        self.cache.lock().unwrap().map.get(&pos).map(|e| e.0.clone())
+    }
+
+    /// A cube in flight whose record is exactly its section: written by a
+    /// population with no entities, and not written since.
+    pub fn cached_plain(&self, pos: SectionPos) -> Option<Arc<Section>> {
+        match self.cache.lock().unwrap().map.get(&pos) {
+            Some((section, true)) => Some(section.clone()),
+            _ => None,
+        }
     }
 
     /// Keeps `section` as cube `pos`'s current content.
     pub fn keep(&self, pos: SectionPos, section: Arc<Section>) {
+        self.keep_as(pos, section, false);
+    }
+
+    /// Keeps `section` as cube `pos`'s current content and its whole record
+    /// (`cached_plain`).
+    pub fn keep_plain(&self, pos: SectionPos, section: Arc<Section>) {
+        self.keep_as(pos, section, true);
+    }
+
+    fn keep_as(&self, pos: SectionPos, section: Arc<Section>, plain: bool) {
         let mut cache = self.cache.lock().unwrap();
-        if cache.map.insert(pos, section).is_none() {
+        if cache.map.insert(pos, (section, plain)).is_none() {
             cache.order.push_back(pos);
         }
         while cache.map.len() > CACHE_CUBES {
