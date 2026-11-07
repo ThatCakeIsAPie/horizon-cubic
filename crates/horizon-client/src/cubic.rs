@@ -34,7 +34,7 @@ use crate::biome::Biomes;
 use crate::chunk::{Chunk, ColumnLayout, LevelShape, Section, block_strategy};
 use crate::cubic_gen::{
     CubicGeneration, CubicKind, Generation, Held, PARTIAL, POPULATED, PopRegion, Population,
-    needs_population, root_flags, set_root_flags,
+    STRUCTURES, needs_population, root_flags, set_root_flags,
 };
 use crate::save::{ChunkExtras, Persistent, SaveTables, decode_with, encode_with};
 use crate::streaming::{ChunkGenerator, Proto};
@@ -45,6 +45,7 @@ use horizon_world::cubic::store::CubeStore;
 use horizon_world::cubic::{MAX_CUBE_Y, MIN_CUBE_Y};
 use horizon_world::nbt::{NamedTag, Tag};
 use horizon_world::registry::BlockRegistry;
+use horizon_world::worldgen::structure::start::StructureStart;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -932,6 +933,44 @@ impl CubicLevel {
         self.terrain_section(pos).0
     }
 
+    /// Custom Cubic's structure references of chunk (`x`, `z`) (vanilla's
+    /// `createReferences`: the starts within 8 chunks whose box crosses
+    /// it), as (structure, start chunk), leaving out those whose terrain
+    /// was populated before the world had structures.
+    pub fn structure_refs(&self, x: i32, z: i32) -> Vec<(Arc<str>, (i32, i32))> {
+        let Some(structures) = &self.wg.structures else {
+            return Vec::new();
+        };
+        let (bx, bz) = (x * 16, z * 16);
+        let starts = structures.touching([bx, bz], [bx + 15, bz + 15]);
+        (starts.into_iter())
+            .filter(|s| !self.made_before_structures(s))
+            .map(|s| (Arc::from(s.name.as_str()), (s.chunk.x, s.chunk.z)))
+            .collect()
+    }
+
+    /// Whether `start` lies in terrain populated before the world had
+    /// structures (an older world's cubes, or ones made with them off): its
+    /// first piece's middle cube was populated without placing them. Such a
+    /// structure was never built, so `/locate`, maps and structure spawns
+    /// pass over it.
+    pub fn made_before_structures(&self, start: &StructureStart) -> bool {
+        let Some(piece) = start.pieces.first() else {
+            return false;
+        };
+        let c = piece.bounding_box().center();
+        let pos = SectionPos::new(c[0] >> 4, c[1] >> 4, c[2] >> 4);
+        let flags = match self.pop.flags(pos) {
+            Some(flags) => flags,
+            None => {
+                let flags = self.read(pos).map_or(0, |root| root_flags(&root));
+                self.pop.learn_flags(pos, flags);
+                flags
+            }
+        };
+        flags & POPULATED != 0 && flags & STRUCTURES == 0
+    }
+
     /// Whether the population of `p` ran (its record's flag).
     fn is_populated(&self, p: SectionPos) -> bool {
         let flags = match self.pop.flags(p) {
@@ -1025,7 +1064,12 @@ impl CubicLevel {
             let old = if plain { None } else { self.read(q) };
             let known = self.pop.flags(q).unwrap_or(0);
             let flags = if own {
-                (known | POPULATED) & !PARTIAL
+                let structures = if self.wg.structures.is_some() {
+                    STRUCTURES
+                } else {
+                    0
+                };
+                (known | POPULATED | structures) & !PARTIAL
             } else if known & (POPULATED | PARTIAL) != 0
                 || (loaded[d].1 && (plain || old.is_some()))
             {
@@ -1247,6 +1291,7 @@ impl CubicLevel {
         }
         if self.wg.kind != CubicKind::Hybrid {
             chunk.sky_covered = self.sky_cover(x, z, window);
+            chunk.structure_refs = self.structure_refs(x, z);
             return chunk;
         }
         // The column's own data lives in the marker cube. A window that does
@@ -3067,6 +3112,78 @@ mod tests {
         assert_eq!(forward_be, backward_be, "{} at {:?}", village.name, c);
         drop((a, b));
         let _ = std::fs::remove_dir_all(&f.dir);
+        let _ = std::fs::remove_dir_all(&g.dir);
+    }
+
+    /// `/locate`, maps and structure spawns in Custom Cubic: the planner
+    /// finds a village around the origin, the chunks under it reference
+    /// its start (what `structures_at` and the spawner read), and in a world
+    /// whose cubes there were populated before it had structures (made with
+    /// them off, then reopened with them on) the village was never built:
+    /// it is passed over and referenced nowhere.
+    #[test]
+    fn custom_structures_are_located_unless_their_terrain_came_first() {
+        use horizon_core::position::ChunkPos;
+        let Some(f) = Fixture::new("structure-locate") else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let level = f.level_with_data(CubicKind::Custom, String::new());
+        let structures = level.generation().structures.clone().expect("structures");
+        let villages: Vec<String> = ["plains", "desert", "savanna", "snowy", "taiga"]
+            .iter()
+            .map(|b| format!("minecraft:village_{b}"))
+            .collect();
+        // Vanilla's search: the first start of the set's rings of sectors
+        // around the origin (not always the nearest).
+        let (name, at) = structures
+            .locate(&villages, [0, 64, 0], 100, &|_, _| false)
+            .expect("a village located");
+        let chunk = ChunkPos::new(at[0] >> 4, at[2] >> 4);
+        let village = (structures.starts_at(chunk).iter())
+            .find(|s| s.name == name)
+            .expect("the located village starts in its chunk")
+            .clone();
+        // A chunk under its first piece references it.
+        let c = village.pieces[0].bounding_box().center();
+        let referenced = |level: &CubicLevel| {
+            (level.structure_refs(c[0] >> 4, c[2] >> 4).into_iter())
+                .any(|(n, at)| *n == *village.name && at == (village.chunk.x, village.chunk.z))
+        };
+        assert!(
+            referenced(&level),
+            "{} at {c:?} is referenced",
+            village.name
+        );
+        assert!(!level.made_before_structures(&village));
+        drop(level);
+        let _ = std::fs::remove_dir_all(&f.dir);
+
+        // The same cubes populated with structures off, then the world
+        // reopened with them on.
+        let Some(g) = Fixture::new("structure-locate-old") else {
+            return;
+        };
+        let mut off = horizon_world::cubic::custom::CustomGeneratorSettings::defaults();
+        for v in horizon_world::cubic::custom::settings::OVERWORLD_STRUCTURE_SETS {
+            off.set_structure_enabled(v.name, false);
+        }
+        let old = g.level_with_data(CubicKind::Custom, off.to_json_compact());
+        old.make_cube(SectionPos::new(c[0] >> 4, c[1] >> 4, c[2] >> 4));
+        old.flush();
+        drop(old);
+        let again = g.level_with_data(CubicKind::Custom, String::new());
+        assert!(
+            again.made_before_structures(&village),
+            "{} came after its terrain",
+            village.name
+        );
+        assert!(
+            !referenced(&again),
+            "{} is referenced nowhere",
+            village.name
+        );
+        drop(again);
         let _ = std::fs::remove_dir_all(&g.dir);
     }
 

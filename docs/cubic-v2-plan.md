@@ -126,10 +126,14 @@ The owner asked for structures with sliders, like the terrain's, defaulting to a
   - A test makes a village's cubes in two opposite orders on two levels and checks that its building blocks and block entities are the same. The decoration around may differ by a few blocks, as it does without structures: a population's ores, trees and a village's snow piles reach into neighbouring areas, so the first of two neighbours decides those.
 - **Cost:** the cube bench (`HORIZON_CUBE_BENCH_DATA=1`, 2,197 cubes around the origin, one thread) goes from 0.52 to 0.56 ms per cube, about 9% more, with `HORIZON_CUBE_BENCH_NO_STRUCTURES=1` as the comparison. At first a cube cost twice as much, and a village's cubes four times: a mineshaft corridor asks the heightmap of almost every block it places. The heightmaps are now found a chunk at a time (`chunk_tops`), reading the cubes from the bound's ceiling down by their density lattice. That costs 1.7 µs a column, against 260 µs for a single column's search.
 - Structures write blocks the way generation does (`LevelFeatureWorld::raw`, vanilla's `WorldGenRegion.setBlock`), without the live level's neighbour shape updates; templates update their edges' shapes themselves.
+- **Lookups** (`structures/locate`): `/locate structure`, explorer and treasure maps, and the structures a position is in (structure mob spawns: witch huts, monuments, outposts; advancements; cats) answer from the planner, not from data stored per chunk.
+  - The level's `VanillaTerrain` (the locator every caller uses) hands its structure queries to the level's `CubicStructures` (`set_cubic_structures`): `starts_at`, `locate` and `locate_for_map`. Maps keep the starts they pointed at in the reference file, as superflat worlds do.
+  - A Custom column's chunk gets its references when it is assembled (`CubicLevel::structure_refs`: vanilla's `createReferences`, the starts within 8 chunks whose box crosses it).
+  - Terrain populated before the world had structures: a new record flag, `STRUCTURES` (bit 2 of `horizon:cubic_flags`), marks a cube whose population placed them. A start whose first piece's middle cube was populated without the flag was never built (an older world, or one made with structures off and switched on later), so `/locate` and maps pass over it and no chunk references it.
+  - Hybrid is unchanged: its vanilla band keeps vanilla's starts, references and locator.
 - **Not done yet:**
   - Terrain adaptation (vanilla's beardifier): the terrain is not flattened under villages and outposts, or dug out around buried structures.
   - Structures in the far view: "Far view: the owner's decisions and later work", item 4.
-  - Starts and references on the level's chunks, so `/locate`, maps and structure mob spawns (witch huts, monuments, outposts) know about these structures.
   - Existing Custom Cubic worlds get structures in the cubes they generate from now on, as a Minecraft update does: a structure that starts in new terrain is cut off where it reaches terrain made before.
 
 ### Density bounds

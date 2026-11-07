@@ -37,15 +37,21 @@
 //! the entities the pieces carry (villagers, guardians, a witch) go to the
 //! [`CubeWorld`].
 //!
+//! # Lookups
+//!
+//! `/locate`, exploration maps and the structures a position is in (mob
+//! spawns, advancements) ask the planner: [`CubicStructures::locate`],
+//! [`CubicStructures::starts_at`] and [`CubicStructures::touching`]. The
+//! starts are a function of the seed, the settings and the terrain, so
+//! nothing is stored per chunk; the integrator leaves out the starts whose
+//! terrain was populated before the world had structures.
+//!
 //! # Not done
 //!
 //! * Terrain adaptation (vanilla's beardifier): the terrain is not flattened
 //!   under villages and outposts or dug around buried structures; a house on
 //!   a slope may float at one side.
 //! * The far view shows no structures (as it shows no trees).
-//! * Starts and references are not on the level's chunks: `/locate`, maps
-//!   and structure mob spawns (witch huts, monuments, outposts) don't know
-//!   these structures.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -233,6 +239,21 @@ impl CubicStructures {
         (self.planner.touching(&mut self.context(), min, max).into_iter())
             .map(|(_, _, s)| s)
             .collect()
+    }
+
+    /// `/locate structure` and exploration maps: the nearest start of one of
+    /// `names` from block `from` within `radius` placement sectors, with its
+    /// locate position (the start chunk's corner), passing over the starts
+    /// `skip` names (structure name, start chunk).
+    pub fn locate(
+        &self,
+        names: &[String],
+        from: [i32; 3],
+        radius: i32,
+        skip: &dyn Fn(&str, ChunkPos) -> bool,
+    ) -> Option<(String, [i32; 3])> {
+        self.planner
+            .locate(&mut self.context(), names, from, radius, skip)
     }
 
     /// A structure's name (`minecraft:village_plains`).
