@@ -911,6 +911,20 @@ pub(super) fn make_streaming(
                 Some(&inner_data),
             )?;
             let _ = save.cubic.set(level.clone());
+            // Custom Cubic's structures answer `/locate`, maps and the
+            // structures a position is in, not the vanilla generator's.
+            if let (Some(structures), Some(locator)) =
+                (level.generation().structures.clone(), locator.as_ref())
+            {
+                let weak = Arc::downgrade(&level);
+                locator.set_cubic_structures(horizon_client::vanillagen::CubicStructureSource {
+                    structures,
+                    made_before: Arc::new(move |start| {
+                        weak.upgrade()
+                            .is_some_and(|level| level.made_before_structures(start))
+                    }),
+                });
+            }
             let window = horizon_client::cubic::shard_window(shape);
             level.set_primary_window(window.clone());
             let terrain = Arc::new(horizon_client::cubic::CubicTerrain {

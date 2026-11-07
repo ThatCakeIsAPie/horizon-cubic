@@ -126,10 +126,20 @@ The owner asked for structures with sliders, like the terrain's, defaulting to a
   - A test makes a village's cubes in two opposite orders on two levels and checks that its building blocks and block entities are the same. The decoration around may differ by a few blocks, as it does without structures: a population's ores, trees and a village's snow piles reach into neighbouring areas, so the first of two neighbours decides those.
 - **Cost:** the cube bench (`HORIZON_CUBE_BENCH_DATA=1`, 2,197 cubes around the origin, one thread) goes from 0.52 to 0.56 ms per cube, about 9% more, with `HORIZON_CUBE_BENCH_NO_STRUCTURES=1` as the comparison. At first a cube cost twice as much, and a village's cubes four times: a mineshaft corridor asks the heightmap of almost every block it places. The heightmaps are now found a chunk at a time (`chunk_tops`), reading the cubes from the bound's ceiling down by their density lattice. That costs 1.7 µs a column, against 260 µs for a single column's search.
 - Structures write blocks the way generation does (`LevelFeatureWorld::raw`, vanilla's `WorldGenRegion.setBlock`), without the live level's neighbour shape updates; templates update their edges' shapes themselves.
+- **Terrain adaptation** (vanilla's beardifier, `structures/terrain-adaptation`):
+  - Each structure's `terrain_adaptation` (beard_thin, beard_box, bury, encapsulate) and its jigsaw junctions shape the terrain. `CubicStructures::beard` is a chunk's `Beardifier.forStructuresInChunk`, built from the starts whose box crosses the chunk. `CustomCubicGenerator::generate_adapted` adds it to the density per block, before the solid/air threshold.
+  - The beard is in vanilla's density units, and Custom Cubic's density is in blocks. So the density is mapped to vanilla's final-density scale near the surface, the beard is added, and the result is mapped back with the same slopes. The scale is `0.045` per block under the surface and a quarter of that over it, saturating at `squeeze(1)` = 11/24, as on vanilla's plains. The map keeps the sign, and with no beard the density is untouched. The replacers see the adapted density, and the gradient is the difference to the next block's adapted density.
+  - The bounds do not know the beard: a cube or lattice cell it reaches is never proven uniform.
+  - The starts are decided on the unadapted terrain (`chunk_tops`), as vanilla's are. The pieces are placed on the adapted one (`CubicStructures::placed_height`, from `adapt_tops`).
+  - The test `villages_stand_on_adapted_ground` checks seed 1's snowy village. Under its rigid pieces, the ground under the floor goes from 78% to 90% of the columns, and air at the floor level from 86% to 100%. The rest are houses whose ground is a street's, beside streets that step down: the streets' junction beards outweigh the house's at its edge, as in vanilla's sum, and the foundation covers it.
+  - Cost on the laptop (bench with 26.3's data): 0.432 to 0.417 ms per cube around the origin, the same blocks (no adapting structure there). Around the village (`HORIZON_CUBE_BENCH_AT=-15,-57`, spec `4,1,7,1`), 0.751 to 0.820 ms per cube, +9%: generate goes from 165 to 225 µs a cube, populate from about 540 to 570 µs.
+- **Lookups** (`structures/locate`): `/locate structure`, explorer and treasure maps, and the structures a position is in (structure mob spawns: witch huts, monuments, outposts; advancements; cats) answer from the planner, not from data stored per chunk.
+  - The level's `VanillaTerrain` (the locator every caller uses) hands its structure queries to the level's `CubicStructures` (`set_cubic_structures`): `starts_at`, `locate` and `locate_for_map`. Maps keep the starts they pointed at in the reference file, as superflat worlds do.
+  - A Custom column's chunk gets its references when it is assembled (`CubicLevel::structure_refs`: vanilla's `createReferences`, the starts within 8 chunks whose box crosses it).
+  - Terrain populated before the world had structures: a new record flag, `STRUCTURES` (bit 2 of `horizon:cubic_flags`), marks a cube whose population placed them. A start whose first piece's middle cube was populated without the flag was never built (an older world, or one made with structures off and switched on later), so `/locate` and maps pass over it and no chunk references it.
+  - Hybrid is unchanged: its vanilla band keeps vanilla's starts, references and locator.
 - **Not done yet:**
-  - Terrain adaptation (vanilla's beardifier): the terrain is not flattened under villages and outposts, or dug out around buried structures.
-  - Structures in the far view: "Far view: the owner's decisions and later work", item 4.
-  - Starts and references on the level's chunks, so `/locate`, maps and structure mob spawns (witch huts, monuments, outposts) know about these structures.
+  - Structures in the far view: built on `structures/far-view` ("Far view: the owner's decisions and later work", item 4).
   - Existing Custom Cubic worlds get structures in the cubes they generate from now on, as a Minecraft update does: a structure that starts in new terrain is cut off where it reaches terrain made before.
 
 ### Density bounds
@@ -346,11 +356,19 @@ These came from the owner while reviewing the Meridian video. They are recorded 
      - Keep every level (or the edited columns' spans) on disk, so builds survive a reopen.
      - Upload only the changed nodes, so the player sees their build's LOD update while they build.
    - The height-map tiles take edits the same way: rebuild the affected columns' spans, and keep edited tiles in the disk cache.
-4. **Structures fill in over time, in the background.** *Later; Custom Cubic's structures generate since 2026-11-07, near terrain only.*
+4. **Structures fill in over time, in the background.** *Built 2026-11-07 for Custom Cubic (below); Hybrid's vanilla structures not yet.*
    - Structureless terrain is generated first, as now.
    - A low-priority CPU job runs structure placement (structure starts and piece layout, not full chunk generation) over the regions the far view covers, nearest and on-screen first.
    - When it finds a structure, it regenerates the far nodes and tiles that the structure's bounding boxes touch, at their current levels, with the structure's blocks voxelized into them.
    - Villages, temples and strongholds then appear in the far view over time, Meridian-style coarse-then-refine but for content. Hybrid's vanilla structures can use the same path.
+   - **Built** (2026-11-07, `structures/far-view`, `cubic_far_structures.rs`):
+     - **When.** The search waits until every planned node is drawn (`LateContent::view`), so `cover_s` and `far_fill_s` keep their terrain-only paths.
+     - **Where it looks.** A thread at idle priority asks the planner only at the chunks where a set can start a structure (`StructurePlanner::candidates`), within 4,096 blocks or the far distance. The order is nearest first, with chunks in front ahead of those behind. Mineshafts and buried treasure (sets under 8 chunks apart) are left out; they stay underground.
+     - **Sketching.** A start found is placed by the near terrain's own code (`CubicStructures::place`) into scratch copies of the generator's cubes, one population area at a time. The blocks it changes, other than to air, are the structure's voxels. A test checks that the sketch of seed 1's snowy village holds every built block the near terrain places there (646 of 646), and a village takes about 0.1 s.
+     - **Voxels.** The far nodes that hold sketched blocks are made on the CPU when the overlay changes them, instead of in the GPU pool. Like the GPU's own nodes they carry no sky cover. Level 0 is exact. A coarser voxel shows the structure's most common block where the structure fills at least 1/64 of it: built blocks win over natural ones, as item 5 asks. A node the overlay leaves unchanged goes back to the GPU.
+     - **Redrawing.** The nodes' kept copies on disk are erased under the sketch. `CubeLod` then queues the drawn nodes over its box to be made again, after all other work (`Queue::later`). The old node stays drawn until the new one replaces it under the same key.
+     - **Tiles stay as they are.** A height-map tile's column spans 4,096 blocks or more, many times the largest structure, so a structure changes neither its heights nor its materials.
+     - **Memory.** Sketches keep 4 bytes a block, 32 MB at most. The farthest go first.
 5. **The thin-feature flex: a 1-block-wide build visible from 50,000 blocks.** *Later, after 3; nice to have, not a priority.*
    - When downsampling, player-built blocks win over natural ones in a mixed voxel.
    - Features thinner than a pixel are drawn at a minimum width of one pixel, the way games draw distant power lines.

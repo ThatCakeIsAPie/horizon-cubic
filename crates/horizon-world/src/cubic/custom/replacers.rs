@@ -693,7 +693,13 @@ impl Replacers {
                 Kind::Decoration(d) => y1 >= d.min_y && y0 <= d.max_y,
                 _ if y1 < r.min_y || y0 > r.max_y => false,
                 Kind::Gradient(g) => (y0.max(r.min_y)..=y1.min(r.max_y))
-                    .any(|y| !(g.function.get(f64::from(y)) <= 0.0)),
+                    // NaN stays live: not `<= 0`.
+                    .any(|y| {
+                        !matches!(
+                            g.function.get(f64::from(y)).partial_cmp(&0.0),
+                            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                        )
+                    }),
                 _ => true,
             };
             if live {

@@ -34,17 +34,18 @@ use crate::biome::Biomes;
 use crate::chunk::{Chunk, ColumnLayout, LevelShape, Section, block_strategy};
 use crate::cubic_gen::{
     CubicGeneration, CubicKind, Generation, Held, PARTIAL, POPULATED, PopRegion, Population,
-    needs_population, root_flags, set_root_flags,
+    STRUCTURES, needs_population, root_flags, set_root_flags,
 };
 use crate::save::{ChunkExtras, Persistent, SaveTables, decode_with, encode_with};
 use crate::streaming::{ChunkGenerator, Proto};
 use horizon_core::paletted::PalettedContainer;
-use horizon_core::position::SectionPos;
+use horizon_core::position::{ChunkPos, SectionPos};
 use horizon_core::ticks::SavedTick;
 use horizon_world::cubic::store::CubeStore;
 use horizon_world::cubic::{MAX_CUBE_Y, MIN_CUBE_Y};
 use horizon_world::nbt::{NamedTag, Tag};
 use horizon_world::registry::BlockRegistry;
+use horizon_world::worldgen::structure::start::StructureStart;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -866,7 +867,10 @@ impl CubicLevel {
         }
         let start = std::time::Instant::now();
         let mut values = Box::new([0u32; 4096]);
-        let uniform = self.wg.generator.generate(pos, &mut values);
+        // The terrain as the structures nearby adapt it (vanilla's beard).
+        let beard =
+            (self.wg.structures.as_ref()).and_then(|s| s.beard(ChunkPos::new(pos.x, pos.z)));
+        let uniform = (self.wg.generator).generate_adapted(pos, &mut values, beard.as_deref());
         let biomes = self.wg.biome_container(&self.biomes, pos.x, pos.z);
         let held = match (uniform, biomes.uniform()) {
             (Some(state), Some(biome)) => Held::Section({
@@ -930,6 +934,44 @@ impl CubicLevel {
     /// Terrain of cube `pos` for a light view (no population).
     pub fn terrain(&self, pos: SectionPos) -> Arc<Section> {
         self.terrain_section(pos).0
+    }
+
+    /// Custom Cubic's structure references of chunk (`x`, `z`) (vanilla's
+    /// `createReferences`: the starts within 8 chunks whose box crosses
+    /// it), as (structure, start chunk), leaving out those whose terrain
+    /// was populated before the world had structures.
+    pub fn structure_refs(&self, x: i32, z: i32) -> Vec<(Arc<str>, (i32, i32))> {
+        let Some(structures) = &self.wg.structures else {
+            return Vec::new();
+        };
+        let (bx, bz) = (x * 16, z * 16);
+        let starts = structures.touching([bx, bz], [bx + 15, bz + 15]);
+        (starts.into_iter())
+            .filter(|s| !self.made_before_structures(s))
+            .map(|s| (Arc::from(s.name.as_str()), (s.chunk.x, s.chunk.z)))
+            .collect()
+    }
+
+    /// Whether `start` lies in terrain populated before the world had
+    /// structures (an older world's cubes, or ones made with them off): its
+    /// first piece's middle cube was populated without placing them. Such a
+    /// structure was never built, so `/locate`, maps and structure spawns
+    /// pass over it.
+    pub fn made_before_structures(&self, start: &StructureStart) -> bool {
+        let Some(piece) = start.pieces.first() else {
+            return false;
+        };
+        let c = piece.bounding_box().center();
+        let pos = SectionPos::new(c[0] >> 4, c[1] >> 4, c[2] >> 4);
+        let flags = match self.pop.flags(pos) {
+            Some(flags) => flags,
+            None => {
+                let flags = self.read(pos).map_or(0, |root| root_flags(&root));
+                self.pop.learn_flags(pos, flags);
+                flags
+            }
+        };
+        flags & POPULATED != 0 && flags & STRUCTURES == 0
     }
 
     /// Whether the population of `p` ran (its record's flag).
@@ -1025,7 +1067,12 @@ impl CubicLevel {
             let old = if plain { None } else { self.read(q) };
             let known = self.pop.flags(q).unwrap_or(0);
             let flags = if own {
-                (known | POPULATED) & !PARTIAL
+                let structures = if self.wg.structures.is_some() {
+                    STRUCTURES
+                } else {
+                    0
+                };
+                (known | POPULATED | structures) & !PARTIAL
             } else if known & (POPULATED | PARTIAL) != 0
                 || (loaded[d].1 && (plain || old.is_some()))
             {
@@ -1247,6 +1294,7 @@ impl CubicLevel {
         }
         if self.wg.kind != CubicKind::Hybrid {
             chunk.sky_covered = self.sky_cover(x, z, window);
+            chunk.structure_refs = self.structure_refs(x, z);
             return chunk;
         }
         // The column's own data lives in the marker cube. A window that does
@@ -3070,6 +3118,292 @@ mod tests {
         let _ = std::fs::remove_dir_all(&g.dir);
     }
 
+    /// Vanilla's terrain adaptation under a village (beard_thin): the
+    /// village nearest the origin, on a slope, gets ground under its rigid
+    /// pieces (a solid block one or two below each one's ground level, its
+    /// box's bottom plus its `ground_level_delta`) and air at that level
+    /// over most of their footprints, where the unadapted terrain leaves
+    /// holes and humps. Not every column: the beards of streets that step
+    /// down beside a house pull the ground down at its edge, as in vanilla
+    /// (the house's foundation covers it), and caves may open under it.
+    #[test]
+    fn villages_stand_on_adapted_ground() {
+        use horizon_world::worldgen::structure::jigsaw::Projection;
+        use horizon_world::worldgen::structure::start::Piece;
+        let Some(f) = Fixture::new("structure-ground") else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let level = f.level_with_data(CubicKind::Custom, String::new());
+        let structures = level.generation().structures.clone().expect("structures");
+        let generator = level.generation().generator.clone();
+        let starts = structures.touching([-1024, -1024], [1024, 1024]);
+        let village = (starts.into_iter())
+            .filter(|s| s.name.contains("village"))
+            .min_by_key(|s| {
+                let c = s.bounding_box.center();
+                i64::from(c[0]).pow(2) + i64::from(c[2]).pow(2)
+            })
+            .expect("a village within 1,024 blocks of the origin");
+        let air = f.assets.registry.default_state("minecraft:air").unwrap().0;
+        let mut cubes: HashMap<(SectionPos, bool), Box<[u32; 4096]>> = HashMap::new();
+        let mut block = |x: i32, y: i32, z: i32, adapted: bool| -> u32 {
+            let pos = SectionPos::new(x >> 4, y >> 4, z >> 4);
+            let cube = cubes.entry((pos, adapted)).or_insert_with(|| {
+                let mut out = Box::new([0u32; 4096]);
+                let beard = adapted
+                    .then(|| structures.beard(ChunkPos::new(pos.x, pos.z)))
+                    .flatten();
+                generator.generate_adapted(pos, &mut out, beard.as_deref());
+                out
+            });
+            cube[((y & 15) << 8 | (z & 15) << 4 | (x & 15)) as usize]
+        };
+        // Columns with ground under the piece, and with air at its ground
+        // level: unadapted, adapted.
+        let (mut columns, mut under, mut over) = (0, [0; 2], [0; 2]);
+        for piece in &village.pieces {
+            let Piece::Pool(pool) = piece else { continue };
+            if pool.element.projection() != Projection::Rigid {
+                continue;
+            }
+            let b = pool.bounding_box;
+            let ground = b.min[1] + pool.ground_level_delta;
+            for x in b.min[0]..=b.max[0] {
+                for z in b.min[2]..=b.max[2] {
+                    columns += 1;
+                    for (i, adapted) in [false, true].into_iter().enumerate() {
+                        // 1.12's surface replacer leaves the top block bare
+                        // where its depth noise is negative: one more down.
+                        let ground_under = block(x, ground - 1, z, adapted) != air
+                            || block(x, ground - 2, z, adapted) != air;
+                        under[i] += usize::from(ground_under);
+                        over[i] += usize::from(block(x, ground, z, adapted) == air);
+                    }
+                }
+            }
+        }
+        let c = village.bounding_box.center();
+        let percent = |n: usize| n * 100 / columns.max(1);
+        let report = format!(
+            "{} at {c:?}, {columns} columns: ground under {}% -> {}%, air at the ground level {}% -> {}%",
+            village.name,
+            percent(under[0]),
+            percent(under[1]),
+            percent(over[0]),
+            percent(over[1])
+        );
+        eprintln!("{report}");
+        assert!(columns > 0, "{report}: no rigid piece");
+        // Seed 1's snowy village: 78% -> 90% and 86% -> 100%. The rest are
+        // houses whose ground is a street's (`ground_level_delta` 0) beside
+        // streets stepping down, whose junctions' beards outweigh the
+        // house's at its edge.
+        assert!(
+            percent(under[1]) >= 88 && percent(over[1]) >= 97,
+            "{report}"
+        );
+        assert!(under[1] > under[0] && over[1] > over[0], "{report}");
+        drop(level);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// `/locate`, maps and structure spawns in Custom Cubic: the planner
+    /// finds a village around the origin, the chunks under it reference
+    /// its start (what `structures_at` and the spawner read), and in a world
+    /// whose cubes there were populated before it had structures (made with
+    /// them off, then reopened with them on) the village was never built:
+    /// it is passed over and referenced nowhere.
+    #[test]
+    fn custom_structures_are_located_unless_their_terrain_came_first() {
+        use horizon_core::position::ChunkPos;
+        let Some(f) = Fixture::new("structure-locate") else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let level = f.level_with_data(CubicKind::Custom, String::new());
+        let structures = level.generation().structures.clone().expect("structures");
+        let villages: Vec<String> = ["plains", "desert", "savanna", "snowy", "taiga"]
+            .iter()
+            .map(|b| format!("minecraft:village_{b}"))
+            .collect();
+        // Vanilla's search: the first start of the set's rings of sectors
+        // around the origin (not always the nearest).
+        let (name, at) = structures
+            .locate(&villages, [0, 64, 0], 100, &|_, _| false)
+            .expect("a village located");
+        let chunk = ChunkPos::new(at[0] >> 4, at[2] >> 4);
+        let village = (structures.starts_at(chunk).iter())
+            .find(|s| s.name == name)
+            .expect("the located village starts in its chunk")
+            .clone();
+        // A chunk under its first piece references it.
+        let c = village.pieces[0].bounding_box().center();
+        let referenced = |level: &CubicLevel| {
+            (level.structure_refs(c[0] >> 4, c[2] >> 4).into_iter())
+                .any(|(n, at)| *n == *village.name && at == (village.chunk.x, village.chunk.z))
+        };
+        assert!(
+            referenced(&level),
+            "{} at {c:?} is referenced",
+            village.name
+        );
+        assert!(!level.made_before_structures(&village));
+        drop(level);
+        let _ = std::fs::remove_dir_all(&f.dir);
+
+        // The same cubes populated with structures off, then the world
+        // reopened with them on.
+        let Some(g) = Fixture::new("structure-locate-old") else {
+            return;
+        };
+        let mut off = horizon_world::cubic::custom::CustomGeneratorSettings::defaults();
+        for v in horizon_world::cubic::custom::settings::OVERWORLD_STRUCTURE_SETS {
+            off.set_structure_enabled(v.name, false);
+        }
+        let old = g.level_with_data(CubicKind::Custom, off.to_json_compact());
+        old.make_cube(SectionPos::new(c[0] >> 4, c[1] >> 4, c[2] >> 4));
+        old.flush();
+        drop(old);
+        let again = g.level_with_data(CubicKind::Custom, String::new());
+        assert!(
+            again.made_before_structures(&village),
+            "{} came after its terrain",
+            village.name
+        );
+        assert!(
+            !referenced(&again),
+            "{} is referenced nowhere",
+            village.name
+        );
+        drop(again);
+        let _ = std::fs::remove_dir_all(&g.dir);
+    }
+
+    /// The far view's sketch of a village (`cubic_far_structures`) holds the
+    /// blocks the near terrain builds: the building blocks of the cubes
+    /// around its first piece, made as the game makes them, are in the
+    /// sketch at the same places, and a coarse far node over it shows them.
+    #[test]
+    fn the_far_sketch_of_a_village_holds_its_built_blocks() {
+        use crate::cubic_far_structures::FarStructures;
+        use crate::lod::cube::{CubeKey, CubeNode, Voxel};
+        let Some(f) = Fixture::new("far-sketch") else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let level = f.level_with_data(CubicKind::Custom, String::new());
+        let structures = level.generation().structures.clone().expect("structures");
+        let registry = f.assets.registry;
+        let air = registry.default_state("minecraft:air").unwrap().0;
+        let starts = structures.touching([-1024, -1024], [1024, 1024]);
+        let village = (starts.iter())
+            .filter(|s| s.name.contains("village"))
+            .min_by_key(|s| i64::from(s.chunk.x).pow(2) + i64::from(s.chunk.z).pow(2))
+            .expect("a village within 1,024 blocks of the origin");
+        let far = FarStructures::new(
+            structures.clone(),
+            level.generation().generator.clone(),
+            None,
+            air,
+        );
+        let t = std::time::Instant::now();
+        assert!(far.sketch_now(village), "{} sketched", village.name);
+        eprintln!(
+            "{} sketched in {:.2} s",
+            village.name,
+            t.elapsed().as_secs_f64()
+        );
+        let built = |name: &str| {
+            [
+                "planks",
+                "cobblestone",
+                "door",
+                "glass",
+                "stairs",
+                "log",
+                "bell",
+                "hay_block",
+            ]
+            .iter()
+            .any(|k| name.contains(k))
+        };
+        let c = village.pieces[0].bounding_box().center();
+        let (lo, hi) = (
+            [c[0] - 24, c[1] - 24, c[2] - 24],
+            [c[0] + 23, c[1] + 23, c[2] + 23],
+        );
+        let sketched: HashMap<[i32; 3], u32> = far.sketched(lo, hi).into_iter().collect();
+        let (mut near, mut found) = (0, 0);
+        let mut states = [0u32; 4096];
+        for cy in lo[1] >> 4..=hi[1] >> 4 {
+            for cz in lo[2] >> 4..=hi[2] >> 4 {
+                for cx in lo[0] >> 4..=hi[0] >> 4 {
+                    let p = SectionPos::new(cx, cy, cz);
+                    level.make_cube(p).section.unpack(&mut states);
+                    for (i, &s) in states.iter().enumerate() {
+                        let name = registry
+                            .state(horizon_world::registry::BlockStateId(s))
+                            .map_or("", |st| st.name.as_str());
+                        if !built(name) {
+                            continue;
+                        }
+                        let at = [
+                            cx * 16 + (i & 15) as i32,
+                            cy * 16 + (i >> 8) as i32,
+                            cz * 16 + (i >> 4 & 15) as i32,
+                        ];
+                        if (0..3).any(|a| !(lo[a]..=hi[a]).contains(&at[a])) {
+                            continue;
+                        }
+                        near += 1;
+                        found += usize::from(sketched.get(&at) == Some(&s));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{} at {c:?}: {found} of {near} built blocks in the sketch",
+            village.name
+        );
+        assert!(
+            near > 50,
+            "{} at {c:?}: {near} built blocks near",
+            village.name
+        );
+        // The populations' trees and features may change a few blocks.
+        assert!(
+            found * 100 >= near * 97,
+            "{} at {c:?}: {found} of {near} built blocks in the sketch",
+            village.name
+        );
+        // A level-4 node (256 blocks) over it, all air, shows the village.
+        let key = CubeKey {
+            level: 4,
+            x: c[0].div_euclid(256),
+            y: c[1].div_euclid(256),
+            z: c[2].div_euclid(256),
+        };
+        let blank = CubeNode::uniform(
+            key,
+            Voxel {
+                state: horizon_world::registry::BlockStateId(air),
+                biome: 0,
+            },
+        );
+        let (drawn, _) = far.overlay(blank);
+        let shown = (0..crate::lod::cube::VOLUME)
+            .filter(|&i| drawn.at(i).state.0 != air)
+            .count();
+        assert!(
+            shown > 0,
+            "{} at {c:?}: nothing in the far node",
+            village.name
+        );
+        drop(level);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
     /// With every structure switched off there are none.
     #[test]
     fn structures_switched_off_make_none() {
@@ -3232,11 +3566,20 @@ mod tests {
         } else {
             f.level_with(CubicKind::Custom, settings)
         };
+        // `HORIZON_CUBE_BENCH_AT`: "X,Z", the cube column the block of cubes
+        // is centred on (default the origin's).
+        let at: Vec<i32> = std::env::var("HORIZON_CUBE_BENCH_AT")
+            .map(|s| {
+                s.split(',')
+                    .map(|v| v.trim().parse().expect("HORIZON_CUBE_BENCH_AT: X,Z"))
+                    .collect()
+            })
+            .unwrap_or_else(|_| vec![0, 0]);
         let mut cubes = Vec::new();
         for y in y0..=y1 {
             for z in -r..=r {
                 for x in -r..=r {
-                    cubes.push(SectionPos::new(x, y, z));
+                    cubes.push(SectionPos::new(at[0] + x, y, at[1] + z));
                 }
             }
         }

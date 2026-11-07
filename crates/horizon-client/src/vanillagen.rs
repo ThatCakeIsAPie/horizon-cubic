@@ -65,6 +65,28 @@ pub struct VanillaTerrain {
     created: std::time::Instant,
     /// A superflat generator (`FlatLevelSource`).
     flat: bool,
+    /// A Custom Cubic level's structures, which answer the structure
+    /// queries in place of this generator's.
+    cubic: std::sync::OnceLock<CubicStructureSource>,
+}
+
+/// A Custom Cubic level's structures for [`VanillaTerrain`]'s structure
+/// queries: the planner, and which starts lie in terrain populated before
+/// the world had them (never built: passed over).
+pub struct CubicStructureSource {
+    pub structures: Arc<horizon_world::cubic::custom::structures::CubicStructures>,
+    pub made_before: Arc<
+        dyn Fn(&horizon_world::worldgen::structure::start::StructureStart) -> bool + Send + Sync,
+    >,
+}
+
+impl CubicStructureSource {
+    /// Whether the start of `name` in chunk `chunk` is one to pass over.
+    fn skips(&self, name: &str, chunk: ChunkPos) -> bool {
+        (self.structures.starts_at(chunk).iter())
+            .find(|s| s.name == name)
+            .is_some_and(|s| (self.made_before)(s))
+    }
 }
 /// A proto chunk, or the position of one whose generation failed.
 enum VanillaProto {
@@ -331,6 +353,7 @@ impl VanillaTerrain {
             last_proto: std::sync::atomic::AtomicU64::new(0),
             created: std::time::Instant::now(),
             flat: false,
+            cubic: std::sync::OnceLock::new(),
         })
     }
     /// The column the dimension's chunks hold (its build range's).
@@ -469,12 +492,21 @@ impl VanillaTerrain {
         }
         out
     }
+    /// Answers the structure queries ([`Self::starts_at`], [`Self::locate`],
+    /// [`Self::locate_for_map`]) from a Custom Cubic level's structures
+    /// instead of this generator's (once; later calls are ignored).
+    pub fn set_cubic_structures(&self, source: CubicStructureSource) {
+        let _ = self.cubic.set(source);
+    }
     /// The structure starts owned by a chunk (cached by the generator).
     pub fn starts_at(
         &self,
         x: i32,
         z: i32,
     ) -> Vec<Arc<horizon_world::worldgen::structure::start::StructureStart>> {
+        if let Some(cubic) = self.cubic.get() {
+            return cubic.structures.starts_at(ChunkPos::new(x, z)).to_vec();
+        }
         let mut worker = self.query.lock().unwrap_or_else(|e| e.into_inner());
         let worker = worker.get_or_insert_with(|| self.generator.worker());
         worker.structure_starts(ChunkPos::new(x, z))
@@ -499,6 +531,10 @@ impl VanillaTerrain {
         from: [i32; 3],
         radius: i32,
     ) -> Option<(String, [i32; 3])> {
+        if let Some(cubic) = self.cubic.get() {
+            let skip = |name: &str, chunk: ChunkPos| cubic.skips(name, chunk);
+            return cubic.structures.locate(names, from, radius, &skip);
+        }
         self.generator.worker().locate(names, from, radius)
     }
     /// The chunks an older version saved, which new chunks blend with
@@ -536,6 +572,17 @@ impl VanillaTerrain {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut referenced = self.referenced.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cubic) = self.cubic.get() {
+            // A cubic level keeps no references in its chunks: the file's.
+            let skip = |name: &str, chunk: ChunkPos| {
+                referenced.contains(&(name.to_owned(), chunk.x, chunk.z))
+                    || cubic.skips(name, chunk)
+            };
+            let found = cubic.structures.locate(names, from, radius, &skip)?;
+            referenced.insert((found.0.clone(), found.1[0] >> 4, found.1[2] >> 4));
+            self.save_references(&referenced);
+            return Some(found);
+        }
         let found =
             self.generator
                 .worker()

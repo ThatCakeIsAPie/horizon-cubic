@@ -175,7 +175,7 @@ impl std::hash::Hasher for PosHasher {
             let mut word = [0u8; 4];
             word[..chunk.len()].copy_from_slice(chunk);
             self.0 = (self.0.rotate_left(5) ^ u64::from(u32::from_le_bytes(word)))
-                .wrapping_mul(0x51_7cc1_b727_220a_95);
+                .wrapping_mul(0x517c_c1b7_2722_0a95);
         }
     }
     fn write_usize(&mut self, _: usize) {}
@@ -891,7 +891,7 @@ impl RavineCarver {
                     && w.may_reach(c)
                 {
                     for s in w.near(lowest(cube)) {
-                        self.carve_sphere(cube, out, s, &w, &mut walls);
+                        self.carve_sphere(cube, out, s, w, &mut walls);
                     }
                 }
             },

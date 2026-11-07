@@ -16,7 +16,10 @@
 //!
 //! A cube's record carries [`FLAGS_KEY`]: bit 0 [`POPULATED`] (the cube's own
 //! population ran) and bit 1 [`PARTIAL`] (the record exists only because a
-//! neighbour's population wrote into it; the cube's own has not run).
+//! neighbour's population wrote into it; the cube's own has not run), and
+//! bit 2 [`STRUCTURES`] (the cube's population placed structures: a world's
+//! cubes populated before it had structures lack it, and `/locate` passes
+//! over the structures that would start in them).
 //! [`Population`] holds the in-memory side: the flags known, a cache of the
 //! sections of cubes in flight, and the striped locks that serialise
 //! populations whose regions overlap.
@@ -47,6 +50,8 @@ pub const FLAGS_KEY: &str = "horizon:cubic_flags";
 pub const POPULATED: u8 = 1;
 /// The record holds terrain and a neighbour's writes only.
 pub const PARTIAL: u8 = 2;
+/// The cube's population placed the structures (set with [`POPULATED`]).
+pub const STRUCTURES: u8 = 4;
 
 /// The cube Ys vanilla's Overworld generator makes (-64..320): Hybrid's band.
 pub const VANILLA_CUBES: std::ops::RangeInclusive<i32> = -4..=19;
