@@ -4,10 +4,10 @@
 |---|---|---|---|---|---|
 | surface | `4,-4,8,1` | 0.7325 | **0.2615** | -64.3% | 4.1% |
 | sky | `4,20,32,1` | 0.2018 | **0.0157** | -92.2% | 6.5% |
-| deep | `4,-40,-28,1` | 0.2991 | **0.1625** | -45.7% | 3.0% |
+| deep | `4,-40,-28,1` | 0.2991 | **0.1395** | -53.4% | 3.0% |
 
-Iterations: 27; kept 17. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 22:45.
+Iterations: 28; kept 18. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 22:51.
 
 ## Hot spots
 
@@ -48,3 +48,4 @@ Updated 2026-11-06 22:45.
 | 19 | surface | keep | 0.2615 | -7.1% | PASS | 111967cb6 | same change: first 0.2645, confirm 0.2615 (--tests); sky 0.0229 |
 | 20 | sky | keep | 0.0182 | -21.2% | PASS | 305283927 | copy-on-write population region cubes (uniform / shared cache array until written): first 0.0186, confirm 0.0182; surface 0.2631, deep 0.1635 (noise) |
 | 21 | sky | keep | 0.0157 | -13.7% | PASS | 356f37d14 | biome blend thread-local caches use a multiplicative integer hasher instead of SipHash: first 0.0156, confirm 0.0157 (--tests); surface 0.2577, deep 0.1606 |
+| 22 | deep | keep | 0.1395 | -14.2% | PASS | c861bf9c0 | region reads mixed sections in place via the palette, unpacks only on first write: first 0.1444, confirm 0.1395 (--tests); surface 0.2577, sky 0.0157 |
