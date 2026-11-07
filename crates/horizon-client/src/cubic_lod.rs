@@ -518,22 +518,60 @@ impl CubicLodSampler {
                 open[j] = !air_box([x, y, z], [x + tile - 1, y, z + tile - 1]);
             }
         }
-        let probe = |x: i32, y: i32, z: i32| {
-            let state = generator.block_at(x, y, z, resolution);
-            state != 0 && state != air && !fluids.contains(&state)
-        };
-        cover_columns(origin, key.level, start, &mut mask, |x, y, z| {
-            let tx = ((x - origin[0]) / tile).clamp(0, 3);
-            let tz = ((z - origin[2]) / tile).clamp(0, 3);
-            let Some(j) = COVER_LOOKS.iter().position(|&up| start.saturating_add(up) == y) else {
-                return probe(x, y, z);
-            };
-            let skip = !open[(tz * 4 + tx) as usize][j];
-            if skip && crate::lod::cube::far_knob("HORIZON_FAR_COVER_CHECK", 0) != 0 && probe(x, y, z) {
-                log::warn!("Horizon far cover: a slab proved free holds solid ground at {x} {y} {z} (level {})", key.level);
+        let solid = |state: u32| state != 0 && state != air && !fluids.contains(&state);
+        let check = crate::lod::cube::far_knob("HORIZON_FAR_COVER_CHECK", 0) != 0;
+        // Each column's looks that are left in one probe of the generator: the
+        // column's noise and biome are worked out once for them all
+        // (`first_at_column`, the same answer as `block_at` at each height).
+        let step = resolution;
+        let quarters = [step / 4, step * 3 / 4];
+        let middle = [step / 2];
+        let offsets: &[i32] = if step >= 32 { &quarters } else { &middle };
+        let mut ys = Vec::with_capacity(COVER_LOOKS.len());
+        for z in 0..16usize {
+            for x in 0..16usize {
+                let bit = z << 4 | x;
+                if mask[bit >> 6] >> (bit & 63) & 1 == 1 {
+                    continue;
+                }
+                let covered = offsets.iter().any(|&dz| {
+                    offsets.iter().any(|&dx| {
+                        let wx = origin[0] + x as i32 * step + dx;
+                        let wz = origin[2] + z as i32 * step + dz;
+                        let tx = ((wx - origin[0]) / tile).clamp(0, 3);
+                        let tz = ((wz - origin[2]) / tile).clamp(0, 3);
+                        let open = &open[(tz * 4 + tx) as usize];
+                        ys.clear();
+                        ys.extend(
+                            COVER_LOOKS
+                                .iter()
+                                .enumerate()
+                                .filter(|&(j, _)| open[j])
+                                .map(|(_, &up)| start.saturating_add(up)),
+                        );
+                        let found = !ys.is_empty()
+                            && generator
+                                .first_at_column(wx, wz, &ys, resolution, |b| solid(b))
+                                .is_some();
+                        if check {
+                            let old = COVER_LOOKS.iter().any(|&up| {
+                                solid(generator.block_at(wx, start.saturating_add(up), wz, resolution))
+                            });
+                            if old != found {
+                                log::warn!(
+                                    "Horizon far cover: column {wx} {wz} over {start} (level {}) is {found}, per-height probes say {old}",
+                                    key.level
+                                );
+                            }
+                        }
+                        found
+                    })
+                });
+                if covered {
+                    mask[bit >> 6] |= 1 << (bit & 63);
+                }
             }
-            !skip && probe(x, y, z)
-        });
+        }
         (Some(mask), exact)
     }
 
@@ -695,6 +733,9 @@ fn unchanged(cache: &CubeLodCache, key: CubeKey, since: u64) -> bool {
 /// wide) that has a solid block (`solid(x, y, z)`) at one of the
 /// [`COVER_LOOKS`] heights over `start`. A voxel wider than 32 blocks is
 /// looked at in its four quarters.
+/// The cover's rule with one probe per height (`cover_of` asks a column's
+/// looks in one probe now): for the tests.
+#[cfg(test)]
 fn cover_columns(
     origin: [i32; 3],
     level: u8,
