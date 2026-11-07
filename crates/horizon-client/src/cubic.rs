@@ -310,6 +310,8 @@ enum Record {
         pos: SectionPos,
         section: Held,
         entities: Vec<Tag>,
+        /// Block entities as saved (`x`, `y`, `z` and their data).
+        block_entities: Vec<Tag>,
         flags: u8,
         registry: &'static BlockRegistry,
         biomes: Arc<Biomes>,
@@ -326,6 +328,7 @@ impl Record {
                 pos,
                 section,
                 entities,
+                block_entities,
                 flags,
                 registry,
                 biomes,
@@ -341,6 +344,11 @@ impl Record {
                     Chunk::with_layout(pos.x, pos.z, ColumnLayout::window(pos.y * 16, 16));
                 one.sections[0] = section.section();
                 let mut root = ctx.encode(&one, 0, false, entities);
+                if !block_entities.is_empty()
+                    && let Tag::Compound(map) = &mut root.tag
+                {
+                    map.insert("block_entities".into(), Tag::List(block_entities.clone()));
+                }
                 set_root_flags(&mut root, *flags);
                 root
             }),
@@ -750,9 +758,15 @@ impl CubicLevel {
         self.queue_record(pos, Record::Tag(tag));
     }
 
-    /// `write_later` of population's cube `pos`, `section` with `entities`,
-    /// encoded when first needed.
-    fn write_cube_later(&self, pos: SectionPos, section: Held, entities: Vec<Tag>) {
+    /// `write_later` of population's cube `pos`, `section` with `entities`
+    /// and `block_entities` (as saved), encoded when first needed.
+    fn write_cube_later(
+        &self,
+        pos: SectionPos,
+        section: Held,
+        entities: Vec<Tag>,
+        block_entities: Vec<Tag>,
+    ) {
         let flags = self.record_flags(pos);
         self.queue_record(
             pos,
@@ -760,6 +774,7 @@ impl CubicLevel {
                 pos,
                 section,
                 entities,
+                block_entities,
                 flags,
                 registry: self.registry,
                 biomes: self.biomes.clone(),
@@ -969,8 +984,10 @@ impl CubicLevel {
             &held,
             self.wg.columns.clone(),
             self.wg.vegetation.clone(),
-        );
+        )
+        .with_structures(self.wg.structures.clone());
         self.wg.generator.populate(p, &mut region);
+        let (placed_block_entities, placed_entities) = region.take_placed();
         let dirty = region.dirty();
         let mut blocks = region.into_blocks();
         for d in 0..8 {
@@ -979,7 +996,21 @@ impl CubicLevel {
                 continue;
             }
             let own = d == 0;
-            if !own && !dirty[d] {
+            let inside = |x: i32, y: i32, z: i32| {
+                SectionPos::new(x >> 4, y >> 4, z >> 4) == q
+            };
+            let new_block_entities: Vec<Tag> = placed_block_entities
+                .iter()
+                .filter(|(p, _)| inside(p[0], p[1], p[2]))
+                .map(|(p, nbt)| placed_block_entity(*p, nbt))
+                .collect();
+            let new_entities: Vec<Tag> = placed_entities
+                .iter()
+                .filter(|e| entity_block(e).is_some_and(|[x, y, z]| inside(x, y, z)))
+                .map(|e| Tag::Compound(e.clone()))
+                .collect();
+            let placed = !new_block_entities.is_empty() || !new_entities.is_empty();
+            if !own && !dirty[d] && !placed {
                 continue;
             }
             let section = if dirty[d] {
@@ -1003,9 +1034,20 @@ impl CubicLevel {
                 known | PARTIAL
             };
             self.pop.set_flags(q, flags);
-            let entities = old.map(|old| record_entities(&old)).unwrap_or_default();
-            let plain = entities.is_empty() && !self.is_marker(q.y);
-            self.write_cube_later(q, section.clone(), entities);
+            let mut entities = old.as_ref().map(record_entities).unwrap_or_default();
+            entities.extend(new_entities);
+            let mut block_entities = old.as_ref().map(record_block_entities).unwrap_or_default();
+            for be in new_block_entities {
+                let at = block_entity_pos(&be);
+                block_entities.retain(|old| block_entity_pos(old) != at);
+                block_entities.push(be);
+            }
+            let plain =
+                entities.is_empty() && block_entities.is_empty() && !self.is_marker(q.y);
+            if !entities.is_empty() {
+                self.note_entities(q, true);
+            }
+            self.write_cube_later(q, section.clone(), entities, block_entities);
             if plain {
                 self.pop.keep_plain(q, section);
             } else {
@@ -1683,6 +1725,55 @@ fn record_entities(root: &NamedTag) -> Vec<Tag> {
     }
 }
 
+/// The block entities a cube record saved, as saved.
+fn record_block_entities(root: &NamedTag) -> Vec<Tag> {
+    match root.tag.get("block_entities") {
+        Some(Tag::List(list)) => list.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// A saved block entity's position.
+fn block_entity_pos(tag: &Tag) -> Option<(i64, i64, i64)> {
+    let int = |k: &str| match tag.get(k) {
+        Some(Tag::Int(v)) => Some(i64::from(*v)),
+        Some(Tag::Long(v)) => Some(*v),
+        Some(Tag::Short(v)) => Some(i64::from(*v)),
+        Some(Tag::Byte(v)) => Some(i64::from(*v)),
+        _ => None,
+    };
+    Some((int("x")?, int("y")?, int("z")?))
+}
+
+/// A block entity a structure placed at `p`, as a record saves it.
+fn placed_block_entity(p: [i32; 3], nbt: &horizon_world::nbt::Compound) -> Tag {
+    let mut map = nbt.clone();
+    map.insert("x".into(), Tag::Int(p[0]));
+    map.insert("y".into(), Tag::Int(p[1]));
+    map.insert("z".into(), Tag::Int(p[2]));
+    Tag::Compound(map)
+}
+
+/// The block an entity's `Pos` is in.
+fn entity_block(entity: &horizon_world::nbt::Compound) -> Option<[i32; 3]> {
+    let Some(Tag::List(pos)) = entity.get(&"Pos".into()) else {
+        return None;
+    };
+    let mut out = [0; 3];
+    for (o, v) in out.iter_mut().zip(pos) {
+        let f = match v {
+            Tag::Double(bits) => f64::from_bits(*bits),
+            Tag::Float(bits) => f64::from(f32::from_bits(*bits)),
+            _ => return None,
+        };
+        if !f.is_finite() {
+            return None;
+        }
+        *o = f.floor() as i32;
+    }
+    (pos.len() == 3).then_some(out)
+}
+
 /// Puts `entities` in a cube record, or takes the key out for none.
 fn set_entities(root: &mut NamedTag, entities: Vec<Tag>) {
     if let Tag::Compound(map) = &mut root.tag {
@@ -2193,6 +2284,40 @@ mod tests {
         }
         fn level_of(&self, kind: CubicKind) -> Arc<CubicLevel> {
             self.level_with(kind, String::new())
+        }
+        /// `level_with`, generating with 26.3's generator data (its biomes,
+        /// vegetation and structures), loaded once per process.
+        fn level_with_data(&self, kind: CubicKind, settings_json: String) -> Arc<CubicLevel> {
+            static DATA: std::sync::OnceLock<Arc<horizon_world::worldgen::generator::GeneratorData>> =
+                std::sync::OnceLock::new();
+            let registry = self.assets.registry;
+            let data = DATA.get_or_init(|| {
+                let root = std::path::PathBuf::from(
+                    std::env::var_os("HORIZON_TEST_RESOURCES").expect("resources"),
+                );
+                horizon_world::worldgen::generator::GeneratorData::load(
+                    &root.join("worldgen"),
+                    registry,
+                )
+                .expect("worldgen data")
+            });
+            let window = LevelShape::cubic_window(LevelShape::OVERWORLD, -192, 512);
+            let generation = CubicGeneration {
+                kind,
+                settings_json,
+            };
+            let level = CubicLevel::new(
+                &self.dir,
+                1,
+                registry,
+                &self.biomes,
+                window,
+                &generation,
+                Some(data),
+            )
+            .expect("level");
+            level.set_tables(self.tables.clone());
+            level
         }
         /// A level whose generator takes `settings_json` (a world's
         /// cubicgen.json; empty: the defaults).
@@ -2861,6 +2986,215 @@ mod tests {
     /// `HORIZON_CUBE_BENCH` is "RADIUS,Y_LOW,Y_HIGH,THREADS" in cubes
     /// (default "4,-4,8,1"). More than one thread is faster, but its hash can
     /// differ from run to run: overlapping populations go in either order.
+    /// Custom Cubic places a village near the origin (with block entities
+    /// and entities), and its blocks don't depend on the order its cubes are
+    /// made in: two levels make the cubes around its centre in opposite
+    /// orders and hold the same building blocks and block entities. (The
+    /// decoration around it may differ by a few blocks, as it does without
+    /// structures: a population's ores, trees and feature piles reach into
+    /// its neighbours' areas, so the first of two neighbours decides those.)
+    #[test]
+    fn structures_do_not_depend_on_the_order_cubes_are_made() {
+        let (Some(f), Some(g)) = (
+            Fixture::new("structure-order-a"),
+            Fixture::new("structure-order-b"),
+        ) else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let a = f.level_with_data(CubicKind::Custom, String::new());
+        let structures = a.generation().structures.clone().expect("structures");
+        let starts = structures.touching([-1024, -1024], [1024, 1024]);
+        let village = starts
+            .iter()
+            .filter(|s| s.name.contains("village"))
+            .min_by_key(|s| {
+                let c = s.bounding_box.center();
+                i64::from(c[0]).pow(2) + i64::from(c[2]).pow(2)
+            })
+            .expect("a village within 1,024 blocks of the origin");
+        let c = village.pieces[0].bounding_box().center();
+        let mut cubes = Vec::new();
+        for cy in (c[1] >> 4) - 1..=(c[1] >> 4) + 1 {
+            for cz in (c[2] >> 4) - 1..=(c[2] >> 4) + 1 {
+                for cx in (c[0] >> 4) - 1..=(c[0] >> 4) + 1 {
+                    cubes.push(SectionPos::new(cx, cy, cz));
+                }
+            }
+        }
+        // What only the village builds, by name.
+        let built = |name: &str| {
+            ["planks", "door", "dirt_path", "lantern", "bell", "chest", "bed", "glass", "stairs", "slab", "cobblestone", "stripped", "fence", "farmland", "hay_block", "torch"]
+                .iter()
+                .any(|k| name.contains(k))
+        };
+        let registry = f.assets.registry;
+        let made = |level: &CubicLevel, order: &[SectionPos]| {
+            let mut blocks = std::collections::BTreeSet::new();
+            let mut block_entities = std::collections::BTreeSet::new();
+            let mut entities = 0;
+            let mut states = [0u32; 4096];
+            for &p in order {
+                let cube = level.make_cube(p);
+                block_entities.extend(cube.block_entities.iter().map(|(at, _)| *at));
+                entities += cube.entities.len();
+                cube.section.unpack(&mut states);
+                for (i, &s) in states.iter().enumerate() {
+                    let name = registry
+                        .state(horizon_world::registry::BlockStateId(s))
+                        .map_or("", |st| st.name.as_str());
+                    if built(name) {
+                        let at = (p.x * 16 + (i & 15) as i32, p.y * 16 + (i >> 8) as i32, p.z * 16 + (i >> 4 & 15) as i32);
+                        blocks.insert((at, s));
+                    }
+                }
+            }
+            (blocks, block_entities, entities)
+        };
+        let (forward, forward_be, entities) = made(&a, &cubes);
+        let b = g.level_with_data(CubicKind::Custom, String::new());
+        cubes.reverse();
+        let (backward, backward_be, _) = made(&b, &cubes);
+        assert!(!forward.is_empty(), "{} at {:?}: nothing built", village.name, c);
+        assert!(
+            forward_be.len() + entities > 0,
+            "{} at {:?}: no block entity or entity",
+            village.name,
+            c
+        );
+        let only: Vec<_> = forward.symmetric_difference(&backward).take(8).collect();
+        assert!(only.is_empty(), "{} at {:?}: {} building blocks differ, e.g. {only:?}", village.name, c, forward.symmetric_difference(&backward).count());
+        assert_eq!(forward_be, backward_be, "{} at {:?}", village.name, c);
+        drop((a, b));
+        let _ = std::fs::remove_dir_all(&f.dir);
+        let _ = std::fs::remove_dir_all(&g.dir);
+    }
+
+    /// With every structure switched off there are none.
+    #[test]
+    fn structures_switched_off_make_none() {
+        let Some(f) = Fixture::new("structures-off") else {
+            return;
+        };
+        let mut s = horizon_world::cubic::custom::CustomGeneratorSettings::defaults();
+        for v in horizon_world::cubic::custom::settings::OVERWORLD_STRUCTURE_SETS {
+            s.set_structure_enabled(v.name, false);
+        }
+        let level = f.level_with_data(CubicKind::Custom, s.to_json_compact());
+        assert!(level.generation().structures.is_none());
+        let on = f.level_with_data(CubicKind::Custom, String::new());
+        assert!(on.generation().structures.is_some(), "the defaults have structures");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// Custom Cubic's structures near the origin: the starts within
+    /// `HORIZON_STRUCTURE_PROBE` blocks (default 1,024), then the cubes
+    /// around the nearest village (or the nearest start) made, with what was
+    /// placed in them: block counts, block entities, entities.
+    #[test]
+    #[ignore = "a probe: run with HORIZON_TEST_RESOURCES"]
+    fn cubic_structures_probe() {
+        let Some(f) = Fixture::new("structures") else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let settings = std::env::var_os("HORIZON_CUBE_BENCH_SETTINGS")
+            .map(|p| std::fs::read_to_string(p).expect("a readable settings file"))
+            .unwrap_or_default();
+        let level = f.level_with_data(CubicKind::Custom, settings);
+        let structures = level
+            .generation()
+            .structures
+            .clone()
+            .expect("Custom Cubic has structures");
+        println!("sets: {}", structures.set_names().join(", "));
+        {
+            let g = level.generation().generator.clone();
+            let t = std::time::Instant::now();
+            let mut sum = 0i64;
+            for i in 0..16 {
+                let tops = g.chunk_tops(312 + (i % 4), 437 + (i / 4));
+                sum += tops.iter().map(|&t| i64::from(t.max(0))).sum::<i64>();
+            }
+            println!("chunk_tops: {:.1} us per column (sum {sum})", t.elapsed().as_secs_f64() * 1e6 / 4096.0);
+        }
+        let r: i32 = std::env::var("HORIZON_STRUCTURE_PROBE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let t = std::time::Instant::now();
+        let mut starts = structures.touching([-r, -r], [r, r]);
+        println!("{} starts within {r} blocks ({:.2} s)", starts.len(), t.elapsed().as_secs_f64());
+        starts.sort_by_key(|s| {
+            let c = s.bounding_box.center();
+            i64::from(c[0]).pow(2) + i64::from(c[2]).pow(2)
+        });
+        let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
+        for s in &starts {
+            *by_name.entry(s.name.clone()).or_default() += 1;
+        }
+        for (name, n) in &by_name {
+            println!("  {name}: {n}");
+        }
+        for s in starts.iter().take(12) {
+            let b = s.bounding_box;
+            println!(
+                "  {} chunk {:?} box {:?}..{:?} pieces {}",
+                s.name,
+                (s.chunk.x, s.chunk.z),
+                b.min,
+                b.max,
+                s.pieces.len()
+            );
+        }
+        let pick = std::env::var("HORIZON_STRUCTURE_PICK").unwrap_or_else(|_| "village".into());
+        let Some(target) = starts
+            .iter()
+            .find(|s| s.name.contains(&pick))
+            .or_else(|| starts.first())
+        else {
+            return;
+        };
+        let b = target.bounding_box;
+        println!("making the cubes of {} at {:?}..{:?}", target.name, b.min, b.max);
+        let t = std::time::Instant::now();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut block_entities = 0;
+        let mut entities = 0;
+        let mut cubes = 0;
+        let mut states = [0u32; 4096];
+        for cy in (b.min[1] >> 4) - 1..=(b.max[1] >> 4) + 1 {
+            for cz in b.min[2] >> 4..=b.max[2] >> 4 {
+                for cx in b.min[0] >> 4..=b.max[0] >> 4 {
+                    let cube = level.make_cube(SectionPos::new(cx, cy, cz));
+                    cubes += 1;
+                    block_entities += cube.block_entities.len();
+                    entities += cube.entities.len();
+                    cube.section.unpack(&mut states);
+                    for &s in &states {
+                        let name = f
+                            .assets
+                            .registry
+                            .state(horizon_world::registry::BlockStateId(s))
+                            .map_or_else(|| "?".to_owned(), |st| st.name.clone());
+                        *counts.entry(name).or_default() += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "{cubes} cubes in {:.2} s: {block_entities} block entities, {entities} entities",
+            t.elapsed().as_secs_f64()
+        );
+        let mut counts: Vec<(String, usize)> = counts.into_iter().collect();
+        counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (name, n) in counts.iter().take(40) {
+            println!("  {name}: {n}");
+        }
+        drop(level);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
     /// The scratch level goes in the system's temporary folder (`TMPDIR`).
     /// `HORIZON_CUBE_BENCH_SETTINGS`: a cubicgen.json to generate with
     /// instead of the defaults (a world's own, to see what it costs).
@@ -2880,7 +3214,24 @@ mod tests {
         let settings = std::env::var_os("HORIZON_CUBE_BENCH_SETTINGS")
             .map(|p| std::fs::read_to_string(p).expect("HORIZON_CUBE_BENCH_SETTINGS: a readable file"))
             .unwrap_or_default();
-        let level = f.level_with(CubicKind::Custom, settings);
+        // `HORIZON_CUBE_BENCH_NO_STRUCTURES`: the preset with every structure
+        // set off (to see what structures cost).
+        let settings = if std::env::var_os("HORIZON_CUBE_BENCH_NO_STRUCTURES").is_some() {
+            let mut s = horizon_world::cubic::custom::CustomGeneratorSettings::defaults();
+            for v in horizon_world::cubic::custom::settings::OVERWORLD_STRUCTURE_SETS {
+                s.set_structure_enabled(v.name, false);
+            }
+            s.to_json_compact()
+        } else {
+            settings
+        };
+        // `HORIZON_CUBE_BENCH_DATA`: generate with 26.3's data (biomes,
+        // vegetation, structures), as the game does.
+        let level = if std::env::var_os("HORIZON_CUBE_BENCH_DATA").is_some() {
+            f.level_with_data(CubicKind::Custom, settings)
+        } else {
+            f.level_with(CubicKind::Custom, settings)
+        };
         let mut cubes = Vec::new();
         for y in y0..=y1 {
             for z in -r..=r {

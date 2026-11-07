@@ -106,7 +106,31 @@ The full spec is the research report, summarised in the module docs of `horizon-
   - It writes into the 2 × 2 × 2 cubes starting at itself: ores, lakes, springs, and 26.3's own vegetation features for the biome at the cube's surface.
   - A cube is sent and simulated only once the eight populations touching it have run. This is Cubic Chunks' rule.
   - Populations run in parallel on a checkerboard of four phases by (x mod 2, z mod 2), so no two write the same cube at once.
-- **Structures:** none in Custom Cubic, as in CubicWorldGen, which implemented only strongholds. Hybrid keeps vanilla's structures in its band.
+- **Structures:** Custom Cubic has 26.3's overworld structures (CubicWorldGen made only strongholds). Hybrid keeps vanilla's structures in its band and has none outside it. See "Structures in Custom Cubic".
+
+### Structures in Custom Cubic (2026-11-07)
+
+The owner asked for structures with sliders, like the terrain's, defaulting to as close to vanilla as possible, so that a custom world can switch some off or tune them.
+
+- **What generates:** 26.3's 18 overworld structure sets: villages, pillager outposts, woodland mansions, desert pyramids, jungle temples, swamp huts, igloos, abandoned camps, ruined portals, trail ruins, ocean monuments, ocean ruins, shipwrecks, buried treasure, mineshafts, trial chambers, ancient cities and strongholds. A mod's sets generate too, untuned.
+- **Settings:** `structureSets`, a Horizon extension to the CubicWorldGen JSON, maps a set's name to its switch and placement numbers: spacing, separation and chance for a random spread; distance, spread and count for strongholds' rings. A missing set or field means vanilla's numbers. CubicWorldGen's own toggles (`villages`, `temples`, ...) still switch their groups off. The Customize screen's Structures page edits these settings (Custom Cubic only).
+- **Starts:** vanilla's placement and structure code (`StructurePlanner`, over the same `StructureState` the vanilla generator uses), asked through a start context over the Custom Cubic generator:
+  - The heightmaps are the terrain's surface: the topmost solid block from density and replacers (`column_top`), ignoring carvers and population. The sea fills up to sea level.
+  - A column has one surface, however high. A village stands on a peak 9,000 blocks up as it does on a plain.
+  - The structures see vanilla's bottom of the level (-64) and no top. Mineshafts, strongholds, trial chambers and ancient cities sit at vanilla's depths, and no start is refused for being too high.
+- **Placement** rides on population, between the lakes and the ores (vanilla's structure steps). The population of cube `c` places, into its area (`c * 16 + 8` to `+ 24` on each axis), every piece of the starts within 8 chunks whose columns cross the area. Each block of a structure belongs to exactly one area, so it is placed once, whichever cube populates first.
+  - The pieces are chosen by their columns, not by their boxes, because a piece that picks its height when placed (a temple on the ground) only crosses the right cube once placed.
+  - Such pieces are *settled* once, as a first placement in the start's own chunk with the start's own random, so every population and thread finds the same height (`LegacyPiece::settle`).
+  - Reads see the population's 2 × 2 × 2 cubes and stone beyond them. Writes stay in those cubes.
+  - Chests get their loot tables and spawners their mobs. Block entities and entities (villagers, guardians, the witch) go into the cube records.
+  - A test makes a village's cubes in two opposite orders on two levels and checks that its building blocks and block entities are the same. The decoration around may differ by a few blocks, as it does without structures: a population's ores, trees and a village's snow piles reach into neighbouring areas, so the first of two neighbours decides those.
+- **Cost:** the cube bench (`HORIZON_CUBE_BENCH_DATA=1`, 2,197 cubes around the origin, one thread) goes from 0.52 to 0.56 ms per cube, about 9% more, with `HORIZON_CUBE_BENCH_NO_STRUCTURES=1` as the comparison. At first a cube cost twice as much, and a village's cubes four times: a mineshaft corridor asks the heightmap of almost every block it places. The heightmaps are now found a chunk at a time (`chunk_tops`), reading the cubes from the bound's ceiling down by their density lattice. That costs 1.7 µs a column, against 260 µs for a single column's search.
+- Structures write blocks the way generation does (`LevelFeatureWorld::raw`, vanilla's `WorldGenRegion.setBlock`), without the live level's neighbour shape updates; templates update their edges' shapes themselves.
+- **Not done yet:**
+  - Terrain adaptation (vanilla's beardifier): the terrain is not flattened under villages and outposts, or dug out around buried structures.
+  - Structures in the far view: "Far view: the owner's decisions and later work", item 4.
+  - Starts and references on the level's chunks, so `/locate`, maps and structure mob spawns (witch huts, monuments, outposts) know about these structures.
+  - Existing Custom Cubic worlds get structures in the cubes they generate from now on, as a Minecraft update does: a structure that starts in new terrain is cut off where it reaches terrain made before.
 
 ### Density bounds
 
@@ -322,7 +346,7 @@ These came from the owner while reviewing the Meridian video. They are recorded 
      - Keep every level (or the edited columns' spans) on disk, so builds survive a reopen.
      - Upload only the changed nodes, so the player sees their build's LOD update while they build.
    - The height-map tiles take edits the same way: rebuild the affected columns' spans, and keep edited tiles in the disk cache.
-4. **Structures fill in over time, in the background.** *Later; Custom Cubic has no structures yet.*
+4. **Structures fill in over time, in the background.** *Later; Custom Cubic's structures generate since 2026-11-07, near terrain only.*
    - Structureless terrain is generated first, as now.
    - A low-priority CPU job runs structure placement (structure starts and piece layout, not full chunk generation) over the regions the far view covers, nearest and on-screen first.
    - When it finds a structure, it regenerates the far nodes and tiles that the structure's bounding boxes touch, at their current levels, with the structure's blocks voxelized into them.
@@ -521,13 +545,13 @@ Measured on the owner's machine (8 cores, 24 GB), at render distance 16, vertica
       1. far views of the player's builds;
       2. occlusion-driven refinement;
       3. far block light;
-      4. structures in the far view, once Custom has structures;
+      4. structures in the far view (Custom has structures now);
       5. the thin-feature flex.
       See "Far view: the owner's decisions and later work".
 
 ## Cut or deferred, on purpose
 
-- CubicWorldGen's structure toggles: kept as fields, nothing generated, as in CubicWorldGen itself. When structures arrive, the far view fills them in over time in the background (see "Far view: the owner's decisions and later work", item 4).
+- CubicWorldGen's `alternateStrongholdsPositions`: kept as a field, unused.
 - `mesaSurface`: simplified clay bands.
 - The replacer and cube-area editors in the Customize screen: CubicWorldGen never had them either. The JSON covers them.
 - Hybrid's vanilla band on the GPU, which needs the 26.3 router in WGSL.

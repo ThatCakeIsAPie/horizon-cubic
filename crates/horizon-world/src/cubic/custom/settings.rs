@@ -22,11 +22,15 @@
 //!   gradient can turn only stone into deepslate; CWG ignores them.
 //! * There is no fixer chain: a `version` below 9 is accepted as it is and
 //!   [`CustomGeneratorSettings::warnings`] says so.
-//! * `structures` (`strongholds`, `villages`, `mineshafts`, `temples`,
-//!   `oceanMonuments`, `woodlandMansions`, `alternateStrongholdsPositions`)
-//!   are kept as fields; nothing generates them yet. `riverSize` is kept and
-//!   unused; `biomeSize` is applied by the integrator through
-//!   [`CustomGeneratorSettings::biome_scale`].
+//! * Structures generate (unlike CWG, which made only strongholds): 26.3's
+//!   overworld structure sets, placed by vanilla's rules around the terrain's
+//!   surface. CWG's toggles (`strongholds`, `villages`, `mineshafts`,
+//!   `temples`, `oceanMonuments`, `woodlandMansions`) switch their groups of
+//!   sets off; the Horizon extension `structureSets` switches and tunes each
+//!   set ([`StructureSetTuning`], vanilla's numbers by default:
+//!   [`OVERWORLD_STRUCTURE_SETS`]). `alternateStrongholdsPositions` is kept and
+//!   unused. `riverSize` is kept and unused; `biomeSize` is applied by the
+//!   integrator through [`CustomGeneratorSettings::biome_scale`].
 //! * Missing `minY` / `maxY` of a replacer mean the whole range, and missing
 //!   `minDensity` / `maxDensity` mean -inf / +inf (CWG's Java fields would be
 //!   0, which no real preset relies on).
@@ -1383,6 +1387,153 @@ impl From<CubeArea> for (IntAabb, CustomGeneratorSettings) {
 }
 
 // ---------------------------------------------------------------------------
+// Structures (Horizon extension)
+// ---------------------------------------------------------------------------
+
+/// One structure set's entry in `structureSets`: a field left out is the
+/// set's own (vanilla's) value.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StructureSetTuning {
+    /// `false` switches the set off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Random spread: the side of the grid cell, in chunks; each cell holds
+    /// one start at most.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spacing: Option<i32>,
+    /// Random spread: chunks at the far side of each cell no start takes, so
+    /// starts are at least this far apart. Less than `spacing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub separation: Option<i32>,
+    /// The chance, 0 to 1, that a cell (a chunk, at spacing 1) that could
+    /// have a start gets one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency: Option<f32>,
+    /// Concentric rings (strongholds): the ring distance unit, in chunks (the
+    /// first ring lies about 4 units out, each next one 6 units further).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance: Option<i32>,
+    /// Concentric rings: starts in the first ring (later rings hold more).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spread: Option<i32>,
+    /// Concentric rings: starts in all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<i32>,
+}
+
+/// How a structure set places its starts, with its numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VanillaPlacement {
+    /// `minecraft:random_spread`.
+    Spread {
+        spacing: i32,
+        separation: i32,
+        frequency: f32,
+    },
+    /// `minecraft:concentric_rings`.
+    Rings {
+        distance: i32,
+        spread: i32,
+        count: i32,
+    },
+}
+
+/// The CubicWorldGen structure toggle a set belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CwgToggle {
+    Villages,
+    Temples,
+    Mineshafts,
+    OceanMonuments,
+    WoodlandMansions,
+    Strongholds,
+}
+
+/// A structure set of 26.3's overworld, with its vanilla placement.
+#[derive(Clone, Copy, Debug)]
+pub struct VanillaStructureSet {
+    pub name: &'static str,
+    pub toggle: Option<CwgToggle>,
+    pub placement: VanillaPlacement,
+}
+
+const fn spread(
+    name: &'static str,
+    toggle: Option<CwgToggle>,
+    spacing: i32,
+    separation: i32,
+    frequency: f32,
+) -> VanillaStructureSet {
+    VanillaStructureSet {
+        name,
+        toggle,
+        placement: VanillaPlacement::Spread {
+            spacing,
+            separation,
+            frequency,
+        },
+    }
+}
+
+/// 26.3's overworld structure sets (`data/minecraft/worldgen/structure_set`)
+/// and their placements, in the order a settings screen lists them.
+pub const OVERWORLD_STRUCTURE_SETS: &[VanillaStructureSet] = &[
+    spread("minecraft:villages", Some(CwgToggle::Villages), 34, 8, 1.0),
+    spread("minecraft:pillager_outposts", None, 32, 8, 0.2),
+    spread(
+        "minecraft:woodland_mansions",
+        Some(CwgToggle::WoodlandMansions),
+        80,
+        20,
+        1.0,
+    ),
+    spread("minecraft:desert_pyramids", Some(CwgToggle::Temples), 32, 8, 1.0),
+    spread("minecraft:jungle_temples", Some(CwgToggle::Temples), 32, 8, 1.0),
+    spread("minecraft:swamp_huts", Some(CwgToggle::Temples), 32, 8, 1.0),
+    spread("minecraft:igloos", Some(CwgToggle::Temples), 32, 8, 1.0),
+    spread("minecraft:abandoned_camp", None, 37, 8, 1.0),
+    spread("minecraft:ruined_portals", None, 40, 15, 1.0),
+    spread("minecraft:trail_ruins", None, 34, 8, 1.0),
+    spread(
+        "minecraft:ocean_monuments",
+        Some(CwgToggle::OceanMonuments),
+        32,
+        5,
+        1.0,
+    ),
+    spread("minecraft:ocean_ruins", None, 20, 8, 1.0),
+    spread("minecraft:shipwrecks", None, 24, 4, 1.0),
+    spread("minecraft:buried_treasures", None, 1, 0, 0.01),
+    spread("minecraft:mineshafts", Some(CwgToggle::Mineshafts), 1, 0, 0.004),
+    spread("minecraft:trial_chambers", None, 34, 12, 1.0),
+    spread("minecraft:ancient_cities", None, 24, 8, 1.0),
+    VanillaStructureSet {
+        name: "minecraft:strongholds",
+        toggle: Some(CwgToggle::Strongholds),
+        placement: VanillaPlacement::Rings {
+            distance: 32,
+            spread: 3,
+            count: 128,
+        },
+    },
+];
+
+/// A structure set's full name: `villages` is `minecraft:villages`.
+pub fn structure_set_name(set: &str) -> String {
+    if set.contains(':') {
+        set.to_owned()
+    } else {
+        format!("minecraft:{set}")
+    }
+}
+
+/// The overworld set named `set` (a full name).
+pub fn vanilla_structure_set(set: &str) -> Option<&'static VanillaStructureSet> {
+    OVERWORLD_STRUCTURE_SETS.iter().find(|v| v.name == set)
+}
+
+// ---------------------------------------------------------------------------
 // The settings object
 // ---------------------------------------------------------------------------
 
@@ -1430,6 +1581,11 @@ pub struct CustomGeneratorSettings {
     pub temples: bool,
     pub ocean_monuments: bool,
     pub woodland_mansions: bool,
+    /// Horizon extension (`structureSets`): each structure set's switch and
+    /// placement, by the set's name (`minecraft:villages`). A set or field
+    /// left out is vanilla's ([`OVERWORLD_STRUCTURE_SETS`]); CWG ignores it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub structure_sets: BTreeMap<String, StructureSetTuning>,
     pub ravines: bool,
     pub dungeons: bool,
     pub dungeon_count: i32,
@@ -1504,6 +1660,7 @@ impl Default for CustomGeneratorSettings {
             temples: true,
             ocean_monuments: true,
             woodland_mansions: true,
+            structure_sets: BTreeMap::new(),
             ravines: true,
             dungeons: true,
             dungeon_count: 7,
@@ -1840,6 +1997,157 @@ impl CustomGeneratorSettings {
         f64::from(self.biome_size.clamp(1, 8)) / 4.0
     }
 
+    fn toggle(&self, t: CwgToggle) -> bool {
+        match t {
+            CwgToggle::Villages => self.villages,
+            CwgToggle::Temples => self.temples,
+            CwgToggle::Mineshafts => self.mineshafts,
+            CwgToggle::OceanMonuments => self.ocean_monuments,
+            CwgToggle::WoodlandMansions => self.woodland_mansions,
+            CwgToggle::Strongholds => self.strongholds,
+        }
+    }
+
+    fn toggle_mut(&mut self, t: CwgToggle) -> &mut bool {
+        match t {
+            CwgToggle::Villages => &mut self.villages,
+            CwgToggle::Temples => &mut self.temples,
+            CwgToggle::Mineshafts => &mut self.mineshafts,
+            CwgToggle::OceanMonuments => &mut self.ocean_monuments,
+            CwgToggle::WoodlandMansions => &mut self.woodland_mansions,
+            CwgToggle::Strongholds => &mut self.strongholds,
+        }
+    }
+
+    /// Whether structure set `set` (`minecraft:villages`, or `villages`)
+    /// generates: its CWG toggle, when it has one, and its own switch in
+    /// `structureSets`. A set this module does not know (a mod's) generates
+    /// unless switched off.
+    pub fn structure_enabled(&self, set: &str) -> bool {
+        let set = structure_set_name(set);
+        let toggle = vanilla_structure_set(&set)
+            .and_then(|v| v.toggle)
+            .is_none_or(|t| self.toggle(t));
+        toggle
+            && self
+                .structure_sets
+                .get(&set)
+                .and_then(|t| t.enabled)
+                .unwrap_or(true)
+    }
+
+    /// Switches structure set `set` on or off. Switching on a set whose CWG
+    /// toggle is off turns the toggle on and switches the toggle's other sets
+    /// off, so only `set` comes back.
+    pub fn set_structure_enabled(&mut self, set: &str, on: bool) {
+        let set = structure_set_name(set);
+        if on
+            && let Some(toggle) = vanilla_structure_set(&set).and_then(|v| v.toggle)
+            && !self.toggle(toggle)
+        {
+            *self.toggle_mut(toggle) = true;
+            for other in OVERWORLD_STRUCTURE_SETS {
+                if other.toggle == Some(toggle) && other.name != set {
+                    self.structure_sets
+                        .entry(other.name.to_owned())
+                        .or_default()
+                        .enabled = Some(false);
+                }
+            }
+        }
+        let entry = self.structure_sets.entry(set.clone()).or_default();
+        entry.enabled = if on { None } else { Some(false) };
+        self.prune_structure_set(&set);
+    }
+
+    /// The placement structure set `set` generates with: vanilla's
+    /// ([`OVERWORLD_STRUCTURE_SETS`]) with the fields of its `structureSets`
+    /// entry over it. `None` for a set this module does not know.
+    pub fn structure_placement(&self, set: &str) -> Option<VanillaPlacement> {
+        let set = structure_set_name(set);
+        let vanilla = vanilla_structure_set(&set)?.placement;
+        let t = self.structure_sets.get(&set);
+        Some(match vanilla {
+            VanillaPlacement::Spread {
+                spacing,
+                separation,
+                frequency,
+            } => VanillaPlacement::Spread {
+                spacing: t.and_then(|t| t.spacing).unwrap_or(spacing),
+                separation: t.and_then(|t| t.separation).unwrap_or(separation),
+                frequency: t.and_then(|t| t.frequency).unwrap_or(frequency),
+            },
+            VanillaPlacement::Rings {
+                distance,
+                spread,
+                count,
+            } => VanillaPlacement::Rings {
+                distance: t.and_then(|t| t.distance).unwrap_or(distance),
+                spread: t.and_then(|t| t.spread).unwrap_or(spread),
+                count: t.and_then(|t| t.count).unwrap_or(count),
+            },
+        })
+    }
+
+    /// Sets structure set `set`'s placement: the fields that differ from
+    /// vanilla's are kept in its `structureSets` entry, the others dropped.
+    /// Nothing for a set this module does not know.
+    pub fn set_structure_placement(&mut self, set: &str, placement: VanillaPlacement) {
+        let set = structure_set_name(set);
+        let Some(vanilla) = vanilla_structure_set(&set).map(|v| v.placement) else {
+            return;
+        };
+        let differs = |a: i32, b: i32| (a != b).then_some(a);
+        let entry = self.structure_sets.entry(set.clone()).or_default();
+        match (placement, vanilla) {
+            (
+                VanillaPlacement::Spread {
+                    spacing,
+                    separation,
+                    frequency,
+                },
+                VanillaPlacement::Spread {
+                    spacing: s0,
+                    separation: p0,
+                    frequency: f0,
+                },
+            ) => {
+                entry.spacing = differs(spacing, s0);
+                entry.separation = differs(separation, p0);
+                entry.frequency = (frequency != f0).then_some(frequency);
+            }
+            (
+                VanillaPlacement::Rings {
+                    distance,
+                    spread,
+                    count,
+                },
+                VanillaPlacement::Rings {
+                    distance: d0,
+                    spread: s0,
+                    count: c0,
+                },
+            ) => {
+                entry.distance = differs(distance, d0);
+                entry.spread = differs(spread, s0);
+                entry.count = differs(count, c0);
+            }
+            _ => {}
+        }
+        self.prune_structure_set(&set);
+    }
+
+    /// Drops `set`'s entry when it says nothing.
+    fn prune_structure_set(&mut self, set: &str) {
+        if self
+            .structure_sets
+            .get(set)
+            .is_some_and(|t| *t == StructureSetTuning::default())
+        {
+            self.structure_sets.remove(set);
+        }
+    }
+
     /// Notes about the settings that are not errors (an old `version`).
     pub fn warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
@@ -1862,6 +2170,48 @@ impl CustomGeneratorSettings {
 
     /// Checks the numbers a generator cannot work with.
     pub fn validate(&self) -> Result<(), String> {
+        for (name, t) in &self.structure_sets {
+            let check = |field: &str, v: Option<i32>, range: std::ops::RangeInclusive<i32>| {
+                match v {
+                    Some(n) if !range.contains(&n) => Err(format!(
+                        "structureSets.{name}.{field} must be {} to {}",
+                        range.start(),
+                        range.end()
+                    )),
+                    _ => Ok(()),
+                }
+            };
+            check("spacing", t.spacing, 1..=4096)?;
+            check("separation", t.separation, 0..=4095)?;
+            check("distance", t.distance, 0..=1023)?;
+            check("spread", t.spread, 0..=1023)?;
+            check("count", t.count, 1..=4095)?;
+            if let Some(f) = t.frequency
+                && !(0.0..=1.0).contains(&f)
+            {
+                return Err(format!("structureSets.{name}.frequency must be 0 to 1"));
+            }
+            // A known set's spacing (its own or the entry's) must exceed its
+            // separation, as vanilla's codec requires; for another set, the
+            // entry's own pair.
+            let pair = match self.structure_placement(name) {
+                Some(VanillaPlacement::Spread {
+                    spacing,
+                    separation,
+                    ..
+                }) => Some((spacing, separation)),
+                Some(VanillaPlacement::Rings { .. }) => None,
+                None => t.spacing.zip(t.separation),
+            };
+            if let Some((spacing, separation)) = pair
+                && separation >= spacing
+                && !(spacing == 1 && separation == 0)
+            {
+                return Err(format!(
+                    "structureSets.{name}: separation must be less than spacing"
+                ));
+            }
+        }
         let ok = |n: i32| matches!(n, 1 | 2 | 4 | 8 | 16);
         for (name, n) in [
             ("noiseSampleSizeX", self.noise_sample_size_x),
@@ -2213,6 +2563,100 @@ impl FlatGeneratorSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structure_sets_are_vanillas_until_tuned() {
+        let mut s = CustomGeneratorSettings::defaults();
+        for v in OVERWORLD_STRUCTURE_SETS {
+            assert!(s.structure_enabled(v.name), "{}", v.name);
+            assert_eq!(s.structure_placement(v.name), Some(v.placement));
+        }
+        // Short names work, unknown sets generate untuned.
+        assert!(s.structure_enabled("villages"));
+        assert!(s.structure_enabled("somemod:castles"));
+        assert_eq!(s.structure_placement("somemod:castles"), None);
+        // Untouched settings write no `structureSets`.
+        assert!(!s.to_json_compact().contains("structureSets"));
+
+        s.set_structure_enabled("minecraft:igloos", false);
+        s.set_structure_placement(
+            "villages",
+            VanillaPlacement::Spread {
+                spacing: 20,
+                separation: 8,
+                frequency: 1.0,
+            },
+        );
+        assert!(!s.structure_enabled("minecraft:igloos"));
+        assert!(s.structure_enabled("minecraft:desert_pyramids"));
+        let v = &s.structure_sets["minecraft:villages"];
+        assert_eq!((v.spacing, v.separation, v.frequency), (Some(20), None, None));
+        let text = s.to_json_compact();
+        assert!(text.contains("structureSets"), "{text}");
+        // (The whole preset does not round-trip exactly: serde_json reads
+        // some of its lake probabilities one ulp off.)
+        let back = CustomGeneratorSettings::from_json(&text).unwrap();
+        assert_eq!(back.structure_sets, s.structure_sets);
+        assert_eq!(back.temples, s.temples);
+        back.validate().unwrap();
+
+        // Back to vanilla's numbers and on: the entries go.
+        s.set_structure_enabled("igloos", true);
+        s.set_structure_placement(
+            "villages",
+            VanillaPlacement::Spread {
+                spacing: 34,
+                separation: 8,
+                frequency: 1.0,
+            },
+        );
+        assert!(s.structure_sets.is_empty(), "{:?}", s.structure_sets);
+    }
+
+    #[test]
+    fn cwg_toggles_switch_their_groups() {
+        let mut s = CustomGeneratorSettings::defaults_without_structures();
+        for v in OVERWORLD_STRUCTURE_SETS {
+            assert_eq!(s.structure_enabled(v.name), v.toggle.is_none(), "{}", v.name);
+        }
+        // One temple back: the toggle comes on, its other sets stay off.
+        s.set_structure_enabled("minecraft:jungle_temples", true);
+        assert!(s.temples);
+        assert!(s.structure_enabled("minecraft:jungle_temples"));
+        for other in ["desert_pyramids", "swamp_huts", "igloos"] {
+            assert!(!s.structure_enabled(other), "{other}");
+        }
+        // CWG JSON switching villages off.
+        let s = CustomGeneratorSettings::from_json(r#"{"villages": false}"#).unwrap();
+        assert!(!s.structure_enabled("minecraft:villages"));
+        assert!(s.structure_enabled("minecraft:pillager_outposts"));
+    }
+
+    #[test]
+    fn structure_tuning_is_validated() {
+        let bad = [
+            r#"{"structureSets": {"minecraft:villages": {"spacing": 0}}}"#,
+            r#"{"structureSets": {"minecraft:villages": {"separation": 34}}}"#,
+            r#"{"structureSets": {"minecraft:villages": {"spacing": 8, "separation": 8}}}"#,
+            r#"{"structureSets": {"minecraft:mineshafts": {"frequency": 1.5}}}"#,
+            r#"{"structureSets": {"minecraft:strongholds": {"count": 0}}}"#,
+            r#"{"structureSets": {"somemod:castles": {"spacing": 4, "separation": 4}}}"#,
+        ];
+        for text in bad {
+            let s = CustomGeneratorSettings::from_json(text).unwrap();
+            assert!(s.validate().is_err(), "{text}");
+        }
+        let good = [
+            r#"{"structureSets": {"minecraft:villages": {"spacing": 9, "separation": 8}}}"#,
+            r#"{"structureSets": {"minecraft:mineshafts": {"frequency": 0.05}}}"#,
+            r#"{"structureSets": {"minecraft:strongholds": {"distance": 8, "spread": 1, "count": 3}}}"#,
+            r#"{"structureSets": {"minecraft:buried_treasures": {"enabled": false}}}"#,
+        ];
+        for text in good {
+            let s = CustomGeneratorSettings::from_json(text).unwrap();
+            s.validate().unwrap_or_else(|e| panic!("{text}: {e}"));
+        }
+    }
 
     #[test]
     fn the_preset_survives_a_json_round_trip() {

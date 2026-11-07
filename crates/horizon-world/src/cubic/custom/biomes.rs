@@ -55,6 +55,11 @@ pub trait BiomeColumns: Send + Sync {
     /// The namespaced name (`minecraft:plains`) of a biome this source can
     /// return.
     fn biome_name(&self, id: BiomeId) -> &str;
+    /// Every biome this source can return, when it knows them (empty when it
+    /// does not): what decides which structures a level can have.
+    fn possible_biomes(&self) -> Vec<BiomeId> {
+        Vec::new()
+    }
 }
 
 /// One biome everywhere (single-biome mode, tests).
@@ -74,6 +79,9 @@ impl FixedBiome {
 impl BiomeColumns for FixedBiome {
     fn biome(&self, _: i32, _: i32) -> BiomeId {
         BiomeId(0)
+    }
+    fn possible_biomes(&self) -> Vec<BiomeId> {
+        vec![BiomeId(0)]
     }
     fn biome_name(&self, _: BiomeId) -> &str {
         &self.name

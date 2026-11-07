@@ -1033,7 +1033,7 @@ fn randomizable_container(name: &str) -> bool {
 /// entities as NBT: the compound a randomizable container's block entity takes, or
 /// None when the block there is not one. The seed is drawn only where vanilla draws
 /// it, inside the `instanceof RandomizableContainer` branch.
-fn loot_table_nbt(
+pub(crate) fn loot_table_nbt(
     registry: &crate::registry::BlockRegistry,
     state: BlockStateId,
     table: &str,
@@ -1048,6 +1048,27 @@ fn loot_table_nbt(
     nbt.insert("id".into(), Tag::String(name.as_str().into()));
     nbt.insert("LootTable".into(), Tag::String(table.into()));
     nbt.insert("LootTableSeed".into(), Tag::Long(random.next_long()));
+    Some(nbt)
+}
+/// SpawnerBlockEntity.setEntityId's compound for the spawner at `state`, or
+/// None when the block there is not a spawner.
+pub(crate) fn spawner_nbt(
+    registry: &crate::registry::BlockRegistry,
+    state: BlockStateId,
+    entity: &str,
+) -> Option<crate::nbt::Compound> {
+    use crate::nbt::Tag;
+    if registry.state(state).map(|s| s.name.as_str()) != Some("minecraft:spawner") {
+        return None;
+    }
+    let mut mob = crate::nbt::Compound::new();
+    mob.insert("id".into(), Tag::String(entity.into()));
+    let mut data = crate::nbt::Compound::new();
+    data.insert("entity".into(), Tag::Compound(mob));
+    let mut nbt = crate::nbt::Compound::new();
+    nbt.insert("id".into(), Tag::String("minecraft:mob_spawner".into()));
+    nbt.insert("SpawnData".into(), Tag::Compound(data));
+    nbt.insert("SpawnPotentials".into(), Tag::List(Vec::new()));
     Some(nbt)
 }
 impl<'a> World<'a> {
@@ -1140,22 +1161,13 @@ impl PlacementContext for World<'_> {
         position: [i32; 3],
         entity: &str,
     ) -> Result<(), PlacementQueryError> {
-        use crate::nbt::Tag;
         let chunk = self.region.chunk(position[0] >> 4, position[2] >> 4)?;
         let state = chunk.block(position[0], position[1], position[2]);
         let registry = self.decoration.bindings.registry();
-        if registry.state(state).map(|s| s.name.as_str()) != Some("minecraft:spawner") {
-            return Ok(());
+        match spawner_nbt(registry, state, entity) {
+            Some(nbt) => self.set_block_entity(position, nbt),
+            None => Ok(()),
         }
-        let mut mob = crate::nbt::Compound::new();
-        mob.insert("id".into(), Tag::String(entity.into()));
-        let mut data = crate::nbt::Compound::new();
-        data.insert("entity".into(), Tag::Compound(mob));
-        let mut nbt = crate::nbt::Compound::new();
-        nbt.insert("id".into(), Tag::String("minecraft:mob_spawner".into()));
-        nbt.insert("SpawnData".into(), Tag::Compound(data));
-        nbt.insert("SpawnPotentials".into(), Tag::List(Vec::new()));
-        self.set_block_entity(position, nbt)
     }
     fn attachment_at(
         &mut self,

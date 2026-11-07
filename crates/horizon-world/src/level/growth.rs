@@ -49,6 +49,8 @@ impl Behaviours {
                 entities: Vec::new(),
                 gate: None,
                 surface: None,
+                heights: None,
+                raw: false,
             };
             let unbounded =
                 crate::worldgen::structure::BoundingBox::new([i32::MIN; 3], [i32::MAX; 3]);
@@ -112,6 +114,8 @@ impl Behaviours {
                 entities: Vec::new(),
                 gate: None,
                 surface: None,
+                heights: None,
+                raw: false,
             };
             let mut place_feature =
                 |w: &mut LevelFeatureWorld<'_, '_, L>,
@@ -142,6 +146,82 @@ impl Behaviours {
             world.entities
         };
         *sim.random() = random;
+        (placed, entities)
+    }
+}
+
+impl Behaviours {
+    /// A cubic level's population of one cube places its part of `start`:
+    /// the pieces over the columns of `select` (the whole height), drawn into
+    /// `chunk_box` (the population's 16 blocks of each axis), with the
+    /// generation heightmaps `heights` gives (the terrain's: the level holds
+    /// only the population's region). The start is settled first
+    /// ([`crate::worldgen::structure::start::settle_start`]) as a first
+    /// placement in `settle_box` (the start chunk's columns) with
+    /// `settle_random`, which every population of the start draws the same:
+    /// a temple stands at one height whichever cube places it first. False
+    /// when a piece failed; the entities the pieces carried come back as NBT.
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_structure_part<L: LevelAccess + ?Sized>(
+        &self,
+        level: &mut L,
+        ticks: &mut super::Ticks,
+        features: &LiveFeatures,
+        start: &crate::worldgen::structure::start::StructureStart,
+        resources: &crate::worldgen::structure::StructureResources,
+        blocks: &dyn crate::worldgen::structure::legacy::SolidRender,
+        select: crate::worldgen::structure::BoundingBox,
+        chunk_box: crate::worldgen::structure::BoundingBox,
+        settle_box: crate::worldgen::structure::BoundingBox,
+        settle_random: &mut horizon_core::random::LegacyRandom,
+        random: &mut horizon_core::random::LegacyRandom,
+        heights: &dyn Fn(crate::heightmap::HeightmapType, i32, i32) -> i32,
+    ) -> (bool, Vec<crate::nbt::Compound>) {
+        let mut sim = self.sim(level, ticks);
+        let mut placed = true;
+        let entities = {
+            let mut world = LevelFeatureWorld {
+                sim: &mut sim,
+                features,
+                entities: Vec::new(),
+                gate: None,
+                surface: None,
+                heights: Some(heights),
+                raw: true,
+            };
+            if crate::worldgen::structure::start::settle_start(
+                start,
+                &mut world,
+                resources,
+                blocks,
+                settle_random,
+                settle_box,
+            )
+            .is_err()
+            {
+                placed = false;
+            }
+            let mut place_feature =
+                |w: &mut LevelFeatureWorld<'_, '_, L>,
+                 r: &mut horizon_core::random::LegacyRandom,
+                 name: &str,
+                 p: [i32; 3]| { Ok(features.place_placed(name, w, r, p)) };
+            if crate::worldgen::structure::start::place_in_box(
+                start,
+                &mut world,
+                resources,
+                blocks,
+                random,
+                select,
+                chunk_box,
+                &mut place_feature,
+            )
+            .is_err()
+            {
+                placed = false;
+            }
+            world.entities
+        };
         (placed, entities)
     }
 }
@@ -284,6 +364,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 entities: Vec::new(),
                 gate: None,
                 surface: None,
+                heights: None,
+                raw: false,
             };
             features.place_configured(name, &mut world, &mut random, [pos.x, pos.y, pos.z])
         };
@@ -304,6 +386,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
                 entities: Vec::new(),
                 gate: None,
                 surface: None,
+                heights: None,
+                raw: false,
             };
             features.place_placed(name, &mut world, &mut random, [pos.x, pos.y, pos.z])
         };

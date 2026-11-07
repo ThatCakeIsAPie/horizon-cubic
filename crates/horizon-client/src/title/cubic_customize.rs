@@ -1,8 +1,11 @@
 //! The Customize screen of Create World's Cubic Chunks world types: a port of
 //! CubicWorldGen's `CustomCubicGui`. Custom Cubic and Hybrid open its five
 //! pages (Basic, Ores, Lakes, Caves, Advanced terrain, with Prev and Next) over
-//! a [`CustomGeneratorSettings`]; Flat Cubic opens a layer editor. Both have
-//! Presets, an overlay that imports and exports the settings as JSON.
+//! a [`CustomGeneratorSettings`]; Custom Cubic has a sixth after Basic,
+//! Horizon's Structures, which switches and tunes vanilla's structure sets
+//! (Hybrid's structures are vanilla's own, from its vanilla band). Flat Cubic
+//! opens a layer editor. Both have Presets, an overlay that imports and exports
+//! the settings as JSON.
 //!
 //! The controls of a page are rebuilt from the state each time they are drawn
 //! or pressed ([`page`]): a [`Widget`] is its rectangle, its label and a
@@ -24,7 +27,8 @@ use horizon_world::cubic::custom::{
     CustomGeneratorSettings, FlatGeneratorSettings,
     settings::{
         BiomeDesc, BlockStateDesc, CaveConfig, FilterType, FlatLayer, LakeConfig,
-        PeriodicGaussianOreConfig, StandardOreConfig, UserFunction, UserFunctionPoint,
+        OVERWORLD_STRUCTURE_SETS, PeriodicGaussianOreConfig, StandardOreConfig, UserFunction,
+        UserFunctionPoint, VanillaPlacement,
     },
 };
 use std::{cell::RefCell, collections::BTreeSet, path::Path, rc::Rc};
@@ -59,16 +63,49 @@ const DEFAULTS: u8 = 106;
 const ALL: u8 = 107;
 const INVERT: u8 = 108;
 
-/// The pages of Custom Cubic and Hybrid, in `CustomCubicGui`'s order.
-pub const PAGES: usize = 5;
-const PAGE_NAMES: [&str; PAGES] = [
-    "horizon.cubic.page.basic",
-    "horizon.cubic.page.ores",
-    "horizon.cubic.page.lakes",
-    "horizon.cubic.page.caves",
-    "horizon.cubic.page.terrain",
+/// A page of Custom Cubic and Hybrid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageId {
+    Basic,
+    /// Horizon's: vanilla's structure sets, each switched and tuned.
+    Structures,
+    Ores,
+    Lakes,
+    Caves,
+    Terrain,
+}
+impl PageId {
+    /// The language key of the page's name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Basic => "horizon.cubic.page.basic",
+            Self::Structures => "horizon.cubic.page.structures",
+            Self::Ores => "horizon.cubic.page.ores",
+            Self::Lakes => "horizon.cubic.page.lakes",
+            Self::Caves => "horizon.cubic.page.caves",
+            Self::Terrain => "horizon.cubic.page.terrain",
+        }
+    }
+}
+/// Custom Cubic's pages: `CustomCubicGui`'s, in its order, with Structures
+/// after Basic.
+const CUSTOM_PAGES: &[PageId] = &[
+    PageId::Basic,
+    PageId::Structures,
+    PageId::Ores,
+    PageId::Lakes,
+    PageId::Caves,
+    PageId::Terrain,
 ];
-const TERRAIN: usize = 4;
+/// Hybrid's: `CustomCubicGui`'s. Its structures come from its vanilla band,
+/// with vanilla's settings, so it has no Structures page.
+const HYBRID_PAGES: &[PageId] = &[
+    PageId::Basic,
+    PageId::Ores,
+    PageId::Lakes,
+    PageId::Caves,
+    PageId::Terrain,
+];
 
 const HEADER: f32 = 24.0;
 const FOOTER: f32 = 33.0;
@@ -85,6 +122,14 @@ const LIST_WIDTH: f32 = 220.0;
 const BOTTOM: i32 = i32::MIN + 1;
 const TOP: i32 = i32::MAX;
 const LAYER_RANGE: i32 = 256;
+/// The Structures page's slider tracks, in chunks or starts (`(min, max)`):
+/// a random spread's spacing (its separation runs from 0 to the spacing less
+/// one), the strongholds' ring distance, first-ring spread and count. The
+/// settings take more, typed into Presets.
+const SPACING: (i32, i32) = (1, 256);
+const RING_DISTANCE: (i32, i32) = (1, 128);
+const RING_SPREAD: (i32, i32) = (1, 64);
+const RING_COUNT: (i32, i32) = (1, 256);
 
 // ---------------------------------------------------------------------------
 // State
@@ -297,13 +342,23 @@ impl State {
     pub fn page(&self) -> usize {
         self.page
     }
-    /// The number of pages: five for CubicWorldGen's settings, one for layers.
+    /// The number of pages: six for Custom Cubic, five for Hybrid, one for
+    /// Flat Cubic's layers.
     pub fn page_count(&self) -> usize {
-        if self.kind.has_terrain_settings() {
-            PAGES
-        } else {
-            1
+        self.pages().len().max(1)
+    }
+    /// The pages of this world type; none for Flat Cubic, whose one page is
+    /// its layers.
+    fn pages(&self) -> &'static [PageId] {
+        match self.kind {
+            CubicKind::Custom => CUSTOM_PAGES,
+            CubicKind::Hybrid => HYBRID_PAGES,
+            CubicKind::Flat => &[],
         }
+    }
+    /// The open page; `None` on Flat Cubic's layers.
+    fn page_id(&self) -> Option<PageId> {
+        self.pages().get(self.page).copied()
     }
     /// Reads `text` as the settings of this world type, replacing the current
     /// ones; an error leaves them as they were.
@@ -715,6 +770,10 @@ impl Builder {
     fn note(&mut self, label: String) {
         self.text(Kind::Note, label);
     }
+    /// Empty room of `height` pixels.
+    fn space(&mut self, height: f32) {
+        self.y += height;
+    }
     /// One, two or three controls across the column.
     fn row(&mut self, items: Vec<Item>) {
         let n = items.len().max(1) as f32;
@@ -745,16 +804,14 @@ impl Builder {
 /// The controls of the open page.
 fn page(state: &State) -> Page {
     let mut b = Builder::new();
-    if !state.kind.has_terrain_settings() {
-        flat_page(&mut b, state);
-    } else {
-        match state.page {
-            0 => basic_page(&mut b, state),
-            1 => ores_page(&mut b, state),
-            2 => lakes_page(&mut b, state),
-            3 => caves_page(&mut b, state),
-            _ => terrain_page(&mut b, state),
-        }
+    match state.page_id() {
+        None => flat_page(&mut b, state),
+        Some(PageId::Basic) => basic_page(&mut b, state),
+        Some(PageId::Structures) => structures_page(&mut b, state),
+        Some(PageId::Ores) => ores_page(&mut b, state),
+        Some(PageId::Lakes) => lakes_page(&mut b, state),
+        Some(PageId::Caves) => caves_page(&mut b, state),
+        Some(PageId::Terrain) => terrain_page(&mut b, state),
     }
     b.finish()
 }
@@ -763,60 +820,15 @@ fn basic_page(b: &mut Builder, state: &State) {
     let s = &state.settings;
     b.heading(tr("horizon.cubic.basic.features"));
     // `*`: nothing in Horizon generates it yet (CWG marks its own unfinished ones).
+    // CWG's structure toggles are on the Structures page, one switch a set.
     b.row(vec![
         mark("horizon.cubic.flag.dungeons", true, s.dungeons, |c, on| {
             c.dungeons = on
-        }),
-        mark(
-            "horizon.cubic.flag.strongholds",
-            true,
-            s.strongholds,
-            |c, on| c.strongholds = on,
-        ),
-    ]);
-    b.row(vec![
-        mark("horizon.cubic.flag.villages", true, s.villages, |c, on| {
-            c.villages = on
-        }),
-        mark(
-            "horizon.cubic.flag.mineshafts",
-            true,
-            s.mineshafts,
-            |c, on| c.mineshafts = on,
-        ),
-    ]);
-    b.row(vec![
-        mark("horizon.cubic.flag.temples", true, s.temples, |c, on| {
-            c.temples = on
         }),
         mark("horizon.cubic.flag.ravines", false, s.ravines, |c, on| {
             c.ravines = on
         }),
     ]);
-    b.row(vec![
-        mark(
-            "horizon.cubic.flag.monuments",
-            true,
-            s.ocean_monuments,
-            |c, on| {
-                c.ocean_monuments = on;
-            },
-        ),
-        mark(
-            "horizon.cubic.flag.mansions",
-            true,
-            s.woodland_mansions,
-            |c, on| {
-                c.woodland_mansions = on;
-            },
-        ),
-    ]);
-    b.row(vec![mark(
-        "horizon.cubic.flag.alternate_strongholds",
-        true,
-        s.alternate_strongholds_positions,
-        |c, on| c.alternate_strongholds_positions = on,
-    )]);
     b.note(tr("horizon.cubic.basic.unimplemented"));
     b.heading(tr("horizon.cubic.basic.world"));
     let biome = if s.biome.is_empty() {
@@ -855,7 +867,7 @@ fn basic_page(b: &mut Builder, state: &State) {
         ),
     ]);
 }
-/// A structure toggle; `star` marks one that is not generated yet.
+/// A feature toggle; `star` marks one that is not generated yet.
 fn mark(
     key: &str,
     star: bool,
@@ -866,6 +878,186 @@ fn mark(
     button(format!("{label}: {}", on_off(on)), move |st| {
         st.edit(|c| f(c, !on));
     })
+}
+
+/// Custom Cubic's Structures page: 26.3's overworld structure sets in
+/// [`OVERWORLD_STRUCTURE_SETS`]' order, each a block of its switch and the
+/// sliders of its placement, which start at the numbers it generates with
+/// (vanilla's unless changed). A random spread has Chance (the frequency),
+/// Spacing and Separation (kept below the spacing, so the settings validate);
+/// the strongholds' rings have Distance, Spread (the first ring's starts) and
+/// Count. The sliders of a set that is off are greyed out. Reset to vanilla
+/// heads the page; the list scrolls like the other pages'.
+fn structures_page(b: &mut Builder, state: &State) {
+    let s = &state.settings;
+    b.note(tr("horizon.cubic.structure.help"));
+    let vanilla = OVERWORLD_STRUCTURE_SETS
+        .iter()
+        .all(|v| s.structure_enabled(v.name) && s.structure_placement(v.name) == Some(v.placement));
+    b.row(vec![disabled(
+        button(tr("horizon.cubic.structure.vanilla"), |st| {
+            st.edit(vanilla_structures);
+        }),
+        vanilla,
+    )]);
+    for set in OVERWORLD_STRUCTURE_SETS {
+        let name = set.name;
+        let Some(placement) = s.structure_placement(name) else {
+            continue;
+        };
+        let on = s.structure_enabled(name);
+        let switch = button(labelled(&set_key(name), on_off(on)), move |st| {
+            st.edit(|c| c.set_structure_enabled(name, !on));
+        });
+        b.space(4.0);
+        match placement {
+            VanillaPlacement::Spread {
+                spacing,
+                separation,
+                frequency,
+            } => {
+                let chance = f64::from(frequency);
+                b.row(vec![
+                    switch,
+                    disabled(
+                        number_shown(
+                            "horizon.cubic.structure.chance",
+                            Mapping::Cubic { max: 1.0 },
+                            chance,
+                            format!("{}%", show((chance * 10_000.0).round() / 100.0)),
+                            move |st, v| spread_mut(st, name, |_, _, f| *f = chance_step(v)),
+                        ),
+                        !on,
+                    ),
+                ]);
+                b.row(vec![
+                    disabled(
+                        int(
+                            "horizon.cubic.structure.spacing",
+                            SPACING.0,
+                            SPACING.1,
+                            spacing,
+                            move |st, v| spread_mut(st, name, |sp, _, _| *sp = v),
+                        ),
+                        !on,
+                    ),
+                    disabled(
+                        int(
+                            "horizon.cubic.structure.separation",
+                            0,
+                            (spacing - 1).max(0),
+                            separation,
+                            move |st, v| spread_mut(st, name, |_, sep, _| *sep = v),
+                        ),
+                        !on || spacing <= 1,
+                    ),
+                ]);
+            }
+            VanillaPlacement::Rings {
+                distance,
+                spread,
+                count,
+            } => {
+                let ring = |key: &str, (min, max): (i32, i32), value: i32, field: usize| {
+                    disabled(
+                        int(key, min, max, value, move |st, v| {
+                            rings_mut(st, name, |r| r[field] = v);
+                        }),
+                        !on,
+                    )
+                };
+                b.row(vec![
+                    switch,
+                    ring(
+                        "horizon.cubic.structure.distance",
+                        RING_DISTANCE,
+                        distance,
+                        0,
+                    ),
+                ]);
+                b.row(vec![
+                    ring("horizon.cubic.structure.spread", RING_SPREAD, spread, 1),
+                    ring("horizon.cubic.structure.count", RING_COUNT, count, 2),
+                ]);
+            }
+        }
+    }
+}
+/// The language key of a structure set's name: `minecraft:villages` is
+/// `horizon.cubic.set.villages`.
+fn set_key(name: &str) -> String {
+    let path = name.split_once(':').map_or(name, |(_, path)| path);
+    format!("horizon.cubic.set.{path}")
+}
+/// A Chance slider's frequency: 0.1% steps below 5%, whole percents above,
+/// so a drag can land on vanilla's 0.4%, 1% and 20%.
+fn chance_step(v: f64) -> f32 {
+    let steps = if v < 0.05 { 1000.0 } else { 100.0 };
+    ((v * steps).round() / steps) as f32
+}
+/// Changes structure set `name`'s random spread: `f` gets its spacing,
+/// separation and frequency. The separation is then pulled below the spacing,
+/// so the settings still validate.
+fn spread_mut(st: &mut State, name: &str, f: impl FnOnce(&mut i32, &mut i32, &mut f32)) {
+    st.edit(|c| {
+        let Some(VanillaPlacement::Spread {
+            mut spacing,
+            mut separation,
+            mut frequency,
+        }) = c.structure_placement(name)
+        else {
+            return;
+        };
+        f(&mut spacing, &mut separation, &mut frequency);
+        let spacing = spacing.max(1);
+        c.set_structure_placement(
+            name,
+            VanillaPlacement::Spread {
+                spacing,
+                separation: separation.clamp(0, spacing - 1),
+                frequency: frequency.clamp(0.0, 1.0),
+            },
+        );
+    });
+}
+/// Changes structure set `name`'s concentric rings: `f` gets its distance,
+/// spread and count, in that order.
+fn rings_mut(st: &mut State, name: &str, f: impl FnOnce(&mut [i32; 3])) {
+    st.edit(|c| {
+        let Some(VanillaPlacement::Rings {
+            distance,
+            spread,
+            count,
+        }) = c.structure_placement(name)
+        else {
+            return;
+        };
+        let mut r = [distance, spread, count];
+        f(&mut r);
+        let [distance, spread, count] = r;
+        c.set_structure_placement(
+            name,
+            VanillaPlacement::Rings {
+                distance,
+                spread,
+                count,
+            },
+        );
+    });
+}
+/// Reset to vanilla: CWG's structure toggles on and every set the page lists
+/// back to its own switch and placement. Entries of sets the page does not
+/// list (a mod's) stay.
+fn vanilla_structures(c: &mut CustomGeneratorSettings) {
+    c.strongholds = true;
+    c.villages = true;
+    c.mineshafts = true;
+    c.temples = true;
+    c.ocean_monuments = true;
+    c.woodland_mansions = true;
+    for set in OVERWORLD_STRUCTURE_SETS {
+        c.structure_sets.remove(set.name);
+    }
 }
 
 /// One ore of the combined list, as the page shows it.
@@ -1833,8 +2025,7 @@ fn flat_page(b: &mut Builder, state: &State) {
 
 /// The list of the open page: top, bottom and left of the column.
 fn list_area(state: &State, (w, h): (f32, f32)) -> (f32, f32, f32) {
-    let pinned = if state.kind.has_terrain_settings() && state.page == TERRAIN && state.show_preview
-    {
+    let pinned = if state.page_id() == Some(PageId::Terrain) && state.show_preview {
         PINNED
     } else {
         0.0
@@ -2210,22 +2401,20 @@ pub(super) fn draw(
         Overlay::Picker(picker) => return draw_picker(title, atlas, batch, cursor, picker, (w, h)),
         Overlay::None => {}
     }
-    let title_text = if state.kind.has_terrain_settings() {
-        Text::translate(
+    let title_text = match state.page_id() {
+        Some(id) => Text::translate(
             "horizon.cubic.page.title",
             &[
                 Text::literal((state.page + 1).to_string()),
-                Text::literal(PAGES.to_string()),
-                Text::translate(PAGE_NAMES[state.page], &[]),
+                Text::literal(state.page_count().to_string()),
+                Text::translate(id.name(), &[]),
             ],
         )
-        .plain()
-    } else {
-        tr("horizon.cubic.flat.title")
+        .plain(),
+        None => tr("horizon.cubic.flat.title"),
     };
     super::centered(atlas, batch, &title_text, 8.0, u32::MAX);
-    let preview_on =
-        state.kind.has_terrain_settings() && state.page == TERRAIN && state.show_preview;
+    let preview_on = state.page_id() == Some(PageId::Terrain) && state.show_preview;
     if preview_on {
         draw_preview(atlas, batch, state, w);
     }
@@ -2602,6 +2791,68 @@ mod tests {
         };
         state.presets_result(&presets)
     }
+    /// Opens page `id` of the world type's pages.
+    fn open(state: &mut State, id: PageId) {
+        let at = state
+            .pages()
+            .iter()
+            .position(|p| *p == id)
+            .unwrap_or_else(|| panic!("{:?} has a {id:?} page", state.kind));
+        state.switch_page(at);
+        assert_eq!(state.page_id(), Some(id));
+    }
+    /// The first control of the open page that, set to `pos`, changes what
+    /// `look` reads of the settings.
+    fn control<T: PartialEq>(
+        state: &State,
+        pos: f32,
+        look: impl Fn(&CustomGeneratorSettings) -> T,
+    ) -> Option<usize> {
+        let before = look(&state.settings);
+        let widgets = page(state).widgets;
+        (0..widgets.len())
+            .filter(|&i| widgets[i].item.set.is_some())
+            .find(|&i| {
+                let mut probe = state.clone();
+                set(&mut probe, i, pos);
+                look(&probe.settings) != before
+            })
+    }
+    fn enabled(state: &State, index: usize) -> bool {
+        page(state).widgets[index].item.enabled
+    }
+    fn spread_of(c: &CustomGeneratorSettings, name: &str) -> (i32, i32, f32) {
+        match c.structure_placement(name) {
+            Some(VanillaPlacement::Spread {
+                spacing,
+                separation,
+                frequency,
+            }) => (spacing, separation, frequency),
+            other => panic!("{name} is a random spread: {other:?}"),
+        }
+    }
+    fn rings_of(c: &CustomGeneratorSettings, name: &str) -> (i32, i32, i32) {
+        match c.structure_placement(name) {
+            Some(VanillaPlacement::Rings {
+                distance,
+                spread,
+                count,
+            }) => (distance, spread, count),
+            other => panic!("{name} is concentric rings: {other:?}"),
+        }
+    }
+    /// The settings validate and come back the same through `cubicgen.json`
+    /// and through a new screen.
+    fn assert_round_trips(s: &State) {
+        s.settings.validate().unwrap();
+        let json = s.json();
+        assert_eq!(
+            CustomGeneratorSettings::from_json(&json).unwrap(),
+            s.settings
+        );
+        let again = state(s.kind, &json);
+        assert_eq!(again.settings, s.settings, "the screen reopens on them");
+    }
 
     #[test]
     fn presets_json_round_trips_through_the_overlay() {
@@ -2690,7 +2941,7 @@ mod tests {
     #[test]
     fn a_period_slider_writes_the_inverse_as_the_frequency() {
         let mut s = state(CubicKind::Custom, "");
-        s.switch_page(TERRAIN);
+        open(&mut s, PageId::Terrain);
         let found = sliders(&s).into_iter().find(|&i| {
             let mut probe = s.clone();
             let before = probe.settings.depth_noise_frequency_x;
@@ -2766,7 +3017,7 @@ mod tests {
     fn ore_height_sliders_have_open_ends_and_hundredth_steps() {
         let mut s = state(CubicKind::Custom, "");
         s.edit(|c| c.standard_ores.push(StandardOreConfig::default()));
-        s.switch_page(1);
+        open(&mut s, PageId::Ores);
         let last = s.settings.standard_ores.len() - 1;
         // The new ore is unbounded both ways; a slider at 0.75 of the track
         // (-2 to 2) is height 1.0, and the end is open again.
@@ -2793,8 +3044,8 @@ mod tests {
             s.settings.caves.len(),
         );
         // Each page's first button is its Add.
-        for page in [1, 2, 3] {
-            s.switch_page(page);
+        for id in [PageId::Ores, PageId::Lakes, PageId::Caves] {
+            open(&mut s, id);
             let add = buttons_of(&s)[0].clone();
             add(&mut s, 0.0);
         }
@@ -2803,7 +3054,7 @@ mod tests {
         assert_eq!(s.settings.caves.len(), caves + 1);
         // On the caves page the buttons are Add, then per cave its block,
         // Delete and Replaceable blocks: the new cave's Delete is the third.
-        s.switch_page(3);
+        open(&mut s, PageId::Caves);
         let buttons = buttons_of(&s);
         buttons[2].clone()(&mut s, 0.0);
         assert_eq!(s.settings.caves.len(), caves);
@@ -2813,7 +3064,7 @@ mod tests {
     fn the_footer_buttons_have_distinct_ids_on_every_page_and_overlay() {
         let mut s = state(CubicKind::Custom, "");
         let mut seen = Vec::new();
-        for page in 0..PAGES {
+        for page in 0..s.page_count() {
             s.switch_page(page);
             seen.push(buttons(480.0, 270.0, &s));
         }
@@ -2836,25 +3087,34 @@ mod tests {
     }
 
     #[test]
-    fn prev_and_next_walk_the_five_pages_and_stop_at_the_ends() {
-        let mut s = state(CubicKind::Hybrid, "");
+    fn prev_and_next_walk_the_pages_and_stop_at_the_ends() {
         let enabled = |s: &State, id: u8| {
             buttons(480.0, 270.0, s)
                 .into_iter()
                 .find(|b| b.id == id)
                 .map(|b| b.enabled)
         };
-        assert_eq!(
-            (enabled(&s, PREV), enabled(&s, NEXT)),
-            (Some(false), Some(true))
-        );
-        for expected in 1..PAGES {
-            press(&mut s, NEXT);
-            assert_eq!(s.page, expected);
+        // Hybrid has CWG's five pages, Custom Cubic Structures too.
+        for (kind, pages) in [(CubicKind::Hybrid, 5), (CubicKind::Custom, 6)] {
+            let mut s = state(kind, "");
+            assert_eq!(s.page_count(), pages);
+            assert_eq!(
+                (enabled(&s, PREV), enabled(&s, NEXT)),
+                (Some(false), Some(true))
+            );
+            for expected in 1..pages {
+                press(&mut s, NEXT);
+                assert_eq!(s.page, expected);
+            }
+            assert_eq!(
+                s.page_id(),
+                Some(PageId::Terrain),
+                "{kind:?} ends on terrain"
+            );
+            assert_eq!(enabled(&s, NEXT), Some(false));
+            press(&mut s, PREV);
+            assert_eq!(s.page, pages - 2);
         }
-        assert_eq!(enabled(&s, NEXT), Some(false));
-        press(&mut s, PREV);
-        assert_eq!(s.page, PAGES - 2);
         // A Flat Cubic world has the layer page only, with no Prev or Next.
         assert_eq!(enabled(&state(CubicKind::Flat, ""), PREV), None);
     }
@@ -2873,5 +3133,314 @@ mod tests {
         );
         assert_eq!(press(&mut s, DONE), Exit::Apply);
         assert_eq!(press(&mut s, CANCEL), Exit::Cancel);
+    }
+
+    /// Reset to vanilla on the Structures page: after the help note.
+    const RESET: usize = 1;
+    /// Where structure set `name`'s block starts on the Structures page: after
+    /// the help note and Reset to vanilla, a switch and three sliders a set.
+    fn switch_of(name: &str) -> usize {
+        let i = OVERWORLD_STRUCTURE_SETS
+            .iter()
+            .position(|v| v.name == name)
+            .unwrap_or_else(|| panic!("{name} is an overworld set"));
+        2 + 4 * i
+    }
+    fn slider_pos(state: &State, index: usize) -> f32 {
+        match page(state).widgets[index].item.kind {
+            Kind::Slider(pos) => pos,
+            _ => panic!("widget {index} is a slider"),
+        }
+    }
+
+    #[test]
+    fn structures_is_custom_cubics_second_page_and_scrolls_through_every_set() {
+        let mut s = state(CubicKind::Custom, "");
+        press(&mut s, NEXT);
+        assert_eq!(s.page_id(), Some(PageId::Structures));
+        // A block a set, in the settings' order: its switch, then three sliders.
+        let widgets = page(&s).widgets;
+        assert_eq!(widgets.len(), 2 + 4 * OVERWORLD_STRUCTURE_SETS.len());
+        assert!(widgets[RESET].item.kind == Kind::Button);
+        for v in OVERWORLD_STRUCTURE_SETS {
+            let at = switch_of(v.name);
+            assert!(widgets[at].item.kind == Kind::Button, "{}", v.name);
+            for slider in &widgets[at + 1..at + 4] {
+                assert!(matches!(slider.item.kind, Kind::Slider(_)), "{}", v.name);
+            }
+        }
+        // Eighteen blocks overflow the list, which scrolls; at its end a press
+        // lands on the last set's switch.
+        let (top, bottom, left) = list_area(&s, SIZE);
+        assert!(content_height(&page(&s)) > 3.0 * (bottom - top));
+        wheel(&mut s, -1000.0, (240.0, 100.0), SIZE);
+        assert!(s.scroll.amount > 0.0);
+        let at = switch_of("minecraft:strongholds");
+        let (x, y, _, h) = absolute(
+            page(&s).widgets[at].rect,
+            s.scroll.amount.trunc(),
+            (left, top),
+        );
+        assert!(y >= top && y + h <= bottom, "the last block is in view");
+        assert!(click(&mut s, (x + 5.0, y + 5.0), SIZE));
+        assert!(!s.settings.structure_enabled("minecraft:strongholds"));
+        // Hybrid's structures are vanilla's, from its vanilla band: no page.
+        let hybrid = state(CubicKind::Hybrid, "");
+        assert!(!hybrid.pages().contains(&PageId::Structures));
+        assert_eq!(hybrid.page_count(), 5);
+    }
+
+    #[test]
+    fn a_structure_switch_turns_its_set_off_and_on() {
+        let mut s = state(CubicKind::Custom, "");
+        open(&mut s, PageId::Structures);
+        for v in OVERWORLD_STRUCTURE_SETS {
+            let at = switch_of(v.name);
+            set(&mut s, at, 0.0);
+            assert!(!s.settings.structure_enabled(v.name), "{} is off", v.name);
+            assert!(
+                OVERWORLD_STRUCTURE_SETS
+                    .iter()
+                    .filter(|o| o.name != v.name)
+                    .all(|o| s.settings.structure_enabled(o.name)),
+                "only {} is off",
+                v.name
+            );
+            // Its sliders grey out; its switch and Reset to vanilla do not.
+            assert!((1..4).all(|i| !enabled(&s, at + i)), "{}", v.name);
+            assert!(enabled(&s, at) && enabled(&s, RESET));
+            assert_round_trips(&s);
+            set(&mut s, at, 0.0);
+            assert!(s.settings.structure_enabled(v.name), "{} is back", v.name);
+            assert!(enabled(&s, at + 1));
+        }
+        assert!(s.settings.structure_sets.is_empty(), "nothing is left over");
+        assert!(!enabled(&s, RESET), "the settings are vanilla's");
+        // A CWG toggle that is off shows its sets off; switching one of them on
+        // brings back that one only.
+        let mut s = state(CubicKind::Custom, r#"{"temples": false}"#);
+        open(&mut s, PageId::Structures);
+        let temples = [
+            "minecraft:desert_pyramids",
+            "minecraft:jungle_temples",
+            "minecraft:swamp_huts",
+            "minecraft:igloos",
+        ];
+        assert!(temples.iter().all(|t| !s.settings.structure_enabled(t)));
+        set(&mut s, switch_of(temples[0]), 0.0);
+        assert!(s.settings.temples && s.settings.structure_enabled(temples[0]));
+        assert!(
+            temples[1..]
+                .iter()
+                .all(|t| !s.settings.structure_enabled(t))
+        );
+        assert_round_trips(&s);
+    }
+
+    #[test]
+    fn structure_sliders_write_the_placement_and_keep_separation_below_spacing() {
+        let mut s = state(CubicKind::Custom, "");
+        open(&mut s, PageId::Structures);
+        let spacing_track = Mapping::Int {
+            min: SPACING.0,
+            max: SPACING.1,
+        };
+        let villages = "minecraft:villages";
+        let at = switch_of(villages);
+        let (chance, spacing, separation) = (at + 1, at + 2, at + 3);
+        // The sliders start at vanilla's numbers.
+        assert_eq!(slider_pos(&s, spacing), spacing_track.pos(34.0));
+        assert_eq!(slider_pos(&s, chance), 1.0);
+        // Only what differs from vanilla is stored.
+        set(&mut s, spacing, 1.0);
+        assert_eq!(spread_of(&s.settings, villages), (256, 8, 1.0));
+        let entry = &s.settings.structure_sets[villages];
+        assert_eq!(
+            (entry.spacing, entry.separation, entry.frequency),
+            (Some(256), None, None)
+        );
+        // The separation runs up to the spacing less one.
+        set(&mut s, separation, 1.0);
+        assert_eq!(spread_of(&s.settings, villages), (256, 255, 1.0));
+        assert_round_trips(&s);
+        // A smaller spacing pulls the separation below it; at 1 it is 0 and
+        // its slider greys out.
+        set(&mut s, spacing, spacing_track.pos(10.0));
+        assert_eq!(spread_of(&s.settings, villages), (10, 9, 1.0));
+        assert_round_trips(&s);
+        set(&mut s, spacing, 0.0);
+        assert_eq!(spread_of(&s.settings, villages), (1, 0, 1.0));
+        assert!(!enabled(&s, separation) && enabled(&s, spacing));
+        assert_round_trips(&s);
+        // Chance is cubic: mineshafts' 0.4% sits well inside the track, which
+        // steps by 0.1% below 5% and by whole percents above.
+        let mineshafts = "minecraft:mineshafts";
+        let chance = switch_of(mineshafts) + 1;
+        assert!((slider_pos(&s, chance) - 0.004f32.cbrt()).abs() < 1e-6);
+        set(&mut s, chance, 0.2);
+        assert_eq!(spread_of(&s.settings, mineshafts).2, 0.008);
+        set(&mut s, chance, 0.5);
+        assert_eq!(spread_of(&s.settings, mineshafts).2, 0.13);
+        assert_round_trips(&s);
+        set(&mut s, chance, Mapping::Cubic { max: 1.0 }.pos(0.004));
+        assert_eq!(spread_of(&s.settings, mineshafts).2, 0.004);
+        assert!(
+            !s.settings.structure_sets.contains_key(mineshafts),
+            "back at vanilla's chance, nothing is stored"
+        );
+        // The strongholds' rings.
+        let strongholds = "minecraft:strongholds";
+        let at = switch_of(strongholds);
+        assert_eq!(rings_of(&s.settings, strongholds), (32, 3, 128));
+        set(&mut s, at + 1, 1.0);
+        set(&mut s, at + 2, 0.0);
+        set(&mut s, at + 3, 1.0);
+        assert_eq!(
+            rings_of(&s.settings, strongholds),
+            (RING_DISTANCE.1, RING_SPREAD.0, RING_COUNT.1)
+        );
+        assert_round_trips(&s);
+    }
+
+    #[test]
+    fn every_structure_slider_keeps_the_settings_valid_and_reset_restores_vanilla() {
+        let mut s = state(CubicKind::Custom, "");
+        open(&mut s, PageId::Structures);
+        let theirs = horizon_world::cubic::custom::settings::StructureSetTuning {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        s.settings
+            .structure_sets
+            .insert("mymod:towers".into(), theirs.clone());
+        for pos in [0.0, 1.0, 0.03, 0.5, 0.97, 0.0] {
+            for i in sliders(&s) {
+                set(&mut s, i, pos);
+                if let Err(e) = s.settings.validate() {
+                    panic!("slider {i} at {pos}: {e}");
+                }
+            }
+        }
+        assert_round_trips(&s);
+        s.edit(|c| c.villages = false);
+        assert!(enabled(&s, RESET));
+        set(&mut s, RESET, 0.0);
+        for v in OVERWORLD_STRUCTURE_SETS {
+            assert!(s.settings.structure_enabled(v.name), "{}", v.name);
+            assert_eq!(s.settings.structure_placement(v.name), Some(v.placement));
+        }
+        assert!(!enabled(&s, RESET), "nothing left to reset");
+        // A set the page does not list keeps its entry.
+        assert_eq!(s.settings.structure_sets.len(), 1);
+        assert_eq!(s.settings.structure_sets["mymod:towers"], theirs);
+        assert_round_trips(&s);
+    }
+
+    #[test]
+    fn the_basic_page_keeps_dungeons_and_ravines_but_no_structure_toggles() {
+        for kind in [CubicKind::Custom, CubicKind::Hybrid] {
+            let s = state(kind, "");
+            assert_eq!(s.page_id(), Some(PageId::Basic));
+            let structures = |c: &CustomGeneratorSettings| {
+                (
+                    (c.strongholds, c.villages, c.mineshafts, c.temples),
+                    (c.ocean_monuments, c.woodland_mansions),
+                    c.alternate_strongholds_positions,
+                    c.structure_sets.clone(),
+                )
+            };
+            for pos in [0.0, 1.0] {
+                assert_eq!(control(&s, pos, structures), None, "{kind:?}");
+            }
+            assert!(control(&s, 0.0, |c| c.dungeons).is_some());
+            assert!(control(&s, 0.0, |c| c.ravines).is_some());
+        }
+    }
+
+    /// The vanilla strings the labels use, under Horizon's bundled ones.
+    struct VanillaStrings;
+    impl crate::lang::ResourceSource for VanillaStrings {
+        fn read(&self, path: &str) -> Option<Vec<u8>> {
+            (path == "assets/minecraft/lang/en_us.json").then(|| {
+                br#"{"options.generic_value": "%s: %s", "options.on": "ON", "options.off": "OFF"}"#
+                    .to_vec()
+            })
+        }
+    }
+
+    #[test]
+    fn the_structures_page_shows_vanillas_numbers_in_english_and_portuguese() {
+        use crate::lang::{Language, scoped};
+        let mut s = state(CubicKind::Custom, "");
+        open(&mut s, PageId::Structures);
+        let labels = |s: &State| {
+            page(s)
+                .widgets
+                .iter()
+                .map(|w| w.item.label.clone())
+                .collect::<Vec<_>>()
+        };
+        let (english, missed) = scoped(Language::load(&[&VanillaStrings], "en_us"), || labels(&s));
+        assert!(missed.is_empty(), "{missed:?}");
+        let block = |name: &str| english[switch_of(name)..switch_of(name) + 4].to_vec();
+        assert_eq!(
+            block("minecraft:villages"),
+            [
+                "Villages: ON",
+                "Chance: 100%",
+                "Spacing: 34",
+                "Separation: 8"
+            ]
+        );
+        assert_eq!(block("minecraft:pillager_outposts")[1], "Chance: 20%");
+        assert_eq!(
+            block("minecraft:buried_treasures")[..2],
+            ["Buried Treasure: ON", "Chance: 1%"]
+        );
+        assert_eq!(
+            block("minecraft:mineshafts")[..2],
+            ["Mineshafts: ON", "Chance: 0.4%"]
+        );
+        assert_eq!(
+            block("minecraft:strongholds"),
+            ["Strongholds: ON", "Distance: 32", "Spread: 3", "Count: 128"]
+        );
+        let (portuguese, _) = scoped(Language::load(&[&VanillaStrings], "pt_br"), || labels(&s));
+        assert!(portuguese[switch_of("minecraft:villages")].starts_with("Vilarejos"));
+        // Every set's name and the page's own strings are in both files.
+        let keys: Vec<String> = OVERWORLD_STRUCTURE_SETS
+            .iter()
+            .map(|v| set_key(v.name))
+            .chain(
+                [
+                    PageId::Structures.name(),
+                    "horizon.cubic.structure.help",
+                    "horizon.cubic.structure.vanilla",
+                    "horizon.cubic.structure.chance",
+                    "horizon.cubic.structure.spacing",
+                    "horizon.cubic.structure.separation",
+                    "horizon.cubic.structure.distance",
+                    "horizon.cubic.structure.spread",
+                    "horizon.cubic.structure.count",
+                ]
+                .map(str::to_owned),
+            )
+            .collect();
+        for (code, file) in [
+            (
+                "en_us",
+                include_str!("../../assets/horizon/lang/en_us.json"),
+            ),
+            (
+                "pt_br",
+                include_str!("../../assets/horizon/lang/pt_br.json"),
+            ),
+        ] {
+            let strings: std::collections::HashMap<String, String> =
+                serde_json::from_str(file).unwrap();
+            for key in &keys {
+                assert!(strings.contains_key(key), "{code} names {key}");
+            }
+        }
     }
 }

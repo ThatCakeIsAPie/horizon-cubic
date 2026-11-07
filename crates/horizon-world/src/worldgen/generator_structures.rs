@@ -1087,3 +1087,122 @@ mod tests {
         }
     }
 }
+
+/// A structure set's placement as a level's settings change it
+/// ([`StructureSet::tune`]); `None` fields keep the set's own.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SetTuning {
+    pub spacing: Option<i32>,
+    pub separation: Option<i32>,
+    pub frequency: Option<f32>,
+    pub distance: Option<i32>,
+    pub spread: Option<i32>,
+    pub count: Option<i32>,
+}
+
+/// Structure starts for a level that a vanilla chunk generator does not make
+/// (a cubic level's Custom Cubic terrain): the bundle's structure sets, with
+/// the starts cached by chunk and the concentric rings searched once, asked
+/// through the caller's [`StartContext`] (its terrain heights and biomes).
+pub struct StructurePlanner {
+    state: StructureState,
+}
+
+impl StructurePlanner {
+    /// The planner of the sets whose structures can start in one of
+    /// `possible` biomes, each as `tune` says: `None` leaves the set out,
+    /// `Some` tunes it. `None` when the bundle has no structures.
+    pub fn new(
+        data: &Arc<GeneratorData>,
+        possible: &BTreeSet<BiomeId>,
+        tune: impl Fn(&str) -> Option<SetTuning>,
+    ) -> Result<Option<Self>, GeneratorError> {
+        let Some(mut state) = StructureState::new(data, possible, Arc::new(OnceLock::new()))?
+        else {
+            return Ok(None);
+        };
+        let mut keep = Vec::new();
+        for &i in &state.possible_sets {
+            let set = &mut state.registry.sets[i];
+            if let Some(t) = tune(&set.name) {
+                set.tune(
+                    t.spacing,
+                    t.separation,
+                    t.frequency,
+                    t.distance,
+                    t.spread,
+                    t.count,
+                );
+                keep.push(i);
+            }
+        }
+        state.possible_sets = keep;
+        Ok(Some(Self { state }))
+    }
+
+    /// The names of the sets that can start (for tests and logs).
+    pub fn set_names(&self) -> Vec<String> {
+        (self.state.possible_sets.iter())
+            .map(|&i| self.state.registry.sets[i].name.clone())
+            .collect()
+    }
+
+    /// The structure starts chunk `chunk` owns, built once.
+    pub fn starts_at(&self, context: &mut impl StartContext, chunk: ChunkPos) -> Starts {
+        self.state.starts_at(context, chunk)
+    }
+
+    /// The starts whose box crosses the columns `min..=max` (block X and Z),
+    /// from chunks up to 8 chunks around them (vanilla's reach), in the order
+    /// a chunk places them: by decoration step, then by the step's structure
+    /// order. Each comes with its step and its index in the step (what the
+    /// placement random is seeded with).
+    pub fn touching(
+        &self,
+        context: &mut impl StartContext,
+        min: [i32; 2],
+        max: [i32; 2],
+    ) -> Vec<(usize, usize, Arc<StructureStart>)> {
+        let (cx0, cz0, cx1, cz1) = ((min[0] >> 4) - 8, (min[1] >> 4) - 8, (max[0] >> 4) + 8, (max[1] >> 4) + 8);
+        let around: Vec<ChunkPos> = (cx0..=cx1)
+            .flat_map(|x| (cz0..=cz1).map(move |z| ChunkPos::new(x, z)))
+            .collect();
+        // As `references`: build those no other worker is building first.
+        let found: Vec<Option<Starts>> = around
+            .iter()
+            .map(|&at| self.state.build_starts(context, at, false))
+            .collect();
+        let mut out = Vec::new();
+        for (&at, found) in around.iter().zip(found) {
+            let starts = found.unwrap_or_else(|| self.state.starts_at(context, at));
+            for start in starts.iter() {
+                let b = start.bounding_box;
+                if b.max[0] >= min[0] && b.min[0] <= max[0] && b.max[2] >= min[1] && b.min[2] <= max[1] {
+                    let step = self.state.registry.structures[start.structure].step;
+                    let index = self.state.by_step[step]
+                        .iter()
+                        .position(|&s| s == start.structure)
+                        .unwrap_or(0);
+                    out.push((step, index, start.clone()));
+                }
+            }
+        }
+        out.sort_by_key(|(step, index, _)| (*step, *index));
+        out
+    }
+
+    /// The pieces' templates and pools.
+    pub fn resources(&self) -> &Arc<StructureResources> {
+        &self.state.resources
+    }
+
+    /// The block facts the pieces ask (`isSolidRender`, ...).
+    pub fn tree_blocks(&self) -> Option<Arc<super::tree_blocks::TreeBlocks>> {
+        self.state.bindings.tree_blocks().ok()
+    }
+
+    /// A structure's name (`minecraft:village_plains`).
+    pub fn structure_name(&self, structure: usize) -> &str {
+        &self.state.registry.structures[structure].name
+    }
+}

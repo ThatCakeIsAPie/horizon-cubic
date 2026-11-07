@@ -37,6 +37,9 @@ impl LegacyPiece for BuriedTreasurePiece {
     fn type_name(&self) -> &'static str {
         "minecraft:btp"
     }
+    fn height_from_terrain(&self) -> bool {
+        true
+    }
     fn post_process(&self, c: &mut PieceContext<'_>) -> Result<()> {
         let [x, _, z] = self.position;
         let mut pos = [x, c.world.height(HeightmapType::OceanFloorWg, x, z)?, z];
@@ -206,6 +209,43 @@ pub fn shipwreck_too_big(template: &StructureTemplate) -> bool {
 }
 
 impl TemplatePiece {
+    /// ShipwreckPiece.postProcess's height: the first placement's, kept.
+    fn shipwreck_y(&self, c: &mut PieceContext<'_>, beached: bool) -> Result<i32> {
+        if let Some(y) = *self.state.lock().unwrap() {
+            return Ok(y);
+        }
+        if shipwreck_too_big(&self.template) {
+            return Ok(self.position[1]);
+        }
+        let kind = if beached {
+            HeightmapType::WorldSurfaceWg
+        } else {
+            HeightmapType::OceanFloorWg
+        };
+        let size = self.template.size;
+        let mut min = c.world.max_y()? + 1;
+        let mut mean = 0;
+        let base = size[0] * size[2];
+        if base == 0 {
+            mean = c.world.height(kind, self.position[0], self.position[2])?;
+        } else {
+            for x in self.position[0]..self.position[0] + size[0] {
+                for z in self.position[2]..self.position[2] + size[2] {
+                    let h = c.world.height(kind, x, z)?;
+                    mean += h;
+                    min = min.min(h);
+                }
+            }
+            mean /= base;
+        }
+        let y = if beached {
+            min - size[1] / 2 - c.random.int(3)
+        } else {
+            mean
+        };
+        *self.state.lock().unwrap() = Some(y);
+        Ok(y)
+    }
     /// `TemplateStructurePiece.addAdditionalSaveData` and its subclasses',
     /// with the height a shipwreck settled on once placed.
     pub fn saved(&self) -> crate::nbt::Compound {
@@ -283,6 +323,20 @@ impl LegacyPiece for TemplatePiece {
     fn bounding_box(&self) -> BoundingBox {
         self.bounding_box
     }
+    /// Igloos, shipwrecks and ocean ruins stand where the ground is.
+    fn height_from_terrain(&self) -> bool {
+        matches!(
+            self.handler,
+            TemplateHandler::Igloo | TemplateHandler::Shipwreck { .. } | TemplateHandler::OceanRuin { .. }
+        )
+    }
+    /// A shipwreck's height.
+    fn settle(&self, c: &mut PieceContext<'_>) -> Result<()> {
+        if let TemplateHandler::Shipwreck { beached } = self.handler {
+            self.shipwreck_y(c, beached)?;
+        }
+        Ok(())
+    }
     fn save(&self) -> Option<crate::nbt::Compound> {
         Some(self.saved())
     }
@@ -353,41 +407,7 @@ impl LegacyPiece for TemplatePiece {
                 }
             }
             TemplateHandler::Shipwreck { beached } => {
-                let adjusted = *self.state.lock().unwrap();
-                let y = match adjusted {
-                    Some(y) => y,
-                    None if shipwreck_too_big(&self.template) => self.position[1],
-                    None => {
-                        let kind = if beached {
-                            HeightmapType::WorldSurfaceWg
-                        } else {
-                            HeightmapType::OceanFloorWg
-                        };
-                        let size = self.template.size;
-                        let mut min = c.world.max_y()? + 1;
-                        let mut mean = 0;
-                        let base = size[0] * size[2];
-                        if base == 0 {
-                            mean = c.world.height(kind, self.position[0], self.position[2])?;
-                        } else {
-                            for x in self.position[0]..self.position[0] + size[0] {
-                                for z in self.position[2]..self.position[2] + size[2] {
-                                    let h = c.world.height(kind, x, z)?;
-                                    mean += h;
-                                    min = min.min(h);
-                                }
-                            }
-                            mean /= base;
-                        }
-                        let y = if beached {
-                            min - size[1] / 2 - c.random.int(3)
-                        } else {
-                            mean
-                        };
-                        *self.state.lock().unwrap() = Some(y);
-                        y
-                    }
-                };
+                let y = self.shipwreck_y(c, beached)?;
                 let position = [self.position[0], y, self.position[2]];
                 if let Some(markers) = self.place_at(c, position, &[])? {
                     for (marker, pos) in markers {
@@ -477,7 +497,10 @@ impl Scattered {
         let (mut total, mut count) = (0, 0);
         for z in b.min[2]..=b.max[2] {
             for x in b.min[0]..=b.max[0] {
-                if c.chunk_box.is_inside([x, 64, z]) {
+                // Vanilla's chunk box is the whole height (it tests y 64): a
+                // cube's box is not, so test the column alone.
+                let (lo, hi) = (c.chunk_box.min, c.chunk_box.max);
+                if (lo[0]..=hi[0]).contains(&x) && (lo[2]..=hi[2]).contains(&z) {
                     total += c
                         .world
                         .height(HeightmapType::MotionBlockingNoLeaves, x, z)?;
@@ -550,6 +573,14 @@ impl LegacyPiece for SwampHutPiece {
     }
     fn type_name(&self) -> &'static str {
         "minecraft:tesh"
+    }
+    fn height_from_terrain(&self) -> bool {
+        true
+    }
+    /// The hut's average ground height over `c`'s chunk.
+    fn settle(&self, c: &mut PieceContext<'_>) -> Result<()> {
+        self.base.average_ground(c, 0)?;
+        Ok(())
     }
     fn post_process(&self, c: &mut PieceContext<'_>) -> Result<()> {
         if !self.base.average_ground(c, 0)? {

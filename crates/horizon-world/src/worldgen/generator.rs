@@ -681,6 +681,10 @@ impl GeneratorData {
             .get(name)
             .map(String::as_str)
     }
+    /// Each biome's temperature settings, by biome id.
+    pub(crate) fn temperature_settings(&self) -> &[BiomeTemperatureSettings] {
+        &self.temperatures
+    }
     pub fn biome_names(&self) -> &[Arc<str>] {
         &self.biome_names
     }

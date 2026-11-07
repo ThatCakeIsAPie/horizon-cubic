@@ -11,9 +11,10 @@
 //!
 //! # Order
 //!
-//! `PrePopulator` (lakes; dungeons are not generated, see below), standard
-//! ores, periodic Gaussian ores, [`CubeWorld::decorate_surface`], liquid
-//! springs. The random is `coords_seed_random(world seed, cx, cy, cz)`.
+//! `PrePopulator` (lakes; dungeons are not generated, see below),
+//! [`CubeWorld::place_structures`], standard ores, periodic Gaussian ores,
+//! [`CubeWorld::decorate_surface`], liquid springs. The random is
+//! `coords_seed_random(world seed, cx, cy, cz)`.
 //!
 //! # Not generated
 //!
@@ -47,6 +48,17 @@ pub trait CubeWorld {
     /// features (trees, grass, flowers, ...) belong here. `random` is the
     /// cube's population random, already advanced past lakes and ores.
     fn decorate_surface(&mut self, _cube: SectionPos, _random: &mut JRandom) {}
+    /// Called after the lakes, before the ores (vanilla's structure steps):
+    /// the structures' parts in the cube's area
+    /// ([`super::structures::CubicStructures::place`]). Draws nothing from
+    /// the population random.
+    fn place_structures(&mut self, _cube: SectionPos) {}
+    /// A block entity a structure placed (a chest with its loot table, a
+    /// spawner), as NBT without its position.
+    fn set_block_entity(&mut self, _p: [i32; 3], _nbt: crate::nbt::Compound) {}
+    /// An entity a structure carried (a villager, a guardian), as NBT with
+    /// its `Pos`.
+    fn add_entity(&mut self, _nbt: crate::nbt::Compound) {}
 }
 
 /// A compiled `GenerationCondition`.
@@ -291,6 +303,7 @@ impl Populator {
         let win = Window { min };
 
         self.lakes(&mut rand, world, &win, &biome);
+        world.place_structures(cube);
         for ore in &self.ores {
             if ore.biomes.as_ref().is_some_and(|b| !b.contains(&biome)) {
                 continue;

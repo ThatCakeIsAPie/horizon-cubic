@@ -95,6 +95,15 @@ impl LegacyPiece for DesertPyramidPiece {
     fn type_name(&self) -> &'static str {
         "minecraft:tedp"
     }
+    fn height_from_terrain(&self) -> bool {
+        true
+    }
+    /// The pyramid's ground height and sink (`-nextInt(3)`).
+    fn settle(&self, c: &mut PieceContext<'_>) -> Result<()> {
+        let offset = -c.random.int(3);
+        self.base.lowest_ground(c, offset)?;
+        Ok(())
+    }
     fn post_process(&self, c: &mut PieceContext<'_>) -> Result<()> {
         let offset = -c.random.int(3);
         if !self.base.lowest_ground(c, offset)? {
@@ -476,6 +485,14 @@ impl LegacyPiece for JungleTemplePiece {
     }
     fn type_name(&self) -> &'static str {
         "minecraft:tejp"
+    }
+    fn height_from_terrain(&self) -> bool {
+        true
+    }
+    /// The temple's average ground height over `c`'s chunk.
+    fn settle(&self, c: &mut PieceContext<'_>) -> Result<()> {
+        self.base.average_ground(c, 0)?;
+        Ok(())
     }
     fn post_process(&self, c: &mut PieceContext<'_>) -> Result<()> {
         if !self.base.average_ground(c, 0)? {

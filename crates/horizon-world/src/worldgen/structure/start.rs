@@ -735,6 +735,46 @@ impl StructureRegistry {
     }
 }
 impl StructureSet {
+    /// Changes the set's placement numbers (a cubic world's structure
+    /// settings): a random spread takes `spacing`, `separation` and
+    /// `frequency`, concentric rings `distance`, `spread` and `count`; `None`
+    /// keeps the set's own. The caller keeps the values in vanilla's ranges
+    /// (separation below spacing).
+    #[allow(clippy::too_many_arguments)]
+    pub fn tune(
+        &mut self,
+        spacing: Option<i32>,
+        separation: Option<i32>,
+        frequency: Option<f32>,
+        distance: Option<i32>,
+        spread: Option<i32>,
+        count: Option<i32>,
+    ) {
+        match &mut self.placement {
+            Placement::RandomSpread {
+                spacing: s,
+                separation: p,
+                ..
+            } => {
+                *s = spacing.unwrap_or(*s).max(1);
+                *p = separation.unwrap_or(*p).clamp(0, (*s - 1).max(0));
+                if let Some(f) = frequency {
+                    self.frequency = f.clamp(0.0, 1.0);
+                }
+            }
+            Placement::ConcentricRings {
+                distance: d,
+                spread: s,
+                count: c,
+                ..
+            } => {
+                *d = distance.unwrap_or(*d).max(0);
+                *s = spread.unwrap_or(*s).max(0);
+                *c = count.unwrap_or(*c).max(1);
+            }
+            _ => {}
+        }
+    }
     /// The random spread's spacing in chunks (`None` for rings).
     pub fn spacing(&self) -> Option<i32> {
         match self.placement {
@@ -799,6 +839,18 @@ impl Piece {
         match self {
             Self::Pool(p) => Some(p.save()),
             Self::Legacy(p) => p.save(),
+        }
+    }
+}
+impl Piece {
+    /// Whether the piece's blocks may stand at a height its box does not
+    /// give: a terrain-matching jigsaw piece (drawn onto the ground), or a
+    /// legacy piece that picks its height when placed
+    /// ([`LegacyPiece::height_from_terrain`]).
+    pub fn height_from_terrain(&self) -> bool {
+        match self {
+            Self::Pool(p) => matches!(p.element.projection(), Projection::TerrainMatching),
+            Self::Legacy(p) => p.height_from_terrain(),
         }
     }
 }
@@ -1577,6 +1629,35 @@ pub fn place_in_chunk<W: FeatureWorld + PlacementContext, R: RandomSource + 'sta
     chunk_box: BoundingBox,
     place_feature: &mut PlaceFeature<'_, W, R>,
 ) -> Result<(), PlacementQueryError> {
+    place_in_box(
+        start,
+        world,
+        resources,
+        blocks,
+        random,
+        chunk_box,
+        chunk_box,
+        place_feature,
+    )
+}
+
+/// [`place_in_chunk`] drawing into `chunk_box` the pieces that cross it,
+/// and the pieces whose height the terrain decides
+/// ([`Piece::height_from_terrain`]) that cross `select`. A cubic level's
+/// population draws into the 16 blocks of height of one cube: `select` is
+/// its columns over the whole height, since a temple standing on the ground
+/// or a path following it is known to cross the cube only once placed.
+#[allow(clippy::too_many_arguments)]
+pub fn place_in_box<W: FeatureWorld + PlacementContext, R: RandomSource + 'static>(
+    start: &StructureStart,
+    world: &mut W,
+    resources: &StructureResources,
+    blocks: &dyn crate::worldgen::structure::legacy::SolidRender,
+    random: &mut R,
+    select: BoundingBox,
+    chunk_box: BoundingBox,
+    place_feature: &mut PlaceFeature<'_, W, R>,
+) -> Result<(), PlacementQueryError> {
     let Some(first) = start.pieces.first() else {
         return Ok(());
     };
@@ -1584,7 +1665,12 @@ pub fn place_in_chunk<W: FeatureWorld + PlacementContext, R: RandomSource + 'sta
     let center = center_box.center();
     let reference = [center[0], center_box.min[1], center[2]];
     for piece in &start.pieces {
-        if piece.bounding_box().intersects(&chunk_box) {
+        let crosses = if piece.height_from_terrain() {
+            piece.bounding_box().intersects(&select)
+        } else {
+            piece.bounding_box().intersects(&chunk_box)
+        };
+        if crosses {
             match piece {
                 Piece::Pool(p) => {
                     p.place(
@@ -1624,6 +1710,43 @@ pub fn place_in_chunk<W: FeatureWorld + PlacementContext, R: RandomSource + 'sta
             reference,
         };
         p.after_place(&mut context, &boxes)?;
+    }
+    Ok(())
+}
+
+/// Settles the start's legacy pieces whose height or shape their first
+/// placement picks from what that placement's chunk sees
+/// ([`LegacyPiece::settle`]), as a first placement in `chunk_box` would. A
+/// level whose chunks place a start in any order, on several threads at once
+/// (a cubic level's cubes), settles each start once before placing it, so
+/// every placement finds the same height.
+pub fn settle_start<W: FeatureWorld + PlacementContext, R: RandomSource + 'static>(
+    start: &StructureStart,
+    world: &mut W,
+    resources: &StructureResources,
+    blocks: &dyn crate::worldgen::structure::legacy::SolidRender,
+    random: &mut R,
+    chunk_box: BoundingBox,
+) -> Result<(), PlacementQueryError> {
+    let Some(first) = start.pieces.first() else {
+        return Ok(());
+    };
+    let center_box = first.bounding_box();
+    let center = center_box.center();
+    let reference = [center[0], center_box.min[1], center[2]];
+    for piece in &start.pieces {
+        if let Piece::Legacy(p) = piece {
+            let mut context = PieceContext {
+                world,
+                resources,
+                blocks,
+                random,
+                chunk_box,
+                chunk: ChunkPos::new(chunk_box.min[0] >> 4, chunk_box.min[2] >> 4),
+                reference,
+            };
+            p.settle(&mut context)?;
+        }
     }
     Ok(())
 }

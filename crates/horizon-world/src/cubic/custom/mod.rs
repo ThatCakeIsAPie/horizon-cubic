@@ -42,9 +42,10 @@
 //! See [`settings`] (defaults, biome names, deepslate), [`biomes`] (heights of
 //! 26.3's biomes), [`replacers`], [`carvers`] and [`populate`]. In short:
 //! Horizon's vanilla-style Perlin replaces libnoise, the default ores are 26.3's,
-//! the default replacers include the deepslate gradient, structures
-//! (strongholds, villages, ...) and dungeons are not generated, `riverSize`
-//! is unused.
+//! the default replacers include the deepslate gradient, dungeons are not
+//! generated, `riverSize` is unused. Structures (26.3's overworld sets) are
+//! the integrator's, through [`structures`] and the
+//! [`CubeWorld::place_structures`] hook.
 
 use std::sync::Arc;
 
@@ -62,6 +63,7 @@ pub mod populate;
 pub mod replacers;
 pub mod rng;
 pub mod settings;
+pub mod structures;
 #[doc(hidden)]
 pub mod testing;
 pub mod vegetation;
@@ -320,6 +322,19 @@ impl CustomCubicGenerator {
         }
     }
 
+    /// The topmost solid block of each column of chunk (`cx`, `cz`)
+    /// (`z << 4 | x`), from density and replacers (carvers and population
+    /// ignored): what generation-time heightmaps see, the blocks `generate`
+    /// starts from. [`NO_TOP`] for a column with no solid block within
+    /// 4,096 blocks under the lowest height the density bound proves has
+    /// only air above it (searched up from sea level).
+    pub fn chunk_tops(&self, cx: i32, cz: i32) -> Box<[i32; 256]> {
+        match &self.kind {
+            Kind::Flat(f) => Box::new([f.surface_y().unwrap_or(NO_TOP); 256]),
+            Kind::Terrain(t) => t.chunk_tops(cx, cz),
+        }
+    }
+
     /// Whether a box of blocks touches a `cubeAreas` entry (their blocks come
     /// from other settings, so the bounds do not apply).
     fn touches_area(&self, min: [i32; 3], max: [i32; 3]) -> bool {
@@ -518,6 +533,9 @@ impl<'a> ColumnProbe<'a> {
     }
 }
 
+/// A column without a solid block ([`CustomCubicGenerator::chunk_tops`]).
+pub const NO_TOP: i32 = i32::MIN / 2;
+
 /// The shortest noise wavelength, in blocks, a cube's first uniformity proof
 /// evaluates (finer octaves are bounded by their amplitude).
 const COARSE_PROOF: f64 = 16.0;
@@ -673,6 +691,62 @@ impl Terrain {
                 column: None,
             }
         }
+    }
+
+    /// `CustomCubicGenerator::chunk_tops`: the ceiling is the first height
+    /// from sea level up, in steps of 256, under 4,096 blocks the bound
+    /// proves air; the cubes under it are then read top down (a cube the
+    /// bound proves air skipped, one it proves solid ending every column
+    /// left, others from their density lattice) until every column has met a
+    /// solid block.
+    fn chunk_tops(&self, cx: i32, cz: i32) -> Box<[i32; 256]> {
+        let mut tops = Box::new([NO_TOP; 256]);
+        let (x0, z0) = (cx * 16, cz * 16);
+        let class = |y0: i32, y1: i32| self.classify_box([x0, y0, z0], [x0 + 15, y1, z0 + 15]);
+        let limit = crate::cubic::MAX_Y - 4096;
+        let mut ceiling = self.sea_level.clamp(crate::cubic::MIN_Y, limit) & !15;
+        while class(ceiling, ceiling + 4095) != BoxClass::Air {
+            ceiling += 256;
+            if ceiling > limit {
+                return tops;
+            }
+        }
+        let mut left = 256;
+        let top_cube = ceiling >> 4;
+        for cy in (top_cube - 256..top_cube).rev() {
+            let y0 = cy * 16;
+            if y0 < crate::cubic::MIN_Y {
+                break;
+            }
+            match class(y0, y0 + 15) {
+                BoxClass::Air => continue,
+                BoxClass::Solid => {
+                    for t in tops.iter_mut().filter(|t| **t == NO_TOP) {
+                        *t = y0 + 15;
+                    }
+                    break;
+                }
+                BoxClass::Mixed => {}
+            }
+            let lattice = Lattice::for_cube(&self.noise, &self.blend, self.sizes, [cx, cy, cz]);
+            let mut found = [NO_TOP; 256];
+            lattice.for_each(|lx, ly, lz, _, _, _, density| {
+                let i = lz << 4 | lx;
+                if density > 0.0 && tops[i] == NO_TOP {
+                    found[i] = found[i].max(y0 + ly as i32);
+                }
+            });
+            for (t, f) in tops.iter_mut().zip(found) {
+                if *t == NO_TOP && f != NO_TOP {
+                    *t = f;
+                    left -= 1;
+                }
+            }
+            if left == 0 {
+                break;
+            }
+        }
+        tops
     }
 
     fn surface_y(&self, x: i32, z: i32, from_y: i32) -> Option<i32> {

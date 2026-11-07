@@ -29,6 +29,15 @@ pub(crate) struct LevelFeatureWorld<'s, 'a, L: LevelAccess + ?Sized> {
     /// answer with (`[low, high)`, so each surface belongs to one population).
     pub gate: Option<&'s dyn Fn([i32; 3]) -> bool>,
     pub surface: Option<(i32, i32)>,
+    /// Generation heightmaps from elsewhere than the level's blocks: a cubic
+    /// level's population holds 32 blocks of height, so the structures it
+    /// places ask the terrain generator where the ground is (`Level.getHeight`
+    /// answers with this when set).
+    pub heights: Option<&'s dyn Fn(HeightmapType, i32, i32) -> i32>,
+    /// Generation's writes (`WorldGenRegion.setBlock`): the block alone, with
+    /// no neighbour or shape updates, as a cubic level's structures are
+    /// placed (templates ask for their edges' shape updates themselves).
+    pub raw: bool,
 }
 
 fn pos([x, y, z]: [i32; 3]) -> BlockPos {
@@ -63,6 +72,10 @@ impl<L: LevelAccess + ?Sized> FeatureWorld for LevelFeatureWorld<'_, '_, L> {
         state: BlockStateId,
         flags: i32,
     ) -> Result<bool, Self::Error> {
+        if self.raw {
+            let p = pos(position);
+            return Ok(self.sim.level.is_loaded(p) && self.sim.level.set_raw(p, state).is_some());
+        }
         Ok(self.sim.set_block(pos(position), state, flags))
     }
 }
@@ -176,13 +189,32 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
         self.sim.level.load_block_entity(pos(position), nbt);
         Ok(())
     }
-    /// Live levels hold no loot-table containers placed by these features.
+    /// RandomizableContainer.setBlockEntityLootTable: a container block there
+    /// takes the table and a loot seed (a structure's chests, a dungeon's).
     fn set_block_entity_loot_table(
         &mut self,
-        _position: [i32; 3],
-        _table: &str,
-        _random: &mut impl RandomSource,
+        position: [i32; 3],
+        table: &str,
+        random: &mut impl RandomSource,
     ) -> Result<(), PlacementQueryError> {
+        let state = self.sim.state(pos(position));
+        let registry = self.features.data().registry();
+        if let Some(nbt) = crate::worldgen::loot_table_nbt(registry, state, table, random) {
+            self.sim.level.load_block_entity(pos(position), nbt);
+        }
+        Ok(())
+    }
+    /// SpawnerBlockEntity.setEntityId: the next spawn data and no potentials.
+    fn configure_spawner(
+        &mut self,
+        position: [i32; 3],
+        entity: &str,
+    ) -> Result<(), PlacementQueryError> {
+        let state = self.sim.state(pos(position));
+        let registry = self.features.data().registry();
+        if let Some(nbt) = crate::worldgen::spawner_nbt(registry, state, entity) {
+            self.sim.level.load_block_entity(pos(position), nbt);
+        }
         Ok(())
     }
     fn block_brightness(&mut self, position: [i32; 3]) -> Result<i32, PlacementQueryError> {
@@ -340,6 +372,9 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
     }
     /// `Level.getHeight(type, x, z)`: one above the highest matching block.
     fn height(&mut self, kind: HeightmapType, x: i32, z: i32) -> Result<i32, PlacementQueryError> {
+        if let Some(heights) = self.heights {
+            return Ok(heights(kind, x, z));
+        }
         let (min, max) = (self.sim.level.min_y(), self.sim.level.max_y());
         for y in (min..max).rev() {
             let state = self.sim.state(BlockPos::new(x, y, z));
@@ -395,6 +430,8 @@ pub fn place_biome_feature<L: LevelAccess + ?Sized>(
         entities: Vec::new(),
         gate: Some(gate),
         surface: Some(surface),
+        heights: None,
+        raw: false,
     };
     features.place_placed_with_biome_check(
         name,

@@ -125,4 +125,8 @@ impl BiomeColumns for ClimateBiomes {
     fn biome_name(&self, id: BiomeId) -> &str {
         self.data.biome_name(id)
     }
+    fn possible_biomes(&self) -> Vec<BiomeId> {
+        let ids: std::collections::BTreeSet<u32> = self.index.values().copied().collect();
+        ids.into_iter().map(BiomeId).collect()
+    }
 }

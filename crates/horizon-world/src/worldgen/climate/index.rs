@@ -209,6 +209,11 @@ pub struct ClimateIndex<T> {
     links: Vec<(u32, u32)>,
 }
 impl<T> ClimateIndex<T> {
+    /// The values of the entries, in their order (each biome of a source once
+    /// per parameter point that names it).
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, v)| v)
+    }
     pub fn new(entries: Vec<(ParameterPoint, T)>) -> Result<Self, IndexError> {
         Self::with_branching(entries, 19)
     }

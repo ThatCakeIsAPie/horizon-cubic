@@ -316,6 +316,18 @@ pub trait LegacyPiece: std::fmt::Debug + Send + Sync {
     fn after_place(&self, _context: &mut PieceContext<'_>, _pieces: &[BoundingBox]) -> Result<()> {
         Ok(())
     }
+    /// What the first `post_process` decides from its chunk alone (a
+    /// temple's ground height, a shipwreck's), decided now as it would be in
+    /// `context`'s chunk, without placing anything: see
+    /// [`super::start::settle_start`].
+    fn settle(&self, _context: &mut PieceContext<'_>) -> Result<()> {
+        Ok(())
+    }
+    /// Whether `post_process` picks the piece's height from the terrain, so
+    /// its box does not say where it ends up (a temple, a shipwreck).
+    fn height_from_terrain(&self) -> bool {
+        false
+    }
 }
 
 /// `StructurePiece.createTag`'s own fields: the type, `BB`, `O` (the

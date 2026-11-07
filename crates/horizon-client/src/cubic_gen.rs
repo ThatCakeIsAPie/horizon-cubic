@@ -28,6 +28,7 @@ use horizon_core::paletted::PalettedContainer;
 use horizon_core::position::SectionPos;
 use horizon_world::cubic::custom::populate::CubeWorld;
 use horizon_world::cubic::custom::rng::JRandom;
+use horizon_world::cubic::custom::structures::CubicStructures;
 use horizon_world::cubic::custom::vegetation::Vegetation;
 use horizon_world::cubic::custom::{
     BiomeColumns, ClimateBiomes, CustomCubicGenerator, CustomGeneratorSettings, FixedBiome,
@@ -111,6 +112,9 @@ pub struct Generation {
     /// data: what the far terrain's biome pass is built from.
     pub climate: Option<Arc<ClimateBiomes>>,
     pub vegetation: Option<Arc<Vegetation>>,
+    /// Custom Cubic's structures (none in Hybrid, whose vanilla band has
+    /// vanilla's, or in Flat, or without the generator data).
+    pub structures: Option<Arc<CubicStructures>>,
     pub seed: i64,
 }
 
@@ -139,6 +143,7 @@ impl Generation {
                 columns: Arc::new(FixedBiome::new("minecraft:plains")),
                 climate: None,
                 vegetation: None,
+                structures: None,
                 seed,
             });
         }
@@ -160,7 +165,12 @@ impl Generation {
             Some(c) => c.clone(),
             None => Arc::new(FixedBiome::new("minecraft:plains")),
         };
-        let generator = CustomCubicGenerator::new(seed, &settings, registry, source.clone())?;
+        let generator = Arc::new(CustomCubicGenerator::new(
+            seed,
+            &settings,
+            registry,
+            source.clone(),
+        )?);
         let columns: Arc<dyn BiomeColumns> = if settings.biome.is_empty() {
             source
         } else {
@@ -170,13 +180,34 @@ impl Generation {
             (Some(data), Some(_)) => Vegetation::new(data, seed).map(Arc::new),
             _ => None,
         };
+        let structures = match data {
+            Some(data) if choice.kind == CubicKind::Custom => {
+                let structures = CubicStructures::new(
+                    data,
+                    seed,
+                    &settings,
+                    generator.clone(),
+                    columns.clone(),
+                )
+                .map(Arc::new);
+                if let Some(s) = &structures {
+                    log::info!(
+                        "Horizon: cubic structures: {}",
+                        s.set_names().join(", ")
+                    );
+                }
+                structures
+            }
+            _ => None,
+        };
         Ok(Self {
             kind: choice.kind,
-            generator: Arc::new(generator),
+            generator,
             settings: Some(settings),
             columns,
             climate,
             vegetation,
+            structures,
             seed,
         })
     }
@@ -222,13 +253,17 @@ pub fn set_root_flags(root: &mut NamedTag, flags: u8) {
 // --------------------------------------------------------- the 2x2x2 world
 
 /// The 2 x 2 x 2 cubes from `origin` as the population's world: the blocks
-/// of eight cubes, which cubes were written, and the vegetation hook.
+/// of eight cubes, which cubes were written, the vegetation and structure
+/// hooks, and the block entities and entities the structures placed.
 pub struct PopRegion {
     origin: SectionPos,
     cubes: [Slot; 8],
     dirty: [bool; 8],
     columns: Arc<dyn BiomeColumns>,
     vegetation: Option<Arc<Vegetation>>,
+    structures: Option<Arc<CubicStructures>>,
+    block_entities: Vec<([i32; 3], horizon_world::nbt::Compound)>,
+    entities: Vec<horizon_world::nbt::Compound>,
 }
 
 impl PopRegion {
@@ -247,7 +282,30 @@ impl PopRegion {
             dirty: [false; 8],
             columns,
             vegetation,
+            structures: None,
+            block_entities: Vec::new(),
+            entities: Vec::new(),
         }
+    }
+
+    /// The region, with `structures` placing their parts.
+    pub fn with_structures(mut self, structures: Option<Arc<CubicStructures>>) -> Self {
+        self.structures = structures;
+        self
+    }
+
+    /// The block entities (at their positions) and the entities the
+    /// structures placed, taken.
+    pub fn take_placed(
+        &mut self,
+    ) -> (
+        Vec<([i32; 3], horizon_world::nbt::Compound)>,
+        Vec<horizon_world::nbt::Compound>,
+    ) {
+        (
+            std::mem::take(&mut self.block_entities),
+            std::mem::take(&mut self.entities),
+        )
     }
 
     fn locate(&self, p: [i32; 3]) -> Option<(usize, usize)> {
@@ -413,6 +471,20 @@ impl CubeWorld for PopRegion {
             let columns = self.columns.clone();
             vegetation.decorate(cube, random, self, &*columns);
         }
+    }
+    fn place_structures(&mut self, cube: SectionPos) {
+        if let Some(structures) = self.structures.clone() {
+            structures.place(cube, self);
+        }
+    }
+    fn set_block_entity(&mut self, p: [i32; 3], nbt: horizon_world::nbt::Compound) {
+        if self.locate(p).is_some() {
+            self.block_entities.retain(|(q, _)| *q != p);
+            self.block_entities.push((p, nbt));
+        }
+    }
+    fn add_entity(&mut self, nbt: horizon_world::nbt::Compound) {
+        self.entities.push(nbt);
     }
 }
 

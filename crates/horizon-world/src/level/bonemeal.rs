@@ -158,6 +158,8 @@ impl Behaviours {
             entities: Vec::new(),
             gate: None,
             surface: None,
+            heights: None,
+            raw: false,
         };
         let at = [pos.x, pos.y, pos.z];
         let placed = place_in_world(
