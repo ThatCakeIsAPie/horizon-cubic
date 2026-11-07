@@ -482,7 +482,7 @@ impl<'a> ColumnProbe<'a> {
         let (t, x, z, resolution) = (self.t, self.x, self.z, self.resolution);
         if let Some(block) = t
             .analyzer()
-            .uniform_block(&t.block_query(x, y, z, resolution))
+            .uniform_block_coarse_first(&t.block_query(x, y, z, resolution), COARSE_PROOF)
         {
             return block;
         }
