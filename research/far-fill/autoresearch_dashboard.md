@@ -1,10 +1,10 @@
 # Lane A: far view fill (desktop) - autoresearch dashboard
 
 **Metric:** far_fill_s: median s to complete a fill over 6 teleports (2 launches x 3 hops), lower is better
-**Baseline:** 17.267 s | **Best:** 8.994 s (-47.9%) | **Min-delta:** 1.5 s | **Iterations:** 9
+**Baseline:** 17.267 s | **Best:** 8.97 s (-48.1%) | **Min-delta:** 1.5 s | **Iterations:** 10
 **Guard:** no timeout; planned within 3%, voxel_px within 2%, fps_steady within 10%, cover_s within 20% of baseline; far view tests
 
-**Kept:** 4 | **Discarded:** 0 | **Screened:** 27 | **Crashed:** 0 | **Guard failures:** 0
+**Kept:** 5 | **Discarded:** 0 | **Screened:** 27 | **Crashed:** 0 | **Guard failures:** 0
 
 | # | Score (s) | Delta | Status | Commit | Description |
 |---|---|---|---|---|---|
@@ -42,3 +42,4 @@
 | 7 | 10.654 | -2.748 | keep | 5b7a3e7368 | merged lane B (origin/research/cube-load 6debf91272): the far view's level 0-1 nodes use the same generate(); evals 10.741 and 10.654 (best was 13.402), spawn fill 17.7-20.4 s (was ~24). Windows terrain hash unchanged (4c048498d55916e2), cube bench surface 1.138 -> 0.456 ms. Tests: far view 206 pass; client cubic 84 pass; world cubic 52 pass + the preset JSON round trip, which fails on unchanged main in the fast profile, and a timing test that failed once under load and passed 5 of 5 after |
 | 8 | 10.276 | -0.378 | screen | (merge 67d659e111 + sampler profile, uncommitted) | merged lane B 67d659e111 (generate speedups; Windows hash unchanged, cube bench 0.390 ms) + sampler counters: 10.276 and 10.498, no gain over 10.654 (within noise). Profile per 5 s: cover 13-33 s, sample 7-14 s, keep 1.5-9 s of ~40 worker-s: the sky cover probes are the biggest cost |
 | 9 | 8.994 | -1.660 | keep | 64e40f1647 | sky cover: skip each look's slab the density bound proves free (was only the whole 600-block box); evals 8.994 / 9.822, pooled median ~9.65 vs 10.65; 0 cover mismatches with HORIZON_FAR_COVER_CHECK; min-delta now 8.7% of best |
+| 10 | 8.970 | -0.024 | keep | 0539ad82ab | cache writes (and parent building) on a Keeper thread: keep 2-13 s -> 0.01-0.13 s per 40 worker-s; evals 9.575 / 8.970 / 9.216 (1 launch), pooled ~9.05 vs ~9.65; below the noise bar, kept on the profile (work off the critical path) |
