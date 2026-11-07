@@ -42,7 +42,11 @@ struct BlockSet(Vec<u64>);
 
 impl BlockSet {
     fn new(ids: &[u32]) -> Self {
-        let len = ids.iter().map(|&id| id as usize / 64 + 1).max().unwrap_or(0);
+        let len = ids
+            .iter()
+            .map(|&id| id as usize / 64 + 1)
+            .max()
+            .unwrap_or(0);
         let mut bits = vec![0u64; len];
         for &id in ids {
             bits[id as usize / 64] |= 1 << (id % 64);
@@ -445,7 +449,10 @@ impl Carvers {
     /// Whether some carver may replace `state`.
     fn replaces(&self, state: u32) -> bool {
         self.caves.iter().any(|c| c.allowed.contains(&state))
-            || self.ravine.as_ref().is_some_and(|r| r.allowed.contains(&state))
+            || self
+                .ravine
+                .as_ref()
+                .is_some_and(|r| r.allowed.contains(&state))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -899,14 +906,19 @@ impl RavineCarver {
         let c = centre(cube);
         let max = self.max_cube_y;
         let mut walls = None;
-        self.active
-            .near(cube, &self.seeds, RAVINE_RARITY, |y| y <= max, |o| {
+        self.active.near(
+            cube,
+            &self.seeds,
+            RAVINE_RARITY,
+            |y| y <= max,
+            |o| {
                 if let Some(w) = self.cache.reaching(o, c, || self.walk(o)) {
                     for s in w.near(lowest(cube)) {
                         self.carve_sphere(cube, out, s, &w, &mut walls);
                     }
                 }
-            });
+            },
+        );
     }
 
     /// `walls`: whether water may be in the cube (as for caves and lava; a

@@ -6,8 +6,8 @@
 | sky | `4,20,32,1` | 0.2018 | **0.0157** | -92.2% | 6.5% |
 | deep | `4,-40,-28,1` | 0.2991 | **0.1262** | -57.8% | 3.0% |
 
-Iterations: 31; kept 20. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 22:58.
+Iterations: 33; kept 20. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 23:05.
 
 ## Hot spots
 
@@ -52,3 +52,5 @@ Updated 2026-11-06 22:58.
 | 23 | deep | discard | 0.1356 | -2.8% | PASS | - | lava/water wall scans skipped when the cube cannot hold any: -2.8% alone (below min-delta); folded into 24 |
 | 24 | deep | keep | 0.1262 | -9.5% | PASS | a6eb67668 | wall-scan skip + bitset replaceable lists in carve_sphere: first 0.1302, confirm 0.1262 (--tests); surface 0.2517, sky 0.0155 |
 | 24 | surface | keep | 0.2517 | -3.7% | PASS | a6eb67668 | measurement on iteration 24 code (surface best tracking; cumulative small gains since 19) |
+| 25 | surface | discard | 0.2453 | -2.5% | PASS | - | population functions generic over the world (PopRegion block/set_block inline instead of dyn calls): -2.5%, below min-delta; patch kept |
+| 26 | deep | discard | 0.1251 | -0.9% | PASS | - | JRandom as an inlined copy of the Java LCG (no cross-crate calls): deep -0.9%, surface -0.9%, sky -2%: below min-delta (and mostly a non-LTO profile effect) |

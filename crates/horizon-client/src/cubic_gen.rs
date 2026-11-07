@@ -510,7 +510,12 @@ impl Population {
 
     /// A cube in flight.
     pub fn cached(&self, pos: SectionPos) -> Option<Held> {
-        self.cache.lock().unwrap().map.get(&pos).map(|e| e.0.clone())
+        self.cache
+            .lock()
+            .unwrap()
+            .map
+            .get(&pos)
+            .map(|e| e.0.clone())
     }
 
     /// Whether cube `pos` is in flight with a record that is exactly its
