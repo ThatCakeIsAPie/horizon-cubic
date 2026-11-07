@@ -1,3 +1,48 @@
+# Horizon Cubic
+
+**Cubic Chunks for [Horizon](https://github.com/horizon-rust/horizon)**, the Rust rebuild of Minecraft: Java Edition 26.3. A cubic world has no height limit: it runs from y −8,388,608 to 8,388,607, loaded in 16 × 16 × 16 cubes around you. Its far view, generated and drawn on the GPU, can show the whole world at once.
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/media/cubic-near.webp" alt="From y 150: full-detail terrain near the player, far terrain out to the horizon"></td>
+    <td width="50%"><img src="docs/media/cubic-far.webp" alt="From y 1,500: the far view's rivers, lakes and oceans"></td>
+  </tr>
+</table>
+
+- **No height limit.** Moving up or down loads one layer of cubes and drops one at the other end, so nothing reloads. Vertical Distance sets how many cubes stay loaded above and below you.
+- **Three world types** (Create World › World › Cubic Chunks):
+  - *Custom Cubic:* CubicWorldGen-style terrain everywhere. Customize has CubicWorldGen's five pages, and Presets imports and exports its JSON.
+  - *Hybrid:* vanilla 26.3 between y −64 and 320 (villages, noise caves), Custom Cubic above and below.
+  - *Flat Cubic:* endless superflat layers.
+- **The whole world as far terrain.** LOD Distance goes up to Whole World.
+  - Detail follows size on screen; Cubic Far Detail runs from Low to Extreme.
+  - The coarsest levels are height-map tiles with exact heights, so a mountain thousands of blocks tall shows from far away.
+  - The spyglass refines what it points at.
+- **Convert a vanilla world** into a Hybrid copy (select it › Edit › Convert to Cubic Chunks). The original is untouched.
+- **LAN:** players far above or below each other get their own shard of the world, and shards merge again when the players meet.
+
+Not done yet:
+- structures in Custom Cubic (CubicWorldGen has none either);
+- snow layers in far terrain;
+- your own builds in far terrain beyond what is nearby.
+
+The design and its measurements are in [docs/cubic-v2-plan.md](docs/cubic-v2-plan.md). Where work stands now: [HANDOFF.md](HANDOFF.md).
+
+### Play it
+
+Build it from source (Rust 1.90+). It uses the 26.3 files the Horizon launcher prepares from your own copy of Minecraft:
+
+1. Install the [Horizon launcher](https://playhorizon.dev) and press Play once.
+2. `cargo build --release -p horizon-client`
+3. Run `horizon-client --resources <launcher data>/versions/<version>/.local/horizon-client/26.3`. On Windows the launcher's data is in `%APPDATA%\horizon-launcher`.
+4. Create a world with Cubic Chunks on, or add `--world "My World" --cubic` to go straight into a new Custom Cubic world.
+
+Built on Horizon by Ludovic Marie and the Horizon contributors, after [OpenCubicChunks](https://github.com/OpenCubicChunks)' CubicChunks and CubicWorldGen. MIT, like Horizon. Not an official Minecraft product, nor approved by or associated with Mojang or Microsoft.
+
+---
+
+*The rest of this README is upstream Horizon's.*
+
 <p align="center">
   <img src="docs/media/banner.webp" alt="The Horizon website: the game you know, rebuilt in Rust" width="100%">
 </p>
