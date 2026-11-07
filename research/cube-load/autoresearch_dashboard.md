@@ -2,12 +2,12 @@
 
 | spec | cubes | baseline | best | change | min-delta |
 |---|---|---|---|---|---|
-| surface | `4,-4,8,1` | 0.7325 | **0.2517** | -65.6% | 4.1% |
+| surface | `4,-4,8,1` | 0.7325 | **0.2480** | -66.1% | 4.1% |
 | sky | `4,20,32,1` | 0.2018 | **0.0130** | -93.6% | 6.5% |
-| deep | `4,-40,-28,1` | 0.2991 | **0.1262** | -57.8% | 3.0% |
+| deep | `4,-40,-28,1` | 0.2991 | **0.1220** | -59.2% | 3.0% |
 
-Iterations: 34; kept 21. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
-Updated 2026-11-06 23:14.
+Iterations: 40; kept 23. Known failing test (fails on main too): horizon-world cubic::custom::settings::tests::the_preset_survives_a_json_round_trip (fails on unchanged main on Linux).
+Updated 2026-11-06 23:35.
 
 ## Hot spots
 
@@ -55,3 +55,9 @@ Updated 2026-11-06 23:14.
 | 25 | surface | discard | 0.2453 | -2.5% | PASS | - | population functions generic over the world (PopRegion block/set_block inline instead of dyn calls): -2.5%, below min-delta; patch kept |
 | 26 | deep | discard | 0.1251 | -0.9% | PASS | - | JRandom as an inlined copy of the Java LCG (no cross-crate calls): deep -0.9%, surface -0.9%, sky -2%: below min-delta (and mostly a non-LTO profile effect) |
 | 27 | sky | keep | 0.0130 | -17.2% | PASS | d53a190fb | uniformity proven first from coarse octaves (wavelength >= 16; finer bounded by amplitude, gradient from all): first 0.0132, confirm 0.0130 (--tests); deep 0.1278, surface 0.2534 (noise) |
+| 28 | surface | feature | 0.2526 | +0.4% | PASS | edb9dd544 | for lane A: CustomCubicGenerator::first_at_column / blocks_at_column (column probes reuse the noise columns and biome); test vs block_at over ~15k points at res 1/2/4/8. 42f4779a2: block_at's early out coarse-first too |
+| 29 | sky | discard | 0.0128 | -1.5% | PASS | - | coarse proof cutoff 32 blocks instead of 16: sky 0.0128, deep 0.1272: no change |
+| 30 | surface | discard | 0.2475 | -1.7% | PASS | - | ore ellipsoid distance tables + generic population functions: 0.2541 / 0.2475 (-1.7%): below min-delta |
+| 31 | deep | discard | 0.1271 | +0.7% | PASS | - | libm sincosf for the walkers' and veins' sin/cos pairs (verified bit-identical to sinf/cosf over all 2^32 f32): deep 0.1271, surface 0.2521: no gain, walk simulation is not trig-bound |
+| 32 | deep | keep | 0.1220 | -3.3% | PASS | 39d90d758 | walks held per region in OnceLocks (no per-origin mutex/hash; region limit 64/shard): first 0.1212, confirm 0.1220 (--tests); surface 0.2480, sky 0.0130 |
+| 32 | surface | keep | 0.2480 | -1.5% | PASS | 39d90d758 | measurement on iteration 32 code |
