@@ -636,6 +636,7 @@ impl Terrain {
             }
         }
         let skip = |ci: usize, cj: usize, ck: usize| proven[(cj * cz + ck) * cx + ci];
+        let mut memo = self.replacers.memo();
         lattice.for_each_except(skip, |lx, ly, lz, dx, dy, dz, density| {
             let ctx = BlockCtx {
                 x: bx + lx as i32,
@@ -648,7 +649,7 @@ impl Terrain {
                 biome: &biomes[lz << 4 | lx],
             };
             let plan = &plans[column_plan[lz << 4 | lx] as usize].1;
-            out[ly << 8 | lz << 4 | lx] = self.replacers.block_planned(plan, &ctx);
+            out[ly << 8 | lz << 4 | lx] = self.replacers.block_planned(plan, &ctx, &mut memo);
         });
     }
 

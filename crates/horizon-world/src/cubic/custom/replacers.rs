@@ -178,13 +178,17 @@ impl Surface {
     }
 
     fn apply(&self, prev: u32, c: &BlockCtx) -> u32 {
+        self.apply_memo(prev, c, None)
+    }
+
+    fn apply_memo(&self, prev: u32, c: &BlockCtx, memo: Option<&mut [f64; 256]>) -> u32 {
         if prev == self.air {
             return prev;
         }
         if c.density > self.max_depth * c.dy.abs() || c.density < 0.0 {
             return prev;
         }
-        let depth = self.noise.get(f64::from(c.x), 0.0, f64::from(c.z));
+        let depth = column_noise(&self.noise, c, memo);
         let adjusted = c.density / c.dy.abs();
         if c.density + c.dy <= 0.0 {
             let y = f64::from(c.y);
@@ -216,6 +220,33 @@ impl Surface {
             };
         }
         prev
+    }
+}
+
+/// `noise` at the block's column (`y` 0), from `memo` (one cube's columns,
+/// NaN until computed) when there is one: the value depends on the column
+/// only, so a cube computes it once per column instead of once per block.
+fn column_noise(noise: &SurfaceNoise, c: &BlockCtx, memo: Option<&mut [f64; 256]>) -> f64 {
+    let get = || noise.get(f64::from(c.x), 0.0, f64::from(c.z));
+    match memo {
+        Some(memo) => {
+            let v = &mut memo[((c.z & 15) << 4 | (c.x & 15)) as usize];
+            if v.is_nan() {
+                *v = get();
+            }
+            *v
+        }
+        None => get(),
+    }
+}
+
+/// One cube's column values of the surface and mesa replacers, by replacer
+/// (`Replacers::memo`, `Replacers::block_planned`).
+pub struct ColumnMemo(Vec<Option<Box<[f64; 256]>>>);
+
+impl ColumnMemo {
+    fn slot(&mut self, i: u16) -> &mut [f64; 256] {
+        self.0[i as usize].get_or_insert_with(|| Box::new([f64::NAN; 256]))
     }
 }
 
@@ -261,10 +292,14 @@ impl Mesa {
     }
 
     fn apply(&self, prev: u32, c: &BlockCtx) -> u32 {
+        self.apply_memo(prev, c, None)
+    }
+
+    fn apply_memo(&self, prev: u32, c: &BlockCtx, memo: Option<&mut [f64; 256]>) -> u32 {
         if c.density < 0.0 {
             return prev;
         }
-        let depth = self.depth_noise.get(f64::from(c.x), 0.0, f64::from(c.z));
+        let depth = column_noise(&self.depth_noise, c, memo);
         let orig = depth - 3.0;
         let coarse = (orig * std::f64::consts::PI).cos() > 0.0;
         let mut top = self.terracotta;
@@ -670,7 +705,12 @@ impl Replacers {
 
     /// `block` with the replacers of a `plan` made for the block's biome and
     /// a Y range holding it.
-    pub fn block_planned(&self, plan: &[u16], c: &BlockCtx) -> u32 {
+    /// An empty `ColumnMemo` for one cube's `block_planned` calls.
+    pub fn memo(&self) -> ColumnMemo {
+        ColumnMemo(self.list.iter().map(|_| None).collect())
+    }
+
+    pub fn block_planned(&self, plan: &[u16], c: &BlockCtx, memo: &mut ColumnMemo) -> u32 {
         let mut block = self.air;
         for &i in plan {
             let r = &self.list[i as usize];
@@ -679,8 +719,8 @@ impl Replacers {
                 Kind::Decoration(d) => d.apply(block, c),
                 _ if c.y < r.min_y || c.y > r.max_y => continue,
                 Kind::Density(d) => d.apply(block, c.density),
-                Kind::Surface(s) => s.apply(block, c),
-                Kind::Mesa(m) => m.apply(block, c),
+                Kind::Surface(s) => s.apply_memo(block, c, Some(memo.slot(i))),
+                Kind::Mesa(m) => m.apply_memo(block, c, Some(memo.slot(i))),
                 Kind::Gradient(g) => g.apply(block, c),
             };
         }
