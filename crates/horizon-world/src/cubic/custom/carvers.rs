@@ -49,45 +49,39 @@ struct Sphere {
 /// Spheres per [`SphereRun`].
 const RUN: usize = 16;
 
-/// The bounds of a run of `RUN` consecutive spheres of a walk: a cube that
-/// `local_box` would reject for each sphere is rejected for the run at once.
+/// The extent of some spheres: the least `centre - radius` and the greatest
+/// `centre + radius` on each axis (`rh` across, `rv` up), computed as
+/// `local_box` computes them.
 #[derive(Clone, Copy, Debug)]
 struct SphereRun {
-    min: [f64; 3],
-    max: [f64; 3],
-    rh: f64,
-    rv: f64,
+    lo: [f64; 3],
+    hi: [f64; 3],
 }
 
 impl SphereRun {
     fn of(spheres: &[Sphere]) -> Self {
         let mut r = Self {
-            min: [f64::MAX; 3],
-            max: [f64::MIN; 3],
-            rh: 0.0,
-            rv: 0.0,
+            lo: [f64::MAX; 3],
+            hi: [f64::MIN; 3],
         };
         for s in spheres {
-            for (i, v) in [s.x, s.y, s.z].into_iter().enumerate() {
-                r.min[i] = r.min[i].min(v);
-                r.max[i] = r.max[i].max(v);
+            let lo = [s.x - s.rh, s.y - s.rv, s.z - s.rh];
+            let hi = [s.x + s.rh, s.y + s.rv, s.z + s.rh];
+            for i in 0..3 {
+                r.lo[i] = r.lo[i].min(lo[i]);
+                r.hi[i] = r.hi[i].max(hi[i]);
             }
-            r.rh = r.rh.max(s.rh);
-            r.rv = r.rv.max(s.rv);
         }
         r
     }
 
-    /// Whether `local_box` rejects every sphere of the run for the cube
-    /// centred on `c`: the same tests, with the run's extremes (each bound
-    /// only moves away from the cube as a sphere's radius shrinks).
-    fn misses(&self, c: [f64; 3]) -> bool {
-        self.max[0] < c[0] - 16.0 - self.rh * 2.0
-            || self.max[1] < c[1] - 16.0 - self.rv * 2.0
-            || self.max[2] < c[2] - 16.0 - self.rh * 2.0
-            || self.min[0] > c[0] + 16.0 + self.rh * 2.0
-            || self.min[1] > c[1] + 16.0 + self.rv * 2.0
-            || self.min[2] > c[2] + 16.0 + self.rh * 2.0
+    /// Whether `local_box` rejects every one of the spheres for the cube
+    /// whose lowest block is `c0`. Its box test, `floor(c + r) - c0 + 1 <= 0`
+    /// or `floor(c - r) - c0 - 1 >= 16` on an axis, is `c + r < c0` or
+    /// `c - r >= c0 + 17` (`c0` is an integer), and a sphere meets one when
+    /// the extent does.
+    fn misses(&self, c0: [f64; 3]) -> bool {
+        (0..3).any(|i| self.hi[i] < c0[i] || self.lo[i] >= c0[i] + 17.0)
     }
 }
 
@@ -133,13 +127,13 @@ impl Walks {
         (0..3).all(|i| centre[i] >= self.min[i] - m && centre[i] <= self.max[i] + m)
     }
 
-    /// The spheres that may touch the cube centred on `c`, in walk order:
-    /// the runs whose bounds reach it.
-    fn near(&self, c: [f64; 3]) -> impl Iterator<Item = &Sphere> {
+    /// The spheres that may touch the cube whose lowest block is `c0`, in
+    /// walk order: the runs whose extent reaches it.
+    fn near(&self, c0: [f64; 3]) -> impl Iterator<Item = &Sphere> {
         self.runs
             .iter()
             .zip(self.spheres.chunks(RUN))
-            .filter(move |(run, _)| !run.misses(c))
+            .filter(move |(run, _)| !run.misses(c0))
             .flat_map(|(_, spheres)| spheres)
     }
 }
@@ -388,6 +382,15 @@ impl Carvers {
             r.carve(cube, out);
         }
     }
+}
+
+/// The cube's lowest block.
+fn lowest(cube: SectionPos) -> [f64; 3] {
+    [
+        f64::from(cube.x * 16),
+        f64::from(cube.y * 16),
+        f64::from(cube.z * 16),
+    ]
 }
 
 fn centre(cube: SectionPos) -> [f64; 3] {
@@ -648,7 +651,7 @@ impl CaveCarver {
             if !w.may_reach(c) {
                 continue;
             }
-            for s in w.near(c) {
+            for s in w.near(lowest(cube)) {
                 self.carve_sphere(cube, out, s, lava);
             }
         }
@@ -791,7 +794,7 @@ impl RavineCarver {
             if !w.may_reach(c) {
                 continue;
             }
-            for s in w.near(c) {
+            for s in w.near(lowest(cube)) {
                 self.carve_sphere(cube, out, s, &w);
             }
         }
