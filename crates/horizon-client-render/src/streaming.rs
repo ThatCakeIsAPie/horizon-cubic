@@ -42,6 +42,9 @@ pub mod job_stats {
     pub(super) fn enabled() -> bool {
         ENABLED.load(Ordering::Relaxed)
     }
+    pub fn enabled_pub() -> bool {
+        enabled()
+    }
     pub(super) fn add(kind: usize, nanos: u64) {
         NANOS[kind].fetch_add(nanos, Ordering::Relaxed);
         COUNT[kind].fetch_add(1, Ordering::Relaxed);
@@ -150,6 +153,13 @@ pub trait ChunkGenerator: Send + Sync + 'static {
     /// A decorated proto chunk's column sections (`Chunk::sections`
     /// indexes) holding a block other than air: what its neighbours' light
     /// layers count once it is at INITIALIZE_LIGHT.
+    /// Whether neighbouring columns made at once slow each other down (a
+    /// cubic level: their populations overlap and wait on the same locks).
+    /// The scheduler then starts, of the nearest columns, ones away from
+    /// those in flight (`spread_pick`). False by default.
+    fn spread_loads(&self) -> bool {
+        false
+    }
     fn non_air_sections(&self, _proto: &Proto) -> Option<SectionMask> {
         None
     }
@@ -434,6 +444,8 @@ pub struct Streaming {
     /// next arrive, though read from the save (`World::loaded_chunks`).
     dropped_new: FxHashSet<(i32, i32)>,
     non_air_sections: Arc<dyn Fn(&Proto) -> Option<SectionMask> + Send + Sync>,
+    /// `ChunkGenerator::spread_loads`.
+    spread_loads: bool,
     /// `ChunkGenerator::proto_heap_bytes`, for the memory census.
     proto_bytes: Arc<dyn Fn(&Proto) -> ([usize; 6], [usize; 16]) + Send + Sync>,
     /// `ChunkGenerator::cache_census`.
@@ -652,6 +664,48 @@ struct GenerationInputs<'a> {
     finishing: &'a FxHashSet<(i32, i32)>,
     decorates: bool,
     remote: bool,
+    /// `ChunkGenerator::spread_loads`.
+    spread: bool,
+}
+
+/// Up to `room` of `cands` (nearest first), preferring columns none of whose
+/// eight neighbours is in flight or already picked; the others only when no
+/// such column is left, so the workers are never kept idle. A cubic level's
+/// columns made side by side wait on each other's population locks: in the
+/// cube benchmark, 8 threads made whole columns 20% faster when no two made
+/// at once were neighbours (research/far-fill, lane C).
+fn spread_pick(
+    cands: &[(i64, i32, i32)],
+    room: usize,
+    generating: &FxHashSet<(i32, i32)>,
+) -> Vec<(i64, i32, i32)> {
+    let mut picked: Vec<(i64, i32, i32)> = Vec::with_capacity(room);
+    let mut later = Vec::new();
+    for &c in cands {
+        if picked.len() == room {
+            break;
+        }
+        let (x, z) = (c.1, c.2);
+        let crowded = (-1..=1).any(|dz| {
+            (-1..=1).any(|dx| {
+                (dx, dz) != (0, 0)
+                    && (generating.contains(&(x + dx, z + dz))
+                        || picked.iter().any(|p| p.1 == x + dx && p.2 == z + dz))
+            })
+        });
+        if crowded {
+            later.push(c);
+        } else {
+            picked.push(c);
+        }
+    }
+    for c in later {
+        if picked.len() == room {
+            break;
+        }
+        picked.push(c);
+    }
+    picked
 }
 impl GenerationScan {
     /// None means the scan was skipped; Some preserves the original candidate
@@ -680,12 +734,16 @@ impl GenerationScan {
                 self.next += 1;
             }
             let room = capacity - input.generating.len();
-            let batch: Vec<_> = self.plan[self.next..]
+            let look = if input.spread { room * 4 } else { room };
+            let mut batch: Vec<_> = self.plan[self.next..]
                 .iter()
                 .filter(|c| missing(c))
-                .take(room)
+                .take(look)
                 .copied()
                 .collect();
+            if input.spread {
+                batch = spread_pick(&batch, room, input.generating);
+            }
             // Past the plan's end, the full scan below decides whether
             // anything is left (and remembers when nothing is).
             if !batch.is_empty() {
@@ -776,7 +834,11 @@ impl GenerationScan {
             self.plan.clear();
             self.plan.extend_from_slice(&wanted);
             self.next = 0;
-            wanted.truncate(capacity - input.generating.len());
+            if input.spread {
+                wanted = spread_pick(&wanted, capacity - input.generating.len(), input.generating);
+            } else {
+                wanted.truncate(capacity - input.generating.len());
+            }
             Some(wanted)
         }
     }
@@ -1043,6 +1105,7 @@ impl Streaming {
         // The work kept in flight is sized for the workers this streamer may
         // use: the pool's, or fewer when asked (tests, a placeholder).
         let workers = threads.clamp(1, pool.threads());
+        let spread_loads = generator.spread_loads();
         let non_air_sections = {
             let generator = generator.clone();
             Arc::new(move |p: &Proto| generator.non_air_sections(p))
@@ -1058,6 +1121,7 @@ impl Streaming {
         Self {
             shared,
             non_air_sections,
+            spread_loads,
             proto_bytes,
             caches,
             jobs,
@@ -2077,7 +2141,9 @@ impl Streaming {
         for key in gone {
             world.dirty_light.remove(&key);
         }
-        let room = (self.workers * 4).saturating_sub(self.lighting.len());
+        let room = (self.workers
+            * crate::lod::cube::far_knob("HORIZON_NEAR_LIGHT_PER_WORKER", 4) as usize)
+            .saturating_sub(self.lighting.len());
         nearest_first(&mut light, room);
         for (_, x, z) in light {
             let Some(region) = self.light_region(world, x, z) else {
@@ -2223,8 +2289,13 @@ impl Streaming {
             finishing: &self.finishing,
             decorates: self.decorates,
             remote: self.remote,
+            spread: self.spread_loads
+                && crate::lod::cube::far_knob("HORIZON_NEAR_SPREAD", 1) != 0,
         };
-        if let Some(wanted) = self.generation_scan.candidates(input, workers * 3) {
+        if let Some(wanted) = self.generation_scan.candidates(
+            input,
+            workers * crate::lod::cube::far_knob("HORIZON_NEAR_GEN_PER_WORKER", 3) as usize,
+        ) {
             for (_, x, z) in wanted {
                 self.generating.insert((x, z));
                 self.submit(Some((x, z)), 0, Job::Generate(x, z));
@@ -3350,6 +3421,20 @@ static NO_CHUNKS: std::sync::LazyLock<HashSet<(i32, i32)>> = std::sync::LazyLock
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn spread_pick_starts_columns_away_from_those_in_flight() {
+        let cands = [(0, 0, 0), (1, 1, 0), (2, 2, 0), (3, 3, 0), (4, 4, 0)];
+        let none = FxHashSet::default();
+        // Nearest first, but no two neighbours at once.
+        let picked: Vec<_> = super::spread_pick(&cands, 2, &none).iter().map(|c| (c.1, c.2)).collect();
+        assert_eq!(picked, [(0, 0), (2, 0)]);
+        // A column in flight at (1, 1) crowds 0..=2: 3 first, then the nearest crowded one,
+        // so the workers are never left idle.
+        let busy: FxHashSet<(i32, i32)> = [(1, 1)].into_iter().collect();
+        let picked: Vec<_> = super::spread_pick(&cands, 2, &busy).iter().map(|c| (c.1, c.2)).collect();
+        assert_eq!(picked, [(3, 0), (0, 0)]);
+    }
     use super::*;
 
     #[test]
@@ -3867,6 +3952,7 @@ mod tests {
                 finishing: &self.finishing,
                 decorates: self.decorates,
                 remote: self.remote,
+                spread: false,
             }
         }
         fn fill(&mut self) {

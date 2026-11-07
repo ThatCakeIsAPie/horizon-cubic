@@ -55,6 +55,8 @@ def main():
     ap.add_argument('--y', type=int, default=300, help='height to look from')
     ap.add_argument('--timeout', type=float, default=180.0, help='seconds a fill may take')
     ap.add_argument('--trace', action='store_true', help='print the cube_lod counters every second while waiting')
+    ap.add_argument('--trace-near', action='store_true',
+                    help='print the near terrain streaming stages four times a second until it is in')
     ap.add_argument('--width', type=int, default=1280)
     ap.add_argument('--height', type=int, default=720)
     ap.add_argument('--detail', choices=['low', 'normal', 'high', 'ultra', 'extreme'],
@@ -114,12 +116,17 @@ def main():
         loading_seen, quiet_since = False, None
         while time.monotonic() - since < args.timeout:
             s = status()
+            if args.trace_near and label not in near:
+                stages = s.get('streaming') or {}
+                print(f'  near t={time.monotonic() - since:5.2f} loading={s.get("terrain_loading")} '
+                      f'chunks={s.get("chunks")} uploads={s.get("pending_uploads")} fps={s.get("fps")} '
+                      + ' '.join(f'{k}={v}' for k, v in stages.items()), flush=True)
             if s.get('terrain_loading') is not None and label not in near:
                 if s['terrain_loading']:
                     loading_seen, quiet_since = True, None
                 elif loading_seen:
                     quiet_since = quiet_since or time.monotonic()
-                    if time.monotonic() - quiet_since >= 1.0:
+                    if time.monotonic() - quiet_since >= 2.0:
                         near[label] = quiet_since - since
             lod = s.get('cube_lod') or {}
             if s.get('fps') is not None:
@@ -163,7 +170,7 @@ def main():
                 quiet_since = None
             else:
                 quiet_since = quiet_since or time.monotonic()
-                if time.monotonic() - quiet_since >= 1.0:
+                if time.monotonic() - quiet_since >= 2.0:
                     near[label] = quiet_since - since
             time.sleep(0.1)
 

@@ -1882,6 +1882,9 @@ impl<G: ChunkGenerator> ChunkGenerator for CubicTerrain<G> {
     fn lod_surface(&self, worker: &mut G::Worker, x: i32, z: i32) -> Option<crate::lod::Surface> {
         self.inner.lod_surface(worker, x, z)
     }
+    fn spread_loads(&self) -> bool {
+        true
+    }
     fn load(&self, x: i32, z: i32) -> Option<Chunk> {
         let window = self.window();
         // A window that doesn't reach vanilla's range needs no vanilla
@@ -2890,15 +2893,37 @@ mod tests {
         let made: Vec<LoadedCube> = if threads == 1 {
             cubes.iter().map(|&p| level.make_cube(p)).collect()
         } else {
-            let next = std::sync::atomic::AtomicUsize::new(0);
+            // `HORIZON_CUBE_BENCH_ORDER`: "cubes" (default) hands out one cube at a
+            // time; "columns" a whole column (as the game loads them); "checker"
+            // whole columns in four rounds by x and z parity, so the columns made
+            // at once are not neighbours (their populations overlap less).
+            let order = std::env::var("HORIZON_CUBE_BENCH_ORDER").unwrap_or_default();
+            let per_column = (y1 - y0 + 1) as usize;
+            let mut jobs: Vec<Vec<usize>> = if order == "columns" || order == "checker" {
+                let side = (2 * r + 1) as usize;
+                let mut columns: Vec<(usize, usize)> =
+                    (0..side * side).map(|c| (c % side, c / side)).collect();
+                if order == "checker" {
+                    columns.sort_by_key(|&(x, z)| (z % 2) * 2 + x % 2);
+                }
+                columns
+                    .into_iter()
+                    .map(|(x, z)| (0..per_column).map(|y| y * side * side + z * side + x).collect())
+                    .collect()
+            } else {
+                (0..cubes.len()).map(|i| vec![i]).collect()
+            };
+            jobs.reverse();
+            let jobs = Mutex::new(jobs);
             let slots: Vec<Mutex<Option<LoadedCube>>> =
                 (0..cubes.len()).map(|_| Mutex::new(None)).collect();
             std::thread::scope(|scope| {
                 for _ in 0..threads {
                     scope.spawn(|| loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(&p) = cubes.get(i) else { break };
-                        *slots[i].lock().unwrap() = Some(level.make_cube(p));
+                        let Some(job) = jobs.lock().unwrap().pop() else { break };
+                        for i in job {
+                            *slots[i].lock().unwrap() = Some(level.make_cube(cubes[i]));
+                        }
                     });
                 }
             });

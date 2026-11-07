@@ -1,0 +1,4 @@
+control | near [4.76, 5.63, 3.59] median 4.76 | far [12.6, 12.5, 10.9] | spawn near 2.82
+HORIZON_NEAR_SPREAD=0 | near [6.13, 5.39, 5.11] median 5.39 | far [12.5, 14.5, 13.0] | spawn near 3.32
+control | near [5.0, 4.43, 4.6] median 4.6 | far [14.3, 13.3, 12.4] | spawn near 2.89
+HORIZON_NEAR_SPREAD=0 | near [5.58, 4.51, 4.68] median 4.68 | far [13.2, 13.0, 13.5] | spawn near 3.33

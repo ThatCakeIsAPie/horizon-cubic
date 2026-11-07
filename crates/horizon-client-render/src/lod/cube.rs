@@ -1472,6 +1472,17 @@ pub mod profile {
         }
         let ms = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / 1e6;
         let n = |c: &AtomicU64| c.swap(0, Relaxed);
+        // The near terrain's streaming jobs too (worker CPU time by kind).
+        if !crate::streaming::job_stats::enabled_pub() {
+            crate::streaming::job_stats::enable(true);
+        } else {
+            let jobs: Vec<String> = crate::streaming::job_stats::take()
+                .into_iter()
+                .filter(|(_, _, count)| *count > 0)
+                .map(|(kind, nanos, count)| format!("{kind} {count} jobs {:.0} ms", nanos as f64 / 1e6))
+                .collect();
+            log::info!("Horizon near jobs ({} ms): {}", now - last, jobs.join(", "));
+        }
         log::info!(
             "Horizon far profile ({} ms): pool wait {:.0} ms, queue wait {:.0} ms, resident_many {:.0} ms, cpu nodes {:.0} ms, gpu nodes {:.0} ms, send {:.0} ms; keys {} (cpu {}); gpu thread busy {:.0} ms over {} rounds, {} keys; sampler: cache {:.0} ms, sample {:.0} ms, cover {:.0} ms (slab proofs {:.0} ms), keep {:.0} ms, far request {:.0} ms",
             now - last,
