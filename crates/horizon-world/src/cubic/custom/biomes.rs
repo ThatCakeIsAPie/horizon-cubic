@@ -245,18 +245,54 @@ impl BiomeResolver {
 // The blend, with per-thread caches
 // ---------------------------------------------------------------------------
 
+/// A multiplicative hash for the caches' integer keys (they are positions
+/// and ids; SipHash's resistance to chosen keys buys nothing here).
+#[derive(Default, Clone, Copy)]
+struct IntHasher(u64);
+
+impl IntHasher {
+    #[inline]
+    fn add(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0xf135_7aea_2e62_a9c5);
+    }
+}
+
+impl std::hash::Hasher for IntHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.add(u64::from(b));
+        }
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.add(u64::from(v));
+    }
+    fn write_i32(&mut self, v: i32) {
+        self.add(u64::from(v as u32));
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.add(v);
+    }
+    fn finish(&self) -> u64 {
+        // The product's high bits are its best mixed; the table indexes by
+        // the low ones.
+        self.0.rotate_left(26)
+    }
+}
+
+type IntMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<IntHasher>>;
+
 #[derive(Default)]
 struct Caches {
-    biomes: HashMap<(i32, i32), BiomeId>,
-    terrain: HashMap<(i32, i32), (f64, f64)>,
-    resolved: HashMap<u32, Rc<ResolvedBiome>>,
+    biomes: IntMap<(i32, i32), BiomeId>,
+    terrain: IntMap<(i32, i32), (f64, f64)>,
+    resolved: IntMap<u32, Rc<ResolvedBiome>>,
     /// Density lattice corners (`Lattice::for_cube`), which neighbouring
     /// cubes share.
-    corners: HashMap<(i32, i32, i32), f64>,
+    corners: IntMap<(i32, i32, i32), f64>,
 }
 
 thread_local! {
-    static CACHES: RefCell<HashMap<u64, Caches>> = RefCell::new(HashMap::new());
+    static CACHES: RefCell<IntMap<u64, Caches>> = RefCell::new(IntMap::default());
 }
 
 const CACHE_LIMIT: usize = 1 << 16;

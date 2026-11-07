@@ -979,7 +979,7 @@ impl CubicLevel {
         );
         self.wg.generator.populate(p, &mut region);
         let dirty = region.dirty();
-        let mut blocks = region.into_blocks().map(Some);
+        let mut blocks = region.into_blocks();
         for d in 0..8 {
             let q = at(d);
             if !horizon_world::cubic::has_cube(q) {
