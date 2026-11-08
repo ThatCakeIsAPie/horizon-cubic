@@ -3280,6 +3280,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&g.dir);
     }
 
+    /// The far view's trees (`cubic_far_structures`, "Trees"): a cell's sketch
+    /// holds tree blocks only, nearly all over the terrain's surface, and a
+    /// coarse far node over them shows them.
+    #[test]
+    fn the_far_view_grows_a_cells_trees_over_the_surface() {
+        use crate::cubic_far_structures::{FarStructures, FarTrees};
+        use crate::lod::cube::{CubeKey, CubeNode, Voxel};
+        let Some(f) = Fixture::new("far-trees") else {
+            eprintln!("no HORIZON_TEST_RESOURCES: skipped");
+            return;
+        };
+        let level = f.level_with_data(CubicKind::Custom, String::new());
+        let g = level.generation();
+        let structures = g.structures.clone().expect("structures");
+        let registry = f.assets.registry;
+        let air = registry.default_state("minecraft:air").unwrap().0;
+        let states = FarTrees::tree_states(registry);
+        let trees = FarTrees {
+            vegetation: g.vegetation.clone().expect("vegetation"),
+            columns: g.columns.clone(),
+            states: states.clone(),
+        };
+        let far = FarStructures::new(
+            structures.clone(),
+            Some(trees),
+            g.generator.clone(),
+            None,
+            air,
+        );
+        // The first cell around the origin with trees.
+        let cells = [
+            (0, 0),
+            (-1, 0),
+            (0, -1),
+            (-1, -1),
+            (1, 0),
+            (0, 1),
+            (1, 1),
+            (-1, 1),
+            (1, -1),
+        ];
+        let cell = cells
+            .into_iter()
+            .find(|&cell| {
+                let t = std::time::Instant::now();
+                let grown = far.sketch_trees_now(cell);
+                eprintln!(
+                    "cell {cell:?}: trees {grown}, {:.2} s",
+                    t.elapsed().as_secs_f64()
+                );
+                grown
+            })
+            .expect("trees within 512 blocks of the origin");
+        let (x0, z0) = (cell.0 * 256, cell.1 * 256);
+        let blocks = far.sketched([x0 - 32, -4096, z0 - 32], [x0 + 287, 4096, z0 + 287]);
+        let name = |state: u32| {
+            (registry.state(horizon_world::registry::BlockStateId(state)))
+                .map_or(String::new(), |s| s.name.clone())
+        };
+        let leaves = blocks
+            .iter()
+            .filter(|(_, s)| name(*s).ends_with("_leaves"))
+            .count();
+        let above = blocks
+            .iter()
+            .filter(|(p, _)| p[1] > structures.column_top(p[0], p[2]))
+            .count();
+        eprintln!(
+            "cell {cell:?}: {} tree blocks, {leaves} leaves, {above} over the surface",
+            blocks.len()
+        );
+        assert!(blocks.len() > 100, "{} tree blocks", blocks.len());
+        assert!(
+            blocks.iter().all(|(_, s)| states.contains(s)),
+            "tree blocks only"
+        );
+        assert!(leaves > 0, "leaves among them");
+        assert!(
+            above * 100 >= blocks.len() * 95,
+            "{above} of {} over the surface",
+            blocks.len()
+        );
+        // A level-4 node (256 blocks) over the first, all air, shows trees.
+        let p = blocks[0].0;
+        let key = CubeKey {
+            level: 4,
+            x: p[0].div_euclid(256),
+            y: p[1].div_euclid(256),
+            z: p[2].div_euclid(256),
+        };
+        let blank = CubeNode::uniform(
+            key,
+            Voxel {
+                state: horizon_world::registry::BlockStateId(air),
+                biome: 0,
+            },
+        );
+        let (drawn, changed) = far.overlay(blank);
+        let shown = (0..crate::lod::cube::VOLUME)
+            .filter(|&i| states.contains(&drawn.at(i).state.0))
+            .count();
+        assert!(changed && shown > 0, "nothing in the far node");
+        drop(level);
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
     /// The far view's sketch of a village (`cubic_far_structures`) holds the
     /// blocks the near terrain builds: the building blocks of the cubes
     /// around its first piece, made as the game makes them, are in the
@@ -3303,6 +3409,7 @@ mod tests {
             .expect("a village within 1,024 blocks of the origin");
         let far = FarStructures::new(
             structures.clone(),
+            None,
             level.generation().generator.clone(),
             None,
             air,

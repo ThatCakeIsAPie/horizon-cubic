@@ -23,6 +23,20 @@
 //! are rebuilt with it. Villages, temples and monuments thus fill in over
 //! time.
 //!
+//! # Trees
+//!
+//! Trees fill in the same way, after the terrain and at the same idle
+//! priority, a 256-block cell at a time, nearest first (a cell and a
+//! structure start are taken in order of distance). For every population
+//! area of the cell with a surface, the near terrain's own population
+//! ([`CustomCubicGenerator::populate`] with the vegetation hook) runs on
+//! scratch cubes at the surface's height. The tree blocks it grows into open
+//! air (logs, leaves, stems, mushroom and wart blocks: [`FarTrees::states`])
+//! are the cell's sketch, drawn by the rules above. Trees reach
+//! [`TREE_RADIUS`] blocks; past that a tree is a fraction of a voxel. A tree
+//! a neighbouring population grew first can stand where the scratch grows
+//! another, so a few trees differ from the near terrain's.
+//!
 //! Height-map tiles (levels 12 and up) are left as they are. A tile column
 //! spans 4,096 blocks or more, many times the largest structure, so a
 //! structure changes neither a tile's heights nor its materials.
@@ -33,8 +47,11 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use horizon_core::position::{ChunkPos, SectionPos};
 use horizon_world::cubic::custom::CustomCubicGenerator;
+use horizon_world::cubic::custom::biomes::BiomeColumns;
 use horizon_world::cubic::custom::populate::CubeWorld;
+use horizon_world::cubic::custom::rng::JRandom;
 use horizon_world::cubic::custom::structures::CubicStructures;
+use horizon_world::cubic::custom::vegetation::Vegetation;
 use horizon_world::registry::BlockStateId;
 use horizon_world::worldgen::structure::start::StructureStart;
 
@@ -54,6 +71,11 @@ const RESEARCH: f64 = 512.0;
 const MAX_BLOCKS: usize = 8 << 20;
 /// Side of the index's cells, in blocks.
 const CELL: i32 = 256;
+/// How far around the camera trees are sketched, in blocks, at most.
+pub const TREE_RADIUS: f64 = 1024.0;
+/// Population cubes sketched for one area at most (a steep area's surface
+/// spans several).
+const TREE_CUBES: i32 = 4;
 /// A start whose box spans more cubes than this is sketched without the
 /// terrain's heights around it (its box's own).
 const MAX_CUBES: usize = 16_384;
@@ -65,6 +87,8 @@ pub struct Sketch {
     min: [i32; 3],
     max: [i32; 3],
     cubes: Vec<(SectionPos, Box<[u32]>)>,
+    /// The cell of a sketch of trees.
+    trees: Option<(i32, i32)>,
 }
 
 impl Sketch {
@@ -134,6 +158,40 @@ impl Index {
     }
 }
 
+/// What a level's far view grows trees with.
+pub struct FarTrees {
+    pub vegetation: Arc<Vegetation>,
+    /// The biomes the vegetation reads (the generation's own source).
+    pub columns: Arc<dyn BiomeColumns>,
+    /// The block states the far view shows of what the vegetation grows.
+    pub states: HashSet<u32>,
+}
+
+impl FarTrees {
+    /// The states of trees and huge fungi and mushrooms (by block name), of
+    /// `registry`.
+    pub fn tree_states(registry: &horizon_world::registry::BlockRegistry) -> HashSet<u32> {
+        let tree = |name: &str| {
+            let name = name.split_once(':').map_or(name, |(_, n)| n);
+            [
+                "_leaves",
+                "_log",
+                "_wood",
+                "_stem",
+                "_hyphae",
+                "mushroom_block",
+                "wart_block",
+            ]
+            .iter()
+            .any(|end| name.ends_with(end))
+                || name == "shroomlight"
+        };
+        (0..registry.len() as u32)
+            .filter(|&id| (registry.state(BlockStateId(id))).is_some_and(|state| tree(&state.name)))
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct View {
     camera: [f64; 3],
@@ -145,6 +203,7 @@ struct View {
 
 struct Inner {
     structures: Arc<CubicStructures>,
+    trees: Option<FarTrees>,
     generator: Arc<CustomCubicGenerator>,
     cache: Option<Arc<CubeLodCache>>,
     air: u32,
@@ -175,6 +234,7 @@ impl Drop for FarStructures {
 impl FarStructures {
     pub fn new(
         structures: Arc<CubicStructures>,
+        trees: Option<FarTrees>,
         generator: Arc<CustomCubicGenerator>,
         cache: Option<Arc<CubeLodCache>>,
         air: u32,
@@ -182,6 +242,7 @@ impl FarStructures {
         Arc::new(Self {
             inner: Arc::new(Inner {
                 structures,
+                trees,
                 generator,
                 cache,
                 air,
@@ -231,6 +292,19 @@ impl FarStructures {
     /// index as the search's would.
     pub fn sketch_now(&self, start: &StructureStart) -> bool {
         match sketch(&self.inner, start) {
+            Some(s) => {
+                self.inner.index.write().unwrap().insert(s);
+                self.inner.count.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Sketches the trees of the 256-block cell `cell` now (for tests and
+    /// probes), as the search would.
+    pub fn sketch_trees_now(&self, cell: (i32, i32)) -> bool {
+        match sketch_trees(&self.inner, cell) {
             Some(s) => {
                 self.inner.index.write().unwrap().insert(s);
                 self.inner.count.fetch_add(1, Ordering::Relaxed);
@@ -313,7 +387,11 @@ fn key_box(key: CubeKey) -> ([i32; 3], [i32; 3]) {
 fn search(inner: &Inner) {
     let mut visited: HashSet<(i32, i32)> = HashSet::new();
     let mut seen: HashSet<(usize, i32, i32)> = HashSet::new();
-    let mut todo: Vec<ChunkPos> = Vec::new();
+    let mut todo: Vec<(f64, ChunkPos)> = Vec::new();
+    let mut grown: HashSet<(i32, i32)> = HashSet::new();
+    let mut cells: Vec<(f64, (i32, i32))> = Vec::new();
+    // The cells grown since the queue was last empty, and since when.
+    let mut growing: Option<(std::time::Instant, usize)> = None;
     let mut around: Option<[f64; 3]> = None;
     loop {
         // Wait for a complete far view.
@@ -338,9 +416,36 @@ fn search(inner: &Inner) {
         if moved {
             around = Some(view.camera);
             todo = candidates(inner, &view, &visited);
-            forget_far(inner, &view, &mut visited, &mut seen);
+            forget_far(inner, &view, &mut visited, &mut seen, &mut grown);
+            cells = tree_cells(inner, &view, &grown);
         }
-        let Some(chunk) = todo.pop() else {
+        // The nearer of the next start's chunk and the next cell of trees.
+        let trees_first = match (todo.last(), cells.last()) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(start), Some(cell)) => cell.0 < start.0,
+        };
+        if trees_first {
+            let Some((_, cell)) = cells.pop() else {
+                continue;
+            };
+            if grown.insert(cell) {
+                growing.get_or_insert((std::time::Instant::now(), 0)).1 += 1;
+                if let Some(sketch) = sketch_trees(inner, cell) {
+                    add(inner, sketch);
+                }
+            }
+            if cells.is_empty()
+                && let Some((since, count)) = growing.take()
+            {
+                log::info!(
+                    "Horizon: far trees: {count} cells of {CELL} blocks grown in {:.1} s",
+                    since.elapsed().as_secs_f64()
+                );
+            }
+            continue;
+        }
+        let Some((_, chunk)) = todo.pop() else {
             // All found here: wait for the camera to move on.
             let view = inner.view.lock().unwrap();
             let _ = inner
@@ -355,53 +460,97 @@ fn search(inner: &Inner) {
             if !seen.insert((start.structure, start.chunk.x, start.chunk.z)) {
                 continue;
             }
-            let Some(sketch) = sketch(inner, start) else {
-                continue;
-            };
-            // The kept nodes under it are made again, with it.
-            if let Some(cache) = &inner.cache {
-                for (pos, _) in &sketch.cubes {
-                    cache.invalidate(*pos);
-                }
+            if let Some(sketch) = sketch(inner, start) {
+                add(inner, sketch);
             }
-            let bounds = (sketch.min, sketch.max);
-            inner.index.write().unwrap().insert(sketch);
-            inner.count.fetch_add(1, Ordering::Relaxed);
-            inner.refreshes.lock().unwrap().push(bounds);
         }
     }
 }
 
+/// A sketch the search made: into the index, and its nodes made again.
+fn add(inner: &Inner, sketch: Sketch) {
+    // The kept nodes under it are made again, with it.
+    if let Some(cache) = &inner.cache {
+        for (pos, _) in &sketch.cubes {
+            cache.invalidate(*pos);
+        }
+    }
+    let bounds = (sketch.min, sketch.max);
+    inner.index.write().unwrap().insert(sketch);
+    inner.count.fetch_add(1, Ordering::Relaxed);
+    inner.refreshes.lock().unwrap().push(bounds);
+}
+
+/// The search's order: the distance from the camera, up to three times it
+/// behind the camera (1 straight ahead).
+fn weight(view: &View, dx: f64, dz: f64) -> f64 {
+    let (fx, fz) = (view.forward[0], view.forward[2]);
+    let flen = (fx * fx + fz * fz).sqrt();
+    let d = (dx * dx + dz * dz).sqrt();
+    let behind = if flen > 0.0 && d > 0.0 {
+        2.0 - (dx * fx + dz * fz) / (d * flen)
+    } else {
+        1.0
+    };
+    d * behind
+}
+
+/// The cells of trees around the camera not grown yet, the next one last
+/// (as [`candidates`]); none without vegetation.
+fn tree_cells(inner: &Inner, view: &View, grown: &HashSet<(i32, i32)>) -> Vec<(f64, (i32, i32))> {
+    if inner.trees.is_none() {
+        return Vec::new();
+    }
+    let r = view.radius.clamp(0.0, TREE_RADIUS);
+    let (cx, cz) = (view.camera[0], view.camera[2]);
+    let cell = |v: f64| ((v.floor() as i64).clamp(-(1 << 30), 1 << 30) as i32).div_euclid(CELL);
+    let mut found = Vec::new();
+    for x in cell(cx - r)..=cell(cx + r) {
+        for z in cell(cz - r)..=cell(cz + r) {
+            if grown.contains(&(x, z)) {
+                continue;
+            }
+            // From the cell's nearest point.
+            let near = |c: f64, lo: i32| c.clamp(f64::from(lo * CELL), f64::from(lo * CELL + CELL));
+            let (dx, dz) = (near(cx, x) - cx, near(cz, z) - cz);
+            if (dx * dx + dz * dz).sqrt() > r {
+                continue;
+            }
+            // A cell's middle sets which way it lies.
+            let (mx, mz) = (
+                f64::from(x * CELL + CELL / 2) - cx,
+                f64::from(z * CELL + CELL / 2) - cz,
+            );
+            let d = (dx * dx + dz * dz).sqrt();
+            let m = (mx * mx + mz * mz).sqrt().max(1.0);
+            found.push((weight(view, mx / m * d, mz / m * d), (x, z)));
+        }
+    }
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    found
+}
+
 /// The candidate chunks around the camera not visited yet, the next one
 /// last: nearest first, those in front before those behind.
-fn candidates(inner: &Inner, view: &View, visited: &HashSet<(i32, i32)>) -> Vec<ChunkPos> {
+fn candidates(inner: &Inner, view: &View, visited: &HashSet<(i32, i32)>) -> Vec<(f64, ChunkPos)> {
     let r = view.radius.max(0.0);
     let (cx, cz) = (view.camera[0], view.camera[2]);
     let chunk = |v: f64| (v.floor() as i64).clamp(-(1 << 30), 1 << 30) as i32 >> 4;
     let min = ChunkPos::new(chunk(cx - r), chunk(cz - r));
     let max = ChunkPos::new(chunk(cx + r), chunk(cz + r));
-    let (fx, fz) = (view.forward[0], view.forward[2]);
-    let flen = (fx * fx + fz * fz).sqrt();
     let mut found: Vec<(f64, ChunkPos)> = (inner.structures.candidates(min, max, MIN_SPACING))
         .into_iter()
         .filter(|c| !visited.contains(&(c.x, c.z)))
         .filter_map(|c| {
             let (dx, dz) = (f64::from(c.x * 16 + 8) - cx, f64::from(c.z * 16 + 8) - cz);
-            let d = (dx * dx + dz * dz).sqrt();
-            if d > r {
+            if (dx * dx + dz * dz).sqrt() > r {
                 return None;
             }
-            // 1 in front, up to 3 behind.
-            let behind = if flen > 0.0 && d > 0.0 {
-                2.0 - (dx * fx + dz * fz) / (d * flen)
-            } else {
-                1.0
-            };
-            Some((d * behind, c))
+            Some((weight(view, dx, dz), c))
         })
         .collect();
     found.sort_by(|a, b| b.0.total_cmp(&a.0));
-    found.into_iter().map(|(_, c)| c).collect()
+    found
 }
 
 /// Drops the sketches past twice the radius when the index is over its
@@ -411,6 +560,7 @@ fn forget_far(
     view: &View,
     visited: &mut HashSet<(i32, i32)>,
     seen: &mut HashSet<(usize, i32, i32)>,
+    grown: &mut HashSet<(i32, i32)>,
 ) {
     let mut index = inner.index.write().unwrap();
     if index.blocks <= MAX_BLOCKS {
@@ -431,6 +581,9 @@ fn forget_far(
     for (_, id) in far {
         if index.blocks <= MAX_BLOCKS / 2 {
             break;
+        }
+        if let Some(cell) = index.sketches.get(&id).and_then(|s| s.trees) {
+            grown.remove(&cell);
         }
         index.remove(id);
         inner.count.fetch_sub(1, Ordering::Relaxed);
@@ -491,6 +644,12 @@ fn sketch(inner: &Inner, start: &StructureStart) -> Option<Sketch> {
         // Cubes below the ones still to place are done with.
         terrain.retain(|p, _| p.y >= cy);
     }
+    to_sketch(changed, None)
+}
+
+/// A sketch of the blocks `changed` (by cube, `index << 20 | state`, the last
+/// write of a block last), or `None` for none.
+fn to_sketch(changed: HashMap<SectionPos, Vec<u32>>, trees: Option<(i32, i32)>) -> Option<Sketch> {
     if changed.is_empty() {
         return None;
     }
@@ -510,7 +669,81 @@ fn sketch(inner: &Inner, start: &StructureStart) -> Option<Sketch> {
             (pos, blocks.into_boxed_slice())
         })
         .collect();
-    Some(Sketch { min, max, cubes })
+    Some(Sketch {
+        min,
+        max,
+        cubes,
+        trees,
+    })
+}
+
+/// The trees of the 256-block cell `cell` (the module docs' "Trees"), or
+/// `None` when none grows there or the level has no vegetation.
+fn sketch_trees(inner: &Inner, cell: (i32, i32)) -> Option<Sketch> {
+    let trees = inner.trees.as_ref()?;
+    let per_side = CELL / 16;
+    let mut terrain: HashMap<SectionPos, Arc<[u32; 4096]>> = HashMap::new();
+    let mut changed: HashMap<SectionPos, Vec<u32>> = HashMap::new();
+    // Population cube `p` decorates the area from `p * 16 + 8`: the cell's
+    // areas are those of its chunks.
+    for pz in cell.1 * per_side..(cell.1 + 1) * per_side {
+        for px in cell.0 * per_side..(cell.0 + 1) * per_side {
+            let (x0, z0) = (px * 16 + 8, pz * 16 + 8);
+            // Where a plant stands (on the topmost solid block), at the area's
+            // corners and middle.
+            let tops: Vec<i32> = [(0, 0), (15, 0), (0, 15), (15, 15), (8, 8)]
+                .iter()
+                .map(|&(dx, dz)| inner.structures.column_top(x0 + dx, z0 + dz))
+                .filter(|&top| top > horizon_world::cubic::custom::NO_TOP)
+                .map(|top| (top + 1 - 8) >> 4)
+                .collect();
+            let (Some(&lo), Some(&hi)) = (tops.iter().min(), tops.iter().max()) else {
+                continue;
+            };
+            for py in lo..=hi.min(lo + TREE_CUBES - 1) {
+                let cube = SectionPos::new(px, py, pz);
+                let mut world = TreeWorld {
+                    scratch: Scratch::new(inner, cube, &mut terrain),
+                    trees,
+                };
+                inner.generator.populate(cube, &mut world);
+                for (p, state) in world.scratch.writes {
+                    if !trees.states.contains(&state) {
+                        continue;
+                    }
+                    let pos = SectionPos::new(p[0] >> 4, p[1] >> 4, p[2] >> 4);
+                    let i = ((p[1] & 15) << 8 | (p[2] & 15) << 4 | (p[0] & 15)) as u32;
+                    // Grown into open air, not over the terrain's own blocks.
+                    if terrain[&pos][i as usize] == inner.air {
+                        changed.entry(pos).or_default().push(i << 20 | state);
+                    }
+                }
+            }
+        }
+        // The next row of areas reads from the next row of cubes on.
+        terrain.retain(|p, _| p.z > pz);
+    }
+    to_sketch(changed, Some(cell))
+}
+
+/// A population's scratch cubes with the vegetation hook: what the near
+/// terrain's population does there, without the structures (sketched apart).
+struct TreeWorld<'a> {
+    scratch: Scratch,
+    trees: &'a FarTrees,
+}
+
+impl CubeWorld for TreeWorld<'_> {
+    fn block(&self, p: [i32; 3]) -> u32 {
+        self.scratch.block(p)
+    }
+    fn set_block(&mut self, p: [i32; 3], state: u32) {
+        self.scratch.set_block(p, state);
+    }
+    fn decorate_surface(&mut self, cube: SectionPos, random: &mut JRandom) {
+        let columns = self.trees.columns.clone();
+        (self.trees.vegetation).decorate(cube, random, &mut self.scratch, &*columns);
+    }
 }
 
 /// A population's 2 x 2 x 2 cubes from the generator (terrain and carvers),
@@ -647,6 +880,7 @@ mod tests {
             cubes: (cubes.into_iter())
                 .map(|(p, b)| (p, b.into_boxed_slice()))
                 .collect(),
+            trees: None,
         })
     }
 
@@ -713,6 +947,7 @@ mod tests {
                 SectionPos::new(31, 4, -1),
                 vec![5 << 20 | 3].into_boxed_slice(),
             )],
+            trees: None,
         });
         assert_eq!(index.touching([510, 0, 0], [511, 100, 1]).len(), 1);
         assert!(index.touching([0, 0, 0], [255, 255, 255]).is_empty());

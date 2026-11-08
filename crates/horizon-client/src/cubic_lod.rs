@@ -272,8 +272,16 @@ impl CubicLodSampler {
         let structures = (level.generation().structures.clone())
             .filter(|_| level.generation().kind == CubicKind::Custom)
             .map(|s| {
+                let trees = (level.generation().vegetation.clone()).map(|vegetation| {
+                    crate::cubic_far_structures::FarTrees {
+                        vegetation,
+                        columns: level.generation().columns.clone(),
+                        states: crate::cubic_far_structures::FarTrees::tree_states(registry),
+                    }
+                });
                 crate::cubic_far_structures::FarStructures::new(
                     s,
+                    trees,
                     level.generation().generator.clone(),
                     cache.clone(),
                     id("minecraft:air"),
