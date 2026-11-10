@@ -7,6 +7,7 @@
 //! (`save::SavedLodSampler`), so edits show as before. A fingerprint of the
 //! game build, the world's data packs, the block and biome registries and the
 //! level's shape guards the folder; when any of them changes it is emptied.
+//! Reduced far detail's approximate samples are kept apart from full ones.
 use super::{Column, Span, Surface};
 use crate::{chunk::LevelShape, fast_hash::FxHashMap};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -19,7 +20,7 @@ use std::{
     sync::Mutex,
 };
 
-const FORMAT: &str = "horizon-lod-bake 2";
+const FORMAT: &str = "horizon-lod-bake 3";
 const FOLDER: &str = "horizon_lod";
 const FINGERPRINT: &str = "fingerprint.txt";
 /// Tiles per bucket file side.
@@ -29,8 +30,9 @@ const KEY_BYTES: usize = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Key {
-    /// `LodSampler::grid(x, z, stride, side)`.
+    /// `LodSampler::grid(x, z, stride, side)`, sampled approximately or not.
     Grid {
+        approximate: bool,
         x: i32,
         z: i32,
         stride: i32,
@@ -40,10 +42,17 @@ enum Key {
 impl Key {
     fn file(self) -> String {
         match self {
-            Key::Grid { x, z, stride, side } => {
+            Key::Grid {
+                approximate,
+                x,
+                z,
+                stride,
+                side,
+            } => {
                 let span = stride * i32::from(side) * GRID_BUCKET;
                 format!(
-                    "g{stride}x{side}.{}.{}.bin",
+                    "{}{stride}x{side}.{}.{}.bin",
+                    if approximate { "a" } else { "g" },
                     x.div_euclid(span),
                     z.div_euclid(span)
                 )
@@ -52,7 +61,13 @@ impl Key {
     }
     fn bytes(self) -> [u8; KEY_BYTES] {
         let (kind, x, z, stride, side) = match self {
-            Key::Grid { x, z, stride, side } => (0u8, x, z, stride, side),
+            Key::Grid {
+                approximate,
+                x,
+                z,
+                stride,
+                side,
+            } => (u8::from(approximate), x, z, stride, side),
         };
         let mut out = [0; KEY_BYTES];
         out[0] = kind;
@@ -65,7 +80,8 @@ impl Key {
     fn from_bytes(b: &[u8; KEY_BYTES]) -> Option<Self> {
         let int = |at: usize| i32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         match b[0] {
-            0 => Some(Key::Grid {
+            kind @ (0 | 1) => Some(Key::Grid {
+                approximate: kind == 1,
                 x: int(1),
                 z: int(5),
                 stride: int(9),
@@ -227,10 +243,17 @@ impl LodBake {
         });
     }
     /// The baked `LodSampler::grid` result, if any.
-    pub fn grid(&self, x: i32, z: i32, stride: i32, side: usize) -> Option<Vec<Column>> {
+    pub fn grid(
+        &self,
+        approximate: bool,
+        [x, z]: [i32; 2],
+        stride: i32,
+        side: usize,
+    ) -> Option<Vec<Column>> {
         let side16 = u16::try_from(side).ok()?;
         self.get(
             Key::Grid {
+                approximate,
                 x,
                 z,
                 stride,
@@ -239,7 +262,14 @@ impl LodBake {
             side * side,
         )
     }
-    pub fn put_grid(&self, x: i32, z: i32, stride: i32, side: usize, columns: &[Column]) {
+    pub fn put_grid(
+        &self,
+        approximate: bool,
+        [x, z]: [i32; 2],
+        stride: i32,
+        side: usize,
+        columns: &[Column],
+    ) {
         // A failed direct sample comes back as empty columns: never keep it.
         let Ok(side) = u16::try_from(side) else {
             return;
@@ -247,22 +277,30 @@ impl LodBake {
         if columns.iter().all(|c| *c == Column::default()) {
             return;
         }
-        self.put(Key::Grid { x, z, stride, side }, columns);
+        self.put(
+            Key::Grid {
+                approximate,
+                x,
+                z,
+                stride,
+                side,
+            },
+            columns,
+        );
     }
 }
 
 /// What baked columns depend on besides the world's seed (fixed per world).
 fn fingerprint(dimension: &Path, shape: LevelShape, block_states: usize, biomes: usize) -> String {
-    let exe = exe_stamp();
+    let build = super::cache::build_key(block_states, biomes);
     let packs = world_packs_digest(dimension);
     format!(
-        "{FORMAT}\nversion {}\nexe {exe}\nlevel {} {}\nblock_states {block_states}\nbiomes {biomes}\ndatapacks {packs}\n",
-        env!("CARGO_PKG_VERSION"),
-        shape.min_y,
-        shape.height,
+        "{FORMAT}\nbuild {build:016x}\nlevel {} {}\ndatapacks {packs}\n",
+        shape.min_y, shape.height,
     )
 }
-/// The running game build: its size and change time.
+/// The running game build: its size and change time. The cubic far cache
+/// (`cube_cache`) and the kept stronghold positions (`ring_cache`) use it.
 pub fn exe_stamp() -> String {
     std::env::current_exe()
         .and_then(fs::metadata)
@@ -442,19 +480,33 @@ mod tests {
         let shape = LevelShape::OVERWORLD;
         {
             let bake = LodBake::open(&dimension, shape, 100, 10).unwrap();
-            assert_eq!(bake.grid(-64, 32, 4, 16), None);
-            bake.put_grid(-64, 32, 4, 16, &grid);
+            assert_eq!(bake.grid(false, [-64, 32], 4, 16), None);
+            bake.put_grid(false, [-64, 32], 4, 16, &grid);
             // A second put of the same key is ignored, not appended.
-            bake.put_grid(-64, 32, 4, 16, &[sample(-1)]);
-            assert_eq!(bake.grid(-64, 32, 4, 16).as_deref(), Some(&grid[..]));
+            bake.put_grid(false, [-64, 32], 4, 16, &[sample(-1)]);
+            assert_eq!(
+                bake.grid(false, [-64, 32], 4, 16).as_deref(),
+                Some(&grid[..])
+            );
+            // Reduced far detail's samples are kept apart from full ones.
+            assert_eq!(bake.grid(true, [-64, 32], 4, 16), None);
+            bake.put_grid(true, [-64, 32], 4, 16, &other);
+            assert_eq!(
+                bake.grid(true, [-64, 32], 4, 16).as_deref(),
+                Some(&other[..])
+            );
         }
         let bake = LodBake::open(&dimension, shape, 100, 10).unwrap();
-        assert_eq!(bake.grid(-64, 32, 4, 16).as_deref(), Some(&grid[..]));
-        assert_eq!(bake.grid(-64, 48, 4, 16), None);
+        assert_eq!(
+            bake.grid(false, [-64, 32], 4, 16).as_deref(),
+            Some(&grid[..])
+        );
+        assert_eq!(bake.grid(false, [-64, 48], 4, 16), None);
         drop(bake);
         // A cut-off record (a crash mid-write) is dropped, the rest is kept:
         // (-128, 32) shares (-64, 32)'s bucket file.
         let key = Key::Grid {
+            approximate: false,
             x: -64,
             z: 32,
             stride: 4,
@@ -463,19 +515,22 @@ mod tests {
         let file = dimension.join(FOLDER).join(key.file());
         let full = fs::metadata(&file).unwrap().len();
         let bake = LodBake::open(&dimension, shape, 100, 10).unwrap();
-        bake.put_grid(-128, 32, 4, 16, &other);
+        bake.put_grid(false, [-128, 32], 4, 16, &other);
         drop(bake);
         let f = fs::OpenOptions::new().write(true).open(&file).unwrap();
         f.set_len(fs::metadata(&file).unwrap().len() - 5).unwrap();
         drop(f);
         let bake = LodBake::open(&dimension, shape, 100, 10).unwrap();
-        assert_eq!(bake.grid(-128, 32, 4, 16), None);
-        assert_eq!(bake.grid(-64, 32, 4, 16).as_deref(), Some(&grid[..]));
+        assert_eq!(bake.grid(false, [-128, 32], 4, 16), None);
+        assert_eq!(
+            bake.grid(false, [-64, 32], 4, 16).as_deref(),
+            Some(&grid[..])
+        );
         assert_eq!(fs::metadata(&file).unwrap().len(), full);
         drop(bake);
         // Another registry (or data pack, build or level shape) empties the folder.
         let bake = LodBake::open(&dimension, shape, 101, 10).unwrap();
-        assert_eq!(bake.grid(-64, 32, 4, 16), None);
+        assert_eq!(bake.grid(false, [-64, 32], 4, 16), None);
         drop(bake);
         fs::remove_dir_all(&world).unwrap();
     }
@@ -486,8 +541,8 @@ mod tests {
         let dimension = world.join("dimensions").join("minecraft").join("overworld");
         fs::create_dir_all(&dimension).unwrap();
         let bake = LodBake::open(&dimension, LevelShape::OVERWORLD, 1, 1).unwrap();
-        bake.put_grid(0, 0, 16, 16, &vec![Column::default(); 256]);
-        assert_eq!(bake.grid(0, 0, 16, 16), None);
+        bake.put_grid(false, [0, 0], 16, 16, &vec![Column::default(); 256]);
+        assert_eq!(bake.grid(false, [0, 0], 16, 16), None);
         drop(bake);
         fs::remove_dir_all(&world).unwrap();
     }

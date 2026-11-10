@@ -15,6 +15,7 @@ pub mod ocean_ruin;
 pub mod piece_limited;
 pub mod processor;
 pub mod ruined_portal;
+pub(crate) mod saved_templates;
 pub mod simple;
 pub mod start;
 pub mod start_checks;
@@ -293,6 +294,8 @@ struct TemplateStore {
     transforms: Arc<StateTransforms>,
     dir: PathBuf,
     loaded: RwLock<HashMap<String, Arc<StructureTemplate>>>,
+    /// Data packs' template files, which win over the prepared ones.
+    pack_templates: BTreeMap<String, Arc<[u8]>>,
 }
 impl TemplateStore {
     fn get(&self, id: &str) -> Arc<StructureTemplate> {
@@ -301,20 +304,22 @@ impl TemplateStore {
         }
         let (namespace, path) = id.split_once(':').unwrap();
         let file = self.dir.join(namespace).join(format!("{path}.nbt"));
-        let loaded = horizon_core::prepared_files::read(&file)
-            .ok()
-            .and_then(|bytes| {
-                let mut raw = Vec::new();
-                flate2::read::GzDecoder::new(bytes.as_slice())
-                    .read_to_end(&mut raw)
-                    .ok()?;
-                let tag = nbt::read_named(&raw, Limits::templates()).ok()?.0.tag;
-                Some(StructureTemplate::from_nbt(
-                    &tag,
-                    self.registry,
-                    &self.transforms,
-                ))
-            });
+        let bytes = match self.pack_templates.get(id) {
+            Some(bytes) => Some(bytes.to_vec()),
+            None => horizon_core::prepared_files::read(&file).ok(),
+        };
+        let loaded = bytes.and_then(|bytes| {
+            let mut raw = Vec::new();
+            flate2::read::GzDecoder::new(bytes.as_slice())
+                .read_to_end(&mut raw)
+                .ok()?;
+            let tag = nbt::read_named(&raw, Limits::templates()).ok()?.0.tag;
+            Some(StructureTemplate::from_nbt(
+                &tag,
+                self.registry,
+                &self.transforms,
+            ))
+        });
         // StructureTemplateManager.getOrCreate: missing templates are empty.
         let mut loaded = loaded.unwrap_or_else(StructureTemplate::empty);
         loaded.location = id.into();
@@ -444,6 +449,7 @@ impl StructureResources {
                 transforms,
                 dir: dir.to_owned(),
                 loaded: RwLock::new(HashMap::new()),
+                pack_templates: BTreeMap::new(),
             }),
             processor_lists,
             jigsaw_states,
@@ -455,6 +461,18 @@ impl StructureResources {
                 .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
                 .collect(),
         }
+    }
+    /// These resources with data packs' template files over the prepared ones.
+    pub fn with_pack_templates(mut self, templates: BTreeMap<String, Arc<[u8]>>) -> Self {
+        // A fresh store: templates loaded before would come from the old files.
+        self.templates = Arc::new(TemplateStore {
+            registry: self.registry,
+            transforms: self.transforms.clone(),
+            dir: self.templates.dir.clone(),
+            loaded: RwLock::new(HashMap::new()),
+            pack_templates: templates,
+        });
+        self
     }
     /// StructureTemplateManager.getOrCreate; missing templates are empty.
     pub fn template(&self, id: &str) -> Option<Arc<StructureTemplate>> {

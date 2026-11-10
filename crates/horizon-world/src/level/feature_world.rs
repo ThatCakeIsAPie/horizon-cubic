@@ -46,11 +46,7 @@ fn pos([x, y, z]: [i32; 3]) -> BlockPos {
 
 impl<L: LevelAccess + ?Sized> LevelFeatureWorld<'_, '_, L> {
     fn sea(&self) -> i32 {
-        match self.sim.level.dimension() {
-            super::Dimension::Nether => 32,
-            super::Dimension::End => 0,
-            super::Dimension::Overworld => 63,
-        }
+        super::vanilla_sea_level(self.sim.level.level_key())
     }
     fn in_tag(&self, state: BlockStateId, tag: &str) -> bool {
         let name = tag.trim_start_matches('#');
@@ -178,6 +174,25 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
     fn can_occlude(&mut self, state: BlockStateId) -> Result<bool, PlacementQueryError> {
         Ok(self.sim.b.has_flag(state, state_flags::CAN_OCCLUDE))
     }
+    /// `MonsterRoomFeature.place`: create only the missing live entity;
+    /// the feature already chose its type and wrote its spawner block.
+    fn configure_spawner(
+        &mut self,
+        position: [i32; 3],
+        entity: &str,
+    ) -> Result<(), PlacementQueryError> {
+        let at = pos(position);
+        if self
+            .sim
+            .b
+            .instance_of(self.sim.state(at), super::classes::Class::Spawner)
+        {
+            self.sim
+                .level
+                .create_feature_spawner(at, crate::worldgen::cave::dungeon_spawner_nbt(entity));
+        }
+        Ok(())
+    }
     /// BeehiveDecorator's bees go into the nest's block entity (the tree
     /// checked the nest is there).
     fn store_beehive_occupants(
@@ -200,19 +215,6 @@ impl<L: LevelAccess + ?Sized> PlacementContext for LevelFeatureWorld<'_, '_, L> 
         let state = self.sim.state(pos(position));
         let registry = self.features.data().registry();
         if let Some(nbt) = crate::worldgen::loot_table_nbt(registry, state, table, random) {
-            self.sim.level.load_block_entity(pos(position), nbt);
-        }
-        Ok(())
-    }
-    /// SpawnerBlockEntity.setEntityId: the next spawn data and no potentials.
-    fn configure_spawner(
-        &mut self,
-        position: [i32; 3],
-        entity: &str,
-    ) -> Result<(), PlacementQueryError> {
-        let state = self.sim.state(pos(position));
-        let registry = self.features.data().registry();
-        if let Some(nbt) = crate::worldgen::spawner_nbt(registry, state, entity) {
             self.sim.level.load_block_entity(pos(position), nbt);
         }
         Ok(())
@@ -440,4 +442,48 @@ pub fn place_biome_feature<L: LevelAccess + ?Sized>(
         random,
         origin,
     )
+}
+
+#[cfg(test)]
+mod dungeon_spawner_default_tests {
+    use super::*;
+    use horizon_core::random::LegacyRandom;
+    struct Unbound {
+        random: LegacyRandom,
+        loads: usize,
+    }
+    impl LevelAccess for Unbound {
+        fn block_state(&self, _: BlockPos) -> BlockStateId {
+            BlockStateId(0)
+        }
+        fn set_raw(&mut self, _: BlockPos, _: BlockStateId) -> Option<BlockStateId> {
+            panic!("default callback must not write")
+        }
+        fn is_loaded(&self, _: BlockPos) -> bool {
+            true
+        }
+        fn random(&mut self) -> &mut LegacyRandom {
+            &mut self.random
+        }
+        fn game_time(&self) -> i64 {
+            0
+        }
+        fn load_block_entity(&mut self, _: BlockPos, _: crate::nbt::Compound) {
+            self.loads += 1;
+        }
+    }
+    #[test]
+    fn unbound_level_keeps_the_optional_creation_callback_noop() {
+        let mut level = Unbound {
+            random: LegacyRandom::new(173),
+            loads: 0,
+        };
+        let before = level.random.clone().next_long();
+        level.create_feature_spawner(
+            BlockPos::new(1, 2, 3),
+            crate::worldgen::cave::dungeon_spawner_nbt("minecraft:zombie"),
+        );
+        assert_eq!(level.loads, 0);
+        assert_eq!(level.random.next_long(), before);
+    }
 }

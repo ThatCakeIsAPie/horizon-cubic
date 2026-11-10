@@ -96,14 +96,60 @@ struct Node {
     space: [Parameter; 7],
     children: Children,
 }
-fn distance(space: &[Parameter; 7], values: &[i64; 7]) -> i64 {
-    space
-        .iter()
-        .zip(values)
-        .fold(0i64, |sum, (parameter, value)| {
-            let distance = parameter.distance(*value);
-            sum.wrapping_add(distance.wrapping_mul(distance))
-        })
+/// A node's box as the search reads it: the six climate intervals, and the
+/// squared distance of its offset interval from the target's offset, which
+/// is always 0, so it is the same for every target.
+#[derive(Clone, Copy, Debug)]
+struct SearchSpace {
+    coordinates: [Parameter; 6],
+    offset: i64,
+}
+impl SearchSpace {
+    fn new(space: &[Parameter; 7]) -> Self {
+        let offset = space[6].distance(0);
+        Self {
+            coordinates: std::array::from_fn(|i| space[i]),
+            offset: offset.wrapping_mul(offset),
+        }
+    }
+    /// Vanilla's `Node.distance`: the sum of the seven squared distances, in
+    /// wrapping long arithmetic, whose sums do not depend on their order.
+    fn distance(&self, values: &[i64; 6]) -> i64 {
+        self.coordinates
+            .iter()
+            .zip(values)
+            .fold(self.offset, |sum, (parameter, value)| {
+                let distance = parameter.distance(*value);
+                sum.wrapping_add(distance.wrapping_mul(distance))
+            })
+    }
+    /// `distance` when it is below `limit`, else at least `limit`: the sum
+    /// stops once it reaches `limit`. Only for bounded boxes and targets, whose
+    /// terms are squares below 2^60 that cannot overflow even all seven
+    /// together, so the sum only grows and a part of it is at most the whole.
+    /// A search only compares a distance with `limit`, its best so far, and
+    /// uses it only when it is below, so the stop changes no result.
+    fn distance_until(&self, values: &[i64; 6], limit: i64) -> i64 {
+        let mut sum = self.offset;
+        for axis in AXES {
+            let distance = self.coordinates[axis].distance(values[axis]);
+            sum += distance * distance;
+            if sum >= limit {
+                break;
+            }
+        }
+        sum
+    }
+}
+/// The order `distance_until` adds the axes in, which does not change a full
+/// sum. Depth first: the overworld's surface biomes are points in depth, so
+/// for most targets depth alone takes a box past the best leaf so far.
+const AXES: [usize; 6] = [4, 2, 0, 1, 3, 5];
+/// Values within `BOUND` are bounded: the distance of a bounded value from a
+/// bounded interval is below 2^30.
+const BOUND: i64 = 1 << 29;
+fn bounded(value: i64) -> bool {
+    -BOUND < value && value < BOUND
 }
 fn compare_space(a: &[Parameter; 7], b: &[Parameter; 7], axis: usize, absolute: bool) -> Ordering {
     for i in 0..7 {
@@ -204,7 +250,9 @@ pub struct ClimateIndex<T> {
     entries: Vec<(ParameterPoint, T)>,
     /// The built tree renumbered breadth first, root at 0, so each branch's
     /// children are one contiguous run and a search walks memory in order.
-    spaces: Vec<[Parameter; 7]>,
+    spaces: Vec<SearchSpace>,
+    /// Every bound of every box, offsets included, is bounded.
+    bounded: bool,
     /// Per node: its first child and child count, or its entry and 0 for a leaf.
     links: Vec<(u32, u32)>,
 }
@@ -255,9 +303,19 @@ impl<T> ClimateIndex<T> {
                 }
             });
         }
+        let bounded = order.iter().all(|id| {
+            nodes[*id]
+                .space
+                .iter()
+                .all(|parameter| bounded(parameter.min) && bounded(parameter.max))
+        });
         Ok(Self {
             entries,
-            spaces: order.iter().map(|id| nodes[*id].space).collect(),
+            spaces: order
+                .iter()
+                .map(|id| SearchSpace::new(&nodes[*id].space))
+                .collect(),
+            bounded,
             links,
         })
     }
@@ -266,9 +324,27 @@ impl<T> ClimateIndex<T> {
     }
     /// The search tree, breadth first with the root at 0 (read-only, for
     /// GPU ports): each node's parameter space, and its first child and
-    /// child count, or its entry index and 0 for a leaf.
-    pub fn tree(&self) -> (&[[Parameter; 7]], &[(u32, u32)]) {
-        (&self.spaces, &self.links)
+    /// child count, or its entry index and 0 for a leaf. The search keeps
+    /// only its own form of the boxes, so they are built again here, as
+    /// `build` made them: a leaf's entry space, a branch's children's union.
+    pub fn tree(&self) -> (Vec<[Parameter; 7]>, &[(u32, u32)]) {
+        let mut spaces = vec![[Parameter::new(0, 0); 7]; self.links.len()];
+        // Breadth first, children come after their parent: fill bottom up.
+        for id in (0..self.links.len()).rev() {
+            spaces[id] = match self.links[id] {
+                (entry, 0) => self.entries[entry as usize].0.parameter_space(),
+                (first, count) => {
+                    let mut space = spaces[first as usize];
+                    for child in first + 1..first + count {
+                        for (parameter, other) in space.iter_mut().zip(spaces[child as usize]) {
+                            *parameter = parameter.union(other);
+                        }
+                    }
+                    space
+                }
+            };
+        }
+        (spaces, &self.links)
     }
     pub fn searcher(&self) -> ClimateSearch<'_, T> {
         ClimateSearch {
@@ -306,26 +382,32 @@ impl<T> ClimateIndex<T> {
         walk(&self.links, 0, &mut result);
         result
     }
+    /// Vanilla's `SubTree.search` below `id`, whose best leaf so far is `best`
+    /// at distance `fitness` (`i64::MAX` with none), returning the best leaf
+    /// and its distance. Vanilla measures the best leaf again in every subtree
+    /// and after each one; passing its distance along gives the same values.
+    /// `bounded`: the tree and the target are, so distances may stop early.
     fn search(
         &self,
         id: usize,
-        values: &[i64; 7],
-        previous: Option<usize>,
-    ) -> Result<usize, IndexError> {
+        values: &[i64; 6],
+        bounded: bool,
+        mut best: Option<usize>,
+        mut fitness: i64,
+    ) -> Result<(usize, i64), IndexError> {
         let (first, count) = self.links[id];
-        if count == 0 {
-            return Ok(id);
-        }
-        let mut best = previous;
-        let mut fitness = previous.map_or(i64::MAX, |id| distance(&self.spaces[id], values));
-        for child in first as usize..(first + count) as usize {
-            let lower = distance(&self.spaces[child], values);
+        let children = first as usize..(first + count) as usize;
+        for (child, space) in children.clone().zip(&self.spaces[children]) {
+            let lower = if bounded {
+                space.distance_until(values, fitness)
+            } else {
+                space.distance(values)
+            };
             if fitness > lower {
-                let result = self.search(child, values, best)?;
-                let next = if result == child {
-                    lower
+                let (result, next) = if self.links[child].1 == 0 {
+                    (child, lower)
                 } else {
-                    distance(&self.spaces[result], values)
+                    self.search(child, values, bounded, best, fitness)?
                 };
                 if fitness > next {
                     fitness = next;
@@ -333,7 +415,7 @@ impl<T> ClimateIndex<T> {
                 }
             }
         }
-        best.ok_or(IndexError::NoResult)
+        best.map(|best| (best, fitness)).ok_or(IndexError::NoResult)
     }
 }
 /// A caller's memo of one search: its target and the leaf found. Searching
@@ -349,12 +431,21 @@ pub struct Nearest {
     fitness: i64,
 }
 impl<T> ClimateIndex<T> {
+    /// As [`ClimateSearch::find`] with no previous result. A bounded search
+    /// stops a box's sum early only when it rejects the box, so the fitness
+    /// of the leaf it returns is the whole distance.
     pub fn nearest(&self, target: TargetPoint) -> Result<Nearest, IndexError> {
-        let values = target.parameters();
-        let leaf = self.search(0, &values, None)?;
+        let parameters = target.parameters();
+        let values: [i64; 6] = std::array::from_fn(|i| parameters[i]);
+        let (leaf, fitness) = if self.links[0].1 == 0 {
+            (0, self.spaces[0].distance(&values))
+        } else {
+            let bounded = self.bounded && values.iter().all(|value| bounded(*value));
+            self.search(0, &values, bounded, None, i64::MAX)?
+        };
         Ok(Nearest {
             leaf: leaf as u32,
-            fitness: distance(&self.spaces[leaf], &values),
+            fitness,
         })
     }
 }
@@ -365,7 +456,19 @@ pub struct ClimateSearch<'a, T> {
 }
 impl<'a, T> ClimateSearch<'a, T> {
     pub fn find(&mut self, target: TargetPoint) -> Result<&'a T, IndexError> {
-        let result = self.index.search(0, &target.parameters(), self.last)?;
+        let parameters = target.parameters();
+        let values = std::array::from_fn(|i| parameters[i]);
+        let result = if self.index.links[0].1 == 0 {
+            0
+        } else {
+            let fitness = self
+                .last
+                .map_or(i64::MAX, |id| self.index.spaces[id].distance(&values));
+            let bounded = self.index.bounded && values.iter().all(|value| bounded(*value));
+            self.index
+                .search(0, &values, bounded, self.last, fitness)?
+                .0
+        };
         self.answer(result)
     }
     /// [`Self::find`] for a target whose fresh answer is `nearest`
@@ -378,12 +481,10 @@ impl<'a, T> ClimateSearch<'a, T> {
         target: TargetPoint,
         nearest: Nearest,
     ) -> Result<&'a T, IndexError> {
+        let parameters = target.parameters();
+        let values: [i64; 6] = std::array::from_fn(|i| parameters[i]);
         let result = match self.last {
-            Some(last)
-                if distance(&self.index.spaces[last], &target.parameters()) == nearest.fitness =>
-            {
-                last
-            }
+            Some(last) if self.index.spaces[last].distance(&values) == nearest.fitness => last,
             _ => nearest.leaf as usize,
         };
         self.answer(result)
@@ -421,6 +522,298 @@ impl<'a, T> ClimateSearch<'a, T> {
 mod tests {
     use super::*;
 
+    /// The search as it was before it passed distances along: a copy of
+    /// vanilla's `SubTree.search` over the built nodes, before the breadth
+    /// first renumbering, measuring all seven coordinates of every box.
+    struct Reference {
+        nodes: Vec<Node>,
+        root: usize,
+        last: Option<usize>,
+    }
+    impl Reference {
+        fn new(entries: &[(ParameterPoint, usize)], branching: usize) -> Self {
+            let mut nodes: Vec<_> = entries
+                .iter()
+                .enumerate()
+                .map(|(id, (point, _))| Node {
+                    space: point.parameter_space(),
+                    children: Children::Leaf(id),
+                })
+                .collect();
+            let children = (0..nodes.len()).collect();
+            let root = build(&mut nodes, children, branching).unwrap();
+            Self {
+                nodes,
+                root,
+                last: None,
+            }
+        }
+        fn distance(&self, id: usize, values: &[i64; 7]) -> i64 {
+            self.nodes[id]
+                .space
+                .iter()
+                .zip(values)
+                .fold(0i64, |sum, (parameter, value)| {
+                    let distance = parameter.distance(*value);
+                    sum.wrapping_add(distance.wrapping_mul(distance))
+                })
+        }
+        fn search(
+            &self,
+            id: usize,
+            values: &[i64; 7],
+            previous: Option<usize>,
+        ) -> Result<usize, IndexError> {
+            let Children::Branch(children) = &self.nodes[id].children else {
+                return Ok(id);
+            };
+            let mut best = previous;
+            let mut fitness = previous.map_or(i64::MAX, |id| self.distance(id, values));
+            for &child in children {
+                let lower = self.distance(child, values);
+                if fitness > lower {
+                    let result = self.search(child, values, best)?;
+                    let next = if result == child {
+                        lower
+                    } else {
+                        self.distance(result, values)
+                    };
+                    if fitness > next {
+                        fitness = next;
+                        best = Some(result);
+                    }
+                }
+            }
+            best.ok_or(IndexError::NoResult)
+        }
+        fn find(&mut self, target: TargetPoint) -> Result<usize, IndexError> {
+            let result = self.search(self.root, &target.parameters(), self.last)?;
+            self.last = Some(result);
+            let Children::Leaf(entry) = self.nodes[result].children else {
+                unreachable!("search returns a leaf");
+            };
+            Ok(entry)
+        }
+    }
+
+    /// SplitMix64, so the corpus needs no random crate.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn range(&mut self, min: i64, max: i64) -> i64 {
+            min + (self.next() % (max - min + 1) as u64) as i64
+        }
+        fn pick(&mut self, values: &[i64]) -> i64 {
+            values[self.below(values.len())]
+        }
+    }
+
+    /// Runs one target sequence through the index and the reference, each
+    /// keeping its previous result. Returns false if the tree cannot be built.
+    fn compare(
+        entries: Vec<(ParameterPoint, usize)>,
+        branching: usize,
+        targets: &[TargetPoint],
+    ) -> bool {
+        let Ok(index) = ClimateIndex::with_branching(entries.clone(), branching) else {
+            return false;
+        };
+        let mut reference = Reference::new(&entries, branching);
+        let mut search = index.searcher();
+        for (step, target) in targets.iter().enumerate() {
+            // A fresh search now and then, as each chunk's biome fill starts one.
+            if step % 1000 == 999 {
+                search = index.searcher();
+                reference.last = None;
+            }
+            let expected = reference.find(*target);
+            let actual = search.find(*target).copied();
+            assert_eq!(actual, expected, "step {step}, target {target:?}");
+        }
+        true
+    }
+
+    fn target(values: [i64; 6]) -> TargetPoint {
+        let [
+            temperature,
+            humidity,
+            continentalness,
+            erosion,
+            depth,
+            weirdness,
+        ] = values;
+        TargetPoint {
+            temperature,
+            humidity,
+            continentalness,
+            erosion,
+            depth,
+            weirdness,
+        }
+    }
+
+    /// Targets near each other in sequence, as neighbouring quarts are, with
+    /// coordinates often set to an entry's endpoint so neighbouring boxes tie,
+    /// and now and then a jump anywhere.
+    fn walk(
+        rng: &mut Rng,
+        entries: &[(ParameterPoint, usize)],
+        count: usize,
+        span: i64,
+    ) -> Vec<TargetPoint> {
+        let mut values = [0i64; 6];
+        (0..count)
+            .map(|_| {
+                for (axis, value) in values.iter_mut().enumerate() {
+                    *value = match rng.below(16) {
+                        0 => rng.range(-span, span),
+                        1..=3 => {
+                            let parameter = entries[rng.below(entries.len())].0.coordinates[axis];
+                            if rng.below(2) == 0 {
+                                parameter.min
+                            } else {
+                                parameter.max
+                            }
+                        }
+                        _ => value.wrapping_add(rng.range(-span / 64, span / 64)),
+                    };
+                }
+                target(values)
+            })
+            .collect()
+    }
+
+    fn vanilla_list(name: &str) -> Option<Vec<(ParameterPoint, usize)>> {
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client/26.3")
+            });
+        let path = root.join(format!("worldgen/biome_parameters/{name}.json"));
+        let Ok(report) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping the {name} list: no {}", path.display());
+            return None;
+        };
+        let json = crate::worldgen::generator::quantize_parameter_report(&report).unwrap();
+        let source =
+            crate::worldgen::biome::MultiNoiseBiomeSource::from_quantized_json(&json).unwrap();
+        Some(
+            source
+                .parameters()
+                .entries()
+                .iter()
+                .enumerate()
+                .map(|(id, (point, _))| (*point, id))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn search_matches_the_reference_on_the_vanilla_lists() {
+        for (name, count) in [("overworld", 200_000), ("nether", 50_000)] {
+            let Some(entries) = vanilla_list(name) else {
+                continue;
+            };
+            let targets = walk(&mut Rng(name.len() as u64), &entries, count, 25_000);
+            assert!(compare(entries, 19, &targets));
+        }
+    }
+
+    #[test]
+    fn search_matches_the_reference_with_ties_and_wrapping() {
+        let mut rng = Rng(0x9997);
+        let mut built = 0;
+        let extremes = [
+            i64::MIN,
+            i64::MIN + 1,
+            -(1 << 31),
+            -1,
+            0,
+            1,
+            (1 << 31) - 1,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        // Around the bound of the early stop, which needs both the tree and
+        // the target bounded: with `BOUND` itself in half of these trees.
+        let edges = [
+            -BOUND,
+            1 - BOUND,
+            -BOUND / 2,
+            0,
+            BOUND / 2,
+            BOUND - 1,
+            BOUND,
+        ];
+        for case in 0..240 {
+            let branching = 2 + case % 31;
+            let count = 1 + rng.below([8, 40, 400, 2000][case % 4]);
+            let wrapping = case % 6 == 5;
+            let edge = case % 6 == 4;
+            let edges =
+                &edges[usize::from(case % 12 == 4)..edges.len() - usize::from(case % 12 == 4)];
+            // A small grid makes many boxes and offsets equally far.
+            let value = |rng: &mut Rng| {
+                if wrapping {
+                    rng.pick(&extremes)
+                } else if edge {
+                    rng.pick(edges)
+                } else {
+                    rng.range(-6, 6) * 100
+                }
+            };
+            let mut entries: Vec<(ParameterPoint, usize)> = Vec::with_capacity(count);
+            for id in 0..count {
+                let point = if id > 0 && rng.below(5) == 0 {
+                    entries[rng.below(id)].0
+                } else {
+                    ParameterPoint {
+                        coordinates: std::array::from_fn(|_| {
+                            let (a, b) = (value(&mut rng), value(&mut rng));
+                            // Some spans inverted: the record does not check them.
+                            if rng.below(8) == 0 {
+                                Parameter::new(a, b)
+                            } else {
+                                Parameter::new(a.min(b), a.max(b))
+                            }
+                        }),
+                        offset: if rng.below(3) == 0 {
+                            value(&mut rng)
+                        } else {
+                            0
+                        },
+                    }
+                };
+                entries.push((point, id));
+            }
+            let targets: Vec<_> = if wrapping {
+                (0..500)
+                    .map(|_| target(std::array::from_fn(|_| rng.pick(&extremes))))
+                    .collect()
+            } else if edge {
+                walk(&mut rng, &entries, 2000, BOUND + (1 << 24))
+            } else {
+                walk(&mut rng, &entries, 2000, 800)
+            };
+            built += compare(entries, branching, &targets) as usize;
+        }
+        // Extreme spans can leave no finite split cost; most trees build.
+        assert!(built > 220, "{built} trees built");
+    }
+
+    /// Hinted searches, and searches given each target's fresh answer
+    /// (`nearest`, found apart), answer as plain ones and keep the same
+    /// previous result.
     #[test]
     fn hinted_search_matches_plain_search_with_ties() {
         let mut seed = 0x2545f4914f6cdd1d_u64;
@@ -449,6 +842,7 @@ mod tests {
             .collect();
         let index = ClimateIndex::new(entries).unwrap();
         let (mut plain, mut hinted) = (index.searcher(), index.searcher());
+        let mut near = index.searcher();
         let mut hints = [SearchHint::default(); 4];
         let mut columns: [Option<TargetPoint>; 4] = [None; 4];
         for step in 0..20_000 {
@@ -461,11 +855,51 @@ mod tests {
                 })),
             };
             columns[column] = Some(target);
+            let expected = plain.find(target).unwrap();
             assert_eq!(
-                plain.find(target).unwrap(),
+                expected,
                 hinted.find_hinted(target, &mut hints[column]).unwrap()
             );
             assert_eq!(plain.last, hinted.last);
+            let nearest = index.nearest(target).unwrap();
+            assert_eq!(expected, near.find_nearest(target, nearest).unwrap());
+            assert_eq!(plain.last, near.last);
+        }
+    }
+
+    /// `tree` gives the boxes `build` made, breadth first from the root.
+    #[test]
+    fn tree_spaces_are_the_built_boxes_breadth_first() {
+        let mut rng = Rng(11);
+        for (count, branching) in [(1, 2), (2, 2), (40, 3), (400, 19), (2000, 7)] {
+            let entries: Vec<(ParameterPoint, usize)> = (0..count)
+                .map(|id| {
+                    let point = ParameterPoint {
+                        coordinates: std::array::from_fn(|_| {
+                            let (a, b) = (rng.range(-600, 600), rng.range(-600, 600));
+                            Parameter::new(a.min(b), a.max(b))
+                        }),
+                        offset: rng.range(0, 3) * 100,
+                    };
+                    (point, id)
+                })
+                .collect();
+            let index = ClimateIndex::with_branching(entries.clone(), branching).unwrap();
+            let reference = Reference::new(&entries, branching);
+            let mut order = vec![reference.root];
+            let mut next = 0;
+            while next < order.len() {
+                if let Children::Branch(children) = &reference.nodes[order[next]].children {
+                    order.extend_from_slice(children);
+                }
+                next += 1;
+            }
+            let (spaces, links) = index.tree();
+            assert_eq!(spaces.len(), order.len());
+            assert_eq!(links.len(), order.len());
+            for (space, id) in spaces.iter().zip(&order) {
+                assert_eq!(*space, reference.nodes[*id].space, "{count} entries");
+            }
         }
     }
 }

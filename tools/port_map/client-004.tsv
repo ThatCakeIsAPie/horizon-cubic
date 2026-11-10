@@ -6,18 +6,20 @@ EndCrystalRenderer.submit	port	crates/horizon-client/src/game/end.rs::Game::end_
 EndCrystalRenderer.extractRenderState	inline	crates/horizon-client/src/game/end.rs::Game::end_crystal_geometry	age, show-bottom and beam target read from the crystal there
 EndCrystalRenderer.shouldRender	inline	crates/horizon-client/src/game/end.rs::Game::end_crystal_geometry	gap: minor: no frustum test; crystals within 256 blocks always draw, beam included
 EnderDragonRenderer.submit	port	crates/horizon-client/src/game/dragon.rs::Game::dragon_geometry	
-EnderDragonRenderer.submitRays	port	crates/horizon-client/src/game/dragon.rs::Game::dragon_rays	
+EnderDragonRenderer.submitRays	port	crates/horizon-client/src/game/dragon/death_render.rs::dragon_rays	
 EnderDragonRenderer.submitCrystalBeams	port	crates/horizon-client/src/game/dragon.rs::Game::crystal_beam	
 EnderDragonRenderer.extractRenderState	inline	crates/horizon-client/src/game/dragon.rs::Game::dragon_geometry	flap, death fade, hurt overlay, nearest-crystal beam and egg distance read there
 EndermanRenderer.getRenderOffset	port	crates/horizon-client/src/mobs/render.rs::enderman_render_offset	EndermanRenderer.getRenderOffset's random side offset for a creepy enderman, 0.02 * minecraft:scale per axis
 EndermanRenderer.extractRenderState	inline	crates/horizon-client/src/mobs/enderman.rs::anim	gap: minor: carried block is drawn by game/mob_blocks.rs, not from this pose
+Entity.getLightProbePosition	port	crates/horizon-client/src/mobs/living.rs::eye_probe_cell	the eye height over Mth.lerp(partialTick, xo, x) on each axis for a mob (`Mob::light_probe`) and a projectile (`Projectile::light_probe_y`); ArmorStand's marker scan overrides it (`entities.rs::ArmorStand::light_probe`)
 EntityRenderDispatcher.getRenderer	skip:other		renderer lookup; Horizon dispatches by mob kind in game.rs::Game::entity_geometry and game/creatures.rs::Game::mob_geometry
 EntityRenderDispatcher.getAvatarRenderer	port	crates/horizon-client/src/mobs/render.rs::body	slim or wide arm model by skin
 EntityRenderDispatcher.shouldRender	skip:other		frustum culling only; Horizon culls with its own entity culler
 EntityRenderDispatcher.extractEntity	skip:other		render-state wrapper with a crash report; Horizon has no separate extraction stage
 EntityRenderDispatcher.fillRendererDetails	skip:debug		crash report detail
 EntityRenderDispatcher.onResourceManagerReload	skip:data		renderer rebuild on resource reload; Horizon loads its assets from files
-EntityRenderer.getBlockLightLevel	port	crates/horizon-client/src/game/creatures.rs::Game::mob_geometry	burning mobs drawn at full light (game/creatures.rs::Game::mob_geometry); other entities use world light
+EntityRenderer.getBoundingBoxForCulling	port	crates/horizon-client/src/game/entity_culling.rs::cull_box	Entity.getInterpolatedBoundingBox(partialTick) - the box at the frame's position - grown by 0.5 for the frustum test; the renderer overrides have their own rows, and a dropped item's is game/item_draw.rs::dropped_item_cull_box
+EntityRenderer.getBlockLightLevel	port	crates/horizon-client/src/game/creatures.rs::Game::mob_geometry	burning mobs, projectiles and dropped items drawn at full block light (game/creatures.rs::Game::mob_geometry, game/item_draw.rs::Game::dropped_item_geometry); other entities use world light
 EntityRenderer.submit	inline	crates/horizon-client/src/game.rs::Game::entity_geometry	leash ropes and name tags drawn in their own passes from there
 EntityRenderer.shouldShowName	port	crates/horizon-client/src/game/names.rs::Game::name_tags	named mob under the crosshair
 EntityRenderer.submitNameDisplay	port	crates/horizon-client/src/game/names.rs::Game::name_tag_geometry	
@@ -46,7 +48,7 @@ FishingHookRenderer.extractRenderState	port	crates/horizon-client/src/game/fishi
 FoxRenderer.extractRenderState	port	crates/horizon-client/src/mobs/body_anim.rs::fox	crouch, sleep, sit, faceplant, pounce and head roll
 FrogRenderer.extractRenderState	port	crates/horizon-client/src/mobs/body_anim.rs::frog	jump, croak, tongue and swim animations; climate texture in mobs/render.rs::body
 GiantMobRenderer.extractRenderState	port	crates/horizon-client/src/mobs/anim.rs::humanoid	gap: minor: giant model comes from the species table (giant#main), not a separate renderer
-GlowSquidRenderer.getBlockLightLevel	port	crates/horizon-client/src/game/creatures.rs::Game::mob_geometry	gap: player: glow squid dark-tick light is not read, so its body never brightens in the dark
+GlowSquidRenderer.getBlockLightLevel	port	crates/horizon-client/src/mobs/aquatic.rs::glow_squid_block_light	the block light a glow squid is drawn with: a clamped lerp over the remaining dark ticks, maxed with the block light; mob_geometry writes it into the second light byte
 GoatRenderer.extractRenderState	port	crates/horizon-client/src/mobs/body_anim.rs::goat	horns and ramming head pitch
 GuardianRenderer.shouldRender	skip:other		frustum culling of the beam only; the guardian body is culled by the entity culler
 GuardianRenderer.getPosition	inline	crates/horizon-client/src/mobs/guardian.rs::beam_geometry	target and eye positions
@@ -68,7 +70,7 @@ IllusionerRenderer.getBoundingBoxForCulling	port	crates/horizon-client/src/game/
 IllusionerRenderer.extractRenderState	port	crates/horizon-client/src/mobs/illusioner.rs::offsets	mirror-image offsets; casting flag
 IronGolemRenderer.extractRenderState	port	crates/horizon-client/src/mobs/golem.rs::client_tick	gap: player: the offered poppy is not drawn in the golem hand and cracks from damage are not drawn
 IronGolemRenderer.setupRotations	port	crates/horizon-client/src/mobs/render.rs::base_transform_at	the 6.5-degree triangle wave over a 13-block walk phase
-ItemEntityRenderer.extractRenderState	port	crates/horizon-client/src/game/item_draw.rs::Game::dropped_item_geometry	bob offset, spin and spread
+ItemEntityRenderer.extractRenderState	port	crates/horizon-client/src/game/item_draw.rs::Game::dropped_item_geometry	bob offset, spin and spread; the light is Entity.getLightProbePosition's eye (0.2125 up, on the frame's position) over getBlockLightLevel's isOnFire rule (`entities.rs::ItemEntity::light_probe`, `render_light`)
 ItemEntityRenderer.renderMultipleFromCount	port	crates/horizon-client/src/item_render.rs::cluster_poses	copies of a stack laid out by depth
 ItemFrameRenderer.submit	port	crates/horizon-client/src/game/frames.rs::Game::frame_geometry	frame model, item or map
 ItemFrameRenderer.getRenderOffset	inline	crates/horizon-client/src/game/frames.rs::Game::frame_geometry	offset in front of the wall
@@ -79,7 +81,7 @@ LivingEntityRenderer.getBoundingBoxForCulling	port	crates/horizon-client/src/gam
 LivingEntityRenderer.isEntityUpsideDown	port	crates/horizon-client/src/mobs/render.rs::base_transform_at	upside-down flip for Dinnerbone and Grumm
 LivingEntityRenderer.isUpsideDownName	inline	crates/horizon-client/src/mobs/render.rs::base_transform_at	name check folded into the flip
 LivingEntityRenderer.extractNameTags	port	crates/horizon-client/src/game/names.rs::Game::name_tags	gap: minor: unsure whether the name-tag distance attributes are read
-LivingEntityRenderer.solveBodyRot	missing		minor: unsure: no rider body-rotation clamp (85 degrees, 50 degree lag) found; mob AI turn limits only
+LivingEntityRenderer.solveBodyRot	port	crates/horizon-client/src/mobs/riders.rs::solve_body_rot	mobs through anim::body_rot, the window's player through tick_player_model
 LlamaRenderer.getTextureLocation	port	crates/horizon-client/src/mobs/render.rs::body	variant and baby texture
 LlamaRenderer.extractRenderState	port	crates/horizon-client/src/mobs/body_anim.rs::llama	chest flag; decor layers in mobs/render.rs::layers
 LlamaSpitRenderer.submit	port	crates/horizon-client/src/game/creatures.rs::Game::mob_geometry	gap: minor: drawn as a camera-facing sprite, not the spit model with its rotation
@@ -113,7 +115,7 @@ PufferfishRenderer.setupRotations	port	crates/horizon-client/src/mobs/render.rs:
 RabbitRenderer.extractRenderState	port	crates/horizon-client/src/mobs/body_anim.rs::rabbit	hop and idle head-tilt animations; Toast name in mobs/render.rs::body
 RavagerRenderer.extractRenderState	port	crates/horizon-client/src/mobs/ravager.rs::anim	stun, bite and roar clocks
 SalmonRenderer.setupRotations	port	crates/horizon-client/src/mobs/aquatic.rs::rotations	the 4.3-amplitude swim wiggle and the flop
-SheepRenderer.extractRenderState	port	crates/horizon-client/src/mobs/render.rs::sheep_wool_rgb	gap: player: sheep named jeb_ do not cycle their wool colour; head eat and sheared state read elsewhere
+SheepRenderer.extractRenderState	inline	crates/horizon-client/src/mobs/render.rs::layers	the sheep's extra layers: a jeb_ custom name takes jeb_wool_rgb(age), else pack_dyes::sheep_wool(color); the undercoat and sheared rules are in the same arm, head eat and age elsewhere
 ShulkerBulletRenderer.submit	port	crates/horizon-client/src/game/creatures.rs::Game::mob_geometry	gap: minor: drawn as a spark sprite, not the spinning two-layer model
 ShulkerBulletRenderer.getBlockLightLevel	port	crates/horizon-client/src/game/creatures.rs::Game::mob_geometry	15 block light wherever the bullet flies; the same pass carries `EntityRenderer.getBlockLightLevel`'s isOnFire rule and `getPackedLightCoords`' eye probe
 ShulkerBulletRenderer.extractRenderState	inline	crates/horizon-client/src/game/creatures.rs::Game::mob_geometry	rotation read there

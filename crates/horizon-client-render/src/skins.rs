@@ -24,11 +24,42 @@ pub struct Textures {
     pub signed: bool,
 }
 
-/// The `getTexture` endpoint's valid URIs from Minecraft services discovery.
+/// The `getTexture` endpoint's valid URIs in production's services discovery
+/// document (`MinecraftServicesEnvironment.PROD`).
 pub const TEXTURE_URIS: [&str; 2] = [
     "https://textures.minecraft.net/texture/{textureId}",
     "http://textures.minecraft.net/texture/{textureId}",
 ];
+
+/// `MinecraftServicesDiscoveryService`'s valid texture URIs: the discovery
+/// document's `profiles` / `getTexture` `validUris`, which
+/// `MinecraftServicesSessionService.isAllowedTextureDomain` checks texture URLs
+/// against. Production's document lists [`TEXTURE_URIS`], so they are used
+/// without asking it; another environment (`HORIZON_API_DISCOVERY`) is asked
+/// once per game, and keeps [`TEXTURE_URIS`] when its document lists none or
+/// can't be fetched.
+pub fn texture_uris() -> &'static [String] {
+    static URIS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    URIS.get_or_init(|| {
+        crate::auth::discovery_overridden()
+            .then(|| crate::auth::discovery().ok())
+            .flatten()
+            .and_then(|doc| discovery_texture_uris(&doc))
+            .unwrap_or_else(|| TEXTURE_URIS.map(str::to_owned).to_vec())
+    })
+}
+
+/// The `profiles` / `getTexture` endpoint's `validUris` in a discovery
+/// document, when it lists any.
+fn discovery_texture_uris(doc: &serde_json::Value) -> Option<Vec<String>> {
+    let uris: Vec<String> = doc
+        .pointer("/discovery/profiles/endpoints/getTexture/validUris")?
+        .as_array()?
+        .iter()
+        .filter_map(|u| u.as_str().map(str::to_owned))
+        .collect();
+    (!uris.is_empty()).then_some(uris)
+}
 
 /// `java.util.Base64.getDecoder().decode`.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
@@ -44,7 +75,7 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
 
 /// `unpackTextures(property)`: the textures of a `textures` property's
 /// base64 JSON payload.
-pub fn unpack(value: &str, signature: Signature, valid_uris: &[&str]) -> Textures {
+pub fn unpack(value: &str, signature: Signature, valid_uris: &[impl AsRef<str>]) -> Textures {
     let empty = Textures::default();
     let Some(json) = base64_decode(value)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -68,7 +99,7 @@ pub fn unpack(value: &str, signature: Signature, valid_uris: &[&str]) -> Texture
         };
         let allowed = valid_uris
             .iter()
-            .any(|u| url.starts_with(&u.replace("{textureId}", "")));
+            .any(|u| url.starts_with(&u.as_ref().replace("{textureId}", "")));
         if !allowed {
             return empty;
         }
@@ -95,7 +126,7 @@ pub fn unpack(value: &str, signature: Signature, valid_uris: &[&str]) -> Texture
 /// those textures be unsigned (`getInsecureSkinInformation`).
 pub fn profile_skin_url(profile: &serde_json::Value) -> Option<String> {
     let (value, signature) = parse_profile(profile).textures?;
-    unpack(&value, signature, &TEXTURE_URIS).skin
+    unpack(&value, signature, texture_uris()).skin
 }
 
 /// The textures of a Minecraft services `/minecraft/profile` answer: the
@@ -114,7 +145,7 @@ pub fn services_profile_textures(profile: &serde_json::Value) -> Textures {
         .and_then(|t| t.get("url"))
         .and_then(|u| u.as_str())
         .filter(|url| {
-            TEXTURE_URIS
+            texture_uris()
                 .iter()
                 .any(|u| url.starts_with(&u.replace("{textureId}", "")))
         })
@@ -127,7 +158,7 @@ pub fn services_profile_textures(profile: &serde_json::Value) -> Textures {
         .and_then(|t| t.get("url"))
         .and_then(|u| u.as_str())
         .filter(|url| {
-            TEXTURE_URIS
+            texture_uris()
                 .iter()
                 .any(|u| url.starts_with(&u.replace("{textureId}", "")))
         })
@@ -155,7 +186,7 @@ pub fn profile_skin_url_nbt(profile: &horizon_world::nbt::Tag) -> Option<String>
             .then(|| nbt_text(p.get("value")))
             .flatten()
     })?;
-    unpack(&value, Signature::Unsigned, &TEXTURE_URIS).skin
+    unpack(&value, Signature::Unsigned, texture_uris()).skin
 }
 
 /// `ResolvableProfile.skinPatch().body()` of a skull's `profile` NBT: the
@@ -237,6 +268,7 @@ pub struct Resolver {
     done: std::sync::mpsc::Receiver<(NameOrId, Option<ResolvedProfile>)>,
     send: std::sync::mpsc::Sender<(NameOrId, Option<ResolvedProfile>)>,
     last_sweep: std::time::Instant,
+    heads: HeadProfiles,
 }
 struct Entry {
     touched: std::time::Instant,
@@ -304,6 +336,7 @@ impl Resolver {
             done,
             send,
             last_sweep: std::time::Instant::now(),
+            heads: HeadProfiles::default(),
         }
     }
     /// `CacheBuilder.expireAfterAccess` with `maximumSize`.
@@ -465,6 +498,64 @@ pub fn dynamic_nbt(profile: &horizon_world::nbt::Tag) -> Option<NameOrId> {
     }
 }
 
+const MAX_HEAD_PROFILES: usize = 4096;
+
+#[derive(Debug, PartialEq)]
+struct HeadProfile {
+    info: ProfileInfo,
+    skin: Option<(String, String)>,
+}
+
+fn prepare_head(profile: &serde_json::Value) -> HeadProfile {
+    let info = parse_profile(profile);
+    let skin = info.textures.as_ref().and_then(|(value, signature)| {
+        let url = unpack(value, *signature, texture_uris()).skin?;
+        let location = skin_location(&texture_hash(&url)?);
+        Some((url, location))
+    });
+    HeadProfile { info, skin }
+}
+
+#[derive(Default)]
+struct HeadProfiles {
+    entries: std::collections::HashMap<serde_json::Value, std::sync::Arc<HeadProfile>>,
+    nbt: std::collections::HashMap<horizon_world::nbt::Tag, std::sync::Arc<serde_json::Value>>,
+    resolved: [std::collections::HashMap<String, std::sync::Arc<HeadProfile>>; 2],
+}
+
+impl HeadProfiles {
+    fn get(&mut self, profile: &serde_json::Value) -> std::sync::Arc<HeadProfile> {
+        if let Some(parsed) = self.entries.get(profile) {
+            return parsed.clone();
+        }
+        if self.entries.len() >= MAX_HEAD_PROFILES {
+            self.entries.clear();
+        }
+        let parsed = std::sync::Arc::new(prepare_head(profile));
+        self.entries.insert(profile.clone(), parsed.clone());
+        parsed
+    }
+}
+
+impl Resolver {
+    /// Cache by NBT value rather than address: equipment can be replaced or
+    /// mutated in place, and neither must leave a stale profile behind.
+    pub fn head_profile_nbt(
+        &mut self,
+        profile: &horizon_world::nbt::Tag,
+    ) -> std::sync::Arc<serde_json::Value> {
+        if let Some(json) = self.heads.nbt.get(profile) {
+            return json.clone();
+        }
+        if self.heads.nbt.len() >= MAX_HEAD_PROFILES {
+            self.heads.nbt.clear();
+        }
+        let json = std::sync::Arc::new(crate::scoreboard::tag_to_json(profile));
+        self.heads.nbt.insert(profile.clone(), json.clone());
+        json
+    }
+}
+
 /// `PlayerSkinRenderCache.getOrDefault` for a head: the resolved skin once
 /// its texture is in the atlas (`atlas`), else `partialProfile`'s default.
 pub fn head_skin(
@@ -478,32 +569,54 @@ pub fn head_skin(
     {
         return sprite;
     }
-    let p = parse_profile(profile);
-    let property = p.textures.or_else(|| {
-        let key = p.dynamic.as_ref()?;
+    let p = resolver.heads.get(profile);
+    // Dynamic resolution is deliberately not cached: pending answers and the
+    // resolver's expiring service results must still advance on every draw.
+    let resolved = p.info.dynamic.as_ref().and_then(|key| {
+        if p.info.textures.is_some() {
+            return None;
+        }
         match resolver.state(key) {
-            Resolve::Done(Some(profile)) => profile.textures(),
+            Resolve::Done(Some(profile)) => {
+                let (_, value, signature) = profile
+                    .properties
+                    .iter()
+                    .find(|(n, _, _)| n == "textures")?;
+                let cache = &mut resolver.heads.resolved[usize::from(signature.is_some())];
+                if let Some(parsed) = cache.get(value) {
+                    return Some(parsed.clone());
+                }
+                if cache.len() >= MAX_HEAD_PROFILES {
+                    cache.clear();
+                }
+                let property = if signature.is_some() {
+                    serde_json::json!({"name": "textures", "value": value, "signature": ""})
+                } else {
+                    serde_json::json!({"name": "textures", "value": value})
+                };
+                let parsed = std::sync::Arc::new(prepare_head(
+                    &serde_json::json!({"properties": [property]}),
+                ));
+                cache.insert(value.clone(), parsed.clone());
+                Some(parsed)
+            }
             _ => None,
         }
     });
-    if let Some((value, signature)) = property
-        && let Some(url) = unpack(&value, signature, &TEXTURE_URIS).skin
-        && let Some(hash) = texture_hash(&url)
-    {
-        let location = skin_location(&hash);
-        match downloads.state(Kind::Skin, &url) {
-            Download::Ready if atlas(&location) => {
-                downloads.drawn(&location);
-                return location;
+    if let Some((url, location)) = resolved.as_deref().unwrap_or(&p).skin.as_ref() {
+        match downloads.state(Kind::Skin, url) {
+            Download::Ready if atlas(location) => {
+                downloads.drawn(location);
+                return location.clone();
             }
             // Its slot was evicted: offer the image again.
             Download::Ready => {
-                downloads.again(&location);
+                downloads.again(location);
             }
             _ => {}
         }
     }
-    crate::tab_list::default_skin(p.id).to_owned()
+    crate::tab_list::default_skin(p.info.id).to_owned()
 }
 
 /// `PlayerSkin.Patch.apply` for a head: the sprite of a profile's `texture`
@@ -1137,6 +1250,80 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn head_profile_cache_matches_uncached_and_is_bounded() {
+        use base64::Engine;
+        let mut cache = super::HeadProfiles::default();
+        for (url, slim) in [
+            ("https://textures.minecraft.net/texture/abc", false),
+            ("https://textures.minecraft.net/texture/abc", true),
+            ("https://evil.example/texture/abc", false),
+        ] {
+            let payload = serde_json::json!({"textures": {
+                "SKIN": {"url": url, "metadata": {"model": if slim { "slim" } else { "classic" }}},
+                "CAPE": {"url": "http://textures.minecraft.net/texture/cape"}
+            }});
+            let value = base64::engine::general_purpose::STANDARD.encode(payload.to_string());
+            for signed in [false, true] {
+                let mut property = serde_json::json!({"name": "textures", "value": value});
+                if signed {
+                    property["signature"] = serde_json::Value::Null;
+                }
+                let profile = serde_json::json!({"properties": [property]});
+                let parsed = cache.get(&profile);
+                assert_eq!(*parsed, super::prepare_head(&profile));
+                let textures = super::unpack(
+                    &value,
+                    if signed {
+                        super::Signature::Signed
+                    } else {
+                        super::Signature::Unsigned
+                    },
+                    &super::TEXTURE_URIS,
+                );
+                assert_eq!(textures.slim, slim && !url.contains("evil"));
+                assert_eq!(textures.cape.is_some(), !url.contains("evil"));
+                assert_eq!(parsed.skin.is_some(), !url.contains("evil"));
+                assert!(std::sync::Arc::ptr_eq(&parsed, &cache.get(&profile)));
+            }
+        }
+        for profile in [
+            serde_json::json!({"properties": [{"name": "textures", "value": "!bad"}]}),
+            serde_json::json!({"name": "Notch"}),
+            serde_json::json!({}),
+        ] {
+            let parsed = cache.get(&profile);
+            assert_eq!(*parsed, super::prepare_head(&profile));
+            assert!(parsed.skin.is_none());
+            assert!(std::sync::Arc::ptr_eq(&parsed, &cache.get(&profile)));
+        }
+        cache.entries.clear();
+        for i in 0..super::MAX_HEAD_PROFILES {
+            cache.get(&serde_json::json!({"id": i}));
+        }
+        assert_eq!(cache.entries.len(), super::MAX_HEAD_PROFILES);
+        cache.get(&serde_json::json!({}));
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn head_profile_nbt_cache_tracks_value_changes() {
+        let mut resolver = super::Resolver::new();
+        let mut tag = horizon_world::nbt::Tag::String("Notch".into());
+        let first = resolver.head_profile_nbt(&tag);
+        assert_eq!(*first, crate::scoreboard::tag_to_json(&tag));
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            &resolver.head_profile_nbt(&tag)
+        ));
+        tag = horizon_world::nbt::Tag::String("Alex".into());
+        assert_eq!(*resolver.head_profile_nbt(&tag), serde_json::json!("Alex"));
+        for i in 0..super::MAX_HEAD_PROFILES {
+            resolver.head_profile_nbt(&horizon_world::nbt::Tag::Int(i as i32));
+        }
+        assert!(resolver.heads.nbt.len() < super::MAX_HEAD_PROFILES);
+    }
+
     /// A profile's `texture` names a pack texture, never a file outside the
     /// packs: bad characters and `..` segments draw nothing.
     #[test]
@@ -1204,6 +1391,33 @@ mod tests {
         assert!(super::read_offline_skin(&file, "slim").is_err());
         assert!(super::read_offline_skin(&dir.join("missing.png"), "").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `MinecraftServicesDiscoveryService`: another environment's document
+    /// names its own texture host; one that lists none names nothing.
+    #[test]
+    fn texture_uris_come_from_the_discovery_document() {
+        use super::{Signature, discovery_texture_uris, unpack};
+        let doc = serde_json::json!({"discovery": {"profiles": {"endpoints": {"getTexture": {
+            "validUris": ["https://skins.example.org/t/{textureId}"]
+        }}}}});
+        let uris = discovery_texture_uris(&doc).unwrap();
+        assert_eq!(uris, ["https://skins.example.org/t/{textureId}"]);
+        // {"textures":{"SKIN":{"url":"https://skins.example.org/t/abc"}}}
+        let ours =
+            "eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHBzOi8vc2tpbnMuZXhhbXBsZS5vcmcvdC9hYmMifX19";
+        assert_eq!(
+            unpack(ours, Signature::Signed, &uris).skin.as_deref(),
+            Some("https://skins.example.org/t/abc")
+        );
+        assert_eq!(
+            unpack(ours, Signature::Signed, &super::TEXTURE_URIS).skin,
+            None
+        );
+        let none = serde_json::json!({"discovery": {"profiles": {"endpoints": {}}}});
+        assert_eq!(discovery_texture_uris(&none), None);
+        let empty = serde_json::json!({"discovery": {"profiles": {"endpoints": {"getTexture": {"validUris": []}}}}});
+        assert_eq!(discovery_texture_uris(&empty), None);
     }
 
     /// `MinecraftProfileTexture.getMetadata("model")`: `slim` marks a slim

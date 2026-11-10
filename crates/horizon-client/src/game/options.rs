@@ -3,6 +3,7 @@
 use super::{Game, Screen};
 use horizon_client::{
     Result,
+    hdr_calibration::WindowState,
     hud::HudBatch,
     lang,
     options_ui::{Event, Page},
@@ -123,10 +124,11 @@ impl Game<'_> {
         self.keys.clear();
         self.screen = Screen::Options;
         self.options_from_title = from_title;
-        self.options_to_game = false;
         let minecart_improvements = self.minecart_improvements();
+        let mods_live = self.mods_live_now();
         let ui = &mut self.ui.options;
         ui.open_at(!from_title && self.title.is_none(), page);
+        ui.mods_live = mods_live;
         ui.minecart_improvements = minecart_improvements;
         let root = self.options.resources.clone();
         ui.languages = lang::available(&[&root]);
@@ -170,6 +172,7 @@ impl Game<'_> {
         if changed {
             let infos = super::packs::pack_infos(&self.vanilla_root(), &self.server_packs.active);
             self.ui.options.update_pack_infos(infos);
+            self.ui.options.pack_configs = super::packs::pack_configs(&self.vanilla_root());
         }
     }
     pub(super) fn draw_options(&mut self, batch: &mut HudBatch) {
@@ -177,11 +180,15 @@ impl Game<'_> {
         let context = self.controller_settings_context();
         let mut ui = std::mem::take(&mut self.ui.options);
         if ui.controller_open() {
-            ui.controller.context = context;
+            ui.set_controller_context(context);
         }
-        ui.draw(&self.settings, batch, &self.gui.atlas, self.cursor);
+        let output = self
+            .renderer
+            .as_ref()
+            .map_or(Default::default(), |r| r.output());
+        ui.draw(&self.settings, output, batch, &self.gui.atlas, self.cursor);
         self.ui.options = ui;
-        self.show_calibration(batch.height);
+        self.show_calibration((batch.width, batch.height));
     }
     /// Whose controller settings these are and what this game sees (`controller_ui`): the
     /// player's badge in splitscreen with its name, and its own controller.
@@ -195,15 +202,14 @@ impl Game<'_> {
             player,
             device: self.pad.device_or_virtual(),
             detected: detected_controller_style(self.pad.device.as_ref(), self.pad.style),
-            style: self.ui.options.pad_style,
-            by_letter: self.ui.options.pad_by_letter,
+            glyphs: self.ui.options.pad_glyphs,
         }
     }
     /// HDR calibration's test picture to the renderer, full screen while it runs: the
-    /// window goes fullscreen for it and back after, if it wasn't already.
-    pub(super) fn show_calibration(&mut self, h: f32) {
+    /// window goes fullscreen for it and back after, as it was (maximized, say).
+    pub(super) fn show_calibration(&mut self, size: (f32, f32)) {
         let picture = (self.screen == Screen::Options)
-            .then(|| self.ui.options.calibration_picture(h))
+            .then(|| self.ui.options.calibration_picture(&self.gui.atlas, size))
             .flatten();
         if let Some(r) = self.renderer.as_mut() {
             r.set_hdr_calibration(picture.map(|(step, nits, band)| {
@@ -217,19 +223,25 @@ impl Game<'_> {
         let Some(window) = &self.window else {
             return;
         };
-        match (picture.is_some(), self.ui.options.calibration_fullscreen) {
+        match (picture.is_some(), self.ui.options.calibration_window) {
             (true, None) => {
-                let was = window.fullscreen().is_some();
-                if !was {
-                    window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                // Before entering fullscreen, which un-maximizes a window on Windows.
+                let was = WindowState::of(window.fullscreen().is_some(), window.is_maximized());
+                if was != WindowState::Fullscreen {
+                    let borderless = horizon_client::window::borderless_fullscreen(window);
+                    horizon_client::window::enter_fullscreen(window, borderless);
                 }
-                self.ui.options.calibration_fullscreen = Some(was);
+                self.ui.options.calibration_window = Some(was);
             }
             (false, Some(was)) => {
-                if !was {
+                let (leave_fullscreen, maximize) = was.leaving();
+                if leave_fullscreen {
                     window.set_fullscreen(None);
                 }
-                self.ui.options.calibration_fullscreen = None;
+                if maximize {
+                    window.set_maximized(true);
+                }
+                self.ui.options.calibration_window = None;
             }
             _ => {}
         }
@@ -346,6 +358,7 @@ impl Game<'_> {
                 Event::Changed => {
                     self.settings.save(&Self::options_path());
                     self.apply_settings();
+                    self.switch_mods();
                     self.sync_native_switches();
                     self.sync_pregen_option();
                     self.sync_agent_control();
@@ -374,26 +387,29 @@ impl Game<'_> {
                 Event::Close if self.ui.options.resource_error.is_some() => {}
                 Event::Close => {
                     self.settings.save(&Self::options_path());
-                    let to_game = std::mem::take(&mut self.options_to_game);
-                    self.screen = if std::mem::take(&mut self.options_to_world_options) {
+                    self.screen = if let Some(screen) = self.panel.recipes_settings_return.take() {
+                        screen
+                    } else if std::mem::take(&mut self.options_to_world_options) {
                         Screen::WorldOptions
-                    } else if self.options_from_title || to_game {
+                    } else if self.options_from_title {
                         Screen::Playing
                     } else {
                         Screen::Paused
                     };
-                    if to_game {
-                        self.capture(true);
-                    }
                     self.dragging = false;
                     // Closed from calibration (horizon-ctl, a lost window): out of it.
-                    self.show_calibration(0.0);
+                    self.show_calibration((0.0, 0.0));
                 }
                 Event::Language(code) => {
                     self.load_language(&code);
                 }
                 Event::Packs(_) => {
                     self.settings.save(&Self::options_path());
+                    self.reload_packs();
+                }
+                Event::PackOptions { entries, chosen } => {
+                    super::packs::save_pack_options(&entries, chosen);
+                    self.ui.options.pack_configs = super::packs::pack_configs(&self.vanilla_root());
                     self.reload_packs();
                 }
                 Event::OpenPackFolder => {
@@ -437,6 +453,14 @@ impl Game<'_> {
                 // The website, through ConfirmLinkScreen as other links.
                 Event::OpenModPage(url) => self.confirm_trusted_link(&url, Screen::Options),
                 Event::ListShaderPacks => {
+                    let (key, _) = horizon_client::shader_pack_list::resolve(
+                        &Self::shader_packs_dir(),
+                        &self.settings.horizon.shader_pack,
+                    );
+                    if key != self.settings.horizon.shader_pack {
+                        self.settings.horizon.shader_pack = key;
+                        self.settings.save(&Self::options_path());
+                    }
                     self.settings.shader_packs =
                         horizon_client::shader_pack_list::scan(&Self::shader_packs_dir());
                 }
@@ -457,12 +481,19 @@ impl Game<'_> {
                 Event::NativeSettings(i) => self.native_settings_refresh(i),
                 Event::NativeButton(i, b) => self.native_settings_event(i, b),
                 Event::Credits => self.open_win_screen(false, super::win::Finish::Options),
+                Event::HudEditor => self.open_hud_editor(true),
                 // AccessibilityOptionsScreen's link button: ConfirmLinkScreen
                 // back to the options screen.
                 Event::AccessibilityHelp => {
                     self.confirm_trusted_link(ACCESSIBILITY_HELP_LINK, Screen::Options)
                 }
                 Event::Narrator => self.narrator_status_changed(),
+                Event::OpenStudioReplay(path) => {
+                    let path = path.to_string_lossy().to_string();
+                    if let Err(e) = self.open_studio_replay(&path) {
+                        log::warn!("Horizon Studio: could not open {path}: {e}");
+                    }
+                }
                 Event::OpenStudioFolder => {
                     let dir = std::path::PathBuf::from("recordings");
                     let _ = std::fs::create_dir_all(&dir);
@@ -521,6 +552,14 @@ impl Game<'_> {
             self.reload_packs();
         }
         self.apply_fullscreen();
+        // A failed HDR start that named no driver becomes the window's driver's, and another
+        // driver's is dropped, so HDR output is tried again.
+        if let Some(driver) = self.renderer.as_ref().and_then(|r| r.hdr_driver())
+            && self.settings.horizon.settle_failed_start(driver)
+            && let Some(dir) = Self::options_path().parent()
+        {
+            self.settings.horizon.save(dir);
+        }
         let s = &self.settings;
         if let Some(r) = self.renderer.as_mut() {
             r.gamma = s.gamma;
@@ -539,19 +578,26 @@ impl Game<'_> {
                 s.horizon.fxaa,
                 s.horizon.taa,
                 s.horizon.upscaling.ratio(),
+                s.horizon.upscaling_sharpness as f32 / 100.0,
             );
             r.set_frame_generation(
                 s.horizon.frame_generation != horizon_client::graphics::FrameGeneration::Off,
             );
             r.set_hdr_lighting(s.horizon.hdr_lighting);
             // Where it is offered (`Renderer::gpu_culling_offer`); unchanged, it does nothing.
-            let _ = r.set_gpu_culling(s.horizon.gpu_culling);
-            r.set_hdr(
-                s.horizon.hdr,
-                s.horizon.paper_white_nits() as f32,
-                s.horizon.peak_nits() as f32,
-                s.horizon.black_level_nits(),
-                s.horizon.hdr_ui_brightness as f32 / 100.0,
+            // Auto has it on while its measurements say so (`GpuCullingAuto`), and starts over
+            // when the choice is another one.
+            let gpu_culling = match s.horizon.gpu_culling {
+                horizon_client::graphics::GpuCullingMode::Off => false,
+                horizon_client::graphics::GpuCullingMode::On => true,
+                horizon_client::graphics::GpuCullingMode::Auto => self.gpu_culling_auto.on(),
+            };
+            if s.horizon.gpu_culling != horizon_client::graphics::GpuCullingMode::Auto {
+                self.gpu_culling_auto.reset();
+            }
+            let _ = r.set_gpu_culling(gpu_culling);
+            r.update_output(
+                &s.horizon,
                 &Self::options_path().with_file_name(horizon_client::graphics::HDR_MARKER),
             );
         }
@@ -591,7 +637,7 @@ impl Game<'_> {
     pub(super) fn observe_fullscreen(&mut self) {
         // HDR calibration's own fullscreen is not the player's option: it
         // goes back to what it was when the calibration ends.
-        if self.ui.options.calibration_fullscreen.is_some() {
+        if self.ui.options.calibration_window.is_some() {
             return;
         }
         let Some(w) = &self.window else { return };
@@ -616,8 +662,11 @@ impl Game<'_> {
             }
             if let Some(w) = &self.window {
                 let on = w.fullscreen().is_none();
-                w.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
-                if !on {
+                if on {
+                    let borderless = horizon_client::window::borderless_fullscreen(w);
+                    horizon_client::window::enter_fullscreen(w, borderless);
+                } else {
+                    w.set_fullscreen(None);
                     windowed_again(w);
                 }
             }

@@ -20,12 +20,11 @@ again restores vanilla's behaviour completely.
 | Sort order and its clicks | `crates/horizon-client/src/inv_sort.rs` (pure, unit tested) |
 | The music page's rows, and the pools it filters | `options_ui.rs` (`Page::Music`), `crates/horizon-client/src/music.rs` (`track_groups`, `MusicManager::set_off`), `sound_events.rs` (`sound_except`) |
 | Cosmetics (show mine, show others'), off with their flag | `extras.rs`, `crates/horizon-client/src/game/cosmetics.rs` ([cosmetics.md](cosmetics.md)) |
-| The settings page | `options_ui.rs` (`Page::Extras`): **Options → Horizon Settings... → Extras...**; fullbright, dynamic lights and hiding block-break particles change the picture, so they are on the graphics screen's Quality page instead (`graphics_ui.rs`, **Options → Video Settings...**) |
 | Ultimine: shapes, kinds, selection, outline, limits | `crates/horizon-client-render/src/ultimine.rs` (pure, unit tested), `game/ultimine.rs` |
-| The settings page | `options_ui.rs` (`Page::Extras`): **Options → Horizon Settings... → Extras...** |
+| The settings page | `extras_ui.rs` (`Page::Extras`, on `settings_shell.rs`): **Options → Horizon Settings... → Extras...**; fullbright, dynamic lights and hiding block-break particles change the picture, so they are on the graphics screen's Quality page instead (`graphics_ui.rs`, **Options → Video Settings...**) |
 
-The settings are grouped by extra, under a header each, two buttons to a row as
-vanilla's options lists are, and each says what it does in its tooltip. An
+The settings are grouped by extra, under a header each, one to a row, and the strip
+under the list says what the row in focus or under the pointer does. An
 extra's own settings (its key, corner, size...) are greyed out while its switch
 is off (`Item::parent`).
 
@@ -79,7 +78,8 @@ horizon-rust/horizon-mods under `native/<name>/`, [mods.md](mods.md#horizons-off
 options. Players install them from the launcher's Mods page, and the launcher builds them into the game
 ([native-mods.md](native-mods.md)). The game keeps
 the hook points they use (`crates/horizon-client/src/game/native_hooks.rs`), and `horizon-extras.txt` keeps the old
-keys and `movedToMods`.
+keys and `movedToMods`. The Extras page keeps a **Zoom** row: the mod's switch and Settings button when
+it is built in, else a note saying to install it from the Mods page.
 
 The game still draws the minimap, for the native mod (`native_minimap` in `native_hooks.rs`, [mods.md](mods.md)):
 - a corner map (top right by default), square or round, small/medium/large, zoom 0.5 to 4 blocks per pixel, rotating
@@ -166,10 +166,13 @@ once and the screens click exactly as vanilla's (`tools/test_menu_click_parity.p
 and the container screen tests are unchanged).
 
 ### Sorting (`sort`, default off; `sortKey`, unbound)
-- A small button right of the container's title (chests, barrels, ender
-  chests, shulker boxes) and one right of the "Inventory" line (the main
-  inventory; the hotbar is left alone). The key, when bound on the Extras
-  page, sorts the part under the cursor (the container when over no slot).
+- On every menu screen, by its slots' roles (`native_slot_roles`): a small
+  button over the top right of its storage slots (chests, barrels, ender
+  chests, shulker boxes, hoppers, dispensers, a mount's chest, a mod menu
+  type's linked slots) and one right of the "Inventory" line (the main
+  inventory; the hotbar is left alone), crafting tables and workstations
+  included. The key, when bound on the Extras page, sorts the part under the
+  cursor (the storage when over no slot).
 - Partial stacks of one item merge, then the stacks go in creative tab order
   (the search tab's), then by name; full stacks before the partial one,
   empty slots last. It needs an empty hand.
@@ -190,7 +193,7 @@ and the container screen tests are unchanged).
 
 ### Scroll wheel changes settings (`wheelCyclesListSettings`, default off)
 - Off, as in vanilla, the wheel scrolls the list under the cursor, on every settings page, Video's
-  included (`AbstractScrollArea.mouseScrolled`, `OptionsUi::wheel`, `GraphicsUi::wheel`). Scrolling
+  included (`AbstractScrollArea.mouseScrolled`, `OptionsUi::wheel`, `GraphicsScreen::wheel_step`). Scrolling
   through a long page can't change an option that passes under the cursor (#5455, #9633). A cycle
   button outside a list, such as a world's Difficulty, still steps
   (`CycleButton.mouseScrolled`).

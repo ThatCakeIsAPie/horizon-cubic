@@ -28,6 +28,10 @@ use std::{
 pub use horizon_client_core::particle_type::ParticleType;
 pub use horizon_items::firework::{DYE_FIREWORK_COLORS, FireworkExplosion, FireworkShape};
 mod native;
+pub mod polytone;
+mod polytone_gpu;
+mod polytone_model;
+mod spawn;
 pub use native::{ParticleController, ParticleUpdate};
 
 /// `ParticleOptions` with the parameters of the option classes used here.
@@ -58,6 +62,17 @@ pub struct ParticleOptions {
     /// A native mod's own particle type, by its namespaced name (`mymod:spark`):
     /// `SimpleParticleType` plus the provider `particles/<name>.json` names.
     pub mod_particle: Option<String>,
+    /// Pre-1.20.5 entity-effect providers use spawn velocity as RGB; true is the ambient provider.
+    pub legacy_entity_effect: Option<bool>,
+    /// A pre-1.21.4 server's trail, which had no duration: TrailParticle.Provider chose
+    /// `nextInt(40) + 10` after constructing the particle. Set by the client for an older
+    /// server only, never read from the wire.
+    pub legacy_trail_lifetime: bool,
+    /// The block or item a `BlockParticleOption` or `ItemParticleOption` carries
+    /// (`minecraft:stone`), for resource packs' particle modifier filters.
+    pub source: Option<std::sync::Arc<str>>,
+    /// What the Polytone emitter that spawned this custom particle sets on it.
+    pub polytone_seed: Option<std::sync::Arc<polytone::Seed>>,
 }
 impl ParticleOptions {
     pub fn simple(ty: ParticleType) -> Self {
@@ -72,14 +87,10 @@ impl ParticleOptions {
             geyser: None,
             vibration: None,
             mod_particle: None,
-        }
-    }
-    /// A native mod's `SimpleParticleType`: the sprite set of
-    /// `assets/<namespace>/particles/<path>.json`, drawn as a plain billboard.
-    pub fn named(name: impl Into<String>) -> Self {
-        Self {
-            mod_particle: Some(name.into()),
-            ..Self::simple(ParticleType::Smoke)
+            legacy_entity_effect: None,
+            legacy_trail_lifetime: false,
+            polytone_seed: None,
+            source: None,
         }
     }
     /// `GeyserParticleOptions(type, waterBlocks)`.
@@ -213,6 +224,8 @@ enum Light {
     AgeEmission4,
     /// `FireflyParticle.getLightCoords`: block light fading in and out, no sky.
     Firefly,
+    /// A Polytone particle's `light_level`: block light at least this level.
+    MinBlock(u8),
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Behaviour {
@@ -514,6 +527,14 @@ pub struct Particle {
     /// `Particle.random`: the particle's own generator (`RandomSource.create()`).
     random: LegacyRandom,
     controller: Option<Box<dyn native::Controller>>,
+    /// A resource pack's Polytone custom particle type, for its `limit` and `exclusion_radius`.
+    polytone_type: Option<std::sync::Arc<str>>,
+    /// A Polytone model particle's faces, drawn instead of its sprite quad.
+    model: Option<std::sync::Arc<polytone_model::ParticleModel>>,
+    /// How a Polytone custom particle's quad turns (`rotation_mode`).
+    orientation: polytone_gpu::Orientation,
+    /// Blended additively (a Polytone `additive_translucent` particle).
+    additive: bool,
 }
 fn aabb_at(p: [f64; 3], w: f32, h: f32) -> Aabb {
     let w = f64::from(w) / 2.0;
@@ -875,6 +896,10 @@ impl Particle {
             frame_ticks: 0,
             random: LegacyRandom::new(0),
             controller: None,
+            polytone_type: None,
+            model: None,
+            orientation: polytone_gpu::Orientation::Camera,
+            additive: false,
         }
     }
     /// The normal age/removal test and previous pose, without vanilla motion.
@@ -1076,6 +1101,7 @@ impl Particle {
                 let b = (b * b) * (b * b);
                 (sky, (block + (b.clamp(0.0, 1.0) * 240.0) as u32).min(240))
             }
+            Light::MinBlock(level) => (sky, block.max(u32::from(level) * 16)),
             Light::Firefly => (
                 0,
                 (255.0 * fade_amount(self.lifetime_progress(self.age as f32 + partial), 0.1, 0.3))
@@ -1169,6 +1195,27 @@ pub struct QuadSnapshot {
     pub light: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TrackingTarget {
+    LocalPlayer,
+    Entity(i32),
+}
+
+/// The entity position and current dimensions that `getX/Y/Z(double)` use.
+#[derive(Clone, Copy)]
+pub struct TrackingBody {
+    pub feet: [f64; 3],
+    pub width: f64,
+    pub height: f64,
+}
+
+struct TrackingEmitter {
+    options: ParticleOptions,
+    target: Option<TrackingTarget>,
+    body: TrackingBody,
+    remaining: u32,
+}
+
 /// World access for particle physics.
 pub struct ParticleLevel<'a> {
     pub world: &'a World,
@@ -1176,8 +1223,9 @@ pub struct ParticleLevel<'a> {
     pub collision: &'a BlockCollisionRegistry<'a>,
     /// Local player feet position and vertical velocity (`PlayerCloudParticle`).
     pub player: Option<([f64; 3], f64)>,
+    pub cached_chunk: std::cell::Cell<Option<((i32, i32), Option<&'a crate::chunk::Chunk>)>>,
 }
-impl ParticleLevel<'_> {
+impl<'a> ParticleLevel<'a> {
     fn collide(&self, bb: Aabb, d: [f64; 3]) -> [f64; 3] {
         let mut scene = SceneCollisions {
             world: self.world,
@@ -1185,9 +1233,6 @@ impl ParticleLevel<'_> {
             subject: None,
         };
         let movement = Vec3::new(d[0], d[1], d[2]);
-        // `Entity.collideBoundingBox(null, ...)`: no entity shapes, no border. Where no
-        // block of the swept box's cells can collide, it finds no shape and the
-        // movement stands, as the resolution below would return it.
         if scene.cells_without_collision(bb.expand_towards(movement)) {
             return d;
         }
@@ -1203,38 +1248,46 @@ impl ParticleLevel<'_> {
             p[2].floor() as i32,
         ]
     }
+    #[inline]
+    pub fn block(&self, x: i32, y: i32, z: i32) -> horizon_world::registry::BlockStateId {
+        let (cx, cz) = (x >> 4, z >> 4);
+        let chunk = match self.cached_chunk.get() {
+            Some(((ccx, ccz), c)) if ccx == cx && ccz == cz => c,
+            _ => {
+                let c = self.world.chunks.get(&(cx, cz)).map(|c| c.as_ref());
+                self.cached_chunk.set(Some(((cx, cz), c)));
+                c
+            }
+        };
+        chunk.map_or(self.world.air, |c| c.block(x & 15, y, z & 15))
+    }
     /// The fluid at a block and `FluidState.getHeight`.
     fn fluid(&self, b: [i32; 3]) -> (Fluid, f64) {
-        let s = self.facts.get(self.world.block(b[0], b[1], b[2]));
+        let s = self.facts.get(self.block(b[0], b[1], b[2]));
         if s.fluid == Fluid::None {
             return (Fluid::None, 0.0);
         }
-        let above = self.facts.get(self.world.block(b[0], b[1] + 1, b[2]));
-        let height = if above.fluid == s.fluid {
+        let above = self.facts.get(self.block(b[0], b[1] + 1, b[2]));
+        let h = if above.fluid == s.fluid {
             1.0
         } else {
             f64::from(s.fluid_level) / 9.0
         };
-        (s.fluid, height)
+        (s.fluid, h)
     }
     /// The fluid at a block and whether it is a source (`FluidState.isSource`).
     pub(crate) fn fluid_source(&self, b: [i32; 3]) -> (Fluid, bool) {
-        let s = self.facts.get(self.world.block(b[0], b[1], b[2]));
+        let s = self.facts.get(self.block(b[0], b[1], b[2]));
         (s.fluid, s.fluid_level == 8 && !s.fluid_falling)
     }
     /// `getCollisionShape(...).max(Y, x, z)` for cached shapes.
     fn collision_top(&self, b: [i32; 3], fx: f64, fz: f64) -> f64 {
-        let state = self.world.block(b[0], b[1], b[2]);
+        let state = self.block(b[0], b[1], b[2]);
         match self.collision.cached_shapes().cached_shape(state) {
             Ok(Some(shape)) if !shape.is_empty() => shape.max_at(Axis::Y, fx, fz),
             Ok(Some(_)) => 0.0,
-            _ => {
-                if self.facts.get(state).full_collision {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
+            _ if self.facts.get(state).full_collision => 1.0,
+            _ => 0.0,
         }
     }
 }
@@ -1243,6 +1296,9 @@ impl ParticleLevel<'_> {
 pub struct ParticleEngine {
     particles: Vec<Particle>,
     pending: Vec<Particle>,
+    /// While the live particles tick (out of `particles`), what their emitters spawn waits
+    /// here, so a spawn's `limit` and `exclusion_radius` see every live particle.
+    spawned_in_tick: Option<Vec<(ParticleOptions, [f64; 3], [f64; 3])>>,
     /// `ParticleEngine.random`, handed to every `ParticleProvider`.
     random: LegacyRandom,
     /// `ClientLevel.random` as particle constructors use it (`level.getRandom()`).
@@ -1269,8 +1325,17 @@ pub struct ParticleEngine {
     /// A native mod's sprite sets, by namespaced particle name.
     mod_sets: HashMap<String, (u32, Option<ModBehaviour>)>,
     set_sprites: Vec<Vec<u32>>,
-    /// `TrackingEmitter`s: particle type, entity feet position, width, height, ticks left.
-    emitters: Vec<(ParticleOptions, [f64; 3], f64, f64, u32)>,
+    /// Resource packs' Polytone custom particle types (#11486).
+    polytone: Option<std::sync::Arc<polytone::Registry>>,
+    /// Vanilla particle types a pack replaces with a custom one of the same id
+    /// (`assets/minecraft/polytone/custom_particles/rain.json` is `minecraft:rain`).
+    polytone_overrides: HashMap<ParticleType, String>,
+    /// The packs' GPU particles' records, one store per type, and the ticks they count in.
+    polytone_gpu: Vec<polytone_gpu::Store>,
+    polytone_ticks: u64,
+    /// The last frame's additively blended quads (`take_additive`).
+    additive: std::sync::Mutex<Vec<Vertex>>,
+    emitters: Vec<TrackingEmitter>,
     /// Camera position for the 32-block spawn limiter.
     pub camera: [f64; 3],
     /// The Particles option (`ParticleStatus`): 0 all, 1 decreased, 2 minimal.
@@ -1448,6 +1513,7 @@ impl ParticleEngine {
         let mut engine = Self {
             particles: Vec::new(),
             pending: Vec::new(),
+            spawned_in_tick: None,
             random: LegacyRandom::new(0x7061_7274),
             level_random: LegacyRandom::new(0x6c65_7665),
             spell_random: LegacyRandom::new(0x7370_656c),
@@ -1461,6 +1527,11 @@ impl ParticleEngine {
             sets: HashMap::new(),
             mod_sets: HashMap::new(),
             set_sprites: Vec::new(),
+            polytone: None,
+            polytone_overrides: HashMap::new(),
+            polytone_gpu: Vec::new(),
+            polytone_ticks: 0,
+            additive: std::sync::Mutex::default(),
             emitters: Vec::new(),
             starters: Vec::new(),
             tracked_explosions: Vec::new(),
@@ -1681,6 +1752,37 @@ impl ParticleEngine {
         particle.controller = Some(Box::new(controller));
         Some(particle)
     }
+    /// Sets (or clears) the resource packs' Polytone custom particle types.
+    pub fn set_polytone(&mut self, registry: Option<std::sync::Arc<polytone::Registry>>) {
+        let registry = registry.filter(|r| !r.is_empty());
+        let same = match (&self.polytone, &registry) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.polytone_gpu.clear();
+            self.polytone_overrides = registry
+                .iter()
+                .flat_map(|r| {
+                    ParticleType::ALL.iter().filter_map(|&ty| {
+                        let id = format!("minecraft:{}", ty.name());
+                        r.get(&id).is_some().then_some((ty, id))
+                    })
+                })
+                .collect();
+        }
+        self.polytone = registry;
+    }
+    /// The quads the last render blends additively (`RenderPipelines` additive, src alpha and
+    /// one), for the frame's additive pass.
+    pub fn take_additive(&self) -> Vec<Vertex> {
+        std::mem::take(&mut *self.additive.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    /// Live GPU particle records (spawns, before `area` spreads them), for tests and status.
+    pub fn polytone_gpu_records(&self) -> usize {
+        self.polytone_gpu.iter().map(polytone_gpu::Store::len).sum()
+    }
     /// Choose a frame from this particle's declared sprite set.
     pub fn set_sprite_frame(&self, particle: &mut Particle, frame: usize) {
         if let Some(sprites) = particle.set.and_then(|s| self.set_sprites.get(s as usize))
@@ -1855,27 +1957,51 @@ impl ParticleEngine {
     pub fn tracking_emitter(
         &mut self,
         options: ParticleOptions,
-        feet: [f64; 3],
-        width: f64,
-        height: f64,
+        target: TrackingTarget,
+        body: TrackingBody,
     ) {
-        self.tracking_emitter_for(options, feet, width, height, 3);
+        self.tracking_emitter_for(options, target, body, 3);
     }
     /// `createTrackingEmitter(entity, type, lifetime)`.
     pub fn tracking_emitter_for(
         &mut self,
         options: ParticleOptions,
-        feet: [f64; 3],
-        width: f64,
-        height: f64,
+        target: TrackingTarget,
+        body: TrackingBody,
         life: u32,
     ) {
-        self.emit(&options, feet, width, height);
+        self.emit(&options, body);
         if life > 1 {
-            self.emitters.push((options, feet, width, height, life - 1));
+            self.emitters.push(TrackingEmitter {
+                options,
+                target: Some(target),
+                body,
+                remaining: life - 1,
+            });
         }
     }
-    fn emit(&mut self, options: &ParticleOptions, feet: [f64; 3], width: f64, height: f64) {
+    /// Vanilla keeps the old entity reference until the emitter expires. Keep
+    /// its final body if it leaves the level, even when the id is paired again.
+    pub fn detach_tracking_target(
+        &mut self,
+        target: TrackingTarget,
+        mut last_body: impl FnMut() -> Option<TrackingBody>,
+    ) {
+        for emitter in &mut self.emitters {
+            if emitter.target == Some(target) {
+                emitter.body = last_body().unwrap_or(emitter.body);
+                emitter.target = None;
+            }
+        }
+    }
+    /// `TrackingEmitter.tick`: the spawn attempts use the tracked entity's
+    /// current feet and dimensions.
+    fn emit(&mut self, options: &ParticleOptions, body: TrackingBody) {
+        let TrackingBody {
+            feet,
+            width,
+            height,
+        } = body;
         for _ in 0..16 {
             let r = &mut self.random;
             let xa = f64::from(r.next_float() * 2.0 - 1.0);
@@ -1883,9 +2009,9 @@ impl ParticleEngine {
             let za = f64::from(r.next_float() * 2.0 - 1.0);
             if xa * xa + ya * ya + za * za <= 1.0 {
                 let p = [
-                    feet[0] + width * xa / 4.0,
+                    feet[0] + width * (xa / 4.0),
                     feet[1] + height * (0.5 + ya / 4.0),
-                    feet[2] + width * za / 4.0,
+                    feet[2] + width * (za / 4.0),
                 ];
                 self.add(options, p, [xa, ya + 0.2, za]);
             }
@@ -1900,63 +2026,6 @@ impl ParticleEngine {
         self.scope_eye.is_some_and(|eye| {
             (eye[0] - pos[0]).powi(2) + (eye[1] - pos[1]).powi(2) + (eye[2] - pos[2]).powi(2) <= 9.0
         })
-    }
-    /// `ClientPacketListener.handleParticleEvent` for `ServerLevel.sendParticles`.
-    pub fn send_particles(
-        &mut self,
-        options: &ParticleOptions,
-        at: [f64; 3],
-        spread: [f64; 3],
-        speed: f64,
-        count: u32,
-    ) {
-        if count == 0 {
-            let v = [speed * spread[0], speed * spread[1], speed * spread[2]];
-            self.add(options, at, v);
-            return;
-        }
-        for _ in 0..count {
-            let r = &mut self.random;
-            let p = [
-                at[0] + r.next_gaussian() * spread[0],
-                at[1] + r.next_gaussian() * spread[1],
-                at[2] + r.next_gaussian() * spread[2],
-            ];
-            let v = [
-                r.next_gaussian() * speed,
-                r.next_gaussian() * speed,
-                r.next_gaussian() * speed,
-            ];
-            self.add(options, p, v);
-        }
-    }
-    /// `ParticleEngine.createParticle`: always spawned, but `ParticleEngine.add`
-    /// drops a spore blossom air particle once `ParticleLimit.SPORE_BLOSSOM` is full.
-    pub fn create(&mut self, options: &ParticleOptions, p: [f64; 3], v: [f64; 3]) {
-        if let Some(requests) = &mut self.created_requests {
-            requests.push((options.clone(), p, v));
-            return;
-        }
-        let seed = self.seeds.next_long();
-        if let Some(particle) = self.make(options, p, v, seed) {
-            *self.made.entry(options.ty.name()).or_default() += 1;
-            // The provider has drawn, so rejecting here keeps vanilla's RNG order.
-            // shortcut: counts live plus queued particles by scanning instead of
-            // vanilla's counted map; use a counter if spore spawning shows in profiles.
-            if particle.ty == ParticleType::SporeBlossomAir
-                && self.particles.len() + self.pending.len() >= SPORE_BLOSSOM_LIMIT
-                && self
-                    .particles
-                    .iter()
-                    .chain(self.pending.iter())
-                    .filter(|q| q.ty == ParticleType::SporeBlossomAir)
-                    .count()
-                    >= SPORE_BLOSSOM_LIMIT
-            {
-                return;
-            }
-            self.pending.push(particle);
-        }
     }
     /// How many particles of each type were made so far.
     pub fn made(&self) -> &std::collections::BTreeMap<&'static str, u64> {
@@ -2084,6 +2153,32 @@ impl ParticleEngine {
         let ty = o.ty;
         // A native mod's SimpleParticleType: vanilla's TextureSheetParticle with
         // the sprite set its particles/<name>.json names, no tint, 20..40 ticks.
+        // A pack's custom particle: a new type, or one replacing the vanilla type of its id.
+        let custom = match &o.mod_particle {
+            Some(name) => Some(name.as_str()),
+            None => self.polytone_overrides.get(&ty).map(String::as_str),
+        };
+        if let Some(name) = custom
+            && let Some(registry) = &self.polytone
+            && let Some(def) = registry.get(name)
+        {
+            let (registry, def, name) = (registry.clone(), def.clone(), name.to_owned());
+            let particle = polytone::make(self, &registry, &name, &def, o, p, v, seed)?;
+            if def.gpu.is_some() {
+                // A GPU particle is only a record: it never becomes an engine particle.
+                let now = self.polytone_ticks;
+                let store = match self.polytone_gpu.iter().position(|s| s.is(&def)) {
+                    Some(i) => &mut self.polytone_gpu[i],
+                    None => {
+                        self.polytone_gpu.push(polytone_gpu::Store::new(&def)?);
+                        self.polytone_gpu.last_mut()?
+                    }
+                };
+                store.spawn(&particle, now, seed as u64);
+                return None;
+            }
+            return Some(particle);
+        }
         if let Some(name) = &o.mod_particle {
             let (set, behaviour) = *self.mod_sets.get(name)?;
             let mut r = LegacyRandom::new(seed);
@@ -3167,8 +3262,16 @@ impl ParticleEngine {
                         q.set_color(b, 0.0, b);
                     }
                     T::EntityEffect => {
-                        q.set_color(o.color[0], o.color[1], o.color[2]);
-                        q.rgba[3] = o.color[3];
+                        if let Some(ambient) = o.legacy_entity_effect {
+                            q.set_color(v[0] as f32, v[1] as f32, v[2] as f32);
+                            // AmbientMobProvider overrides constructor alpha; MobProvider only sets RGB.
+                            if ambient {
+                                q.rgba[3] = 0.15;
+                            }
+                        } else {
+                            q.set_color(o.color[0], o.color[1], o.color[2]);
+                            q.rgba[3] = o.color[3];
+                        }
                     }
                     T::Effect | T::InstantEffect => {
                         q.set_color(o.color[0], o.color[1], o.color[2]);
@@ -3177,7 +3280,12 @@ impl ParticleEngine {
                     _ => {}
                 }
                 q.behaviour = Behaviour::Spell {
-                    original_alpha: q.rgba[3],
+                    // The old SpellParticle.tick always eased back to 1, including ambient effects.
+                    original_alpha: if o.legacy_entity_effect.is_some() {
+                        1.0
+                    } else {
+                        q.rgba[3]
+                    },
                 };
                 q.set = set;
                 q
@@ -3469,7 +3577,11 @@ impl ParticleEngine {
                     scaled(o.color[2], jb),
                 );
                 q.size = 0.26;
-                q.lifetime = duration;
+                q.lifetime = if o.legacy_trail_lifetime {
+                    self.level_random.next_int_bound(40).unwrap_or(0) + 10
+                } else {
+                    duration
+                };
                 q.has_physics = false;
                 q.free_move = true;
                 q.light = Light::FullBright;
@@ -3700,21 +3812,49 @@ impl ParticleEngine {
             }
         }
     }
+    /// A tick where no emitter follows an entity's live body (tests, fixtures, benches).
     pub fn tick(&mut self, level: &ParticleLevel) {
+        self.tick_tracking(level, |_| None);
+    }
+    /// A tick whose tracking emitters read each followed entity's live body.
+    pub fn tick_tracking(
+        &mut self,
+        level: &ParticleLevel,
+        mut tracking_body: impl FnMut(TrackingTarget) -> Option<TrackingBody>,
+    ) {
+        self.polytone_ticks += 1;
+        for store in &mut self.polytone_gpu {
+            store.expire(self.polytone_ticks);
+        }
+        // The sounds the packs' custom particles played last tick.
+        if let Some(registry) = &self.polytone {
+            self.sounds.extend(registry.take_sounds());
+        }
         self.tick_starters();
         self.tick_explosions(level);
-        for (options, feet, width, height, life) in std::mem::take(&mut self.emitters) {
-            self.emit(&options, feet, width, height);
-            if life > 1 {
-                self.emitters.push((options, feet, width, height, life - 1));
+        let mut emitters = std::mem::take(&mut self.emitters);
+        emitters.retain_mut(|emitter| {
+            if let Some(target) = emitter.target {
+                match tracking_body(target) {
+                    Some(body) => emitter.body = body,
+                    None => emitter.target = None,
+                }
             }
-        }
+            self.emit(&emitter.options, emitter.body);
+            emitter.remaining -= 1;
+            emitter.remaining > 0
+        });
+        self.emitters = emitters;
         let mut particles = std::mem::take(&mut self.particles);
+        self.spawned_in_tick = Some(Vec::new());
         for p in &mut particles {
             self.tick_particle(p, level);
         }
         particles.retain(|p| !p.removed);
         self.particles = particles;
+        for (options, pos, velocity) in self.spawned_in_tick.take().unwrap_or_default() {
+            self.add(&options, pos, velocity);
+        }
         let pending = std::mem::take(&mut self.pending);
         for mut p in pending {
             if p.pre_tick {
@@ -3822,8 +3962,12 @@ impl ParticleEngine {
                     if let Some(frame) = update.frame {
                         self.set_sprite_frame(p, frame);
                     }
-                    for (options, pos, velocity) in update.spawned {
-                        self.add(&options, pos, velocity);
+                    if let Some(later) = &mut self.spawned_in_tick {
+                        later.extend(update.spawned);
+                    } else {
+                        for (options, pos, velocity) in update.spawned {
+                            self.add(&options, pos, velocity);
+                        }
                     }
                 } else {
                     p.remove();
@@ -3848,15 +3992,12 @@ impl ParticleEngine {
             }
             Behaviour::Lava => {
                 p.base_tick(level);
-                if !p.removed {
-                    let odds = p.age as f32 / p.lifetime as f32;
-                    if p.random.next_float() > odds {
-                        self.add(
-                            &ParticleOptions::simple(ParticleType::Smoke),
-                            p.position,
-                            p.velocity,
-                        );
-                    }
+                if !p.removed && p.random.next_float() > p.age as f32 / p.lifetime as f32 {
+                    self.add(
+                        &ParticleOptions::simple(ParticleType::Smoke),
+                        p.position,
+                        p.velocity,
+                    );
                 }
             }
             Behaviour::Crit => {
@@ -3940,9 +4081,7 @@ impl ParticleEngine {
                     *c *= f64::from(0.98f32);
                 }
                 if p.on_ground {
-                    if p.random.next_float() < 0.5 {
-                        p.removed = true;
-                    }
+                    p.removed |= p.random.next_float() < 0.5;
                     p.velocity[0] *= f64::from(0.7f32);
                     p.velocity[2] *= f64::from(0.7f32);
                 }
@@ -3982,13 +4121,10 @@ impl ParticleEngine {
             } => {
                 p.base_tick(level);
                 let (fluid, source) = level.fluid_source(ParticleLevel::block_at(p.position));
-                if !(p.removed || (fluid == Fluid::Water && source)) {
-                    p.removed = true;
-                }
-                if !p.removed && p.position[1] >= y_end {
-                    p.removed = true;
-                }
-                if !p.removed && p.position[1] <= y_prev {
+                if !(fluid == Fluid::Water && source)
+                    || p.position[1] >= y_end
+                    || p.position[1] <= y_prev
+                {
                     p.removed = true;
                 }
                 // randomHorizontalWiggling, then a second, horizontal move.
@@ -4012,9 +4148,8 @@ impl ParticleEngine {
                 p.base_tick(level);
                 self.sprite_from_age(p);
                 if p.age as f32 > fade_start {
-                    let frames_since_fade_out_start = p.age as f32 - fade_start;
                     p.rgba[3] =
-                        (p.lifetime as f32 - frames_since_fade_out_start) / p.lifetime as f32;
+                        (p.lifetime as f32 - (p.age as f32 - fade_start)) / p.lifetime as f32;
                 }
             }
             Behaviour::NoxiousGasCloud => {
@@ -4478,7 +4613,7 @@ impl ParticleEngine {
                     self.sprite_from_age(p);
                     half(p);
                     let b = ParticleLevel::block_at(p.position);
-                    if level.facts.is_air(level.world.block(b[0], b[1], b[2])) {
+                    if level.facts.is_air(level.block(b[0], b[1], b[2])) {
                         p.velocity[1] -= f64::from(0.0074f32);
                     }
                 }
@@ -4486,7 +4621,7 @@ impl ParticleEngine {
             Behaviour::Firefly => {
                 p.base_tick(level);
                 let b = ParticleLevel::block_at(p.position);
-                if !level.facts.is_air(level.world.block(b[0], b[1], b[2])) {
+                if !level.facts.is_air(level.block(b[0], b[1], b[2])) {
                     p.removed = true;
                 } else {
                     p.rgba[3] = fade_amount(p.lifetime_progress(p.age as f32), 0.3, 0.5);
@@ -4693,6 +4828,8 @@ impl ParticleEngine {
         let base = Quat::from_rotation_y(std::f32::consts::PI - yaw.to_radians())
             * Quat::from_rotation_x(-pitch.to_radians());
         let mut light_cache = ParticleLightCache::default();
+        let mut additive = self.additive.lock().unwrap_or_else(|e| e.into_inner());
+        additive.clear();
         let mut section_cache =
             (CULL && frustum.is_some()).then(ParticleSectionFrustumCache::default);
         for p in &self.particles {
@@ -4764,7 +4901,18 @@ impl ParticleEngine {
                 ) - camera;
                 (pos.as_vec3(), p.quad_size(partial))
             });
-            let rotation = if p.roll != 0.0 {
+            let rotation = if p.orientation != polytone_gpu::Orientation::Camera {
+                // A custom particle's `movement_aligned` quad has its texture's top against
+                // its motion (measured in Java: a light ray rising toward the noon sun hangs
+                // below the leaves it starts at); a GPU particle's has it along its motion.
+                let velocity = -FVec3::new(
+                    p.velocity[0] as f32,
+                    p.velocity[1] as f32,
+                    p.velocity[2] as f32,
+                );
+                let roll = p.o_roll + (p.roll - p.o_roll) * partial;
+                polytone_gpu::orient(p.orientation, center, velocity, roll, base)
+            } else if p.roll != 0.0 {
                 base * Quat::from_rotation_z(p.o_roll + (p.roll - p.o_roll) * partial)
             } else {
                 base
@@ -4846,6 +4994,36 @@ impl ParticleEngine {
                 r.u0 + du * p.uv[2],
                 r.v0 + dv * p.uv[3],
             );
+            let target: &mut Vec<Vertex> = if p.additive { &mut additive } else { &mut *out };
+            let overlay = if p.additive {
+                crate::gfx::ADDITIVE_PARTICLE_OVERLAY
+            } else if layer {
+                crate::gfx::TRANSLUCENT_PARTICLE_OVERLAY
+            } else {
+                0
+            };
+            // A Polytone model particle: its model's faces, scaled by its size and turned as
+            // its quad would be.
+            if let Some(model) = &p.model {
+                for quad in &model.quads {
+                    let Some(&(r, _)) = self.atlas.get(&quad.sprite) else {
+                        continue;
+                    };
+                    let (du, dv) = (r.u1 - r.u0, r.v1 - r.v0);
+                    for (corner, uv) in quad.corners.iter().zip(quad.uv) {
+                        target.push(Vertex {
+                            normal: [0; 4],
+                            pos: (center + rotation * (*corner * size)).to_array(),
+                            uv: [r.u0 + du * uv[0], r.v0 + dv * uv[1]],
+                            layer: overlay | u32::from(hdr_tier(p.ty)) << 16,
+                            color,
+                            light,
+                            glint_uv: [0.0, 0.0],
+                        });
+                    }
+                }
+                continue;
+            }
             for rotation in rotations.into_iter().flatten() {
                 for (n, uv) in [
                     ((1.0, -1.0), [u1, v1]),
@@ -4854,15 +5032,11 @@ impl ParticleEngine {
                     ((-1.0, -1.0), [u0, v1]),
                 ] {
                     let v = center + rotation * FVec3::new(n.0, n.1, 0.0) * size;
-                    out.push(Vertex {
+                    target.push(Vertex {
                         normal: [0; 4],
                         pos: v.to_array(),
                         uv,
-                        layer: if layer {
-                            crate::gfx::TRANSLUCENT_PARTICLE_OVERLAY
-                        } else {
-                            0
-                        } | u32::from(hdr_tier(p.ty)) << 16,
+                        layer: overlay | u32::from(hdr_tier(p.ty)) << 16,
                         color,
                         light,
 
@@ -4870,6 +5044,19 @@ impl ParticleEngine {
                     });
                 }
             }
+        }
+        for store in &self.polytone_gpu {
+            store.render(
+                &self.atlas,
+                camera,
+                base,
+                self.polytone_ticks,
+                partial,
+                &mut light_cache,
+                light_at,
+                out,
+                &mut additive,
+            );
         }
     }
 }
@@ -4898,11 +5085,12 @@ fn hdr_tier(ty: ParticleType) -> u8 {
 }
 /// `Particle.LifetimeAlpha.currentAlphaForAge`.
 fn lifetime_alpha(a: [f32; 4], age: i32, lifetime: i32, partial: f32) -> f32 {
-    if (a[0] - a[1]).abs() < 1.0e-5 {
-        return a[0];
-    }
     let t = ((age as f32 + partial) / lifetime as f32 - a[2]) / (a[3] - a[2]);
-    a[0] + (a[1] - a[0]) * t.clamp(0.0, 1.0)
+    if (a[0] - a[1]).abs() < 1.0e-5 {
+        a[0]
+    } else {
+        a[0] + (a[1] - a[0]) * t.clamp(0.0, 1.0)
+    }
 }
 
 struct Starter {
@@ -4938,8 +5126,49 @@ const CREEPER: [[f64; 2]; 12] = [
 ];
 
 #[cfg(test)]
+mod tick_bench;
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_spell_providers_use_velocity_rgb_and_their_original_alpha_rules() {
+        let mut engine = ParticleEngine::new(Path::new(""), &HashMap::new(), &HashSet::new());
+        let velocity = [0.25, 0.5, 0.75];
+        for scoped in [false, true] {
+            engine.set_scope_eye(scoped.then_some([0.0; 3]));
+            for ambient in [false, true] {
+                let mut options =
+                    ParticleOptions::colored(ParticleType::EntityEffect, [1.0, 0.0, 0.0, 0.8]);
+                options.legacy_entity_effect = Some(ambient);
+                let particle = engine.make(&options, [0.0; 3], velocity, 7).unwrap();
+                let alpha = if ambient {
+                    0.15
+                } else if scoped {
+                    0.0
+                } else {
+                    1.0
+                };
+                assert_eq!(particle.rgba, [0.25, 0.5, 0.75, alpha]);
+                assert_eq!(
+                    particle.behaviour,
+                    Behaviour::Spell {
+                        original_alpha: 1.0
+                    }
+                );
+            }
+            let options =
+                ParticleOptions::colored(ParticleType::EntityEffect, [1.0, 0.0, 0.0, 0.8]);
+            let current = engine.make(&options, [0.0; 3], velocity, 7).unwrap();
+            assert_eq!(current.rgba, options.color);
+            assert_eq!(
+                current.behaviour,
+                Behaviour::Spell {
+                    original_alpha: 0.8
+                }
+            );
+        }
+    }
 
     #[test]
     fn particle_light_cache_reuses_exact_blocks_and_fails_open_on_collisions() {
@@ -5292,6 +5521,7 @@ mod tests {
             facts: &facts,
             collision: &collision,
             player: None,
+            cached_chunk: std::cell::Cell::new(None),
         };
         let mut engine = ParticleEngine::new(Path::new(""), &HashMap::new(), &HashSet::new());
         engine.set_sprites.push(vec![10, 11, 12]);
@@ -5383,6 +5613,7 @@ mod tests {
             facts: &facts,
             collision: &collision,
             player: None,
+            cached_chunk: std::cell::Cell::new(None),
         };
         let mut engine = ParticleEngine::new(Path::new(""), &HashMap::new(), &HashSet::new());
         let mut particle = Particle::blank(ParticleType::Smoke, [0.0; 3]);
@@ -5698,6 +5929,40 @@ mod tests {
         let s =
             (p.velocity[0].powi(2) + (p.velocity[1] - 0.1).powi(2) + p.velocity[2].powi(2)).sqrt();
         assert!((0.15 * 0.4 - 1e-6..=0.45 * 0.4 + 1e-6).contains(&s));
+    }
+    #[test]
+    fn legacy_trails_choose_a_lifetime_for_each_particle_from_the_level_random() {
+        let mut engine = ParticleEngine::new(Path::new(""), &HashMap::new(), &HashSet::new());
+        engine.seed_randoms(1, 42, 2);
+        let legacy = ParticleOptions {
+            legacy_trail_lifetime: true,
+            ..ParticleOptions::trail([1.0, 2.0, 3.0], 0x7f3f1f, -1)
+        };
+        for _ in 0..5 {
+            engine.create(&legacy, [0.0; 3], [0.0; 3]);
+        }
+        // java.util.Random(42).nextInt(40) + 10, as vanilla 1.21.3 TrailParticle.Provider does.
+        assert_eq!(
+            engine
+                .pending
+                .iter()
+                .map(|p| p.lifetime)
+                .collect::<Vec<_>>(),
+            [20, 13, 18, 14, 20]
+        );
+        engine.create(
+            &ParticleOptions::trail([1.0, 2.0, 3.0], 0x7f3f1f, 37),
+            [0.0; 3],
+            [0.0; 3],
+        );
+        assert_eq!(engine.pending.last().unwrap().lifetime, 37);
+        // A current server's -1 is a lifetime like any other, not the old marker.
+        engine.create(
+            &ParticleOptions::trail([1.0, 2.0, 3.0], 0x7f3f1f, -1),
+            [0.0; 3],
+            [0.0; 3],
+        );
+        assert_eq!(engine.pending.last().unwrap().lifetime, -1);
     }
     #[test]
     fn sizes_follow_vanilla_curves() {

@@ -55,6 +55,13 @@ impl Error {
                 "sales_off" | "claim_closed" | "claim_not_open" | "not_for_sale" => {
                     "The shop isn't selling right now. Nothing was charged."
                 }
+                // Paddle sells where the player is: the founder set is claimed through its free
+                // checkout, which the Shop opens on playhorizon.dev (`Error::use_checkout`).
+                "use_checkout" => {
+                    "Where you are, the founder set is claimed through a free checkout on \
+                     playhorizon.dev. Claim it from the Shop: it opens the checkout for you."
+                }
+                "not_offered_here" => "The founder set can't be claimed from your country.",
                 _ => "Paddle couldn't start the checkout. Nothing was charged.",
             })
             .into(),
@@ -62,6 +69,12 @@ impl Error {
                 tr("Horizon's cosmetics service had a problem. Try again later.").into()
             }
         }
+    }
+
+    /// The service refused a one-click claim because Paddle sells where the player is: the
+    /// claim goes through the free checkout instead (`Claim::one_click` is no longer true).
+    pub fn use_checkout(&self) -> bool {
+        matches!(self, Self::Shop(code) if code == "use_checkout")
     }
 
     /// Whether the change that failed should wait and be sent again: the service wasn't
@@ -218,6 +231,9 @@ pub struct Collection {
     pub names: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub lines: BTreeMap<String, String>,
+    /// The set that holds everything the collection sells: the Shop's hero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -680,7 +696,8 @@ impl Service {
                         _,
                         code @ ("player" | "name" | "owned" | "claimed" | "sales_off"
                         | "claim_closed" | "claim_not_open" | "not_for_sale" | "paddle"
-                        | "amount" | "currency" | "items" | "overlap"),
+                        | "amount" | "currency" | "items" | "overlap" | "use_checkout"
+                        | "not_offered_here"),
                     ) => Error::Shop(code.into()),
                     (status, _) => Error::Service(status),
                 });

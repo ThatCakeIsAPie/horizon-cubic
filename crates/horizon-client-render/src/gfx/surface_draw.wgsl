@@ -135,8 +135,17 @@ fn st_ground(base: u32, nx: i32, nz: i32, fallback: i32) -> i32 {
     return st_top_plane(bitcast<i32>(st_tiles[last]));
 }
 
+// What crosses to terrain.wgsl's fragment stages is `TerrainWire` (`to_wire`).
 @vertex fn vs_surface(@builtin(vertex_index) vertex: u32,
-    @builtin(instance_index) slot: u32) -> TerrainOut {
+    @builtin(instance_index) slot: u32) -> TerrainWire {
+    return to_wire(st_surface_vertex(vertex, slot));
+}
+@vertex fn vs_surface_water(@builtin(vertex_index) vertex: u32,
+    @builtin(instance_index) slot: u32) -> TerrainWire {
+    return to_wire(st_water_vertex(vertex, slot));
+}
+
+fn st_surface_vertex(vertex: u32, slot: u32) -> TerrainOut {
     let base = slot * ST_TILE_WORDS;
     let level = st_tiles[base + 2u];
     let spans = max(st_tiles[base + 3u], 1u);
@@ -215,8 +224,7 @@ fn st_ground(base: u32, nx: i32, nz: i32, fallback: i32) -> i32 {
 
 // The water over a column whose highest span lies below the sea, at the sea's
 // top plane.
-@vertex fn vs_surface_water(@builtin(vertex_index) vertex: u32,
-    @builtin(instance_index) slot: u32) -> TerrainOut {
+fn st_water_vertex(vertex: u32, slot: u32) -> TerrainOut {
     let base = slot * ST_TILE_WORDS;
     let level = st_tiles[base + 2u];
     let col = vertex / 6u;

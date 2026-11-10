@@ -1342,10 +1342,7 @@ impl SurfaceTiles {
             bind_group_layouts: &[Some(setup.bindings), Some(&draw_layout)],
             ..Default::default()
         });
-        let constants = [
-            ("SPRITE_ARRAYS", setup.sprite_constants[0]),
-            ("SPRITE_SPLIT", setup.sprite_constants[1]),
-        ];
+        let constants = setup.constants();
         let pipeline = |label: &str, vs: &str, fs: &str, blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),

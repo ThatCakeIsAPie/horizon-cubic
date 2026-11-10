@@ -178,6 +178,17 @@ pub trait DensitySampler: std::fmt::Debug + Send + Sync {
         })
     }
 
+    /// [`Self::sample_volume`] for a caller that reads only the Ys set in `needed`: bit `y` of
+    /// `needed[column]`, X/Z columns in buffer order. The other values may differ.
+    fn sample_needed(
+        &self,
+        context: &mut SamplerContext,
+        buffer: &mut [f32],
+        volume: DensityVolume,
+        _needed: &[u64],
+    ) -> Result<(), SampleError> {
+        self.sample_volume(context, buffer, volume)
+    }
     /// `Some(inputs)` when each value `sample_volume` writes depends only on
     /// its own block position and on the same values of `inputs`: never on
     /// the volume's origin, extent or other samples, nor on world fields.
@@ -468,6 +479,20 @@ impl DensitySampler for NoiseSampler {
         Ok(self
             .noise
             .add_to_volume(buffer, volume, self.xz_scale, self.y_scale, 1.0)?)
+    }
+    fn sample_needed(
+        &self,
+        _: &mut SamplerContext,
+        buffer: &mut [f32],
+        volume: DensityVolume,
+        needed: &[u64],
+    ) -> Result<(), SampleError> {
+        check_buffer(buffer, volume)?;
+        buffer.fill(0.0);
+        let (xz_scale, y_scale) = (self.xz_scale, self.y_scale);
+        Ok(self
+            .noise
+            .add_to_needed(buffer, volume, xz_scale, y_scale, 1.0, needed)?)
     }
 }
 

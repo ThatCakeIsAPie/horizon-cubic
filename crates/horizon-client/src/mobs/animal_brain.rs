@@ -1870,7 +1870,7 @@ fn manhattan(a: [i32; 3], b: [i32; 3]) -> i32 {
 }
 /// `Swim`: deeper than the jump threshold, or in lava.
 fn swim_condition(m: &Mob) -> bool {
-    m.fluids.water > m.fluid_jump_threshold() || m.fluids.in_lava
+    m.floats()
 }
 /// `PositionTracker.isVisibleBy`.
 fn tracker_visible(m: &mut Mob, w: &MobWorld, t: Tracker) -> bool {
@@ -2433,7 +2433,7 @@ fn axolotl_action(m: &mut Mob, cx: &mut Bx, action: AxolotlAction, until: &mut i
             if cx
                 .w
                 .target_info(target)
-                .is_some_and(|t| m.within_melee_range(&t))
+                .is_some_and(|t| m.within_melee_range(cx.w, &t))
                 && visible_contains(m, cx.w, target)
             {
                 mem(m).walk_target.clear();
@@ -2460,7 +2460,7 @@ fn axolotl_action(m: &mut Mob, cx: &mut Bx, action: AxolotlAction, until: &mut i
                 || !cx
                     .w
                     .target_info(target)
-                    .is_some_and(|t| m.within_melee_range(&t))
+                    .is_some_and(|t| m.within_melee_range(cx.w, &t))
             {
                 return false;
             }

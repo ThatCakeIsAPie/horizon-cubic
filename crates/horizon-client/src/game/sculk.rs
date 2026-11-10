@@ -5,6 +5,7 @@
 //! spreader from deaths, and the darkness wardens and shriekers cast.
 use super::{Game, Result};
 use horizon_client::actions::Action;
+use horizon_client::join_seq::ListStamp;
 use horizon_client::{
     containers::BlockEntity,
     effects::{EffectInstance, PlayerEffects},
@@ -97,6 +98,8 @@ pub(super) struct SculkState {
     /// The vehicle each rider had last tick and where it stood.
     mounts: FxHashMap<Who, (u32, [f64; 3])>,
     damaged: FxHashMap<u32, i64>,
+    /// Set while the mobs' events are posted (`tick_mob_sculk_events`).
+    mob_slots: Option<MobSlots>,
     last_health: Option<f32>,
     /// The darkness effect's blend factor, previous and current tick.
     pub darkness: (f32, f32),
@@ -104,6 +107,31 @@ pub(super) struct SculkState {
     pub actor: Option<Who>,
     ticks: u32,
     pub tracker_loaded: bool,
+    /// The wardens' and allays' slots in the mob list, and the list they were
+    /// read from: see `listener_slots`.
+    listeners: Vec<u32>,
+    listeners_of: Option<ListStamp>,
+}
+
+/// How far from a warden's or an allay's feet an event may be heard: their
+/// listeners reach 16 blocks from the eye's block (`warden::listen`,
+/// `allay::listen`), the eye stands under 3 blocks up, and flooring to blocks
+/// adds under 2. Past this they do nothing with it.
+const LISTENING_MOB_REACH: f64 = 24.0;
+
+fn dist_sqr_f(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (0..3).map(|i| (a[i] - b[i]) * (a[i] - b[i])).sum()
+}
+
+/// Where each mob is in `Game::mobs` while the mobs' events are posted, for
+/// the thousands of lookups by id they make, and whether any mob listens.
+struct MobSlots {
+    /// The first slot of each id, as a scan would find.
+    by_id: FxHashMap<u32, usize>,
+    /// The wardens and allays (the mobs that listen): slot, id and position.
+    listeners: Vec<(usize, u32, [f64; 3])>,
+    /// `Game::next_entity` when they were taken: unchanged, no mob joined.
+    next_entity: u32,
 }
 
 impl SculkState {
@@ -331,12 +359,19 @@ impl Game<'_> {
             self.sculk.tracker = WardenSpawnTracker::from_nbt(tag);
         }
     }
-    /// Write the tracker into the player data being saved.
+    /// The tracker as saved, once it has been loaded.
+    pub(super) fn warden_tracker_tag(&self) -> Option<horizon_world::nbt::Tag> {
+        self.sculk
+            .tracker_loaded
+            .then(|| self.sculk.tracker.to_nbt())
+    }
+    /// Write the tracker into the player data being saved. With a LAN owner,
+    /// `store_owner` rewrites that from the owner's guest, so it puts the
+    /// tracker there as well (`playerdata::with_warden`).
     pub(super) fn save_warden_tracker(&mut self) {
-        if !self.sculk.tracker_loaded {
+        let Some(tag) = self.warden_tracker_tag() else {
             return;
-        }
-        let tag = self.sculk.tracker.to_nbt();
+        };
         let extra = self
             .level
             .player_extra
@@ -446,6 +481,21 @@ impl Game<'_> {
             }
             self.sculk.known = loaded;
         }
+        self.sculk_sync_writes();
+    }
+
+    /// `LevelChunk.setBlockState`: finish sculk placement before a command
+    /// or `BlockItem.updateCustomBlockEntityTag` loads saved entity fields.
+    pub(super) fn sculk_place_entity(&mut self, state: BlockStateId) -> bool {
+        self.sculk_prepare();
+        if self.kind_of_state(state.0) == 0 {
+            return false;
+        }
+        self.sculk_sync_writes();
+        true
+    }
+
+    fn sculk_sync_writes(&mut self) {
         let writes = std::mem::take(&mut self.world.watched_writes);
         for (key, old, new) in writes {
             let (old_kind, new_kind) = (self.kind_of_state(old), self.kind_of_state(new));
@@ -540,6 +590,8 @@ impl Game<'_> {
         Context {
             source: Some(Who::Player),
             owner: None,
+            source_uuid: None,
+            owner_uuid: None,
             dampening_state: self.state_dampens(state),
             spectator: self.spectator(),
             stepping_carefully: self.keys.held(Action::Sneak),
@@ -550,13 +602,28 @@ impl Game<'_> {
         }
     }
     /// `GameEvent.Context.of(mob, state)`.
-    pub(super) fn mob_context(&self, id: u32, state: Option<BlockStateId>) -> Context {
-        self.context_of_mob(self.mobs.iter().find(|m| m.id == id), id, state)
+    pub(super) fn mob_context(&mut self, id: u32, state: Option<BlockStateId>) -> Context {
+        let mob = self.mob_slot(id).map(|i| &self.mobs[i]);
+        self.context_of_mob(mob, id, state)
+    }
+    /// The slot of the first mob with this id, from the slots taken for the
+    /// mobs' events while the mob is still there (mobs are only appended
+    /// meanwhile), else from the mob index (as a scan finds it).
+    fn mob_slot(&mut self, id: u32) -> Option<usize> {
+        if let Some(slots) = &self.sculk.mob_slots
+            && let Some(&i) = slots.by_id.get(&id)
+            && self.mobs.get(i).is_some_and(|m| m.id == id)
+        {
+            return Some(i);
+        }
+        self.mob_index.find(&self.mobs, id)
     }
     fn context_of_mob(&self, mob: Option<&Mob>, id: u32, state: Option<BlockStateId>) -> Context {
         Context {
             source: Some(Who::Mob(id)),
             owner: None,
+            source_uuid: None,
+            owner_uuid: None,
             dampening_state: self.state_dampens(state),
             spectator: false,
             stepping_carefully: false,
@@ -566,7 +633,7 @@ impl Game<'_> {
             player: mob.is_some_and(|m| m.rider.is_some()),
         }
     }
-    pub(super) fn who_context(&self, who: Option<Who>, state: Option<BlockStateId>) -> Context {
+    pub(super) fn who_context(&mut self, who: Option<Who>, state: Option<BlockStateId>) -> Context {
         match who {
             Some(Who::Player) => self.player_context(state),
             Some(Who::Mob(id)) => self.mob_context(id, state),
@@ -577,10 +644,42 @@ impl Game<'_> {
         }
     }
 
+    /// `LivingEntity.onEquipItem`'s game event for a mob: EQUIP when the new
+    /// stack is equippable in that slot, UNEQUIP when the slot is emptied.
+    pub(super) fn mob_equip_event(&mut self, id: u32, at: [f64; 3], equip: bool) {
+        let event = if equip {
+            "minecraft:equip"
+        } else {
+            "minecraft:unequip"
+        };
+        let ctx = self.who_context(Some(Who::Mob(id)), None);
+        self.post_game_event(event, at, ctx);
+    }
+
     // ---- posting ----
 
     /// `Level.gameEvent`: tell the listeners within reach.
     pub(super) fn post_game_event(&mut self, event: &'static str, pos: [f64; 3], ctx: Context) {
+        #[cfg(test)]
+        TEST_POSTED_EVENTS.with(|events| {
+            if let Some(events) = events.borrow_mut().as_mut() {
+                events.push((event, pos, ctx.source));
+            }
+        });
+        #[cfg(test)]
+        super::item_use::interact_vibration_tests::record_event(event, pos, ctx.source);
+        self.post_game_event_with(event, pos, |_| ctx);
+    }
+    /// [`Self::post_game_event`] with the context worked out only when some
+    /// listener may hear the event (`GameEventDispatcher.post` visits only the
+    /// listeners registered in the sections around it): most of a server's
+    /// mobs are near none.
+    fn post_game_event_with(
+        &mut self,
+        event: &'static str,
+        pos: [f64; 3],
+        ctx: impl FnOnce(&mut Self) -> Context,
+    ) {
         self.native_game_event(event, pos);
         super::dispense_fixture::record(|| {
             format!(
@@ -596,16 +695,97 @@ impl Game<'_> {
         let at = block_of(pos);
         let radius = sculk::notification_radius(event).min(16);
         let near = self.sculk.index.within(at, radius);
+        // The wardens and allays that may hear it, in the mobs' order, while
+        // the slots taken for the mobs' events hold; else every mob is asked.
+        let mobs = self.sculk.mob_slots.as_ref().and_then(|s| {
+            let mut near = Vec::new();
+            for &(i, id, from) in &s.listeners {
+                if self.mobs.get(i).is_none_or(|m| m.id != id) {
+                    return None;
+                }
+                let d = dist_sqr_f(from, pos);
+                if d.is_nan() || d <= LISTENING_MOB_REACH * LISTENING_MOB_REACH {
+                    near.push(i);
+                }
+            }
+            (s.next_entity == self.next_entity).then_some(near)
+        });
+        if near.is_empty() && mobs.as_ref().is_some_and(Vec::is_empty) {
+            return;
+        }
+        let ctx = ctx(self);
+        let ctx = self.with_vibration_uuids(ctx);
         for key in near {
             self.sculk_listen(key, event, pos, &ctx);
         }
-        for i in 0..self.mobs.len() {
-            if self.mobs[i].species() == Species::Warden && self.mobs[i].alive() {
-                self.warden_listen(i, event, pos, &ctx);
+        match mobs {
+            Some(mobs) => {
+                for i in mobs {
+                    self.mob_listen(i, event, pos, &ctx);
+                }
             }
-            if self.mobs[i].species() == Species::Allay && self.mobs[i].alive() {
-                self.allay_listen(i, event, pos, &ctx);
+            None => {
+                let stamp = self.mobs.stamp();
+                let slots = self.listener_slots(stamp);
+                for &i in &slots {
+                    if (i as usize) < self.mobs.len() {
+                        self.mob_listen(i as usize, event, pos, &ctx);
+                    }
+                }
+                self.sculk.listeners = slots;
+                self.sculk.listeners_of = Some(stamp);
             }
+        }
+    }
+    /// The slots of the wardens and allays (the mobs that hear game events),
+    /// in list order, for an event posted outside the mobs' own events. A walk
+    /// over the list misses the cache once per mob, and a busy server posts
+    /// hundreds of such events a tick: one walk serves until the list is next
+    /// written to ([`ListStamp`]).
+    fn listener_slots(&mut self, stamp: ListStamp) -> Vec<u32> {
+        let mut slots = std::mem::take(&mut self.sculk.listeners);
+        // Taken: an event a listener posts while it hears this one finds none
+        // and walks the list itself.
+        if self.sculk.listeners_of.take() != Some(stamp) {
+            slots.clear();
+            slots.extend(
+                self.mobs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| matches!(m.species(), Species::Warden | Species::Allay))
+                    .map(|(i, _)| i as u32),
+            );
+        }
+        slots
+    }
+    /// The context with the saved identities of its source and owner, as
+    /// `VibrationInfo`'s constructor takes them from the entities when the
+    /// event is heard. Only what the context already names is filled.
+    fn with_vibration_uuids(&self, mut ctx: Context) -> Context {
+        if ctx.source_uuid.is_none() {
+            ctx.source_uuid = self.vibration_uuid(ctx.source);
+        }
+        if ctx.owner_uuid.is_none() {
+            ctx.owner_uuid = self.vibration_uuid(ctx.owner);
+        }
+        ctx
+    }
+    /// The saved UUID of a vibration's mob through the save layer's
+    /// `save_who_uuid`. `Who::Player` stays `None`: on a server it can be the
+    /// acting guest as well as the host, so it names no single entity here.
+    fn vibration_uuid(&self, who: Option<Who>) -> Option<[i32; 4]> {
+        match who {
+            Some(who @ Who::Mob(_)) => self.save_who_uuid(who),
+            _ => None,
+        }
+    }
+    /// The mob at `index` hears a game event, if it is a warden or an allay.
+    fn mob_listen(&mut self, index: usize, event: &'static str, pos: [f64; 3], ctx: &Context) {
+        if self.mobs[index].species() == Species::Warden && self.mobs[index].alive() {
+            self.warden_listen(index, event, pos, ctx);
+        }
+        if self.mobs[index].species() == Species::Allay && self.mobs[index].alive() {
+            self.allay_listen(index, event, pos, ctx);
         }
     }
     /// A game event at a block (`Level.gameEvent(source, event, pos)`).
@@ -623,9 +803,8 @@ impl Game<'_> {
     /// the end-of-tick scan then knows this damage.
     pub(super) fn mob_damage_event(&mut self, id: u32) {
         if let Some(t) = self
-            .mobs
-            .iter()
-            .find(|m| m.id == id)
+            .mob_index
+            .get(&self.mobs, id)
             .and_then(|m| m.last_damage.map(|(_, t)| t))
         {
             self.sculk.damaged.insert(id, t);
@@ -639,15 +818,13 @@ impl Game<'_> {
                 .player
                 .as_ref()
                 .map(|p| [p.position.x, p.position.y, p.position.z]),
-            Who::Mob(id) => self
-                .mobs
-                .iter()
-                .find(|m| m.id == id)
-                .map(|m| [m.position.x, m.position.y, m.position.z]),
+            Who::Mob(id) => self.mob_slot(id).map(|i| {
+                let p = self.mobs[i].position;
+                [p.x, p.y, p.z]
+            }),
         };
         if let Some(at) = at {
-            let ctx = self.who_context(Some(who), None);
-            self.post_game_event(event, at, ctx);
+            self.post_game_event_with(event, at, |g| g.who_context(Some(who), None));
         }
     }
     /// `LevelEvent::GameEvent` from the block behaviour library.
@@ -747,6 +924,8 @@ impl Game<'_> {
                     pos,
                     source: ctx.source,
                     owner: ctx.owner,
+                    source_uuid: ctx.source_uuid,
+                    owner_uuid: ctx.owner_uuid,
                 },
                 time,
             );
@@ -840,6 +1019,7 @@ impl Game<'_> {
         // a sculk tick does loads, unloads or lights a chunk or moves a ticket.
         let levels = self.tickets.levels();
         let chunks = &self.world.chunks;
+        let pending = &self.world.entities_pending;
         let mut ticking = FxHashMap::<(i32, i32), bool>::default();
         let mut ticks = |cx: i32, cz: i32| {
             *ticking.entry((cx, cz)).or_insert_with(|| {
@@ -858,7 +1038,9 @@ impl Game<'_> {
             .iter()
             .filter_map(|&key| {
                 let (cx, cz) = (key.0 >> 4, key.2 >> 4);
+                // `LevelChunk.isTicking`: its own chunk's entities loaded too.
                 if !ticks(cx, cz)
+                    || pending.contains(&(cx, cz))
                     || matches!(entities.get(&key), Some(BlockEntity::Sculk(e)) if e.idle())
                 {
                     return None;
@@ -1057,6 +1239,7 @@ impl Game<'_> {
                     let d = [at[0] - dest[0], at[1] - dest[1], at[2] - dest[2]];
                     let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() as f32;
                     let time = self.world.game_time;
+                    let source_uuid = self.vibration_uuid(Some(who));
                     if let Some(e) = self.sculk_entity(key) {
                         e.vibration.schedule(
                             Info {
@@ -1065,6 +1248,8 @@ impl Game<'_> {
                                 pos: at,
                                 source: Some(who),
                                 owner: None,
+                                source_uuid,
+                                owner_uuid: None,
                             },
                             time,
                         );
@@ -1359,9 +1544,11 @@ impl Game<'_> {
         {
             return;
         }
-        let mut effect =
-            horizon_client::effects::EffectInstance::new("darkness", warden::DARKNESS_DURATION, 0);
-        effect.visible = false;
+        // `new MobEffectInstance(DARKNESS, 260, 0, false, false)`: no
+        // particles and no icon (#11385).
+        let effect =
+            horizon_client::effects::EffectInstance::new("darkness", warden::DARKNESS_DURATION, 0)
+                .with_flags(false, false);
         self.potions.effects.add(effect);
     }
 
@@ -1545,7 +1732,7 @@ impl Game<'_> {
         self.particles
             .add(&ParticleOptions::sculk_charge(roll), at, speed);
     }
-    /// `LevelEvent` 3007: ten shrieks rising from the shrieker, and the shriek.
+    /// `LevelEventHandler.levelEvent` 3007: ten shrieks and a local sound.
     pub(super) fn shriek_event(&mut self, pos: BlockPos) {
         let top = f64::from(pos.y) + 0.5;
         for i in 0..10 {
@@ -1558,7 +1745,7 @@ impl Game<'_> {
         let state = self.world.block(pos.x, pos.y, pos.z);
         if self.state_property(state, "waterlogged") != Some("true") {
             let pitch = 0.6 + self.particles.random().next_float() * 0.4;
-            self.audio.play(
+            self.audio.play_unshared(
                 "minecraft:block.sculk_shrieker.shriek",
                 Some([f64::from(pos.x) + 0.5, top, f64::from(pos.z) + 0.5]),
                 2.0,
@@ -1669,11 +1856,15 @@ impl Game<'_> {
             let present: HashSet<u32> = self.dropped.iter().map(|item| item.id).collect();
             self.sculk.falling_items.retain(|id| present.contains(id));
         }
-        // Dropped items are entities too: Entity.applyEffectsFromBlocks.
+        // Dropped items are entities too: Entity.applyEffectsFromBlocks, from
+        // ItemEntity.tick, so only for the items in entity-ticking chunks.
+        let ticking = self.entity_ticking_area();
         let items: Vec<[f64; 3]> = self
             .dropped
             .iter()
-            .filter(|i| i.on_ground)
+            .filter(|i| {
+                i.on_ground && ticking(i.position.x.floor() as i32, i.position.z.floor() as i32)
+            })
             .map(|i| [i.position.x, i.position.y, i.position.z])
             .collect();
         for at in items {
@@ -1893,15 +2084,54 @@ impl Game<'_> {
                 )
             })
             .collect();
+        let mut by_id = FxHashMap::default();
+        for (i, m) in self.mobs.iter().enumerate() {
+            by_id.entry(m.id).or_insert(i);
+        }
+        let listeners = self
+            .mobs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.species(), Species::Warden | Species::Allay))
+            .map(|(i, m)| (i, m.id, [m.position.x, m.position.y, m.position.z]))
+            .collect();
+        self.sculk.mob_slots = Some(MobSlots {
+            by_id,
+            listeners,
+            next_entity: self.next_entity,
+        });
+        // Steps, landings, splashes, flaps and stepping on redstone ore come
+        // from the mob's own tick (Entity.move, LivingEntity.aiStep's
+        // applyEffectsFromBlocks), which ServerLevel.tick runs only in
+        // entity-ticking chunks: for the mobs `tick_creature_entities` ticked,
+        // and those standing in that area (the sculk fixture posts before the
+        // mobs tick). Damage and mounting are raised by `hurt` and
+        // `startRiding`, ticking or not.
+        let ticking = self.entity_ticking_area();
         for (id, at, on_ground, in_water, species, damaged, vehicle, age, resting) in snapshot {
-            if on_ground {
+            let ticked = self.creatures.ticked.contains(&id)
+                || ticking(at[0].floor() as i32, at[2].floor() as i32);
+            if on_ground && ticked {
                 self.step_on_redstone_ore(at, false, false);
             }
             // A mob first seen already riding raised its event when it spawned.
             let seen = self.sculk.steps.contains_key(&Who::Mob(id));
             self.mount_events(Who::Mob(id), vehicle, seen);
             let emits = !matches!(species, Species::Shulker);
-            if emits {
+            if emits && !ticked {
+                // Where it is now, without a move: a mob put elsewhere while
+                // it did not tick (a command) walked nowhere.
+                let entry = self.sculk.steps.entry(Who::Mob(id)).or_insert(Steps {
+                    move_dist: 0.0,
+                    next_step: 1.0,
+                    last: at,
+                    on_ground,
+                    in_water,
+                });
+                entry.last = at;
+                entry.on_ground = on_ground;
+                entry.in_water = in_water;
+            } else if emits {
                 let warden = species == Species::Warden;
                 self.entity_motion_events(
                     Who::Mob(id),
@@ -1926,13 +2156,14 @@ impl Game<'_> {
                     }
                 }
             }
-            if let Some(t) = damaged {
-                let seen = self.sculk.damaged.insert(id, t);
-                if seen != Some(t) {
-                    self.post_entity_event("minecraft:entity_damage", Who::Mob(id));
-                }
+            if let Some(t) = damaged
+                && self.sculk.damaged.get(&id) != Some(&t)
+            {
+                self.sculk.damaged.insert(id, t);
+                self.post_entity_event("minecraft:entity_damage", Who::Mob(id));
             }
         }
+        self.sculk.mob_slots = None;
         let alive: FxHashSet<u32> = self.mobs.iter().map(|m| m.id).collect();
         self.sculk.damaged.retain(|id, _| alive.contains(id));
         self.sculk.steps.retain(|who, _| match who {
@@ -1945,9 +2176,9 @@ impl Game<'_> {
         });
     }
     /// Where the vehicle `id` stands: a mob, boat, minecart or cushion.
-    fn vehicle_position(&self, id: u32) -> Option<[f64; 3]> {
-        let p = if let Some(m) = self.mobs.iter().find(|m| m.id == id) {
-            m.position
+    fn vehicle_position(&mut self, id: u32) -> Option<[f64; 3]> {
+        let p = if let Some(i) = self.mob_slot(id) {
+            self.mobs[i].position
         } else if let Some(b) = self.boats.iter().find(|b| b.id == id) {
             b.position
         } else if let Some(c) = self.carts.iter().find(|c| c.id == id) {
@@ -1963,6 +2194,10 @@ impl Game<'_> {
     /// for a rider first seen riding.
     fn mount_events(&mut self, who: Who, vehicle: Option<u32>, announce: bool) {
         let last = self.sculk.mounts.get(&who).copied();
+        // Riding nothing, as last tick: nothing to tell or keep.
+        if vehicle.is_none() && last.is_none() {
+            return;
+        }
         let now = vehicle.and_then(|id| self.vehicle_position(id));
         if last.map(|l| l.0) != vehicle {
             if let Some((_, at)) = last {
@@ -2018,11 +2253,12 @@ impl Game<'_> {
         .flatten()
     }
     /// `Entity.mainSupportingBlockPos` of a player or mob on the ground.
-    fn main_support(&self, who: Who) -> Option<BlockPos> {
+    fn main_support(&mut self, who: Who) -> Option<BlockPos> {
         match who {
             Who::Player => self.player.as_ref()?.ground.supporting_block,
             Who::Mob(id) => {
-                let mob = self.mobs.iter().find(|m| m.id == id)?;
+                let slot = self.mob_slot(id)?;
+                let mob = &self.mobs[slot];
                 self.supporting_block(mob.position, mob.bounds())
             }
         }
@@ -2039,6 +2275,16 @@ impl Game<'_> {
         warden: bool,
     ) {
         self.sculk_prepare();
+        // Standing as it stood with no step due (a mob outside the simulation
+        // distance, or one at rest): nothing below would change or be heard.
+        if let Some(e) = self.sculk.steps.get(&who)
+            && e.last == at
+            && e.on_ground == on_ground
+            && e.in_water == in_water
+            && e.move_dist <= e.next_step
+        {
+            return;
+        }
         let entry = self.sculk.steps.entry(who).or_insert(Steps {
             move_dist: 0.0,
             next_step: 1.0,
@@ -2066,8 +2312,9 @@ impl Game<'_> {
                     at[2].floor() as i32,
                 ),
             };
-            let ctx = self.who_context(Some(who), Some(state));
-            self.post_game_event("minecraft:hit_ground", at, ctx);
+            self.post_game_event_with("minecraft:hit_ground", at, |g| {
+                g.who_context(Some(who), Some(state))
+            });
         }
         // Entity.updateInWaterStateAndDoFluidPushing: entering water splashes.
         if in_water && !previous.in_water {
@@ -2118,8 +2365,9 @@ impl Game<'_> {
                 } else {
                     (move_dist as i32).wrapping_add(1) as f32
                 };
-                let ctx = self.who_context(Some(who), Some(state));
-                self.post_game_event("minecraft:step", at, ctx);
+                self.post_game_event_with("minecraft:step", at, |g| {
+                    g.who_context(Some(who), Some(state))
+                });
             } else if in_water {
                 entry.next_step = (move_dist as i32).wrapping_add(1) as f32;
                 self.post_entity_event("minecraft:swim", who);
@@ -2135,6 +2383,61 @@ impl Game<'_> {
             [m.position.x, m.position.y, m.position.z],
             ctx,
         );
+    }
+    /// `Entity.kill` for an entity that is no mob (`BlockAttachedEntity.kill`,
+    /// `ArmorStand.kill`, `VehicleEntity.destroy`): removed, then
+    /// `gameEvent(ENTITY_DIE, attributedTo != null ? attributedTo : this)` at
+    /// the entity's position. `by_player`: the player's hit killed it, so the
+    /// player is the source. Nonliving self sources have no Who handle;
+    /// their listener facts are represented by the default context.
+    pub(super) fn entity_killed_event(&mut self, at: [f64; 3], by_player: bool) {
+        self.entity_killed_event_by(at, by_player.then_some(super::commands::Target::Player));
+    }
+    /// `BlockAttachedEntity.kill` / `ArmorStand.kill` with DamageSource.getEntity.
+    pub(super) fn entity_killed_event_by(
+        &mut self,
+        at: [f64; 3],
+        source: Option<super::commands::Target>,
+    ) {
+        self.entity_event_by("minecraft:entity_die", at, source);
+    }
+    /// `Entity.gameEvent(event, attributedTo)` at `at`, attributed to `source`
+    /// (a LAN guest posts as that player), else to the entity itself.
+    pub(super) fn entity_event_by(
+        &mut self,
+        event: &'static str,
+        at: [f64; 3],
+        source: Option<super::commands::Target>,
+    ) {
+        use super::commands::Target;
+        if let Some(Target::Guest(conn)) = source {
+            if self.lan_acting == Some(conn) {
+                let ctx = self.player_context(None);
+                self.post_game_event(event, at, ctx);
+                return;
+            }
+            if let Some(mut host) = self.lan.take() {
+                let posted = self
+                    .as_guest(&mut host, conn, |g| {
+                        let ctx = g.player_context(None);
+                        g.post_game_event(event, at, ctx);
+                    })
+                    .is_some();
+                self.lan = Some(host);
+                if posted {
+                    return;
+                }
+            }
+        }
+        let who = match source {
+            Some(Target::Player) => Some(Who::Player),
+            Some(Target::Mob(id)) => Some(Who::Mob(id)),
+            _ => None,
+        };
+        let mut ctx = self.who_context(who, None);
+        // A stand is living, but Warden.canTargetEntity explicitly excludes it.
+        ctx.living |= matches!(source, Some(Target::Stand(_)));
+        self.post_game_event(event, at, ctx);
     }
 }
 
@@ -2186,6 +2489,72 @@ fn flaps(species: Species, resting: bool, on_ground: bool, age: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wardens that hear an event are those in the list when it is
+    /// posted, however the list changed since the last one.
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn wardens_hear_events_however_the_list_changed_between_them() {
+        let mut game = super::super::native_machines::tests::server_game();
+        game.sculk_prepare();
+        let warden = game
+            .res
+            .mob_types()
+            .get("minecraft:warden")
+            .cloned()
+            .unwrap();
+        let zombie = game
+            .res
+            .mob_types()
+            .get("minecraft:zombie")
+            .cloned()
+            .unwrap();
+        let at = |x| horizon_core::geometry::Vec3::new(x, 100.0, 0.0);
+        let post = |game: &mut Game<'_>| {
+            game.post_game_event("minecraft:explode", [0.5, 100.5, 0.5], Context::default());
+            let later = game.world.game_time + 1;
+            let heard = |m: &mut Mob| {
+                let warden = m.extra.warden.as_mut()?;
+                let heard = warden.vibration.selector.chosen_candidate(later);
+                warden.vibration = Default::default();
+                heard
+            };
+            let mut ids: Vec<u32> = game
+                .mobs
+                .iter_mut()
+                .filter_map(|m| heard(m).map(|_| m.id))
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(post(&mut game), [0u32; 0], "nobody to hear it");
+        assert_eq!(post(&mut game), [0u32; 0]);
+
+        game.mobs.push(Mob::new(1, zombie.clone(), at(1.0), 0.0));
+        game.mobs.push(Mob::new(2, warden.clone(), at(2.0), 0.0));
+        assert_eq!(post(&mut game), [2], "one that joined since");
+        assert_eq!(post(&mut game), [2], "and again with nothing changed");
+
+        game.mobs
+            .insert(0, Mob::new(3, warden.clone(), at(3.0), 0.0));
+        assert_eq!(post(&mut game), [2, 3], "the slots moved");
+
+        let level = std::mem::take(&mut game.mobs);
+        assert_eq!(post(&mut game), [0u32; 0], "another level's list");
+        game.mobs = level;
+        assert_eq!(post(&mut game), [2, 3], "this level's again");
+
+        game.mobs.retain(|m| m.id != 3);
+        assert_eq!(post(&mut game), [2], "one that left");
+
+        // A write that keeps every slot and makes the zombie's a listener.
+        game.mobs[0] = Mob::new(1, warden, at(1.0), 0.0);
+        assert_eq!(post(&mut game), [1, 2], "one replaced in its slot");
+
+        game.mobs[0].removed = true;
+        game.mobs[0].health = 0.0;
+        assert_eq!(post(&mut game), [2], "the dead hear nothing");
+    }
 
     /// Retaining keeps the insertion order and the membership in step.
     #[test]
@@ -2265,5 +2634,289 @@ mod tests {
         assert_eq!(center((1, 2, 3)), [1.5, 2.5, 3.5]);
         assert_eq!(block_of([1.5, 2.5, -0.5]), [1, 2, -1]);
         assert_eq!(dist_sqr([0, 0, 0], (3, 4, 0)), 25);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_POSTED_EVENTS: std::cell::RefCell<Option<Vec<(&'static str, [f64; 3], Option<Who>)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod command_damage_listener_tests {
+    use super::*;
+    use crate::game::{Audio, Options, Progress, Settings, load_resources};
+    use horizon_client::chunk::Chunk;
+    use horizon_core::position::ChunkPos;
+    use std::sync::Arc;
+
+    fn selected(game: &Game<'_>, key: (i32, i32, i32)) -> Option<(Info, i64)> {
+        let Some(BlockEntity::Sculk(sensor)) = game.world.block_entities.get(&key) else {
+            panic!("actual command-created sensor must be registered");
+        };
+        sensor.vibration.selector.current
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    fn command_damage_posts_before_teleport_and_deduplicates_the_scan() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let settings = Settings::default();
+        let loaded = load_resources(
+            root.clone(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            true,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut game = Game::new(
+            &loaded.resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&root),
+            None,
+        )
+        .unwrap();
+        game.build_registries();
+        game.set_allow_commands(true);
+        for x in 0..=2 {
+            game.world
+                .chunks
+                .insert((x, 0), Arc::new(Chunk::empty(x, 0)));
+            game.block_ticks
+                .add_empty_chunk(ChunkPos::new(x, 0))
+                .unwrap();
+        }
+        assert!(game.run_command("forceload add 0 0 47 15"));
+        assert!(game.run_command("fill 0 199 0 47 199 15 stone"));
+        assert_eq!(
+            game.world.block(4, 199, 4),
+            game.pack
+                .assets
+                .registry
+                .default_state("minecraft:stone")
+                .unwrap()
+        );
+        let origin = (7, 200, 4);
+        let destination = (39, 200, 4);
+        for (index, accepted) in [true, false].into_iter().enumerate() {
+            if index != 0 {
+                assert!(game.run_command("setblock 7 200 4 air strict"));
+                assert!(game.run_command("setblock 39 200 4 air strict"));
+            }
+            let uuid = format!("00000071-0000-0000-0000-{:012x}", index + 1);
+            assert!(game.run_command(&format!(
+                "summon pig 4.5 200 4.5 {{UUID:[I;113,0,0,{}],Health:10f,NoAI:1b,NoGravity:1b,Invulnerable:{}b,Motion:[0d,0d,0d]}}",
+                index + 1, if accepted {0} else {1},
+            )));
+            let id = game.mobs.last().expect("actual summon must create pig").id;
+            assert_eq!(game.uuid_for(id), [113, 0, 0, index as i32 + 1]);
+            assert!(game.run_command("setblock 7 200 4 sculk_sensor strict"));
+            assert!(game.run_command("setblock 39 200 4 sculk_sensor strict"));
+            game.sculk_prepare();
+            game.sculk_sync_index();
+            assert!(selected(&game, origin).is_none());
+            assert!(selected(&game, destination).is_none());
+            let before = game.world.game_time;
+            let mob = game.mobs.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(mob.species(), Species::Pig);
+            assert_eq!(mob.health, 10.0);
+            assert!(mob.no_ai && mob.no_gravity);
+            assert_eq!(mob.position, Vec3::new(4.5, 200.0, 4.5));
+            assert_eq!(
+                game.run_command(&format!("damage {uuid} 2 minecraft:cactus")),
+                accepted
+            );
+            let mob = game.mobs.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(mob.health, if accepted { 8.0 } else { 10.0 });
+            if accepted {
+                let (event, tick) =
+                    selected(&game, origin).expect("accepted command hit must already be heard");
+                assert_eq!(event.event, "minecraft:entity_damage");
+                assert_eq!(event.pos, [4.5, 200.0, 4.5]);
+                assert_eq!(event.source, Some(Who::Mob(id)));
+                assert_eq!(tick, before);
+                assert_eq!(
+                    game.sculk.damaged.get(&id).copied(),
+                    mob.last_damage.map(|(_, tick)| tick)
+                );
+            } else {
+                assert!(selected(&game, origin).is_none());
+                assert!(!game.sculk.damaged.contains_key(&id));
+            }
+            assert!(game.run_command(&format!("tp {uuid} 36.5 200 4.5")));
+            assert_eq!(game.world.game_time, before);
+            assert_eq!(
+                game.mobs.iter().find(|m| m.id == id).unwrap().position,
+                Vec3::new(36.5, 200.0, 4.5)
+            );
+            assert!(selected(&game, destination).is_none());
+            if accepted {
+                assert_eq!(selected(&game, origin).unwrap().0.pos, [4.5, 200.0, 4.5]);
+            }
+            game.world.game_time += 1;
+            game.tick_mob_sculk_events();
+            assert!(
+                selected(&game, destination).is_none(),
+                "end-of-tick scan must not post the old hit again at the moved victim"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shriek_capture_tests {
+    use super::*;
+    use crate::game::{Audio, Options, Progress, Settings, load_resources};
+    use horizon_client::chunk::Chunk;
+    use horizon_core::{position::ChunkPos, random::LegacyRandom};
+    use horizon_world::level::LevelEvent;
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
+    fn level_event_shriek_keeps_local_play_and_random_but_not_shared_capture() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let settings = Settings::default();
+        let loaded = load_resources(
+            root.clone(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            true,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut game = Game::new(
+            &loaded.resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&root),
+            None,
+        )
+        .unwrap();
+        game.build_registries();
+        game.set_allow_commands(true);
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        game.block_ticks
+            .add_empty_chunk(ChunkPos::new(0, 0))
+            .unwrap();
+        assert!(game.run_command("forceload add 0 0"));
+        assert!(game.run_command("setblock 4 200 4 sculk_shrieker[waterlogged=false] strict"));
+        assert!(game.run_command("setblock 7 200 4 sculk_shrieker[waterlogged=true] strict"));
+        assert_eq!(
+            game.state_property(game.world.block(4, 200, 4), "waterlogged"),
+            Some("false")
+        );
+        assert_eq!(
+            game.state_property(game.world.block(7, 200, 4), "waterlogged"),
+            Some("true")
+        );
+        game.particles.requested = Some(Vec::new());
+        game.particles.seed_randoms(6500, 6501, 6502);
+        let mut random = LegacyRandom::new(6500);
+        let clock = game.world.game_time;
+        let mut world_random = game.world.random.clone();
+        let effect = "minecraft:block.sculk_shrieker.shriek";
+        let before = "minecraft:block.note_block.pling";
+        let after = "minecraft:block.amethyst_block.chime";
+        game.audio.capture = Some(Vec::new());
+        game.audio
+            .play_on(4, before, Some([1.5, 200.0, 4.5]), 1.0, 1.0);
+        game.level_events.push(LevelEvent::LevelEvent {
+            id: 3007,
+            pos: BlockPos::new(4, 200, 4),
+            data: 0,
+        });
+        game.process_level_events().unwrap();
+        assert_eq!(
+            game.audio.heard.get(effect),
+            Some(&1),
+            "dry effect must still play locally"
+        );
+        random.next_float(); // Same single pitch draw after the particle requests.
+        assert_eq!(
+            game.particles.random().next_long(),
+            random.next_long(),
+            "dry random continuation"
+        );
+        game.level_events.push(LevelEvent::LevelEvent {
+            id: 3007,
+            pos: BlockPos::new(7, 200, 4),
+            data: 0,
+        });
+        game.process_level_events().unwrap();
+        assert_eq!(
+            game.audio.heard.get(effect),
+            Some(&1),
+            "waterlogged effect stays silent"
+        );
+        assert_eq!(
+            game.particles.random().next_long(),
+            random.next_long(),
+            "wet branch consumes no pitch draw"
+        );
+        let requests = game.particles.requested.as_ref().unwrap();
+        assert_eq!(requests.len(), 20);
+        for (i, (options, position, velocity)) in requests.iter().enumerate() {
+            assert_eq!(options.ty, ParticleType::Shriek);
+            assert_eq!(options.scale, ((i % 10) * 5) as f32);
+            assert_eq!(*position, [if i < 10 { 4.5 } else { 7.5 }, 200.5, 4.5]);
+            assert_eq!(*velocity, [0.0; 3]);
+        }
+        game.audio
+            .play_on(4, after, Some([2.5, 200.0, 4.5]), 0.5, 1.25);
+        assert_eq!(game.audio.heard.get(before), Some(&1));
+        assert_eq!(game.audio.heard.get(after), Some(&1));
+        assert_eq!(game.world.game_time, clock);
+        assert_eq!(
+            game.world.random.next_long(),
+            world_random.next_long(),
+            "level random continuation"
+        );
+        let shared = game
+            .audio
+            .capture
+            .as_ref()
+            .expect("shared capture restored");
+        assert_eq!(
+            shared.iter().map(|s| s.event.as_str()).collect::<Vec<_>>(),
+            vec![before, after],
+            "client-level shriek entered shared capture"
+        );
+        for (sound, (position, volume, pitch)) in shared.iter().zip([
+            ([1.5, 200.0, 4.5], 1.0, 1.0),
+            ([2.5, 200.0, 4.5], 0.5, 1.25),
+        ]) {
+            assert_eq!(
+                (sound.position, sound.volume, sound.pitch, sound.source),
+                (position, volume, pitch, 4)
+            );
+            assert_eq!((sound.entity, sound.except_entity), (None, None));
+        }
     }
 }

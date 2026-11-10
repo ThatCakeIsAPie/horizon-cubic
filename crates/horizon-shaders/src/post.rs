@@ -185,6 +185,15 @@ const HAND: [&str; 4] = [
     "gbuffers_basic",
 ];
 
+/// `gbuffers_hand_water` and its fallbacks (2.3): translucent held items, after deferred.
+const HAND_WATER: [&str; 5] = [
+    "gbuffers_hand_water",
+    "gbuffers_hand",
+    "gbuffers_textured_lit",
+    "gbuffers_textured",
+    "gbuffers_basic",
+];
+
 /// `gbuffers_weather` and its fallbacks (2.3).
 const WEATHER: [&str; 4] = [
     "gbuffers_weather",
@@ -214,13 +223,11 @@ const PARTICLES: [&str; 4] = [
     "gbuffers_basic",
 ];
 
-/// The sun and moon's default blend: added to the sky, as vanilla draws them.
-pub const CELESTIAL_BLEND: Blend = [
-    Factor::SrcAlpha,
-    Factor::One,
-    Factor::One,
-    Factor::OneMinusSrcAlpha,
-];
+/// The sun and moon's default blend: added to the sky, and their own alpha replacing the
+/// buffer's, as vanilla draws them (`RenderPipelines.CELESTIAL`, `BlendFunction.OVERLAY`). Iris
+/// 1.11.7 left the sun's alpha (2.0) in an RGBA32F buffer the sky had written 1.0 to, with a
+/// probe pack of ours (#10490).
+pub const CELESTIAL_BLEND: Blend = [Factor::SrcAlpha, Factor::One, Factor::One, Factor::Zero];
 
 const GROUPS: [(Group, &str); 6] = [
     (Group::Setup, "setup"),
@@ -231,6 +238,12 @@ const GROUPS: [(Group, &str); 6] = [
     (Group::Final, "final"),
 ];
 
+/// The stars' blend: added to the sky, their own alpha replacing the buffer's, as vanilla draws
+/// them (`RenderPipelines.STARS`, `BlendFunction.OVERLAY`). Iris 1.11.7 drew them so with a probe
+/// pack of ours (#10490): colour 0.25 × 0.5 over the disc's 1.0 read 1.125, alpha 0.5.
+pub const STARS_BLEND: Blend = [Factor::SrcAlpha, Factor::One, Factor::One, Factor::Zero];
+
+#[derive(Clone)]
 pub struct PostProgram {
     /// The program's name (`composite3`).
     pub name: String,
@@ -243,6 +256,10 @@ pub struct PostProgram {
     pub flips: Vec<(u32, bool)>,
     /// How the program's output blends into its buffers; `None` writes them.
     pub blend: Option<Blend>,
+    /// `gbuffers_skybasic` without a `blend.*` of its own: each part of the sky blends as
+    /// vanilla draws it, the disc and the void without blending (`RenderPipelines.SKY`), the stars
+    /// with [`STARS_BLEND`] and the sunset fan with `blend`.
+    pub vanilla_sky_blends: bool,
     /// Per-buffer blend overrides, keyed by colortex index (not output location).
     pub buffer_blends: Vec<(u32, Option<Blend>)>,
     /// Bit n: `colortex<n>MipmapEnabled` in its fragment stage, so buffer n's mip chain is
@@ -409,6 +426,7 @@ pub enum ShadowCulling {
     Reversed,
 }
 
+#[derive(Clone)]
 pub struct Post {
     /// The folder the programs came from: `""` for `shaders` itself, else `world0`...
     pub folder: String,
@@ -426,6 +444,14 @@ pub struct Post {
     pub terrain_cutout: Option<PostProgram>,
     /// What draws translucent terrain (water, stained glass) after deferred.
     pub water: Option<PostProgram>,
+    /// The pack has no program for solid and cutout terrain (none of `gbuffers_terrain`'s
+    /// chain, nor `_solid` or `_cutout`), or for translucent terrain (none of
+    /// `gbuffers_water`'s): nothing draws that terrain, into no buffer nor depth. Iris 1.11.7
+    /// drew no terrain with our probe packs having no gbuffers programs, at the root or in a
+    /// dimension's folder (#10455). A program that is there but doesn't load still leaves its
+    /// terrain to the game.
+    pub terrain_undrawn: bool,
+    pub water_undrawn: bool,
     /// What draws the sky (disc, sunset, stars, void) before terrain.
     pub sky: Option<PostProgram>,
     /// What draws the sun and moon, between the sunset and the stars.
@@ -434,10 +460,14 @@ pub struct Post {
     pub entities: Option<PostProgram>,
     /// What draws block entities, after terrain.
     pub block: Option<PostProgram>,
+    /// An authored translucent block variant; absent or failed keeps the ordinary block path.
+    pub block_translucent: Option<PostProgram>,
     /// What draws translucent entities (name tags, shadows), after the others.
     pub entities_translucent: Option<PostProgram>,
     /// What draws particles.
     pub particles: Option<PostProgram>,
+    /// The translucent particle variant for explicit mixed ordering, when it loads.
+    pub particles_translucent: Option<PostProgram>,
     /// What draws beacon and End gateway beams (after deferred, blended).
     pub beacon_beam: Option<PostProgram>,
     pub damaged_block: Option<PostProgram>,
@@ -445,13 +475,13 @@ pub struct Post {
     pub clouds: Option<PostProgram>,
     /// What draws lines (the block outline), with the pack's own transform and look.
     pub lines: Option<PostProgram>,
-    /// What draws rain and snow, after deferred.
+    /// What draws rain and snow, after deferred. They never write depth, whatever `rain.depth`
+    /// says: Iris 1.11.7 left none of either in `depthtex0` (probe packs of ours, #10492).
     pub weather: Option<PostProgram>,
-    /// `rain.depth`: whether rain and snow write depth. Without an explicit false, retain
-    /// Horizon's existing writes; the inspected packs do not establish the external default.
-    pub rain_depth: bool,
     /// What draws the first-person hand and held items.
     pub hand: Option<PostProgram>,
+    /// What draws their translucent parts (stained glass, ice...), after deferred and blended.
+    pub hand_water: Option<PostProgram>,
     /// `clouds=off`: no clouds at all, neither the game's nor the pack's program for them.
     pub clouds_off: bool,
     /// Some program reads a shadow buffer, or `shadow.enabled=true`: the shadow pass runs (2.5).
@@ -460,6 +490,11 @@ pub struct Post {
     /// translucent terrain (`shadow_water` or `shadow`), into the shadow buffers (2.4).
     pub shadow: Option<PostProgram>,
     pub shadow_water: Option<PostProgram>,
+    /// `shadow_water` without the boats' water patches (`GbuffersInputs::water_patches`), for a
+    /// GPU that refuses it with them: their vertex output is one more than a pack writing as
+    /// many as the GPU takes has room for. The water's light then shows in the boats, as before
+    /// the patches, and the rest of the shadow pass stays.
+    pub shadow_water_plain: Option<PostProgram>,
     /// What draws entities (`shadow_entities` or `shadow`) and block entities (`shadow_block` or
     /// `shadow`) from the light, unless `shadowEntities`/`shadowBlockEntities` is false.
     pub shadow_entities: Option<PostProgram>,
@@ -508,8 +543,10 @@ impl Post {
             &self.sky_textured,
             &self.entities,
             &self.block,
+            &self.block_translucent,
             &self.entities_translucent,
             &self.particles,
+            &self.particles_translucent,
             &self.damaged_block,
             &self.clouds,
             &self.weather,
@@ -639,25 +676,28 @@ pub fn load_post(
         terrain: None,
         terrain_cutout: None,
         water: None,
+        terrain_undrawn: false,
+        water_undrawn: false,
         sky: None,
         sky_textured: None,
         entities: None,
         block: None,
+        block_translucent: None,
         entities_translucent: None,
         particles: None,
+        particles_translucent: None,
         beacon_beam: None,
         damaged_block: None,
         clouds: None,
         lines: None,
         weather: None,
-        rain_depth: properties
-            .get("rain.depth")
-            .is_none_or(|v| v.trim() != "false"),
         hand: None,
+        hand_water: None,
         clouds_off: false,
         shadow_pass: false,
         shadow: None,
         shadow_water: None,
+        shadow_water_plain: None,
         shadow_entities: None,
         shadow_block: None,
         shadow_only_player: false,
@@ -767,13 +807,18 @@ pub fn load_post(
             })
         })
     };
-    // The sky blends as vanilla draws its sunset fan and stars unless `blend.*` says otherwise.
+    // The sky's parts blend as vanilla draws them (the sunset fan translucent, the stars
+    // [`STARS_BLEND`], the disc and the void not at all), unless `blend.*` says otherwise. Iris 1.11.7 left exactly what
+    // `gbuffers_skybasic` wrote on the sky disc, alpha 0.25 included, with a probe pack of ours
+    // (#10490).
     let sky = inputs
         .sky
         .as_ref()
         .and_then(|i| gbuffers(&SKY, Group::Gbuffers, i));
     let sky = sky.map(|mut p| {
-        p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
+        let own = blend(properties, &p.name);
+        p.vanilla_sky_blends = own.is_none();
+        p.blend = own.unwrap_or(Some(TRANSLUCENT_BLEND));
         p
     });
     let celestial = inputs.celestial.as_ref();
@@ -830,6 +875,13 @@ pub fn load_post(
     let mut gbuffers_dyn = |names: &[&str], i: &GbuffersInputs| gbuffers(names, Group::Gbuffers, i);
     let entities_translucent = translucent(&ENTITIES_TRANSLUCENT, 0.0, &mut gbuffers_dyn);
     let particles = translucent(&PARTICLES, 0.1, &mut gbuffers_dyn);
+    // Optional slots deliberately have no fallback chain: an absent, disabled or rejected
+    // variant must leave the legacy material grouping and state intact.
+    let block_translucent = translucent(&["gbuffers_block_translucent"], 0.0, &mut gbuffers_dyn);
+    let mixed = properties.get("particles.ordering").map(str::trim) == Some("mixed");
+    let particles_translucent = mixed
+        .then(|| translucent(&["gbuffers_particles_translucent"], 0.1, &mut gbuffers_dyn))
+        .flatten();
     let beacon_beam = translucent(&BEACON_BEAM, 0.0, &mut gbuffers_dyn);
     // Clouds blend, as vanilla's do (OQ-23).
     let clouds = inputs
@@ -865,6 +917,15 @@ pub fn load_post(
         .and_then(|i| gbuffers(&HAND, Group::Gbuffers, i))
         .map(|mut p| {
             p.blend = blend(properties, &p.name).flatten();
+            p
+        });
+    // Translucent held items draw after deferred as translucent terrain does, and blend.
+    let hand_water = inputs
+        .hand
+        .as_ref()
+        .and_then(|i| gbuffers(&HAND_WATER, Group::Translucent, i))
+        .map(|mut p| {
+            p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
             p
         });
     if let Some(terrain) = &inputs.terrain {
@@ -937,8 +998,29 @@ pub fn load_post(
             },
         };
         // gbuffers_water falls back to gbuffers_terrain's chain (2.3).
-        let water = gbuffers(&WATER, Group::Translucent, terrain);
+        // Water discards what lies behind the boats' water patches (`GbuffersInputs::water_mask`).
+        let water = gbuffers(
+            &WATER,
+            Group::Translucent,
+            &GbuffersInputs {
+                water_mask: true,
+                ..terrain.clone()
+            },
+        );
         loader.post.notes.extend(lone);
+        loader.post.terrain_undrawn = !has_solid && !has_cutout;
+        loader.post.water_undrawn = !WATER.iter().any(|n| loader.has(n));
+        for (undrawn, part) in [
+            (loader.post.terrain_undrawn, "terrain"),
+            (loader.post.water_undrawn, "translucent terrain"),
+        ] {
+            if undrawn {
+                loader
+                    .post
+                    .notes
+                    .push(format!("no program for {part}; nothing draws it"));
+            }
+        }
         loader.post.terrain = solid;
         loader.post.water = water.map(|mut p| {
             p.blend = blend(properties, &p.name).unwrap_or(Some(TRANSLUCENT_BLEND));
@@ -954,8 +1036,10 @@ pub fn load_post(
     loader.post.sky_textured = sky_textured;
     loader.post.entities = entities;
     loader.post.block = block;
+    loader.post.block_translucent = block_translucent;
     loader.post.entities_translucent = entities_translucent;
     loader.post.particles = particles;
+    loader.post.particles_translucent = particles_translucent;
     loader.post.beacon_beam = beacon_beam;
     loader.post.damaged_block = damaged_block;
     loader.post.clouds_off = properties.get("clouds").is_some_and(|v| v.trim() == "off");
@@ -963,10 +1047,11 @@ pub fn load_post(
     loader.post.lines = lines;
     loader.post.weather = weather;
     loader.post.hand = hand;
+    loader.post.hand_water = hand_water;
     let flag = |key: &str| properties.get(key).map(|v| v.trim() == "true");
     loader.post.translucent_late = flag("separateEntityDraws").unwrap_or(false);
-    // `after` when the pack has a deferred program, else `mixed`; ours are all translucent, so
-    // `mixed` draws them after deferred too.
+    // Keep the legacy timing here. The renderer moves ordinary mixed particles earlier
+    // only after it has successfully built their translucent variant.
     loader.post.particles_late = match properties.get("particles.ordering").map(str::trim) {
         Some("before") => false,
         Some(_) => true,
@@ -1001,17 +1086,26 @@ fn load_shadow(
         &post.sky_textured,
         &post.entities,
         &post.block,
+        &post.block_translucent,
         &post.entities_translucent,
         &post.particles,
+        &post.particles_translucent,
         &post.beacon_beam,
         &post.damaged_block,
         &post.clouds,
         &post.weather,
         &post.hand,
+        &post.hand_water,
     ];
+    // A program's compute stages count as its other stages do: Iris 1.11.7 drew the shadow map
+    // for a probe pack of ours whose only reader of it was `prepare.csh` (#10490).
     let reads = (post.programs.iter())
         .chain(gbuffers.into_iter().flatten())
-        .flat_map(|p| p.program.iter().flat_map(|q| &q.interface.samplers))
+        .flat_map(|p| {
+            let stages = p.program.iter().map(|q| &q.interface);
+            stages.chain(p.compute.iter().map(|(_, c)| &c.interface))
+        })
+        .flat_map(|i| &i.samplers)
         .any(|s| {
             SHADOW_SAMPLERS.contains(&s.name.as_str())
                 || config::shadow_color(&s.name).is_some_and(|n| n < loader.post.shadow_colors)
@@ -1027,15 +1121,19 @@ fn load_shadow(
         // Observed in probe packs of ours (p9063a, p9063c), not a rule Iris states: Iris 1.11.7
         // honoured a `colortexNFormat` declared only in `shadow.fsh` or `shadowcomp.fsh` of a
         // pack Horizon runs without a shadow pass. So the colortex formats of the shadow
-        // programs' fragment shaders are read here, and nothing else of them (nothing else was
-        // probed). The other shadow programs' files were not probed; they are read as `shadow`.
+        // programs' fragment shaders are read here, with `shadow.fsh`'s shadow settings
+        // (`shadowDistance` and `sunPathRotation` probed, #10490), and nothing else of them
+        // (nothing else was probed). The other shadow programs' files were not probed; they are
+        // read as `shadow`, formats only.
         let names = ["shadow", "shadow_water", "shadow_entities", "shadow_block"]
             .map(str::to_owned)
             .into_iter()
             .chain(std::iter::once("shadowcomp".to_owned()))
             .chain((1..=99).map(|n| format!("shadowcomp{n}")));
         for name in names {
-            loader.read_formats(&name);
+            // `shadow.fsh`'s shadow settings count too (`Config::read_formats_and_shadow`).
+            let shadow = name == "shadow";
+            loader.read_formats(&name, shadow);
         }
         return;
     }
@@ -1090,8 +1188,20 @@ fn load_shadow(
     let shadow = keep("shadowTerrain")
         .then(|| load(&["shadow"], terrain, true, true))
         .flatten();
+    // Its water keeps out of the boats' water patches (`GbuffersInputs::water_patches`).
+    let water_inputs = terrain.map(|t| GbuffersInputs {
+        water_patches: true,
+        ..t.clone()
+    });
     let water = keep("shadowTranslucent")
-        .then(|| load(&["shadow_water", "shadow"], terrain, true, false))
+        .then(|| {
+            load(
+                &["shadow_water", "shadow"],
+                water_inputs.as_ref(),
+                true,
+                false,
+            )
+        })
         .flatten();
     let shadow_entities = (keep("shadowEntities") || only_player)
         .then(|| load(&["shadow_entities", "shadow"], entities, false, true))
@@ -1099,6 +1209,12 @@ fn load_shadow(
     let shadow_block = (keep("shadowBlockEntities") || only_lit)
         .then(|| load(&["shadow_block", "shadow"], entities, false, true))
         .flatten();
+    let water_plain = water
+        .as_ref()
+        .and_then(|_| load(&["shadow_water", "shadow"], terrain, true, false));
+    // The plain one's notes are the patched one's again: each once.
+    let mut seen = std::collections::HashSet::new();
+    loader.post.notes.retain(|n| seen.insert(n.clone()));
     if shadow.is_none() && terrain.is_some() {
         loader
             .post
@@ -1108,6 +1224,7 @@ fn load_shadow(
     loader.geometry = None;
     loader.post.shadow = shadow;
     loader.post.shadow_water = water;
+    loader.post.shadow_water_plain = water_plain;
     loader.post.shadow_entities = shadow_entities;
     loader.post.shadow_block = shadow_block;
     loader.post.shadow_only_player = only_player;
@@ -1186,6 +1303,7 @@ impl Loader<'_> {
                 program: None,
                 buffers: Vec::new(),
                 blend: None,
+                vanilla_sky_blends: false,
                 mipmaps: 0,
                 compute,
                 geometry_triangles: 0,
@@ -1283,6 +1401,7 @@ impl Loader<'_> {
             program: Some(program),
             buffers,
             blend: None,
+            vanilla_sky_blends: false,
             mipmaps,
             compute,
             geometry_triangles: 0,
@@ -1290,8 +1409,9 @@ impl Loader<'_> {
     }
 
     /// Reads the colortex formats of program `name` without loading it, when it is there and
-    /// enabled: those of its fragment shader, as [`Self::load`] reads them.
-    fn read_formats(&mut self, name: &str) {
+    /// enabled: those of its fragment shader, as [`Self::load`] reads them; with `shadow`, its
+    /// shadow settings too.
+    fn read_formats(&mut self, name: &str, shadow: bool) {
         let path = |ext: &str| match self.folder {
             "" => format!("{name}.{ext}"),
             f => format!("{f}/{name}.{ext}"),
@@ -1308,7 +1428,11 @@ impl Loader<'_> {
             return;
         }
         let fragment = self.preprocess(&fsh);
-        self.post.config.read_formats(&fragment);
+        if shadow {
+            self.post.config.read_formats_and_shadow(&fragment);
+        } else {
+            self.post.config.read_formats(&fragment);
+        }
     }
 
     /// Stage file `path` through the preprocessor; the pack's images declared without a format
@@ -1414,6 +1538,7 @@ impl Loader<'_> {
             program: Some(program),
             buffers,
             blend: None,
+            vanilla_sky_blends: false,
             mipmaps: 0,
             compute: Vec::new(),
             geometry_triangles: triangles,
@@ -1671,6 +1796,52 @@ mod tests {
             "{:?}",
             post.notes
         );
+    }
+
+    /// #10455, with probe packs of ours in Iris 1.11.7: a pack (or the dimension folder it
+    /// uses) with no gbuffers programs drew no terrain, solid or translucent, into any buffer or
+    /// depth, and the root folder's gbuffers programs didn't draw the Nether's terrain when
+    /// `world-1` had none. A `gbuffers_water` alone draws translucent terrain only (Horizon's
+    /// choice; not measured in Iris).
+    #[test]
+    fn a_folder_without_terrain_programs_draws_no_terrain() {
+        const VSH: &str = "#version 120\nvoid main() { gl_Position = ftransform(); }";
+        const FSH: &str =
+            "#version 120\n/* DRAWBUFFERS:0 */\nvoid main() { gl_FragData[0] = vec4(1.0); }";
+        let pack = Pack::from_zip_bytes(
+            "original-undrawn-terrain",
+            crate::pack::tests::zip(&[
+                ("shaders/gbuffers_basic.vsh", VSH),
+                ("shaders/gbuffers_basic.fsh", FSH),
+                ("shaders/world-1/composite.vsh", VSH),
+                ("shaders/world-1/composite.fsh", FSH),
+                ("shaders/world1/gbuffers_water.vsh", VSH),
+                ("shaders/world1/gbuffers_water.fsh", FSH),
+            ]),
+        )
+        .unwrap();
+        let inputs = GameInputs {
+            terrain: Some(GbuffersInputs::default()),
+            ..Default::default()
+        };
+        let load = |folder: &str| {
+            let post = load_post(
+                &pack,
+                folder,
+                &Properties::default(),
+                &Macros::standard(),
+                &inputs,
+            );
+            (
+                post.terrain.is_some(),
+                post.water.is_some(),
+                post.terrain_undrawn,
+                post.water_undrawn,
+            )
+        };
+        assert_eq!(load(""), (true, true, false, false));
+        assert_eq!(load("world-1"), (false, false, true, true));
+        assert_eq!(load("world1"), (false, true, true, false));
     }
 
     #[test]
@@ -2368,6 +2539,11 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
             post.shadow_water.as_ref().map(|p| p.name.as_str()),
             Some("shadow")
         );
+        // ...with the boats' water patches, and once more without them.
+        assert_eq!(
+            post.shadow_water_plain.as_ref().map(|p| p.name.as_str()),
+            Some("shadow")
+        );
         // Entities fall back to shadow; block entities have their own program.
         let name = |p: &Option<PostProgram>| p.as_ref().map(|p| p.name.clone());
         assert_eq!(
@@ -2405,6 +2581,62 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
         assert!(none("shadow.enabled=true").shadow.is_some());
         let post = none("shadow.enabled=true\nshadowTranslucent=false");
         assert!(post.shadow.is_some() && post.shadow_water.is_none());
+    }
+
+    /// A compute stage that samples a shadow buffer turns the shadow pass on as a fragment stage
+    /// does. Iris 1.11.7 with probe packs of ours (#10490), where nothing else read them: a
+    /// `prepare.csh` alone sampling shadowtex0 read the terrain's depth there (0.3956 at our noon
+    /// scene), a `composite.csh` beside a `composite.fsh` that reads none read the same, and a
+    /// `prepare.csh` sampling shadowcolor0 read what `shadow.fsh` wrote (0.251); Horizon read an
+    /// empty map (1.0) in all three.
+    #[test]
+    fn a_compute_stage_reading_a_shadow_buffer_turns_the_shadow_pass_on() {
+        let csh = |sampler: &str| {
+            format!(
+                "#version 430\nlayout(local_size_x = 1) in;\nconst ivec3 workGroups = ivec3(1, 1, 1);\n\
+                 uniform sampler2D {sampler};\nlayout(rgba8) writeonly uniform image2D colorimg5;\n\
+                 void main() {{ imageStore(colorimg5, ivec2(0), texture({sampler}, vec2(0.5))); }}\n"
+            )
+        };
+        let load = |files: &[(&str, &str)]| {
+            let mut files = files.to_vec();
+            files.extend([
+                ("shaders/final.vsh", VSH),
+                ("shaders/final.fsh", FSH),
+                ("shaders/shadow.vsh", VSH),
+                ("shaders/shadow.fsh", FSH),
+            ]);
+            let pack = Pack::from_zip_bytes("t", zip(&files)).unwrap();
+            let properties = Properties::parse("", &Macros::default());
+            load_post(
+                &pack,
+                "",
+                &properties,
+                &Macros::standard(),
+                &GameInputs::default(),
+            )
+        };
+        let prepare = csh("shadowtex0");
+        let post = load(&[("shaders/prepare.csh", &prepare)]);
+        assert!(
+            post.programs.iter().any(|p| p.name == "prepare"),
+            "{:?}",
+            post.notes
+        );
+        assert!(post.shadow_pass, "{:?}", post.notes);
+        let post = load(&[
+            ("shaders/composite.vsh", VSH),
+            ("shaders/composite.fsh", FSH),
+            ("shaders/composite.csh", &prepare),
+        ]);
+        let composite = post.programs.iter().find(|p| p.name == "composite");
+        assert_eq!(composite.map(|p| p.compute.len()), Some(1));
+        assert!(post.shadow_pass, "{:?}", post.notes);
+        let color = csh("shadowcolor0");
+        assert!(load(&[("shaders/prepare.csh", &color)]).shadow_pass);
+        // A compute stage that reads none leaves it off, as before.
+        let colortex = csh("colortex1");
+        assert!(!load(&[("shaders/prepare.csh", &colortex)]).shadow_pass);
     }
 
     /// `HIGHER_SHADOWCOLOR` (required or optional) gives the shadow programs shadowcolor2 to 7,
@@ -2493,6 +2725,43 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
         assert!(!post.shadow_pass);
         let post = load("shadow.enabled = true\n", Some("0,1,2,3,4"));
         assert_eq!(buffers(&post), (2, Some(vec![0, 1]), vec![vec![]]));
+    }
+
+    /// A pack without a shadow pass still takes `shadow.fsh`'s shadow settings, not
+    /// `shadow.vsh`'s: Iris 1.11.7 applied `shadowDistance` and `sunPathRotation` from the first
+    /// (shadow projection, sun position) and not from the second, with probe packs of ours whose
+    /// shadow buffers nothing read (#10490).
+    #[test]
+    fn shadow_fsh_settings_count_without_a_shadow_pass() {
+        let settings = "const float shadowDistance = 48.0;\nconst float sunPathRotation = 20.0;\n";
+        let load = |vsh: &str, fsh: &str| {
+            let files = [
+                ("shaders/final.vsh", VSH),
+                ("shaders/final.fsh", FSH),
+                ("shaders/shadow.vsh", vsh),
+                ("shaders/shadow.fsh", fsh),
+            ];
+            let pack = Pack::from_zip_bytes("t", zip(&files)).unwrap();
+            let properties = Properties::parse("", &Macros::default());
+            load_post(
+                &pack,
+                "",
+                &properties,
+                &Macros::standard(),
+                &GameInputs::default(),
+            )
+        };
+        let with = |text: &str, file: &str| format!("#version 120\n{text}{}", &file[13..]);
+        let post = load(VSH, &with(settings, FSH));
+        assert!(!post.shadow_pass);
+        let s = &post.config.shadow;
+        assert_eq!((s.distance, s.sun_path_rotation), (48.0, 20.0));
+        let post = load(&with(settings, VSH), FSH);
+        let (s, d) = (&post.config.shadow, crate::config::Shadow::default());
+        assert_eq!(
+            (s.distance, s.sun_path_rotation),
+            (d.distance, d.sun_path_rotation)
+        );
     }
 
     /// A shadow program with a geometry stage draws terrain, entities and block entities, each
@@ -2596,8 +2865,10 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
         assert!(off.clouds.is_none() && off.clouds_off);
     }
 
+    /// Without `gbuffers_weather` or the textured programs, rain and snow draw with
+    /// `gbuffers_basic`, blended, whatever `rain.depth` says.
     #[test]
-    fn rain_depth_follows_live_properties_independently_of_weather_fallback() {
+    fn weather_falls_back_to_basic_whatever_rain_depth_says() {
         let pack = Pack::from_zip_bytes(
             "original-weather-depth",
             crate::pack::tests::zip(&[
@@ -2617,23 +2888,9 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
             weather: Some(GbuffersInputs::default()),
             ..Default::default()
         };
-        for (text, writes) in [
-            ("rain.depth = true", true),
-            ("rain.depth = false", false),
-            (
-                "#if 0\nrain.depth=true\n#else\nrain.depth = false\n#endif",
-                false,
-            ),
-            ("rain.depth=true\nrain.depth=false", false),
-            ("rain.depth=false\nrain.depth=true", true),
-            // These defaults preserve accepted main as a compatibility choice, not a claim
-            // about the external default contract, which the permitted packs don't establish.
-            ("", true),
-            ("rain.depth=invalid", true),
-        ] {
+        for text in ["", "rain.depth = true", "rain.depth = false"] {
             let properties = Properties::parse(text, &macros);
             let post = load_post(&pack, "", &properties, &macros, &inputs);
-            assert_eq!(post.rain_depth, writes, "{text:?}");
             let weather = post.weather.expect("weather fallback loads");
             assert_eq!(weather.name, "gbuffers_basic");
             assert_eq!(weather.group, Group::Translucent);
@@ -2840,6 +3097,57 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
         );
     }
 
+    /// A pack's own `gbuffers_hand_water` draws the translucent held items: after deferred,
+    /// blended, beside its opaque `gbuffers_hand`.
+    #[test]
+    fn translucent_held_items_draw_with_gbuffers_hand_water() {
+        let vsh = "#version 120\nvarying vec2 uv;\nvoid main() {\n    gl_Position = ftransform();\n    uv = gl_MultiTexCoord0.xy;\n}\n";
+        let fsh = "#version 120\nuniform sampler2D texture;\nvarying vec2 uv;\nvoid main() {\n    gl_FragData[0] = texture2D(texture, uv);\n}\n";
+        let pack = Pack::from_zip_bytes(
+            "P.zip",
+            zip(&[
+                ("shaders/gbuffers_hand.vsh", vsh),
+                ("shaders/gbuffers_hand.fsh", fsh),
+                ("shaders/gbuffers_hand_water.vsh", vsh),
+                ("shaders/gbuffers_hand_water.fsh", fsh),
+            ]),
+        )
+        .unwrap();
+        let hand = crate::GbuffersInputs {
+            declarations: "layout(location = 0) in vec3 hz_v_pos;".into(),
+            body: "    hz_Vertex = vec4(hz_v_pos, 1.0);\n    hz_Color = vec4(1.0);\n".into(),
+            ..Default::default()
+        };
+        let inputs = GameInputs {
+            hand: Some(hand),
+            ..Default::default()
+        };
+        let post = load_post(
+            &pack,
+            "",
+            &Properties::default(),
+            &Macros::standard(),
+            &inputs,
+        );
+        let (opaque, translucent) = (post.hand.unwrap(), post.hand_water.unwrap());
+        assert_eq!(
+            (opaque.name.as_str(), opaque.blend),
+            ("gbuffers_hand", None)
+        );
+        assert_eq!(
+            (
+                translucent.name.as_str(),
+                translucent.group,
+                translucent.blend
+            ),
+            (
+                "gbuffers_hand_water",
+                Group::Translucent,
+                Some(TRANSLUCENT_BLEND)
+            )
+        );
+    }
+
     #[test]
     fn water_falls_back_to_terrain_and_blends() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/packs/terrain-test");
@@ -2876,11 +3184,22 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
                 Some(TRANSLUCENT_BLEND)
             )
         );
+        // Its parts blend as vanilla's: the stars with BlendFunction.OVERLAY.
+        assert!(sky.vanilla_sky_blends);
+        assert_eq!(
+            STARS_BLEND,
+            [Factor::SrcAlpha, Factor::One, Factor::One, Factor::Zero]
+        );
         // gbuffers_skytextured falls back to gbuffers_textured, then gbuffers_basic.
         let sun = post.sky_textured.unwrap();
         assert_eq!(
             (sun.name.as_str(), sun.blend),
             ("gbuffers_textured", Some(CELESTIAL_BLEND))
+        );
+        // Vanilla's `BlendFunction.OVERLAY`: colour added, alpha the sun's own.
+        assert_eq!(
+            sun.blend,
+            Some([Factor::SrcAlpha, Factor::One, Factor::One, Factor::Zero])
         );
         assert_eq!(
             (water.group, water.blend),
@@ -2915,11 +3234,21 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
             (clouds.name.as_str(), clouds.blend),
             ("gbuffers_textured", Some(TRANSLUCENT_BLEND))
         );
-        // The hand falls back to gbuffers_textured and does not blend.
+        // The hand falls back to gbuffers_textured and does not blend; its translucent items
+        // fall back to the same program, after deferred and blended.
         let hand = post.hand.as_ref().unwrap();
         assert_eq!(
             (hand.name.as_str(), hand.group, hand.blend),
             ("gbuffers_textured", Group::Gbuffers, None)
+        );
+        let hand_water = post.hand_water.as_ref().unwrap();
+        assert_eq!(
+            (hand_water.name.as_str(), hand_water.group, hand_water.blend),
+            (
+                "gbuffers_textured",
+                Group::Translucent,
+                Some(TRANSLUCENT_BLEND)
+            )
         );
         // Weather falls back to gbuffers_textured, after deferred, blended.
         let weather = post.weather.as_ref().unwrap();
@@ -3037,60 +3366,10 @@ blend.composite1.colortex3 = ONE ONE ONE ONE
 }
 
 #[cfg(test)]
-mod lifecycle_tests {
-    use super::*;
-    #[test]
-    fn setup_and_begin_compute_load_before_prepare_even_with_only_a_suffix() {
-        let compute = "#version 430\nlayout(local_size_x=1) in; void main(){}";
-        let zip = crate::pack::tests::zip(&[
-            ("shaders/setup.csh", compute),
-            ("shaders/begin_a.csh", compute),
-            ("shaders/prepare.csh", compute),
-        ]);
-        let pack = Pack::from_zip_bytes("lifecycle.zip", zip).unwrap();
-        let post = load_post(
-            &pack,
-            "",
-            &Properties::default(),
-            &Macros::standard(),
-            &GameInputs::default(),
-        );
-        assert!(post.notes.is_empty(), "{:?}", post.notes);
-        assert_eq!(
-            post.programs
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>(),
-            ["setup", "begin", "prepare"]
-        );
-    }
-}
+mod lifecycle_tests;
 
 #[cfg(test)]
-mod buffer_blend_tests {
-    use super::*;
-    #[test]
-    fn buffer_blends_use_colortex_numbers_and_preserve_explicit_off() {
-        let props = Properties::parse(
-            "blend.gbuffers_water=off\nblend.gbuffers_water.colortex13=ONE ONE_MINUS_SRC_ALPHA ONE ONE_MINUS_SRC_ALPHA\nblend.gbuffers_water.colortex2=off\n",
-            &Macros::standard(),
-        );
-        let overrides = buffer_blends(&props, "gbuffers_water");
-        assert_eq!(blend(&props, "gbuffers_water"), Some(None));
-        assert_eq!(
-            overrides,
-            vec![
-                (
-                    13,
-                    Some([
-                        Factor::One,
-                        Factor::OneMinusSrcAlpha,
-                        Factor::One,
-                        Factor::OneMinusSrcAlpha
-                    ])
-                ),
-                (2, None)
-            ]
-        );
-    }
-}
+mod buffer_blend_tests;
+
+#[cfg(test)]
+mod material_variant_tests;

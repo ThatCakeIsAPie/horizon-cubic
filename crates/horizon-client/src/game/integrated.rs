@@ -64,6 +64,8 @@ struct Flags {
     /// `options.entityDistanceScaling` (an `f32`'s bits), which
     /// `IntegratedServer.getScaledTrackingDistance` reads on every call.
     entity_distance: AtomicU32,
+    /// The PvP page's legacy combat rules, which the server's hits follow from the next tick.
+    legacy_rules: AtomicBool,
     /// `MinecraftServer.isCurrentlySaving`: the server is autosaving.
     saving: AtomicBool,
     /// Splitscreen players joined through memory (offline uuids): let in although the world is
@@ -200,6 +202,10 @@ impl Integrated {
             .entity_distance
             .store(entity.to_bits(), Ordering::Relaxed);
     }
+    /// The window's legacy combat rules option, for the server's hits.
+    pub fn set_legacy_rules(&self, on: bool) {
+        self.flags.legacy_rules.store(on, Ordering::Relaxed);
+    }
     /// `IntegratedServer.getPort` while `isPublished`.
     pub fn published(&self) -> Option<u16> {
         Some(self.flags.published.load(Ordering::Relaxed)).filter(|&p| p != 0)
@@ -233,6 +239,11 @@ impl Integrated {
             }
             Err(RecvTimeoutError::Disconnected) => None,
         }
+    }
+    /// `execute`: run `f` on the server thread between two ticks, without
+    /// waiting for it. False once the server has stopped.
+    pub fn post(&self, f: impl FnOnce(&mut Game<'_>) + Send + 'static) -> bool {
+        self.tasks.send(Box::new(f)).is_ok()
     }
     /// `IntegratedServer.halt(true)`: returns once the world is saved and let go.
     pub fn stop(mut self) -> Result<()> {
@@ -359,6 +370,11 @@ impl Game<'_> {
     pub(super) fn has_singleplayer_server(&self) -> bool {
         self.remote.is_none() || self.integrated.is_some()
     }
+    /// `Minecraft.isMultiplayerServer`: on another's server, or a world of one's own open to the
+    /// network.
+    pub(super) fn is_multiplayer_server(&self) -> bool {
+        !self.has_singleplayer_server() || self.is_published()
+    }
     /// `IntegratedServer.isPublished`: the world is open to the network.
     pub(super) fn is_published(&self) -> bool {
         self.lan.is_some()
@@ -394,14 +410,21 @@ impl Game<'_> {
             .as_ref()
             .map_or_else(|| self.options.player_name(), |a| a.name.clone());
         let new_world = create.is_some();
+        // `IntegratedServer`'s constructor: `setSingleplayerProfile(minecraft.getGameProfile())`
+        // — the signed-in account's own UUID. Only an offline start names its player by the
+        // offline profile. The owner is the world's player, so a world without
+        // `singleplayer_uuid` (a Realms download, `renameAndDropPlayer`) finds the owner's
+        // `players/data/<uuid>.dat` instead of starting a new player.
+        let owner = auth
+            .as_ref()
+            .map_or_else(|| offline_uuid(&player), |a| a.uuid);
         let launch = Launch {
             folder: folder.to_owned(),
             name: name.map(str::to_owned),
             seed,
             creative,
             create: create.cloned(),
-            // An offline-mode server names its players by their offline profile.
-            owner: offline_uuid(&player),
+            owner,
             player: player.clone(),
             owner_profile: auth.as_ref().map(|a| {
                 let id = a.uuid;
@@ -457,6 +480,9 @@ impl Game<'_> {
         flags
             .entity_distance
             .store(settings.entity_distance.to_bits(), Ordering::Relaxed);
+        flags
+            .legacy_rules
+            .store(settings.extras.pvp.combat.rules, Ordering::Relaxed);
         let (ready_tx, ready) = channel();
         let (tasks, server_tasks) = channel();
         let server_flags = flags.clone();
@@ -547,6 +573,7 @@ impl Game<'_> {
         self.server_packs_world_pack(&folder);
         self.connect_local(pipe, &player)?;
         if let Some(r) = self.remote.as_mut() {
+            r.save_folder = Some(folder.clone());
             // `new LevelLoadTracker(newWorld ? 500L : 0L)`.
             r.level_load = horizon_client::level_loading::LevelLoadTracker::new(if new_world {
                 horizon_client::level_loading::LEVEL_LOAD_CLOSE_DELAY_MS
@@ -692,6 +719,7 @@ impl Game<'_> {
                 self.wait_for_next_server_tick(&mut next, true);
                 continue;
             }
+            self.server_tick_deadline = Some(next + self.clock.tick_duration());
             let paused = flags.paused.load(Ordering::Relaxed);
             if paused && !was_paused {
                 // IntegratedServer.tickServer: the tick the game pauses saves
@@ -819,6 +847,9 @@ impl Game<'_> {
             })),
             levels: self.level_shapes,
             owner_profile: launch.owner_profile.clone(),
+            // `IntegratedServer.getSingleplayerProfile`: the window's own player logs in
+            // through memory as the account's profile, whatever the hello says.
+            singleplayer_profile: Some((launch.player.clone(), owner)),
             // IntegratedServer.initServer: the MOTD names the owner and the world.
             ..NetConfig::lan(
                 0,
@@ -855,10 +886,11 @@ impl Game<'_> {
             pending: None,
             load: LoadPhase::default(),
         });
-        // MinecraftServer.prepareLevels: no forced chunks to load, so the
-        // stage is over at once; the player's chunks come after.
+        // MinecraftServer.prepareLevels: the saved tickets' chunks load; the
+        // player's chunks come after.
         let view = &flags.load;
         view.start(Stage::LoadInitialChunks, 0);
+        startup::time("server.prepare_levels", || self.prepare_levels())?;
         view.finish(Stage::LoadInitialChunks);
         let _ = ready.send(Ok((pipe, self.level.name.clone())));
         startup::time("server.settle_spawn", || self.settle_spawn())
@@ -957,7 +989,8 @@ impl Game<'_> {
                     g.chat_capture = Some(Vec::new());
                     // A command a native mod registered goes to the mods
                     // first, as the owner's own chat does (the console is
-                    // level 4, so every registered usage is allowed).
+                    // level 4, so every registered usage is allowed; one with
+                    // a permission node asks the mods for the owner).
                     if !g.perform_native_command(conn, 4, command.trim()) {
                         g.run_command(&command);
                     }
@@ -1062,11 +1095,12 @@ impl Game<'_> {
     /// Publish or unpublish for real, once the hub is in its place (a
     /// player's `/publish` runs while it is out).
     /// IntegratedServer.tickServer: the server follows the window's render
-    /// and simulation distances when they change.
+    /// and simulation distances when they change (and Horizon's legacy combat rules).
     fn follow_distances(&mut self, flags: &Flags) {
         // IntegratedServer.getScaledTrackingDistance reads the option each time.
         self.settings.entity_distance =
             f32::from_bits(flags.entity_distance.load(Ordering::Relaxed));
+        self.settings.extras.pvp.combat.rules = flags.legacy_rules.load(Ordering::Relaxed);
         let Some(host) = self.lan.as_mut() else {
             return;
         };
@@ -1214,6 +1248,9 @@ fn serve(
         launch.creative,
         launch.create.as_ref(),
     )
+    // `IntegratedServer.setSingleplayerProfile`: the account this world belongs to
+    // (an older world's offline owner moves to it at open).
+    .map(|request| request.owned_by(&launch.player, launch.owner))
     .and_then(|request| {
         WorldLoader::start(
             request,

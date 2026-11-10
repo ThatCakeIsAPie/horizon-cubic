@@ -113,7 +113,7 @@ pub struct LoadedCube {
     pub section: Arc<Section>,
     /// Block entities at absolute positions in the cube.
     pub block_entities: Vec<((i32, i32, i32), crate::containers::BlockEntity)>,
-    pub block_names: Vec<((i32, i32, i32), String)>,
+    pub block_names: Vec<((i32, i32, i32), Tag)>,
     /// The entities saved in the cube (vanilla entity NBT, absolute `Pos`).
     pub entities: Vec<Tag>,
     /// Scheduled ticks at positions in the cube, as saved (`delay` relative

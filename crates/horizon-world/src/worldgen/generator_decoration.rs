@@ -414,6 +414,12 @@ impl Decoration {
         if region[4].is_decorated() {
             return Ok(DecorateStats::default());
         }
+        // The full chunks of the region, before their terrain moves into it.
+        let full: Vec<ChunkPos> = region
+            .iter()
+            .filter(|chunk| chunk.is_full())
+            .map(|chunk| chunk.position())
+            .collect();
         let mut chunks = Vec::with_capacity(9);
         let mut biomes = Vec::with_capacity(9);
         let (min_y, height) = (region[4].terrain.min_y(), region[4].terrain.height());
@@ -439,7 +445,7 @@ impl Decoration {
             Ok(terrain) => terrain,
             Err(e) => return Err(resource(e.to_string())),
         };
-        let structures_only = worker.structures_only;
+        let structures_only = worker.structures_only || !region[4].features;
         let references = region[4].structure_starts.clone();
         let mut block_entities = Vec::new();
         for chunk in region.iter_mut() {
@@ -469,9 +475,10 @@ impl Decoration {
             // WorldGenRegion.isOutsideBuildHeight: the level's range, not the noise's.
             build: (min_y, min_y + height),
             shape_ticks: std::cell::RefCell::new(crate::level::Ticks::new(0)),
-            tick_buffer: std::cell::RefCell::new(Vec::new()),
             last_tag: None,
             floor_bounds: [None; 9],
+            shape_capture: std::cell::RefCell::new(Vec::new()),
+            full,
         };
         let mut stats = DecorateStats::default();
         let blocks = self.blocks;
@@ -668,10 +675,10 @@ impl World<'_> {
     }
     /// A block write at `[x, y, z]` may raise its chunk's heights up to y + 1.
     fn raise_floor_bound(&mut self, [x, y, z]: [i32; 3]) {
-        if let Some(slot) = self.chunk_slot(x >> 4, z >> 4) {
-            if let Some(bound) = &mut self.floor_bounds[slot] {
-                *bound = (*bound).max(y.saturating_add(1));
-            }
+        if let Some(slot) = self.chunk_slot(x >> 4, z >> 4)
+            && let Some(bound) = &mut self.floor_bounds[slot]
+        {
+            *bound = (*bound).max(y.saturating_add(1));
         }
     }
     /// `floor_bounds` for chunk `cx`, `cz`, computed from its heightmap on
@@ -761,6 +768,8 @@ impl PlacementContext for OriginWorld<'_> {
 /// WorldGenRegion-style view: reads anywhere in the 3×3 region, writes within
 /// the FEATURES step's write radius, biome lookups through the biome zoom.
 struct World<'a> {
+    /// The region's full chunks (`ImposterProtoChunk(chunk, false)`).
+    full: Vec<ChunkPos>,
     block_entities: Vec<([i32; 3], crate::nbt::Compound)>,
     entities: Vec<crate::nbt::Compound>,
     level_random: &'a mut dyn super::structure::legacy::PieceRandom,
@@ -784,14 +793,14 @@ struct World<'a> {
     build: (i32, i32),
     /// The tick capture `shape_update` passes to `updateShape`.
     shape_ticks: std::cell::RefCell<crate::level::Ticks>,
-    /// The emptied capture `schedule_captured` hands back to `shape_update`.
-    tick_buffer: std::cell::RefCell<Vec<crate::level::ticks::CapturedTick>>,
     /// `block_matches_tag`'s last tag and its states.
     last_tag: Option<(Box<str>, Option<Arc<BTreeSet<BlockStateId>>>)>,
     /// Per region chunk (X-major in Z rows, as `uniform_biomes`): a bound no
     /// OCEAN_FLOOR_WG first-available height in it exceeds, once asked.
     /// Heightmaps change only through this world's writes, which raise it.
     floor_bounds: [Option<i32>; 9],
+    /// Reusable capture storage for shape updates in this decoration region.
+    shape_capture: std::cell::RefCell<Vec<crate::level::ticks::CapturedTick>>,
 }
 /// Read-only `LevelAccess` view of the decoration region for
 /// `BlockState.updateShape` (writes go through `World::set_block`).
@@ -850,7 +859,7 @@ impl World<'_> {
         // capturing, scheduling leaves the rest of `Ticks` untouched, so the
         // region keeps one instead of building one per update.
         let mut ticks = self.shape_ticks.borrow_mut();
-        ticks.capture = Some(std::mem::take(&mut *self.tick_buffer.borrow_mut()));
+        ticks.capture = Some(std::mem::take(&mut *self.shape_capture.borrow_mut()));
         let updated = behaviours.update_shape(
             &mut level,
             &mut ticks,
@@ -868,22 +877,25 @@ impl World<'_> {
         behaviours: &crate::level::Behaviours,
         mut ticks: Vec<crate::level::ticks::CapturedTick>,
     ) -> Result<(), PlacementQueryError> {
-        for &t in &ticks {
-            let at = [t.pos.x, t.pos.y, t.pos.z];
-            if t.fluid {
-                let fluid = crate::fluid::FluidKind::ALL[t.kind as usize];
-                self.schedule_fluid_tick(at, fluid, t.delay)?;
-            } else {
-                let state = behaviours
-                    .table
-                    .default_state(crate::level::BlockId(t.kind as u16));
-                self.schedule_block_tick(at, state, t.delay)?;
+        let result = (|| {
+            for t in &ticks {
+                let at = [t.pos.x, t.pos.y, t.pos.z];
+                if t.fluid {
+                    if let Some(fluid) = crate::fluid::FluidKind::from_index(t.kind as usize) {
+                        self.schedule_fluid_tick(at, fluid, t.delay)?;
+                    }
+                } else {
+                    let state = behaviours
+                        .table
+                        .default_state(crate::level::BlockId(t.kind as u16));
+                    self.schedule_block_tick(at, state, t.delay)?;
+                }
             }
-        }
-        // The next shape update captures into the same allocation.
+            Ok(())
+        })();
         ticks.clear();
-        *self.tick_buffer.get_mut() = ticks;
-        Ok(())
+        *self.shape_capture.borrow_mut() = ticks;
+        result
     }
 }
 impl DecorationWorld for World<'_> {
@@ -899,7 +911,11 @@ impl DecorationWorld for World<'_> {
     /// bitset instead of sorting every quart of the column.
     fn chunk_biomes(&mut self, chunk: ChunkPos) -> Result<Vec<BiomeId>, RegionError> {
         let biomes = self.biomes.chunk(chunk).map_err(RegionError::Biome)?;
-        let mut seen: Vec<u64> = Vec::new();
+        // Ordinary registry ids fit in the stack array. Keep a spill for
+        // unusually large modded registries without changing the ascending
+        // iteration order of the bitset.
+        let mut seen = [0u64; 128];
+        let mut seen_spill = Vec::new();
         let mut last = None;
         let mut section = 0;
         while let Some(values) = biomes.section(section) {
@@ -909,15 +925,25 @@ impl DecorationWorld for World<'_> {
                 }
                 last = Some(id);
                 let word = id.0 as usize / 64;
-                if seen.len() <= word {
-                    seen.resize(word + 1, 0);
+                if let Some(bits) = seen.get_mut(word) {
+                    *bits |= 1 << (id.0 % 64);
+                } else {
+                    let spill_word = word - seen.len();
+                    if seen_spill.len() <= spill_word {
+                        seen_spill.resize(spill_word + 1, 0);
+                    }
+                    seen_spill[spill_word] |= 1 << (id.0 % 64);
                 }
-                seen[word] |= 1 << (id.0 % 64);
             }
             section += 1;
         }
-        let mut out = Vec::new();
-        for (word, &bits) in seen.iter().enumerate() {
+        let count = seen
+            .iter()
+            .chain(seen_spill.iter())
+            .map(|bits| bits.count_ones() as usize)
+            .sum();
+        let mut out = Vec::with_capacity(count);
+        for (word, &bits) in seen.iter().chain(seen_spill.iter()).enumerate() {
             let mut bits = bits;
             while bits != 0 {
                 out.push(BiomeId(word as u32 * 64 + bits.trailing_zeros()));
@@ -928,6 +954,12 @@ impl DecorationWorld for World<'_> {
     }
     fn set_currently_generating(&mut self, _: Option<FeatureIdentity>) -> Result<(), RegionError> {
         Ok(())
+    }
+}
+impl World<'_> {
+    /// Whether `position` is in one of the region's full chunks.
+    fn is_full_chunk(&self, [x, _, z]: [i32; 3]) -> bool {
+        self.full.iter().any(|p| p.x == x >> 4 && p.z == z >> 4)
     }
 }
 impl FeatureWorld for World<'_> {
@@ -956,6 +988,12 @@ impl FeatureWorld for World<'_> {
             .contains_block(BlockPos::new(position[0], position[1], position[2]))
         {
             return Ok(false);
+        }
+        // ImposterProtoChunk(chunk, false): setBlockState, setBlockEntity,
+        // removeBlockEntity and markPosForPostProcessing change nothing, and
+        // WorldGenRegion.setBlock still answers true.
+        if self.is_full_chunk(position) {
+            return Ok(true);
         }
         let old = self.region.block(position)?;
         self.region.set_block_worldgen(position, state)?;
@@ -1048,27 +1086,6 @@ pub(crate) fn loot_table_nbt(
     nbt.insert("id".into(), Tag::String(name.as_str().into()));
     nbt.insert("LootTable".into(), Tag::String(table.into()));
     nbt.insert("LootTableSeed".into(), Tag::Long(random.next_long()));
-    Some(nbt)
-}
-/// SpawnerBlockEntity.setEntityId's compound for the spawner at `state`, or
-/// None when the block there is not a spawner.
-pub(crate) fn spawner_nbt(
-    registry: &crate::registry::BlockRegistry,
-    state: BlockStateId,
-    entity: &str,
-) -> Option<crate::nbt::Compound> {
-    use crate::nbt::Tag;
-    if registry.state(state).map(|s| s.name.as_str()) != Some("minecraft:spawner") {
-        return None;
-    }
-    let mut mob = crate::nbt::Compound::new();
-    mob.insert("id".into(), Tag::String(entity.into()));
-    let mut data = crate::nbt::Compound::new();
-    data.insert("entity".into(), Tag::Compound(mob));
-    let mut nbt = crate::nbt::Compound::new();
-    nbt.insert("id".into(), Tag::String("minecraft:mob_spawner".into()));
-    nbt.insert("SpawnData".into(), Tag::Compound(data));
-    nbt.insert("SpawnPotentials".into(), Tag::List(Vec::new()));
     Some(nbt)
 }
 impl<'a> World<'a> {
@@ -1164,10 +1181,10 @@ impl PlacementContext for World<'_> {
         let chunk = self.region.chunk(position[0] >> 4, position[2] >> 4)?;
         let state = chunk.block(position[0], position[1], position[2]);
         let registry = self.decoration.bindings.registry();
-        match spawner_nbt(registry, state, entity) {
-            Some(nbt) => self.set_block_entity(position, nbt),
-            None => Ok(()),
+        if registry.state(state).map(|s| s.name.as_str()) != Some("minecraft:spawner") {
+            return Ok(());
         }
+        self.set_block_entity(position, super::cave::dungeon_spawner_nbt(entity))
     }
     fn attachment_at(
         &mut self,
@@ -1449,12 +1466,16 @@ impl PlacementContext for World<'_> {
             .zone
             .contains_block(BlockPos::new(position[0], position[1], position[2])))
     }
-    /// ProtoChunk.setBlockState: the section and the stage's heightmaps.
+    /// ProtoChunk.setBlockState: the section and the stage's heightmaps
+    /// (nothing on a full chunk: ImposterProtoChunk(chunk, false)).
     fn set_chunk_block(
         &mut self,
         position: [i32; 3],
         state: BlockStateId,
     ) -> Result<(), PlacementQueryError> {
+        if self.is_full_chunk(position) {
+            return Ok(());
+        }
         self.region
             .set_block_worldgen(position, state)
             .map_err(|e| query(format!("{e:?}")))?;

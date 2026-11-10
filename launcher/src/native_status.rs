@@ -15,7 +15,9 @@ pub type Mod = (String, String, Option<String>);
 /// Whether an installed file (`installed::Entry::file`) is a native mod.
 pub fn is_native_file(file: &str) -> bool {
     file.strip_prefix(native_mods::INSTALLED)
-        .is_some_and(|rest| rest.starts_with('/') && rest.ends_with(".hnmod"))
+        .is_some_and(|rest| {
+            rest.starts_with('/') && (rest.ends_with(".hnmod") || rest.ends_with(".hmod"))
+        })
 }
 
 /// Where an instance's native mods stand.
@@ -72,6 +74,8 @@ pub struct Build {
     /// It compiled another commit than its Nightly's, with no record of why: built before the
     /// launcher kept which mods pinned it ([`pinning`] reads them from the instance's mods).
     pub pinned_unknown: bool,
+    /// The mods turned on that it was built without, and why.
+    pub left_out: Vec<native_mods::LeftOut>,
 }
 
 impl Build {
@@ -87,6 +91,7 @@ impl Build {
             base: about.base,
             horizon: about.horizon,
             pinned_by: about.pinned_by,
+            left_out: about.left_out,
         }
     }
 
@@ -122,9 +127,7 @@ pub fn enabled(home: &Path) -> Vec<Mod> {
         match horizon_mods::index::native::Bundle::read(&path) {
             Ok(b) => {
                 if java::is_enabled(home, &b.manifest.id) {
-                    let digest = native_mods::digest(
-                        b.files.iter().map(|(n, d)| (n.as_str(), d.as_slice())),
-                    );
+                    let digest = native_mods::digest(b.source_files().into_iter());
                     out.push((b.manifest.id, b.manifest.version, Some(digest)));
                 }
             }
@@ -199,9 +202,16 @@ pub fn built(version: &str) -> Option<Vec<Mod>> {
     Some(parse_built(&about))
 }
 
+/// The mods a build was made for: those it holds and those it left out (a build already tried
+/// them: it is up to date with the same mods turned on).
 fn parse_built(about: &serde_json::Value) -> Vec<Mod> {
     let mods = about["mods"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let left_out = about["left_out"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     mods.iter()
+        .chain(left_out)
         .filter_map(|m| {
             Some((
                 m["id"].as_str()?.into(),
@@ -234,7 +244,7 @@ fn hnmods(home: &Path) -> Vec<std::path::PathBuf> {
     let mut paths: Vec<_> = fs::read_dir(home.join(native_mods::INSTALLED))
         .map(|dir| dir.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
-    paths.retain(|p| p.extension().is_some_and(|e| e == "hnmod"));
+    paths.retain(|p| horizon_mods::index::native::is_file(p));
     paths.sort();
     paths
 }
@@ -414,6 +424,17 @@ mod tests {
         });
         assert_eq!(parse_built(&about), [m("zoom", "2.1"), d("y", "1", "ab")]);
         assert!(parse_built(&serde_json::json!({})).is_empty());
+        // A mod the build left out was tried: the same mods turned on need no new build, a new
+        // version of it does.
+        let about = serde_json::json!({
+            "mods": [{"id": "zoom", "version": "2.1"}],
+            "left_out": [{"id": "hitbox_plus", "version": "1.3.0", "why": "other-version"}],
+        });
+        let build = parse_built(&about);
+        let on = [m("zoom", "2.1"), m("hitbox_plus", "1.3.0")];
+        assert_eq!(state(&on, Some(build.as_slice())), State::UpToDate);
+        let on = [m("zoom", "2.1"), m("hitbox_plus", "1.3.1")];
+        assert_eq!(state(&on, Some(build.as_slice())), State::Outdated);
         assert_eq!(built("v0.1.0"), None, "not a native build");
     }
 
@@ -451,6 +472,7 @@ mod tests {
             base_horizon: base_horizon.map(str::to_owned),
             pinned_by: Vec::new(),
             on_base: false,
+            left_out: Vec::new(),
         };
         let pin = "9d979caa48a3bb58203319b9ea044db58c38e0d8";
         let own = "d91cab6000000000000000000000000000000000";

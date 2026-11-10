@@ -673,6 +673,11 @@ impl LevelAccess for Region<'_, '_> {
             self.world.set_block_entity([pos.x, pos.y, pos.z], nbt);
         }
     }
+    /// The pieces' spawners (`LevelFeatureWorld::configure_spawner` checked the
+    /// block is one): generation just placed it, so it has no entity yet.
+    fn create_feature_spawner(&mut self, pos: BlockPos, nbt: crate::nbt::Compound) {
+        self.load_block_entity(pos, nbt);
+    }
 }
 
 #[cfg(test)]

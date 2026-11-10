@@ -10,6 +10,7 @@ pub mod anticheat;
 pub mod arrivals;
 pub mod attributes;
 pub mod border;
+pub mod chunk_sync;
 pub mod chunks;
 pub mod code_of_conduct;
 mod command_order;
@@ -25,11 +26,13 @@ pub mod forwarding;
 pub mod guest;
 pub mod handoff;
 pub mod hub;
+pub mod import;
 mod io_pool;
 pub mod menu;
 pub mod playerdata;
 pub mod prediction;
 pub mod recipes;
+mod registry_names;
 pub mod scoreboard;
 mod sound_order;
 pub mod tracking;
@@ -84,6 +87,62 @@ pub struct Joined {
     /// The login used up an expectation of a proxy's (`player-expect`) when it
     /// started (`arrivals`).
     pub expected: bool,
+    /// What the client said during its configuration that the game hears once it joined.
+    pub configured: Configured,
+}
+
+/// What a client said during its configuration, kept for the game (`native_packets.rs`): the
+/// plugin channels it registered (`minecraft:register`), in order, and its answers to the
+/// server's resource pack (pack id, `ServerboundResourcePackPacket.Action` id), in order.
+#[derive(Clone, Debug, Default)]
+pub struct Configured {
+    pub channels: Vec<String>,
+    pub pack_answers: Vec<(u128, i32)>,
+}
+
+/// The most plugin channels kept for one client ([`apply_channels`]).
+pub const MAX_CHANNELS: usize = 128;
+/// The longest plugin channel name kept, in bytes.
+pub const MAX_CHANNEL_NAME: usize = 256;
+
+/// Whether a plugin channel message on `channel` registers channels (`minecraft:register`,
+/// true) or unregisters them (`minecraft:unregister`, false), as Bukkit's and Fabric's
+/// clients and proxies send them; None for any other channel. Vanilla reads neither.
+pub fn channel_registration(channel: &str) -> Option<bool> {
+    match channel {
+        "minecraft:register" => Some(true),
+        "minecraft:unregister" => Some(false),
+        _ => None,
+    }
+}
+
+/// Applies a register or unregister message's NUL-separated channel names to `channels`: the
+/// names it added or removed, in the message's order. A name that isn't printable ASCII with a
+/// `:`, is longer than [`MAX_CHANNEL_NAME`], or would take `channels` past [`MAX_CHANNELS`] is
+/// skipped; a name already registered, or not registered, changes nothing.
+pub fn apply_channels(channels: &mut Vec<String>, data: &[u8], register: bool) -> Vec<String> {
+    let mut changed = Vec::new();
+    for name in data.split(|b| *b == 0) {
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        if name.len() > MAX_CHANNEL_NAME
+            || !name.contains(':')
+            || !name.bytes().all(|b| b.is_ascii_graphic())
+        {
+            continue;
+        }
+        if register {
+            if channels.len() < MAX_CHANNELS && !channels.iter().any(|c| c == name) {
+                channels.push(name.to_owned());
+                changed.push(name.to_owned());
+            }
+        } else if let Some(at) = channels.iter().position(|c| c == name) {
+            channels.remove(at);
+            changed.push(name.to_owned());
+        }
+    }
+    changed
 }
 /// What a [`PlayerSender`] made for a test's channel gives it.
 pub enum Out {
@@ -149,6 +208,12 @@ pub const HORIZON_CLIENTS_ONLY: &str = "horizon-clients-only";
 /// What another client is told.
 pub const HORIZON_CLIENTS_ONLY_REASON: &str =
     "This server is for the Horizon client: playhorizon.dev";
+/// The server.properties key (server.toml's `server.accept_older_clients`) that lets 26.2 clients join
+/// (off unless "true").
+pub const ACCEPT_OLDER_CLIENTS: &str = "horizon-accept-older-clients";
+/// What a 26.2 client is told while only its packet ids are translated (#10404).
+pub const OLDER_CLIENTS_UNFINISHED: &str =
+    "This server lets 26.2 join, but Horizon cannot translate 26.2 yet: join with 26.3";
 
 /// A vanilla client refused from a cubic world: the lang key a Horizon client translates, and
 /// the text a vanilla one shows (a component's `fallback`).
@@ -211,10 +276,23 @@ pub struct NetConfig {
     /// An integrated server's owner profile: the properties the window's own
     /// (memory) connection logs in with.
     pub owner_profile: Option<Arc<OwnerProfile>>,
+    /// `IntegratedServer.getSingleplayerProfile` (`Minecraft.getGameProfile`): the
+    /// integrated server's own player's name and UUID. A memory login whose name matches
+    /// is that profile (the account's UUID); every other login derives the offline one.
+    pub singleplayer_profile: Option<(String, u128)>,
     /// `horizon-clients-only` (Horizon's own server.properties key, off): a
     /// client whose `minecraft:brand` isn't Horizon's is turned away during
     /// configuration. A brand can be spoofed: a gate, not security.
     pub horizon_clients_only: bool,
+    /// `horizon-accept-older-clients` (off): a client of 26.2 joins too, its packets renumbered
+    /// (horizon_protocol::adapter::ClientSession). Off, it is turned away as vanilla turns it away.
+    pub accept_older_clients: bool,
+    /// Lets an older client past configuration although only its packet ids are translated yet
+    /// (#10404's later parts translate the registry ids and the packets whose layout changed): for tests
+    /// of the id renumbering, never in server.toml. False, such a client is told
+    /// [`OLDER_CLIENTS_UNFINISHED`] before any registry data, tag or play packet would reach it in 26.3's
+    /// ids and layouts.
+    pub older_clients_play: bool,
     /// `horizon-lod-distance` (Horizon's own server.properties key, 64): how
     /// far, in chunks, the server samples far terrain for Horizon clients
     /// (`lod_net`); 0 serves none.
@@ -263,9 +341,12 @@ impl NetConfig {
             code_of_conducts: Vec::new(),
             server_links: Vec::new(),
             horizon_clients_only: false,
+            accept_older_clients: false,
+            older_clients_play: false,
             lod_distance: crate::lod_net::DEFAULT_DISTANCE,
             levels: crate::chunk::LevelShapes::VANILLA,
             owner_profile: None,
+            singleplayer_profile: None,
         }
     }
 }
@@ -386,6 +467,8 @@ pub struct Shared {
     closing: AtomicUsize,
     /// Connections turned away since the last report of them, and when that was.
     turned_away: Mutex<(usize, Option<Instant>)>,
+    /// A stop waits for a proxy to move the players out (`arrivals::StopWait`): no login comes in.
+    shutting_down: AtomicBool,
 }
 impl Shared {
     /// Whether the world has a cubic level (`Hub::new`, `Hub::cubic_window_changed`).
@@ -415,6 +498,9 @@ impl Shared {
         uuid: u128,
         name: &str,
     ) -> Option<horizon_world::nbt::Tag> {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return Some(translatable("multiplayer.disconnect.server_shutdown", &[]));
+        }
         if let Some(gate) = &self.config.gate
             && let Some(reason) = gate(address, uuid, name)
         {
@@ -440,6 +526,10 @@ impl Shared {
         }
         self.online.lock().unwrap().push((uuid, name.to_owned()));
         None
+    }
+    /// A stop has begun: every login from now on is refused as the server's shutdown.
+    pub fn refuse_logins(&self) {
+        self.shutting_down.store(true, Ordering::Relaxed);
     }
     fn is_online(&self, uuid: u128) -> bool {
         self.online.lock().unwrap().iter().any(|(u, _)| *u == uuid)
@@ -496,6 +586,10 @@ impl Shared {
     /// ServerStatus.CODEC): description, players with up to 12 shuffled
     /// names, version, favicon and enforcesSecureChat when true.
     pub fn status_json(&self) -> String {
+        self.status_json_for(PROTOCOL_VERSION)
+    }
+    /// [`Self::status_json`] stating `protocol`: an older client's own, when it may join.
+    pub fn status_json_for(&self, protocol: i32) -> String {
         use crate::server::json::Json;
         let motd = self.motd.lock().unwrap().clone();
         let online: Vec<(u128, String)> = self.online.lock().unwrap().clone();
@@ -537,10 +631,7 @@ impl Shared {
                 "version".to_owned(),
                 Json::Object(vec![
                     ("name".to_owned(), Json::String(GAME_VERSION.to_owned())),
-                    (
-                        "protocol".to_owned(),
-                        Json::Number(PROTOCOL_VERSION.to_string()),
-                    ),
+                    ("protocol".to_owned(), Json::Number(protocol.to_string())),
                 ]),
             ),
         ];
@@ -629,6 +720,7 @@ impl Lan {
             next_connection: AtomicU64::new(0),
             closing: AtomicUsize::new(0),
             turned_away: Mutex::new((0, None)),
+            shutting_down: AtomicBool::new(false),
             random: Mutex::new(crate::server::java_properties::now_millis() as u64 | 1),
             config,
         });
@@ -981,6 +1073,37 @@ pub(super) fn test_loopback() -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn channel_messages_register_and_unregister_each_name_once() {
+        let mut channels = Vec::new();
+        let added = super::apply_channels(
+            &mut channels,
+            b"fabric:registry/sync\0voxy:info\0voxy:info\0nocolon\0bad name:x",
+            true,
+        );
+        assert_eq!(added, ["fabric:registry/sync", "voxy:info"]);
+        assert_eq!(channels, ["fabric:registry/sync", "voxy:info"]);
+        let removed = super::apply_channels(&mut channels, b"voxy:info\0other:one", false);
+        assert_eq!(removed, ["voxy:info"]);
+        assert_eq!(channels, ["fabric:registry/sync"]);
+        let many: Vec<u8> = (0..200)
+            .map(|i| format!("m:c{i}"))
+            .collect::<Vec<_>>()
+            .join("\0")
+            .into_bytes();
+        super::apply_channels(&mut channels, &many, true);
+        assert_eq!(channels.len(), super::MAX_CHANNELS);
+        assert_eq!(
+            super::channel_registration("minecraft:register"),
+            Some(true)
+        );
+        assert_eq!(
+            super::channel_registration("minecraft:unregister"),
+            Some(false)
+        );
+        assert_eq!(super::channel_registration("minecraft:brand"), None);
+    }
+
+    #[test]
     fn a_local_server_accepts_only_the_requested_loopback_address() {
         let lan = super::Lan::start_with(
             std::sync::Arc::new(super::data::SyncData::empty()),
@@ -1047,6 +1170,25 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Once a stop waits for a proxy, no login takes a place, an op's neither.
+    #[test]
+    fn a_server_that_refuses_logins_takes_no_one_in() {
+        let config = NetConfig {
+            announce: false,
+            listen: false,
+            bypasses_limit: Some(Arc::new(|_| true)),
+            ..NetConfig::loopback(0, "Stopping".into(), 8)
+        };
+        let lan = Lan::start_with(Arc::new(data::SyncData::empty()), config).unwrap();
+        assert!(lan.shared.try_admit(MEMORY_ADDRESS, 1, "Player").is_none());
+        lan.shared.refuse_logins();
+        assert_eq!(
+            lan.shared.try_admit(MEMORY_ADDRESS, 2, "Late"),
+            Some(translatable("multiplayer.disconnect.server_shutdown", &[]))
+        );
+        assert_eq!(lan.shared.online(), 1);
     }
 
     #[test]

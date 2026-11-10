@@ -103,6 +103,22 @@ pub struct DrawSetup<'a> {
     pub counts: bool,
 }
 
+impl DrawSetup<'_> {
+    /// The fragment constants of terrain.wgsl's stages, as the renderer's terrain pipelines
+    /// give them: the sprite arrays, and `HDR_WRITE_LIGHT` on the float frame
+    /// (`LINEAR_FRAME`), whose world shaders write their own light rather than a mark.
+    pub fn constants(&self) -> [(&'static str, f64); 3] {
+        [
+            ("SPRITE_ARRAYS", self.sprite_constants[0]),
+            ("SPRITE_SPLIT", self.sprite_constants[1]),
+            (
+                "HDR_WRITE_LIGHT",
+                f64::from(u8::from(self.format == super::LINEAR_FRAME)),
+            ),
+        ]
+    }
+}
+
 pub struct CubeFar {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -136,11 +152,12 @@ pub struct CubeFar {
     stats: FarStats,
 }
 
-/// The terrain shader with the vertex-pulling entry point appended.
+/// The terrain shader (with the HDR light it writes, `terrain_shader`) and the
+/// vertex-pulling entry point appended.
 pub fn shader_source() -> String {
     format!(
         "{}\n{}",
-        include_str!("../terrain.wgsl"),
+        super::terrain_shader(),
         include_str!("cube_far.wgsl")
     )
 }
@@ -300,10 +317,7 @@ impl CubeFar {
             bind_group_layouts: &[Some(setup.bindings), Some(&draw_layout)],
             ..Default::default()
         });
-        let constants = [
-            ("SPRITE_ARRAYS", setup.sprite_constants[0]),
-            ("SPRITE_SPLIT", setup.sprite_constants[1]),
-        ];
+        let constants = setup.constants();
         let pipeline = |label: &str, fragment: &str, blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),

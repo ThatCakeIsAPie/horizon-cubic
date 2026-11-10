@@ -172,7 +172,7 @@ pub fn register(m: &mut Mob) {
             g.add(4, RandomLookAround::default());
             g.add(5, LookAtPlayer::new(6.0));
             g.add(5, super::dolphin::Jump::new(10));
-            g.add(6, MeleeAttack::new(1.2, true));
+            g.add(6, MeleeAttack::new(f64::from(1.2_f32), true));
             g.add(7, super::dolphin::MoveToItem::default());
             g.add(8, super::dolphin::PlayWithItems);
             g.add(8, super::dolphin::FollowPlayerRidden::new(false));
@@ -463,16 +463,22 @@ pub fn hurt_server(m: &mut Mob) {
     set_dark_ticks(m, 100);
 }
 
+/// `GlowSquid.aiStep`: its positive dark timer runs after the parent step,
+/// including when NoAI skips server AI. This upkeep consumes no random draws.
+pub(super) fn glow_squid_dark_tick(m: &mut Mob) {
+    let ticks = dark_ticks(m);
+    if ticks > 0 {
+        set_dark_ticks(m, ticks - 1);
+    }
+}
+
 /// `GlowSquid.aiStep` after `super.aiStep()`: the dark timer counts down, and
 /// a `glow` particle appears at `getRandomX(0.6)`, `getRandomY()`,
 /// `getRandomZ(0.6)` (drawn in that order). A window that simulates the world
 /// and a client of a server both draw it, so the server's own `ai_step` pushes
 /// the event as well (as the nautilus bubbles do).
 fn glow_squid_ai_step(m: &mut Mob, events: &mut Vec<MobEvent>) {
-    let ticks = dark_ticks(m);
-    if ticks > 0 {
-        set_dark_ticks(m, ticks - 1);
-    }
+    glow_squid_dark_tick(m);
     let (w, h) = (f64::from(m.width()), f64::from(m.height()));
     let r = &mut m.random;
     let x = m.position.x + w * ((2.0 * r.next_double() - 1.0) * 0.6);
@@ -938,9 +944,9 @@ impl Goal for PufferfishPuff {
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
         let area = m.bounds().inflate(Vec3::new(2.0, 2.0, 2.0));
         let player =
-            cx.w.player
-                .as_ref()
-                .is_some_and(|p| p.alive && !p.creative && area.intersects(p.bounds));
+            cx.w.player.as_ref().is_some_and(|p| {
+                p.alive && !p.creative && !p.spectator && area.intersects(p.bounds)
+            });
         // TARGETING_CONDITIONS: not #not_scary_for_pufferfish, and alive.
         let mob = cx.w.others_near(area).any(|s| {
             s.id != m.id
@@ -1604,4 +1610,45 @@ mod pufferfish_sting_tests {
             }
         });
     }
+
+    /// `Pufferfish.PufferfishPuffGoal.canUse` targets players with
+    /// `TargetingConditions.forNonCombat()`, which never picks a spectator.
+    #[test]
+    fn a_spectator_does_not_puff_a_pufferfish() {
+        use crate::mobs::world::{test_player, with_test_world};
+        let mut outcomes = Vec::new();
+        if !with_test_world(&[], |w, types| {
+            let kind = Arc::new(types.types["minecraft:pufferfish"].clone());
+            for spectator in [false, true] {
+                let mut world = w.clone();
+                let mut p = test_player(Vec3::new(0.5, 64.0, 0.5));
+                p.spectator = spectator;
+                world.player = Some(p);
+                let mut fish = Mob::new(1, kind.clone(), Vec3::new(0.5, 64.0, 0.5), 0.0);
+                fish.no_gravity = true;
+                fish.ai.goals.add(1, PufferfishPuff);
+                let mut lr = LegacyRandom::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    lr: &mut lr,
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut fish.ai.goals);
+                goals.tick(&mut fish, &mut cx);
+                outcomes.push(goals.is_running("PufferfishPuff"));
+                fish.ai.goals = goals;
+            }
+        }) {
+            return;
+        }
+        assert_eq!(
+            outcomes,
+            vec![true, false],
+            "a survival player puffs it; a spectator does not"
+        );
+    }
 }
+
+#[cfg(test)]
+mod countdown_tests;
