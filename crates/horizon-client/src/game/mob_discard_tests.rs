@@ -70,7 +70,8 @@ fn discarded_mob_leaves_selectors_and_saves_while_frozen() {
         game.target_with_uuid(dying_uuid),
         Some(commands::Target::Mob(43))
     );
-    let keys = [(0, 0)].into();
+    let columns: HashSet<persist::ChunkKey> = [(0, 0)].into();
+    let keys = persist::EntityScope::columns(&columns);
     let mut saved = HashMap::new();
     game.save_every_entity(&keys, &mut saved);
     assert_eq!(saved.values().map(Vec::len).sum::<usize>(), 1);

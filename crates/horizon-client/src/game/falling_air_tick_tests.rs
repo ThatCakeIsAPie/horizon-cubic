@@ -58,7 +58,8 @@ fn loaded_air_is_discarded_on_first_actual_game_tick() {
         2,
         "both actual command loads must be admitted"
     );
-    let keys = [(0, 0)].into_iter().collect();
+    let columns: HashSet<persist::ChunkKey> = [(0, 0)].into_iter().collect();
+    let keys = persist::EntityScope::columns(&columns);
     let ids: Vec<_> = game.falling.iter().map(|f| f.id).collect();
     for (i, state) in ["minecraft:air", "minecraft:sand"].into_iter().enumerate() {
         let f = &game.falling[i];

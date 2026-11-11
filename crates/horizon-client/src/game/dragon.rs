@@ -5739,7 +5739,7 @@ mod dragon_fireball_spawn_tests {
         // forced chunk so the server ticks it.
         assert_eq!(
             game.enter_command_level(crate::game::Dim::End),
-            Some(crate::game::Dim::Overworld)
+            Some(crate::game::LevelId::from(crate::game::Dim::Overworld))
         );
         assert!(game.dimension_type().has_ender_dragon_fight, "the End");
         for x in -1..2 {
